@@ -1,0 +1,16 @@
+{
+  "domain": "heating_analytics",
+  "name": "Heating Analytics",
+  "version": "1.0.0",
+  "documentation": "https://github.com/thuemah/heating_analytics",
+  "issue_tracker": "https://github.com/thuemah/heating_analytics/issues",
+  "requirements": [
+    "astral>=2.2"
+  ],
+  "codeowners": [
+    "@thuemah"
+  ],
+  "iot_class": "local_polling",
+  "config_flow": true,
+  "dependencies": []
+}

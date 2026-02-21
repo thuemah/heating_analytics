@@ -1,0 +1,23 @@
+{
+    "config": {
+        "error": {
+            "weather_entity_required": "Værtjeneste er påkrevd.",
+            "weather_entity_not_found": "Valgt værtjeneste ble ikke funnet.",
+            "weather_missing_temperature": "Valgt værtjeneste leverer ikke nåværende temperatur.",
+            "weather_missing_wind_speed": "Valgt værtjeneste leverer ikke nåværende vindhastighet."
+        },
+        "step": {
+            "user": {
+                "title": "Oppsett av Heating Analytics",
+                "description": "Konfigurer oppvarmingsanalyse. Du kan bruke spesifikke sensorer eller falle tilbake på en værintegrasjon."
+            },
+            "reconfigure": {
+                "title": "Rekonfigurer Heating Analytics",
+                "description": "Oppdater din konfigurasjon."
+            }
+        },
+        "abort": {
+            "already_configured": "Enheten er allerede konfigurert"
+        }
+    }
+}

@@ -1,0 +1,136 @@
+import_from_csv:
+  name: Import from CSV
+  description: Import historical data from a CSV file into the learning model.
+  fields:
+    file_path:
+      name: File path
+      description: The absolute path to the CSV file on the server.
+      required: true
+      selector:
+        text:
+    column_mapping:
+      name: Column Mapping
+      description: JSON object mapping CSV column names to 'timestamp', 'energy', 'temperature', 'wind_speed', and optionally 'wind_gust', 'cloud_coverage' and 'is_auxiliary'.
+      required: true
+      selector:
+        object:
+    update_model:
+      name: Update Learning Model
+      description: If true, the learning model will be trained on the imported data. If false, only history and graphs are updated.
+      default: true
+      selector:
+        boolean:
+
+export_to_csv:
+  name: Export to CSV
+  description: Export data (Daily History or Hourly Log) to a CSV file.
+  fields:
+    file_path:
+      name: File path
+      description: The absolute path where the CSV file will be saved (e.g., /config/heating_data.csv).
+      required: true
+      selector:
+        text:
+    export_type:
+      name: Export Type
+      description: Type of data to export ('daily' or 'hourly').
+      required: true
+      selector:
+        select:
+          options:
+            - daily
+            - hourly
+
+reset_learning_data:
+  name: Reset Learning Data
+  description: Reset all learned correlation data and start fresh.
+
+reset_forecast_accuracy:
+  name: Reset Forecast Accuracy
+  description: Reset the forecast accuracy tracking history (forecast vs actual). This clears the "Forecast History" tab but preserves energy logs.
+
+backup_data:
+  name: Full System Backup
+  description: Create a full backup of the system state (Learning Model, History, Logs, Settings) to a JSON file.
+  fields:
+    file_path:
+      name: File path
+      description: The absolute path where the backup JSON file will be saved (e.g., /config/heating_backup.json).
+      required: true
+      selector:
+        text:
+
+restore_data:
+  name: Full System Restore
+  description: "Restore the system state from a full backup JSON file. WARNING: This will overwrite all current data!"
+  fields:
+    file_path:
+      name: File path
+      description: The absolute path to the backup JSON file.
+      required: true
+      selector:
+        text:
+
+reset_unit_learning_data:
+  name: Reset Unit Learning Data
+  description: Reset the learned correlation model for a specific heating unit. This forces the unit back into 'Cold Start' mode, allowing buffered data to be applied or new data to be collected.
+  fields:
+    entity_id:
+      name: Entity
+      description: The heating unit energy sensor to reset (e.g., sensor.heating_floor_energy).
+      required: true
+      selector:
+        entity:
+          domain: sensor
+
+replace_sensor_source:
+  name: Replace Sensor Source
+  description: Replace a heating unit's energy sensor with a new one, migrating all historical data and learning models to the new entity ID.
+  fields:
+    old_entity_id:
+      name: Old Entity
+      description: The entity ID of the old energy sensor to be replaced (e.g., sensor.old_heater).
+      required: true
+      selector:
+        entity:
+          domain: sensor
+    new_entity_id:
+      name: New Entity
+      description: The entity ID of the new energy sensor (e.g., sensor.new_heater).
+      required: true
+      selector:
+        entity:
+          domain: sensor
+
+compare_periods:
+  name: Compare Periods
+  description: "Compare two historical periods. Period 1 is the current/recent period, Period 2 is the reference/baseline. Deltas show P1 relative to P2 (positive = P1 is higher)."
+  fields:
+    period_1_start:
+      name: Period 1 Start (Current)
+      description: "Start date for the current/recent period (e.g., '2026-01-01')."
+      required: true
+      selector:
+        date:
+    period_1_end:
+      name: Period 1 End (Current)
+      description: "End date for the current/recent period (e.g., '2026-01-31')."
+      required: true
+      selector:
+        date:
+    period_2_start:
+      name: Period 2 Start (Reference)
+      description: "Start date for the reference/baseline period (e.g., '2025-01-01')."
+      required: true
+      selector:
+        date:
+    period_2_end:
+      name: Period 2 End (Reference)
+      description: "End date for the reference/baseline period (e.g., '2025-01-31')."
+      required: true
+      selector:
+        date:
+
+exit_cooldown:
+  name: Exit Auxiliary Cooldown
+  description: Manually force the system to exit the auxiliary cooldown/decay state. Use this if you want to resume normal model learning immediately after an auxiliary event, bypassing the thermal settling period.

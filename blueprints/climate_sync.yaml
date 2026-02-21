@@ -1,0 +1,88 @@
+blueprint:
+  name: Heating Analytics - Climate State Sync
+  description: >
+    Synchronizes climate entity states (heat/cool/off) to a Heating Analytics
+    mode select helper. Supports both standard and guest mode tracking.
+
+  domain: automation
+
+  source_url: https://github.com/thuemah/heating_analytics/blob/main/blueprints/climate_sync.yaml
+
+  input:
+    climate_entity:
+      name: Climate Entity
+      description: The climate entity to monitor for state changes
+      selector:
+        entity:
+          domain: climate
+
+    mode_helper:
+      name: Mode Helper Entity
+      description: The Heating Analytics select helper to update
+      selector:
+        entity:
+          domain: select
+
+    use_guest_prefix:
+      name: Use Guest Mode Prefix
+      description: >
+        Enable to prefix heating/cooling states with 'guest_' for tracking
+        consumption separately from main heating system
+      default: false
+      selector:
+        boolean:
+
+# Use queued mode to handle rapid state changes gracefully
+mode: queued
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: !input climate_entity
+    to:
+      - "off"
+      - "heat"
+      - "cool"
+      - "heat_cool"
+      - "auto"
+      - "dry"
+      - "fan_only"
+#      - "unavailable" # beholder da sin siste status
+#      - "unknown"     # beholder da sin siste status 
+
+variables:
+  # Load the boolean input into a variable for robust access in templates
+  _use_guest_prefix: !input use_guest_prefix
+  # Calculate prefix based on guest mode setting
+  prefix: "{{ 'guest_' if _use_guest_prefix else '' }}"
+  hvac_state: "{{ trigger.to_state.state }}"
+
+action:
+  - choose:
+      # Heat mode
+      - conditions:
+          - "{{ hvac_state == 'heat' }}"
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input mode_helper
+            data:
+              option: "{{ prefix ~ 'heating' }}"
+
+      # Cool mode
+      - conditions:
+          - "{{ hvac_state == 'cool' }}"
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input mode_helper
+            data:
+              option: "{{ prefix ~ 'cooling' }}"
+
+    # Default: off (also handles unavailable/unknown gracefully)
+    default:
+      - service: select.select_option
+        target:
+          entity_id: !input mode_helper
+        data:
+          option: "off"
