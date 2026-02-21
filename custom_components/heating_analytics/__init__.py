@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform, EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import HomeAssistant, ServiceCall, Event
+from homeassistant.core import HomeAssistant, ServiceCall, Event, SupportsResponse
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import HeatingDataCoordinator
@@ -32,6 +35,7 @@ SERVICE_RESTORE_DATA = "restore_data"
 SERVICE_REPLACE_SENSOR = "replace_sensor_source"
 SERVICE_COMPARE_PERIODS = "compare_periods"
 SERVICE_EXIT_COOLDOWN = "exit_cooldown"
+SERVICE_GET_FORECAST = "get_forecast"
 
 SERVICE_SCHEMA_IMPORT = vol.Schema({
     vol.Required("file_path"): cv.string,
@@ -289,6 +293,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         schema=vol.Schema({}),
     )
 
+    # Register Get Forecast Service
+    async def handle_get_forecast(call: ServiceCall) -> dict:
+        """Handle the get forecast service call."""
+        entity_id = call.data.get("entity_id")
+        days = call.data.get("days", 1)
+
+        target_coordinator = None
+
+        if entity_id:
+            registry = er.async_get(hass)
+            entry = registry.async_get(entity_id)
+            if entry and entry.config_entry_id:
+                target_coordinator = hass.data[DOMAIN].get(entry.config_entry_id)
+
+        if not target_coordinator:
+            # Default to first available
+            coordinators = _get_coordinators(hass)
+            if coordinators:
+                target_coordinator = coordinators[0]
+
+        if not target_coordinator:
+             raise ValueError("No Heating Analytics instance found.")
+
+        _LOGGER.debug(f"Handling get_forecast for {days} days (Coordinator: {target_coordinator.entry.entry_id})")
+
+        now = dt_util.now()
+        start_time = now
+        end_time = now + timedelta(days=days)
+
+        result = target_coordinator.forecast.get_hourly_forecast(start_time, end_time)
+        return {"forecast": result}
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GET_FORECAST,
+        handle_get_forecast,
+        supports_response=SupportsResponse.ONLY,
+    )
+
     return True
 
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -350,5 +393,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_REPLACE_SENSOR)
             hass.services.async_remove(DOMAIN, SERVICE_COMPARE_PERIODS)
             hass.services.async_remove(DOMAIN, SERVICE_EXIT_COOLDOWN)
+            hass.services.async_remove(DOMAIN, SERVICE_GET_FORECAST)
 
     return unload_ok

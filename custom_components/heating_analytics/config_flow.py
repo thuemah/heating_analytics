@@ -46,6 +46,10 @@ from .const import (
     CONF_FORECAST_CROSSOVER_DAY,
     DEFAULT_FORECAST_CROSSOVER_DAY,
     CONF_AUX_AFFECTED_ENTITIES,
+    CONF_THERMAL_INERTIA,
+    THERMAL_INERTIA_FAST,
+    THERMAL_INERTIA_NORMAL,
+    THERMAL_INERTIA_SLOW,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -210,6 +214,18 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             vol.Required("balance_point", default=get_val("balance_point", DEFAULT_BALANCE_POINT)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=25, step=0.5, unit_of_measurement="°C")
+            ),
+            # Thermal Inertia Profile (User Selectable)
+            vol.Required(CONF_THERMAL_INERTIA, default=get_val(CONF_THERMAL_INERTIA, THERMAL_INERTIA_NORMAL)): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        THERMAL_INERTIA_FAST,
+                        THERMAL_INERTIA_NORMAL,
+                        THERMAL_INERTIA_SLOW
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                    translation_key="thermal_inertia"
+                )
             ),
             # Learning Rate (Convert float back to percentage for display)
             vol.Required("learning_rate", default=round(get_val("learning_rate", DEFAULT_LEARNING_RATE) * 100, 1)): selector.NumberSelector(

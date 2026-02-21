@@ -62,7 +62,7 @@ async def test_weather_source_selection(hass, mock_entry):
     coordinator.forecast.calculate_plan_revision_impact.return_value = {}
 
     # FIX: Return tuple of 7 elements for unpacking
-    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
+    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
 
     coordinator.forecast.get_forecast_for_hour.return_value = None
     # FIX: Mock get_plan_for_hour to return a 2-tuple
@@ -135,9 +135,9 @@ async def test_mixed_source_selection(hass, mock_entry):
     coordinator.forecast.calculate_future_energy.return_value = (0.0, 0.0, {})
     coordinator.forecast.calculate_weather_deviation.return_value = {}
     coordinator.forecast.calculate_plan_revision_impact.return_value = {}
-    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
-    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
-    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
+    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
+    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
+    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
     coordinator.forecast.get_forecast_for_hour.return_value = None
     # FIX: Mock get_plan_for_hour to return a 2-tuple
     coordinator.forecast.get_plan_for_hour.return_value = (0.0, {})
@@ -200,7 +200,8 @@ async def test_strict_mode_no_fallback(hass, mock_entry):
     coordinator.forecast.calculate_future_energy.return_value = (0.0, 0.0, {})
     coordinator.forecast.calculate_weather_deviation.return_value = {}
     coordinator.forecast.calculate_plan_revision_impact.return_value = {}
-    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
+    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
+    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
     coordinator.forecast.get_forecast_for_hour.return_value = None
     # FIX: Mock get_plan_for_hour to return a 2-tuple
     coordinator.forecast.get_plan_for_hour.return_value = (0.0, {})
@@ -269,7 +270,7 @@ async def test_optional_gust_sensor(hass, mock_entry):
     coordinator.forecast.calculate_future_energy.return_value = (0.0, 0.0, {})
     coordinator.forecast.calculate_weather_deviation.return_value = {}
     coordinator.forecast.calculate_plan_revision_impact.return_value = {}
-    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
+    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
     coordinator.forecast.get_forecast_for_hour.return_value = None
     # FIX: Mock get_plan_for_hour to return a 2-tuple
     coordinator.forecast.get_plan_for_hour.return_value = (0.0, {})

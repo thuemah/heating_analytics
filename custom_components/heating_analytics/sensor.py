@@ -80,8 +80,6 @@ from .const import (
     SENSOR_PERIOD_COMPARISON,
     SENSOR_THERMAL_STATE,
 
-    DEFAULT_INERTIA_WEIGHTS,
-
     # Forecast Attributes
     ATTR_FORECAST_DETAILS,
     ATTR_DAILY_FORECAST,
@@ -333,7 +331,7 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
                 # Initialize Inertia (Stateful Simulation)
                 # We must start from CURRENT inertia and evolve it through the day
                 inertia_now = coordinator._calculate_inertia_temp() or 0.0
-                history_needed = len(DEFAULT_INERTIA_WEIGHTS) - 1
+                history_needed = len(coordinator.inertia_weights) - 1
 
                 # Fetch recent history to seed the simulation correctly (instead of flat line)
                 local_inertia = coordinator._get_inertia_list(now)
@@ -353,7 +351,7 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
                         if f_dt and dt_util.as_local(f_dt).date() == now.date():
                             # Pass mutable sim_inertia: it will be updated by _process_forecast_item
                             # This fixes the "Borderline Technical Error" (Inertia Reset)
-                            pred, _, _, _, _, _, _ = forecast_mgr._process_forecast_item(
+                            pred, _, _, _, _, _, _, _ = forecast_mgr._process_forecast_item(
                                 item, sim_inertia, weather_wind_unit, current_cloud, ignore_aux=False
                             )
                             if pred > max_hour_kwh:

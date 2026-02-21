@@ -14,6 +14,7 @@ def mock_coordinator():
     coordinator.hass = MagicMock()
     coordinator.hass.config.time_zone = "UTC"
     coordinator.weather_entity = "weather.test"
+    coordinator.inertia_weights = DEFAULT_INERTIA_WEIGHTS
     coordinator.entry = MagicMock()
     coordinator.entry.data = {}
     coordinator.data = {}

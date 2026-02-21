@@ -48,7 +48,7 @@ def test_future_forecast_ignores_aux(mock_coordinator, mock_dt_util):
     fm = ForecastManager(mock_coordinator)
 
     # Mock _process_forecast_item to verify it receives ignore_aux=True
-    with patch.object(fm, '_process_forecast_item', return_value=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})) as mock_process:
+    with patch.object(fm, '_process_forecast_item', return_value=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)) as mock_process:
 
         # Setup 24h data for Tomorrow
         target_date = date(2023, 10, 11) # Tomorrow
@@ -79,7 +79,7 @@ def test_today_forecast_respects_aux(mock_coordinator, mock_dt_util):
     """Test that today's forecast calls _process_forecast_item with ignore_aux=False."""
     fm = ForecastManager(mock_coordinator)
 
-    with patch.object(fm, '_process_forecast_item', return_value=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})) as mock_process:
+    with patch.object(fm, '_process_forecast_item', return_value=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)) as mock_process:
 
         # Setup 24h data for Today
         target_date = date(2023, 10, 10) # Today

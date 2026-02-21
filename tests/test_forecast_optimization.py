@@ -49,8 +49,8 @@ class TestForecastOptimization(unittest.TestCase):
         self.coordinator.forecast.get_forecast_for_hour.return_value = forecast_item
 
         # Mock _process_forecast_item to return dummy values
-        # Returns: (predicted_kwh, solar_kwh, inertia_val, raw_temp, wind_speed_raw, wind_speed_ms, unit_breakdown)
-        self.coordinator.forecast._process_forecast_item.return_value = (5.0, 0.0, 10.0, 10.0, 5.0, 1.4, {})
+        # Returns: (predicted_kwh, solar_kwh, inertia_val, raw_temp, wind_speed_raw, wind_speed_ms, unit_breakdown, aux_impact)
+        self.coordinator.forecast._process_forecast_item.return_value = (5.0, 0.0, 10.0, 10.0, 5.0, 1.4, {}, 0.0)
 
         # Execution
         current_time = datetime(2023, 10, 27, 12, 30)
@@ -67,7 +67,7 @@ class TestForecastOptimization(unittest.TestCase):
 
         forecast_item = {"datetime": "2023-10-27T12:00:00"}
         self.coordinator.forecast.get_forecast_for_hour.return_value = forecast_item
-        self.coordinator.forecast._process_forecast_item.return_value = (5.0, 0.0, 10.0, 10.0, 5.0, 1.4, {})
+        self.coordinator.forecast._process_forecast_item.return_value = (5.0, 0.0, 10.0, 10.0, 5.0, 1.4, {}, 0.0)
 
         current_time = datetime(2023, 10, 27, 12, 30)
         self.coordinator._update_daily_budgets(1.0, current_time, 30)

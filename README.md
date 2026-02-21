@@ -270,6 +270,15 @@ A complete dashboard configuration is available in [dashboard_heating.md](dashbo
 | **Wind Gust Factor** | 0.6 | Weight given to wind gusts (60%) |
 | **Wind Threshold** | 5.5 m/s | Threshold for 'High Wind' conditions. |
 | **Extreme Wind Threshold** | 10.8 m/s | Threshold for 'Extreme Wind' conditions. |
+| **Thermal Inertia** | Normal | Building thermal mass profile (Fast, Normal, Slow) |
+
+### Thermal Inertia Profiles
+
+You can configure how quickly your house reacts to outside temperature changes.
+
+- **Normal (Default):** 4-hour window (20% current, 80% history). Best for standard insulated homes.
+- **Fast:** 2-hour window (50% current, 50% history). Best for poorly insulated homes or low thermal mass (e.g., wooden cabin).
+- **Slow:** 12-hour window (Bell curve). Best for high thermal mass buildings (e.g., concrete/stone, passive houses) where today's heating depends heavily on yesterday's weather.
 
 ### Heating Strategy: Which Units to Track?
 
@@ -552,6 +561,38 @@ data:
 **Why Use This Instead of Full Reset?**
 
 Unlike `reset_learning_data`, this service preserves the learning buffer. The buffer contains the last 10 samples collected for each temperature/wind condition. When the model resets, these samples are immediately used to "jump-start" learning, giving you accurate predictions within hours instead of days.
+
+---
+
+### Get Hourly Forecast Plan
+
+**Service:** `heating_analytics.get_forecast`
+
+Retrieve the detailed hourly heating plan (prediction) for today.
+
+**Parameters:**
+- `type`: `hourly` (Only supported type currently)
+
+**Returns:**
+A dictionary containing the forecast plan:
+- `forecast`: List of hourly objects with:
+    - `datetime`: ISO timestamp
+    - `predicted_kwh`: Expected energy usage
+    - `temperature`: Outdoor temperature
+    - `wind_speed`: Wind speed
+    - `aux_impact_kwh`: Estimated savings from auxiliary heating (if active)
+
+**Example:**
+```yaml
+service: heating_analytics.get_forecast
+data:
+  type: hourly
+response_variable: heating_plan
+```
+
+**Use Case:**
+- Automations that need to know *exactly* how much energy the house will use in the next few hours.
+- Custom dashboards that need raw prediction data.
 
 ---
 

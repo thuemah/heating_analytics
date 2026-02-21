@@ -102,6 +102,13 @@ from .const import (
     CONF_FORECAST_CROSSOVER_DAY,
     DEFAULT_FORECAST_CROSSOVER_DAY,
     DEFAULT_INERTIA_WEIGHTS,
+    CONF_THERMAL_INERTIA,
+    THERMAL_INERTIA_FAST,
+    THERMAL_INERTIA_NORMAL,
+    THERMAL_INERTIA_SLOW,
+    INERTIA_PROFILE_FAST,
+    INERTIA_PROFILE_NORMAL,
+    INERTIA_PROFILE_SLOW,
     SOURCE_SENSOR,
     SOURCE_WEATHER,
     MODE_HEATING,
@@ -267,6 +274,15 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self.solar_enabled = entry.data.get(CONF_SOLAR_ENABLED, DEFAULT_SOLAR_ENABLED)
         self.solar_azimuth = entry.data.get(CONF_SOLAR_AZIMUTH, DEFAULT_SOLAR_AZIMUTH)
         self.solar_correction_percent = DEFAULT_SOLAR_CORRECTION
+
+        # Load Thermal Inertia Profile (Default to Normal/4h if missing)
+        inertia_setting = self.entry.data.get(CONF_THERMAL_INERTIA, THERMAL_INERTIA_NORMAL)
+        if inertia_setting == THERMAL_INERTIA_FAST:
+            self.inertia_weights = INERTIA_PROFILE_FAST
+        elif inertia_setting == THERMAL_INERTIA_SLOW:
+            self.inertia_weights = INERTIA_PROFILE_SLOW
+        else:
+            self.inertia_weights = INERTIA_PROFILE_NORMAL
 
         # Load Aux Affected Entities (Default to all energy sensors if missing)
         self.aux_affected_entities = self.entry.data.get(CONF_AUX_AFFECTED_ENTITIES)
@@ -725,7 +741,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
     def _get_inertia_parameters(self) -> tuple[int, int]:
         """Helper to derive requirements from weights."""
-        total_needed = len(DEFAULT_INERTIA_WEIGHTS)
+        total_needed = len(self.inertia_weights)
         hours_back = total_needed - 1
         max_gap = total_needed
         return hours_back, max_gap
@@ -749,14 +765,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Temp[-2] matches Weight[-2]
 
         num_temps = len(temps)
-        num_weights = len(DEFAULT_INERTIA_WEIGHTS)
+        num_weights = len(self.inertia_weights)
 
         # Take the last N weights where N = num_temps
         # But limited by num_weights (shouldn't happen if logic is correct, but safe)
         count = min(num_temps, num_weights)
 
         active_temps = temps[-count:]
-        active_weights = DEFAULT_INERTIA_WEIGHTS[-count:]
+        active_weights = self.inertia_weights[-count:]
 
         total_weight = sum(active_weights)
         if total_weight == 0:
@@ -857,7 +873,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Calculate the inertia temperature (Weighted Average).
 
         Uses the last N-1 valid hours of history from hourly_log + current/latest known temp.
-        N = len(DEFAULT_INERTIA_WEIGHTS).
+        N = len(self.inertia_weights).
         """
         current_time = dt_util.now()
         temps = self._get_inertia_list(current_time)
@@ -866,7 +882,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             return None
 
         # Graceful degradation logging
-        required_len = len(DEFAULT_INERTIA_WEIGHTS)
+        required_len = len(self.inertia_weights)
         if len(temps) == 1:
             pass # Normal start-up or only current available
         elif len(temps) < required_len:
@@ -1707,7 +1723,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
              "raw_temperature": round(temp, 1) if temp is not None else None,
              "effective_temperature": round(inertia_temp, 1) if inertia_temp is not None else None,
              "inertia_history": [round(t, 1) for t in inertia_list],
-             "weights": list(DEFAULT_INERTIA_WEIGHTS[-len(inertia_list):]) if inertia_list else [],
+             "weights": list(self.inertia_weights[-len(inertia_list):]) if inertia_list else [],
              "samples_used": len(inertia_list),
              "last_updated": current_time.isoformat(),
              "balance_point": self.balance_point,
@@ -2167,7 +2183,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Helper to process an item
         def _get_f_kwh(item, ignore_aux=False):
             if not item: return None
-            val, _, _, _, _, _, _ = self.forecast._process_forecast_item(
+            val, _, _, _, _, _, _, _ = self.forecast._process_forecast_item(
                 item, list(local_inertia_seed), weather_wind_unit, current_cloud, ignore_aux=ignore_aux
             )
             return val

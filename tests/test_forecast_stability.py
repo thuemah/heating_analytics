@@ -43,8 +43,8 @@ async def test_forecast_today_uses_plan_rate(hass):
         })
 
         # Mock _process_forecast_item to return 2.0 (Plan Rate)
-        # Returns: (predicted, solar, inertia, raw_temp, wind, wind_ms, unit_breakdown)
-        coordinator.forecast._process_forecast_item = MagicMock(return_value=(2.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}))
+        # Returns: (predicted, solar, inertia, raw_temp, wind, wind_ms, unit_breakdown, aux_impact_kwh)
+        coordinator.forecast._process_forecast_item = MagicMock(return_value=(2.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0))
 
         # Mock Future Forecast
         coordinator.forecast.calculate_future_energy = MagicMock(return_value=(10.0, 0.0, {}))

@@ -57,7 +57,7 @@ def test_smart_fill_logic_future_dense(mock_fm):
 
         # Patch CLASS method to avoid instance binding issues
         with patch("custom_components.heating_analytics.forecast.ForecastManager._process_forecast_item",
-                      return_value=(1.0, 0.0, 10.0, 10.0, 5.0, 5.0, {})) as mock_proc:
+                      return_value=(1.0, 0.0, 10.0, 10.0, 5.0, 5.0, {}, 0.0)) as mock_proc:
 
             # Should use Smart Fill
             result = mock_fm.get_future_day_prediction(target_date)

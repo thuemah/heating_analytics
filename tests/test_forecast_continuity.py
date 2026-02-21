@@ -47,8 +47,8 @@ async def test_forecast_continuity_high_consumption(hass):
         coordinator.forecast.get_forecast_for_hour = MagicMock(return_value={"some": "item"})
 
         # Mock _process_forecast_item to return 1.0 kWh/h
-        # Returns: (predicted, solar, inertia, raw_temp, wind, wind_ms, unit_breakdown)
-        coordinator.forecast._process_forecast_item = MagicMock(return_value=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}))
+        # Returns: (predicted, solar, inertia, raw_temp, wind, wind_ms, unit_breakdown, aux_impact_kwh)
+        coordinator.forecast._process_forecast_item = MagicMock(return_value=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0))
 
         # Mock Future Forecast (Next hours) = 10.0
         coordinator.forecast.calculate_future_energy = MagicMock(return_value=(10.0, 0.0, {}))

@@ -223,7 +223,7 @@ async def test_cooldown_default_all_affected(hass):
         coord.async_set_updated_data = MagicMock()
 
         # Mock forecast item processing to return a valid tuple
-        coord.forecast._process_forecast_item.return_value = (0.0, 0.0, {}, 0.0, {}, 0.0, 0.0)
+        coord.forecast._process_forecast_item.return_value = (0.0, 0.0, {}, 0.0, {}, 0.0, 0.0, 0.0)
 
         # Verify default behavior in init
         # Note: In init it does: self.aux_affected_entities = self.energy_sensors if None
@@ -261,7 +261,7 @@ async def test_cooldown_default_all_affected(hass):
 
         # Mock forecast item processing to return a valid tuple
         # val, solar, breakdown, gross, gross_breakdown, _, _
-        coord.forecast._process_forecast_item.return_value = (0.0, 0.0, {}, 0.0, {}, 0.0, 0.0)
+        coord.forecast._process_forecast_item.return_value = (0.0, 0.0, {}, 0.0, {}, 0.0, 0.0, 0.0)
 
         await coord._process_hourly_data(current_time)
 

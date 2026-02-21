@@ -15,7 +15,6 @@ from .const import (
     CONF_FORECAST_CROSSOVER_DAY,
     CONF_SECONDARY_WEATHER_ENTITY,
     DEFAULT_FORECAST_CROSSOVER_DAY,
-    DEFAULT_INERTIA_WEIGHTS,
     CLOUD_COVERAGE_MAP,
     ATTR_TEMP_FORECAST_TODAY,
     ATTR_TDD_DAILY_STABLE,
@@ -509,7 +508,7 @@ class ForecastManager:
         inertia_history = []
         target_iso = today_start.isoformat()
 
-        history_needed = len(DEFAULT_INERTIA_WEIGHTS) - 1
+        history_needed = len(self.coordinator.inertia_weights) - 1
 
         if self.coordinator._hourly_log:
             recent_logs = []
@@ -589,7 +588,7 @@ class ForecastManager:
         """Calculate sum of predicted energy for future hours using LIVE forecast."""
         # Prepare for Inertia Calculation on Forecast
         inertia_history = []
-        history_needed = len(DEFAULT_INERTIA_WEIGHTS) - 1
+        history_needed = len(self.coordinator.inertia_weights) - 1
 
         if self.coordinator._hourly_log:
             recent_logs = []
@@ -705,7 +704,7 @@ class ForecastManager:
 
         # 3. Call the internal processing function to get the kWh value
         # We pass a copy of inertia_history because _process_forecast_item modifies it.
-        predicted_kwh, _, _, _, _, _, unit_breakdown = self._process_forecast_item(
+        predicted_kwh, _, _, _, _, _, unit_breakdown, _ = self._process_forecast_item(
             item=forecast_item,
             inertia_history=list(inertia_history),
             wind_unit=weather_wind_unit,
@@ -976,7 +975,7 @@ class ForecastManager:
         current_cloud = self.coordinator._get_cloud_coverage()
 
         # Inertia Simulation Setup
-        history_needed = len(DEFAULT_INERTIA_WEIGHTS) - 1
+        history_needed = len(self.coordinator.inertia_weights) - 1
         if initial_inertia:
             local_inertia_history = list(initial_inertia)
         else:
@@ -987,7 +986,7 @@ class ForecastManager:
                 local_inertia_history = [first_temp] * history_needed
 
         for f in processed_items:
-            predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, _ = self._process_forecast_item(
+            predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, _, _ = self._process_forecast_item(
                 f, local_inertia_history, weather_wind_unit, current_cloud, ignore_aux=ignore_aux
             )
 
@@ -1024,7 +1023,7 @@ class ForecastManager:
         force_aux: bool = False,
         screen_override: float | None = None,
         force_no_wind: bool = False
-    ) -> tuple[float, float, float, float, float, float, dict]:
+    ) -> tuple[float, float, float, float, float, float, dict, float]:
         """Process a single forecast item for energy prediction.
 
         Args:
@@ -1038,7 +1037,7 @@ class ForecastManager:
             force_no_wind: If True, forces effective wind to 0.0.
 
         Returns:
-            (predicted_kwh, solar_kwh, inertia_val, raw_temp, wind_speed_raw, wind_speed_ms, unit_breakdown)
+            (predicted_kwh, solar_kwh, inertia_val, raw_temp, wind_speed_raw, wind_speed_ms, unit_breakdown, aux_impact_kwh)
         """
         raw_temp = float(item.get("temperature", 0.0))
 
@@ -1134,8 +1133,9 @@ class ForecastManager:
         predicted = res["total_kwh"]
         solar_kwh = res["breakdown"]["solar_reduction_kwh"]
         unit_breakdown = res["unit_breakdown"]
+        aux_impact_kwh = res["breakdown"]["aux_reduction_kwh"]
 
-        return predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown
+        return predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown, aux_impact_kwh
 
     def _calculate_from_daily_forecast(
         self,
@@ -1257,7 +1257,10 @@ class ForecastManager:
                 predicted = res[0]
                 solar_kwh = res[1]
                 inertia_val = res[2]
+                raw_temp = res[3]
+                w_speed = res[4]
                 unit_breakdown = res[6]
+                aux_impact = res[7]
 
                 total_energy += predicted
                 total_solar += solar_kwh
@@ -1272,10 +1275,16 @@ class ForecastManager:
 
                 # Capture hourly details
                 hourly_plan.append({
+                    "datetime": f_dt.isoformat(),
                     "hour": f_dt.hour,
                     "kwh": round(predicted, 2),
+                    "temp": round(raw_temp, 1),
+                    "wind_speed": round(w_speed, 1),
+                    "solar_kwh": round(solar_kwh, 2),
                     "inertia_temp": round(inertia_val, 1),
-                    "aux_expected": is_aux_used
+                    "aux_expected": is_aux_used,
+                    "aux_impact_kwh": round(aux_impact, 2),
+                    "unit_breakdown": unit_breakdown
                 })
 
                 for entity_id, stats in unit_breakdown.items():
@@ -2018,7 +2027,7 @@ class ForecastManager:
         if not running_inertia:
              current_inertia_avg = self.coordinator._calculate_inertia_temp()
              if current_inertia_avg:
-                 history_needed = len(DEFAULT_INERTIA_WEIGHTS) - 1
+                 history_needed = len(self.coordinator.inertia_weights) - 1
                  running_inertia = [current_inertia_avg] * history_needed
 
         current = today
@@ -2209,3 +2218,37 @@ class ForecastManager:
         stats[ATTR_DAILY_FORECAST] = daily_details
 
         return stats
+
+    def get_hourly_forecast(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        ignore_aux: bool = False
+    ) -> list[dict]:
+        """Get detailed hourly forecast plan for a time range.
+
+        This method prepares the necessary thermal inertia history and calls the
+        internal forecast summation logic to generate a rich dataset suitable for
+        API responses.
+
+        Args:
+            start_time: Start datetime (inclusive).
+            end_time: End datetime (exclusive).
+            ignore_aux: If True, calculates using normal mode baseline regardless of active aux.
+
+        Returns:
+            List of hourly forecast dictionaries containing energy, weather, and unit breakdown.
+        """
+        # Seed inertia from history up to start_time
+        inertia_history = self.coordinator._get_inertia_list(start_time)
+
+        # Call internal logic to generate plan
+        result = self._sum_forecast_energy_internal(
+            start_time=start_time,
+            end_time=end_time,
+            inertia_history=inertia_history,
+            include_start=True, # Include the start hour
+            ignore_aux=ignore_aux
+        )
+
+        return result.get("hourly_plan", [])

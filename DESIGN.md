@@ -77,6 +77,11 @@ Buildings do not react instantly to outside air temperature. The system calculat
     *   T-2 Hours: 30%
     *   T-3 Hours: 20%
     *   **Logic:** Symmetric arc profile. The middle hours (H-1, H-2) carry the most weight, reflecting that a well-insulated house's heating demand correlates most with the 1-3 hour temperature trend.
+
+*   **Configurable Profiles:**
+    *   **Fast (2h):** `(0.50, 0.50)` - High responsiveness. Good for poorly insulated structures.
+    *   **Slow (12h):** Bell curve over 12 hours. Good for high thermal mass (concrete, passive house).
+
 *   **Design Rule:** `NEVER` use future data (forecasts) to calculate inertia for the past. This prevents data leakage in the learning model.
 
 ### C. Regime-Aware Prediction

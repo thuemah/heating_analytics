@@ -50,7 +50,7 @@ async def test_exit_cooldown_service_call(hass, mock_entry):
 
     # Capture the handler function
     handler = None
-    def mock_register(domain, service, callback, schema=None):
+    def mock_register(domain, service, callback, schema=None, **kwargs):
         nonlocal handler
         if domain == DOMAIN and service == SERVICE_EXIT_COOLDOWN:
             handler = callback

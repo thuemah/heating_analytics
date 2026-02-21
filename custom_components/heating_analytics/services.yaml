@@ -134,3 +134,23 @@ compare_periods:
 exit_cooldown:
   name: Exit Auxiliary Cooldown
   description: Manually force the system to exit the auxiliary cooldown/decay state. Use this if you want to resume normal model learning immediately after an auxiliary event, bypassing the thermal settling period.
+
+get_forecast:
+  name: Get Forecast Data
+  description: Returns detailed hourly forecast data for the specified duration. Response variable contains a list of hourly objects.
+  fields:
+    entity_id:
+      name: Entity
+      description: The Heating Analytics sensor to target (optional, defaults to primary instance).
+      selector:
+        entity:
+          integration: heating_analytics
+    days:
+      name: Days
+      description: Number of days to forecast (1-7).
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 7
+          mode: box

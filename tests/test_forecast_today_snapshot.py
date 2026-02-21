@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from custom_components.heating_analytics.forecast import ForecastManager
+from custom_components.heating_analytics.const import DEFAULT_INERTIA_WEIGHTS
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 from custom_components.heating_analytics.const import (
     ATTR_DAILY_FORECAST,
@@ -16,6 +17,7 @@ def mock_coordinator():
     coordinator.hass = MagicMock()
     coordinator.hass.config.time_zone = "UTC"
     coordinator.weather_entity = "weather.test"
+    coordinator.inertia_weights = DEFAULT_INERTIA_WEIGHTS
     coordinator.entry = MagicMock()
     coordinator.entry.data = {}
     coordinator.data = {}

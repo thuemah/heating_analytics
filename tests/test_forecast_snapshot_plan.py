@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from custom_components.heating_analytics.forecast import ForecastManager
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
+from custom_components.heating_analytics.const import DEFAULT_INERTIA_WEIGHTS
 
 @pytest.fixture
 def mock_coordinator():
@@ -24,6 +25,7 @@ def mock_coordinator():
     coordinator.get_unit_mode = MagicMock(return_value="normal")
     coordinator._hourly_log = [] # No history
     coordinator.auxiliary_heating_active = False # Default state
+    coordinator.inertia_weights = DEFAULT_INERTIA_WEIGHTS
 
     return coordinator
 
@@ -47,14 +49,14 @@ def test_snapshot_generation_includes_hourly_plan(mock_now, mock_start_of_day, m
     ]
 
     # Mock _process_forecast_item to return controllable values
-    # Returns: (predicted_kwh, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown)
+    # Returns: (predicted_kwh, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown, aux_impact_kwh)
     # We'll use side_effect to vary return values
     def process_side_effect(item, *args, **kwargs):
         temp = float(item["temperature"])
         if temp == 10.0:
-            return (1.5, 0.0, 5.0, 10.0, 0.0, 0.0, {})
+            return (1.5, 0.0, 5.0, 10.0, 0.0, 0.0, {}, 0.0)
         else:
-            return (2.0, 0.0, 4.0, 9.0, 0.0, 0.0, {})
+            return (2.0, 0.0, 4.0, 9.0, 0.0, 0.0, {}, 0.0)
 
     with patch.object(fm, '_process_forecast_item', side_effect=process_side_effect) as mock_process:
         snapshot = fm._capture_daily_forecast_snapshot()
