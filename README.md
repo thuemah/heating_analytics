@@ -23,17 +23,9 @@ Think of it as a fitness tracker for your home's heating system.
 
 ## How It Works
 
-```mermaid
-graph LR
-    A[Weather Forecast] --> D[Heating Analytics Brain]
-    B[Energy Meter] --> D
-    C[Temperature Sensors] --> D
-    D --> E[Predicted Energy]
-    D --> F[Deviation Alerts]
-    D --> G[Efficiency Metrics]
+<img width="1308" height="1252" alt="flow4" src="https://github.com/user-attachments/assets/d1a3b194-ed9c-447c-bc50-3f16f759d6cc" />
 
-    style D fill:#4CAF50,stroke:#2E7D32,color:#fff
-```
+
 
 The integration continuously learns the relationship between outdoor conditions (temperature, wind, solar) and your heating consumption. Once trained, it predicts what you *should* use and compares it to reality—alerting you to unexpected deviations.
 
@@ -62,6 +54,15 @@ The integration continuously learns the relationship between outdoor conditions 
 > **Note on Accuracy:**
 > The model needs **7-14 days** of varied weather to learn your home's behavior. In the first week, predictions may fluctuate as it calibrates. This is normal—it's learning your unique thermal profile!
 
+## Crucial Prerequisites: Consistency is Key
+This integration uses high-resolution machine learning to build its thermodynamic models. The system is incredibly robust and will actually learn to compensate for systematic sensor errors (e.g., an energy meter that always underreports by 5%) – **but it cannot compensate for random chaos.**
+
+**To get accurate predictions and deviation alerts, you need:**
+1. **Consistent Energy Data:** Your energy sensors can be local (Zigbee/Z-Wave) or cloud-based APIs, as long as the reporting is *consistent*. 
+   *  *The enemy is randomness: APIs that frequently drop offline for hours, or batch-update 12 hours of data at once, will ruin the learning cycle.*
+2. **Reliable Outdoor Temperature:** A local outdoor sensor is best, but a stable weather integration (like Met.no, Open-Meteo or OpenWeatherMap) works perfectly fine as long as it reasonably tracks your local microclimate.
+3. **Wind Data (Weather Integrations Preferred!):** Surprisingly, local personal weather stations often provide *terrible* wind data due to turbulence from nearby trees and houses. Using your standard Home Assistant weather integration for wind speed and gusts is highly recommended to accurately calculate the "Wind Chill Penalty" on your home.
+4. **Patience:** The system needs time to observe your home across different temperatures and wind conditions before the models stabilize and the "Deviations" become accurate. Give it a few days of learning!
 ---
 
 ### Level 2: Tuning for Precision (Optional)
@@ -251,6 +252,15 @@ A complete dashboard configuration is available in [dashboard_heating.md](dashbo
 - Deviation alerts
 - Weather & solar impact
 - Week-ahead forecast
+
+<img width="626" height="417" alt="tmp" src="https://github.com/user-attachments/assets/7d9c91be-8d21-426d-9ccb-ea6b75df20a8" />
+
+
+<img width="682" height="1326" alt="week_ahead" src="https://github.com/user-attachments/assets/0666e162-e64f-4b49-b7c9-a82a12223692" />
+
+
+<img width="677" height="941" alt="model_comparison" src="https://github.com/user-attachments/assets/ea956d36-d809-470d-bcf3-3a08aa6d29e3" />
+
 
 **Required HACS Integrations:**
 
