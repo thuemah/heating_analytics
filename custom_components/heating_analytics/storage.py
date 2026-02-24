@@ -23,6 +23,9 @@ from .const import (
     ATTR_LAST_HOUR_EXPECTED,
     ATTR_LAST_HOUR_DEVIATION,
     ATTR_LAST_HOUR_DEVIATION_PCT,
+    ATTR_MIDNIGHT_FORECAST,
+    ATTR_MIDNIGHT_UNIT_ESTIMATES,
+    ATTR_MIDNIGHT_UNIT_MODES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -516,6 +519,14 @@ class StorageManager:
                                 }
             if "midnight_forecast_snapshot" in data:
                 self.coordinator.forecast._midnight_forecast_snapshot = data["midnight_forecast_snapshot"]
+                # Publish to coordinator.data immediately so sensors have values before first update_daily_forecast
+                snap = data["midnight_forecast_snapshot"]
+                today_str_snap = dt_util.now().date().isoformat()
+                if snap.get("date") == today_str_snap:
+                    self.coordinator.data[ATTR_MIDNIGHT_FORECAST] = snap["kwh"]
+                    self.coordinator.data[ATTR_MIDNIGHT_UNIT_ESTIMATES] = snap.get("unit_estimates")
+                    self.coordinator.data[ATTR_MIDNIGHT_UNIT_MODES] = snap.get("unit_modes")
+                    _LOGGER.info(f"Restored midnight forecast snapshot: {snap['kwh']:.2f} kWh")
 
             # Restore Reference and Live Forecasts (fixes persistence bug)
             ref_forecast = data.get("reference_forecast")

@@ -94,8 +94,8 @@ def test_solar_coefficient_neighbor_logic(mock_coordinator):
 
     # Target "12". With balance_point=12.0, target_t=12 is MODE_COOLING.
     # Learned data (9 and 11) are MODE_HEATING.
-    # Should fall back to DEFAULT_SOLAR_COEFF_COOLING = 0.17.
-    assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "12") == 0.17
+    # Should fall back to DEFAULT_SOLAR_COEFF_COOLING = 0.40.
+    assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "12") == 0.40
 
 def test_per_unit_neighbor_logic(mock_coordinator):
     """Test neighbor lookup for per-unit predictions."""

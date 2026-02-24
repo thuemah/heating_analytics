@@ -64,13 +64,11 @@ ENERGY_GUARD_THRESHOLD = 0.01  # 10 Wh - Consistent guard against division by ze
 DEFAULT_SOLAR_LEARNING_RATE = 0.01
 DEFAULT_AUX_LEARNING_RATE = 0.01
 
-# Solar coefficients optimized for heat pump installations (COP ~2.3-2.5)
-# These values account for the fact that solar gain saves less electricity with heat pumps
-# compared to direct electric heating (1 kWh solar gain saves ~1/COP kWh electricity)
-# - Heat pumps (COP 2.5-3.5): Model will fine-tune to 0.10-0.14 over 1-2 weeks
-# - Direct electric heating: Model will learn upward to 0.30-0.40 over 1-2 weeks
-DEFAULT_SOLAR_COEFF_HEATING = 0.15  # Was 0.35 (optimized for direct electric)
-DEFAULT_SOLAR_COEFF_COOLING = 0.17  # Was 0.40 (maintains ~1.13x ratio for summer impact)
+# Default solar coefficients — starting point for per-unit EMA learning.
+# Suitable for mixed installations (heat pumps + direct electric).
+# The model will fine-tune per unit within 1-2 weeks of sunny weather.
+DEFAULT_SOLAR_COEFF_HEATING = 0.35
+DEFAULT_SOLAR_COEFF_COOLING = 0.40
 
 CONF_WIND_UNIT = "wind_unit"
 CONF_ENABLE_LIFETIME_TRACKING = "enable_lifetime_tracking"
