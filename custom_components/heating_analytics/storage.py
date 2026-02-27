@@ -313,6 +313,7 @@ class StorageManager:
             # Load hourly persistence (with hour validation)
             current_time = dt_util.now()
             current_hour = current_time.replace(minute=0, second=0, microsecond=0)
+            stale_energy_baselines = False
 
             acc_start_iso = data.get("accumulation_start_time")
             if acc_start_iso:
@@ -345,6 +346,9 @@ class StorageManager:
                     self.coordinator._hourly_delta_per_unit = {}
                     self.coordinator._hourly_expected_per_unit = {}
                     self.coordinator._last_minute_processed = None
+                    # Mark baselines as stale so they are discarded after the
+                    # unconditional last_energy_values load below.
+                    stale_energy_baselines = True
 
             # Load hourly aggregates (with hour validation)
             aggregates = data.get("hourly_aggregates", {})
@@ -386,6 +390,10 @@ class StorageManager:
             if isinstance(loaded_last_values, dict):
                 self.coordinator._last_energy_values = loaded_last_values
                 self._cleanup_removed_sensors(self.coordinator._last_energy_values)
+            # Discard stale baselines from a previous hour to prevent cross-hour
+            # delta accumulation on the first post-restart reading.
+            if stale_energy_baselines:
+                self.coordinator._last_energy_values = {}
 
             # Check if "accumulated_energy_today" is from today, else reset
             last_save_date = data.get("last_save_date")

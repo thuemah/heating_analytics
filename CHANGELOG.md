@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-02-27
+
+### Fixed
+- Fixed `actual_kwh` inflation after a restart spanning an hour boundary. Stale energy meter baselines (`_last_energy_values`) were previously retained across hour changes on restore, causing the first delta after restart to absorb the entire missed gap into the next logged hour. Baselines are now cleared when the restored data belongs to a different hour, so the first reading after restart establishes a clean baseline.
+- Atmospheric attenuation fade zone to 5°–10° solar elevation. the system overestimated solar heating effect when the sun is low on the horizon. The mathematical model now includes an atmospheric attenuation factor. Cutoff: Solar factor is forced to 0.0 when elevation is < 5 degrees.
+
 ## [1.1.1] - 2026-02-24
 
 ### Fixed

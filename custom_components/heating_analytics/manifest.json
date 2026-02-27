@@ -1,7 +1,7 @@
 {
   "domain": "heating_analytics",
   "name": "Heating Analytics",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "documentation": "https://github.com/thuemah/heating_analytics",
   "issue_tracker": "https://github.com/thuemah/heating_analytics/issues",
   "requirements": [
