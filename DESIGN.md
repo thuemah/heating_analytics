@@ -319,3 +319,21 @@ These principles guide all development on this integration:
     *   No hard logic jumps based on time of day.
 3.  **Fail-Forward:** If a sensor fails, the system falls back to the best available estimate (e.g., Reference Forecast -> Semantic Average -> 0), rather than crashing.
 4.  **Metric-Driven Development:** Optimization tasks are prioritized by `Value = (Impact × Urgency) / Effort`.
+
+---
+
+## 8. Known Limitations
+
+### Thermal Hysteresis After Deep Cold Spells
+
+The model treats identical outdoor temperatures as thermodynamically equivalent, regardless of the thermal history that preceded them. In practice, a house at +2 °C after a week below −10 °C behaves very differently from a house at +2 °C after cooling down from a mild period.
+
+**Root causes:**
+
+-   **Deep thermal mass lag.** Foundations and structural elements have a thermal time constant of days to weeks, not hours. After a deep cold spell they continue acting as a heat sink well after outdoor air has warmed, drawing energy from the heating system invisibly to the 4-hour inertia window.
+-   **Heat pump COP history.** During the cold spell the heat pump operated in its least efficient zone (low COP, frequent defrost cycles). This accumulated thermal debt is not captured in any current model variable.
+-   **Symmetric inertia model.** The 4-hour thermal inertia horizon represents only the shallow, fast thermal mass (indoor air, wall surfaces). It is direction-agnostic: warming from cold and cooling from warm are treated as mirror images of the same physical process, which they are not.
+
+**Observed symptom:** After a deep cold spell the model consistently *underestimates* actual heat demand during the recovery phase. Conversely, when temperatures drop from a mild baseline the model tends to *overestimate* demand at the same outdoor temperatures. The asymmetry is most pronounced near +1 °C to +3 °C.
+
+**Why it is not fixed:** A correct remedy would require either a multi-day thermal state variable (e.g., an exponentially smoothed 48–72 h temperature integrator) or asymmetric inertia coefficients conditioned on the direction of thermal travel. Both approaches introduce meaningful implementation complexity, require sufficient historical data to calibrate, and carry a real risk of making predictions worse in the statistically dominant case (normal, non-extreme temperature transitions) in order to improve them in the rare case (transition out of a deep cold spell, which occurs only a handful of times per winter season). The current pragmatic decision is to accept this limitation and document it here rather than risk destabilising the model's everyday accuracy.

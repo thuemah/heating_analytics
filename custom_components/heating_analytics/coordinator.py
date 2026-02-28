@@ -850,10 +850,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         current_temp = None
 
         if self.outdoor_temp_source == SOURCE_SENSOR and self.outdoor_temp_sensor:
-            current_temp = self._get_float_state(self.outdoor_temp_sensor)
-            # If sensor read failed but we have samples for this hour, use average
-            if current_temp is None and self._hourly_sample_count > 0:
+            # Prefer hourly rolling average for consistency with historical log entries,
+            # which are stored as hourly averages. Fall back to raw sensor reading only
+            # if no samples have been collected yet this hour.
+            if self._hourly_sample_count > 0:
                 current_temp = self._hourly_temp_sum / self._hourly_sample_count
+            else:
+                current_temp = self._get_float_state(self.outdoor_temp_sensor)
 
         elif self.outdoor_temp_source == SOURCE_WEATHER or (
             self.outdoor_temp_source == SOURCE_SENSOR and not self.outdoor_temp_sensor
