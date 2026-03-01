@@ -374,12 +374,16 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
             # Fallback: No forecast available (beyond forecast horizon)
             # Use last year's same date as proxy for expected energy
             ly_date = get_last_year_iso_date(date_obj)
-            model_kwh, solar_kwh, _, _, _ = self.coordinator.calculate_modeled_energy(ly_date, ly_date)
+            model_kwh, solar_kwh, avg_temp, avg_wind, _ = self.coordinator.calculate_modeled_energy(ly_date, ly_date)
+            wind_bucket = None
+            if avg_wind is not None:
+                wind_bucket = self.coordinator._get_wind_bucket(avg_wind)
+
             return {
                 'date': date_obj.isoformat(),
-                'temp': None,
-                'wind': None,
-                'wind_bucket': None,
+                'temp': avg_temp,
+                'wind': avg_wind,
+                'wind_bucket': wind_bucket,
                 'kwh': round(model_kwh, 2),
                 'solar_kwh': round(solar_kwh, 2)
             }

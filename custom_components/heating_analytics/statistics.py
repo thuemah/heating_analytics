@@ -1833,12 +1833,17 @@ class StatisticsManager:
                     else:
                         # Fallback: Last Year
                         ly_date = get_last_year_iso_date(current)
-                        model_kwh, solar_kwh, _, _, _ = self.coordinator.calculate_modeled_energy(ly_date, ly_date)
+                        model_kwh, solar_kwh, avg_temp, avg_wind, _ = self.coordinator.calculate_modeled_energy(ly_date, ly_date)
+
+                        wind_bucket = None
+                        if avg_wind is not None:
+                            wind_bucket = self.coordinator._get_wind_bucket(avg_wind)
+
                         day_data = {
                             'date': current.isoformat(),
-                            'temp': None,
-                            'wind': None,
-                            'wind_bucket': None,
+                            'temp': avg_temp,
+                            'wind': avg_wind,
+                            'wind_bucket': wind_bucket,
                             'kwh': round(model_kwh, 2),
                             'solar_kwh': round(solar_kwh, 2)
                         }

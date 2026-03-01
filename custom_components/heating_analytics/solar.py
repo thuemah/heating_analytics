@@ -37,24 +37,24 @@ class SolarCalculator:
     def calculate_solar_factor(self, elevation: float, azimuth: float, cloud_coverage: float) -> float:
         """Calculate solar factor (0.0 - 1.0)."""
         # 1. Elevation Factor
-        # Atmospheric Attenuation Logic:
-        # - Ignore < 5 degrees (too much atmosphere)
-        # - Fade in linearly 5-10 degrees
-        # - Full impact > 10 degrees
-        if elevation < 5.0:
+        # Air Mass and Atmospheric Transmittance Logic
+        if elevation <= 0.0:
             return 0.0
 
-        elev_rad = math.radians(elevation)
+        # Cap elevation at 1° minimum to keep air mass finite (sin of near-zero angles
+        # produces astronomically large AM values that carry no physical meaning).
+        safe_elev = max(1.0, elevation)
+        elev_rad = math.radians(safe_elev)
+
+        # Calculate Air Mass (AM) and atmospheric transmittance intensity
+        am = 1.0 / math.sin(elev_rad)
+        intensity = 0.7 ** am
+
         # Switch to Vertical Geometry: cos(elevation)
         # This gives higher factors for low sun (Winter) and lower for high sun (Summer)
         raw_elev_factor = max(0.0, math.cos(elev_rad))
 
-        # Apply Atmospheric Fade
-        if elevation < 10.0:
-            attenuation = (elevation - 5.0) / 5.0
-            elev_factor = raw_elev_factor * attenuation
-        else:
-            elev_factor = raw_elev_factor
+        elev_factor = raw_elev_factor * intensity
 
         # 2. Azimuth Factor (Peak at Configured Azimuth)
         # Kelvin Twist: Uses a 3-zone logic to account for self-shading (egenskygge)

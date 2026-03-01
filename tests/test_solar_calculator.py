@@ -24,17 +24,21 @@ def calculator(coordinator):
 
 def test_calculate_solar_factor_vertical_geometry(calculator):
     # Vertical Surface Logic:
-    # Elevation 0 (Horizon) => cos(0) = 1.0 (Max Impact)
+    # Elevation 0 (Horizon) => 0.0
     # Elevation 90 (Zenith) => cos(90) = 0.0 (Min Impact)
 
-    # Horizon (Sunset/Sunrise) - use 1.0 deg which is < 5.0 deg cutoff
-    # Elev 1, Azimuth 180 (Direct), Cloud 0
-    # Should now be 0.0 due to atmospheric attenuation
-    assert calculator.calculate_solar_factor(1, 180, 0) == 0.0
+    # 0 or negative elevation should yield 0.0
+    assert calculator.calculate_solar_factor(0, 180, 0) == 0.0
+    assert calculator.calculate_solar_factor(-5, 180, 0) == 0.0
 
-    # Test standard behavior above 10 degrees
-    # Elev 20 deg => cos(20) ~= 0.939
-    expected_20 = math.cos(math.radians(20))
+    # Test standard behavior at 20 degrees
+    # AM = 1 / sin(20) ~= 2.92
+    # Intensity = 0.7 ^ AM ~= 0.352
+    # raw_elev_factor = cos(20) ~= 0.939
+    # expected_20 ~= 0.352 * 0.939 ~= 0.331
+    am_20 = 1.0 / math.sin(math.radians(20))
+    intensity_20 = 0.7 ** am_20
+    expected_20 = math.cos(math.radians(20)) * intensity_20
     assert pytest.approx(calculator.calculate_solar_factor(20, 180, 0), 0.001) == expected_20
 
     # Zenith (High Noon in Tropics)
@@ -43,38 +47,45 @@ def test_calculate_solar_factor_vertical_geometry(calculator):
     assert pytest.approx(calculator.calculate_solar_factor(90, 180, 0), 0.000000001) == 0.0
 
     # 45 degrees elevation
-    # cos(45) approx 0.707
-    expected = math.cos(math.radians(45))
-    assert pytest.approx(calculator.calculate_solar_factor(45, 180, 0), 0.001) == expected
+    am_45 = 1.0 / math.sin(math.radians(45))
+    intensity_45 = 0.7 ** am_45
+    expected_45 = math.cos(math.radians(45)) * intensity_45
+    assert pytest.approx(calculator.calculate_solar_factor(45, 180, 0), 0.001) == expected_45
 
 def test_calculate_solar_factor_atmospheric_attenuation(calculator):
-    # 1. Below Cutoff (4.9 degrees) -> 0.0
-    assert calculator.calculate_solar_factor(4.9, 180, 0) == 0.0
+    # New atmospheric model: AM = 1 / sin(elevation), Intensity = 0.7^AM
 
-    # 2. At Cutoff (5.0 degrees) -> 0.0 (attenuation factor 0.0)
-    # (5 - 5) / 5 = 0.0
-    assert calculator.calculate_solar_factor(5.0, 180, 0) == 0.0
+    # 1. Low angle (5 degrees)
+    # AM = 1 / sin(5) = 11.47
+    # Intensity = 0.7^11.47 ~= 0.016
+    am_5 = 1.0 / math.sin(math.radians(5))
+    intensity_5 = 0.7 ** am_5
+    expected_5 = math.cos(math.radians(5)) * intensity_5
+    assert pytest.approx(calculator.calculate_solar_factor(5.0, 180, 0), 0.001) == expected_5
 
-    # 3. Mid-Fade (7.5 degrees) -> 50% attenuation
-    # (7.5 - 5) / 5 = 0.5
-    raw_factor = math.cos(math.radians(7.5))
-    expected = raw_factor * 0.5
-    assert pytest.approx(calculator.calculate_solar_factor(7.5, 180, 0), 0.001) == expected
+    # 2. Extreme low angle (1 degree)
+    # AM = 1 / sin(1) = 57.29
+    # Intensity = 0.7^57.29 ~= 1.3e-9 (effectively 0)
+    am_1 = 1.0 / math.sin(math.radians(1))
+    intensity_1 = 0.7 ** am_1
+    expected_1 = math.cos(math.radians(1)) * intensity_1
+    assert pytest.approx(calculator.calculate_solar_factor(1.0, 180, 0), 0.001) == expected_1
 
-    # 4. At Fade End (10.0 degrees) -> 100% (No attenuation)
-    # (10 - 5) / 5 = 1.0
-    # Note: Logic is 'if < 10', so 10 falls into 'else' block which is also 100%
-    expected_full = math.cos(math.radians(10.0))
-    assert pytest.approx(calculator.calculate_solar_factor(10.0, 180, 0), 0.001) == expected_full
+    # 3. Mid angle (30 degrees)
+    am_30 = 1.0 / math.sin(math.radians(30))
+    intensity_30 = 0.7 ** am_30
+    expected_30 = math.cos(math.radians(30)) * intensity_30
+    assert pytest.approx(calculator.calculate_solar_factor(30.0, 180, 0), 0.001) == expected_30
 
 def test_calculate_solar_factor_azimuth_config(calculator, coordinator):
-    # Note: We use elevation 20 to avoid atmospheric attenuation logic (<10 deg)
+    # Elev 20 => cos(20) ~0.9397. Intensity = 0.7^(1/sin(20)) ~0.352
+    am_20 = 1.0 / math.sin(math.radians(20))
+    intensity_20 = 0.7 ** am_20
+    expected_elev = math.cos(math.radians(20)) * intensity_20
 
     # Case 1: Configured South (180), Sun at South (180)
     # Azimuth factor = 0.5 + 0.5 * cos(0) = 1.0
     coordinator.solar_azimuth = 180
-    # Elev 20 => cos(20) ~0.9397. Az 1.0. Cloud 1.0.
-    expected_elev = math.cos(math.radians(20))
     assert pytest.approx(calculator.calculate_solar_factor(20, 180, 0), 0.001) == expected_elev
 
     # Case 2: Configured West (270), Sun at West (270)
@@ -86,7 +97,7 @@ def test_calculate_solar_factor_azimuth_config(calculator, coordinator):
     # Diff = 90 deg.
     # New Kelvin Twist: Zone 2 (75-90) -> Diffuse Floor = 0.1
     coordinator.solar_azimuth = 270
-    # Elev 20 => Elev factor ~0.94. Az factor 0.1. Cloud 1.0 => Total ~0.094
+    # Elev 20 => Elev factor * 0.1. Cloud 1.0
     expected_diffuse = expected_elev * 0.1
     assert pytest.approx(calculator.calculate_solar_factor(20, 180, 0), 0.001) == expected_diffuse
 
