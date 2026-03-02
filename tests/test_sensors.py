@@ -90,6 +90,7 @@ async def test_deviation_sensor(hass: HomeAssistant, mock_coordinator, mock_entr
         ATTR_DEVIATION: 10.0,
         ATTR_FORECAST_TODAY: 110.0,
         ATTR_PREDICTED: 100.0,
+        ATTR_MIDNIGHT_FORECAST: 100.0,
         ATTR_ENERGY_TODAY: 55.0,
         ATTR_EXPECTED_TODAY: 50.0,
         ATTR_DEVIATION_BREAKDOWN: [

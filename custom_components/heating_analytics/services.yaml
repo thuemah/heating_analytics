@@ -154,3 +154,29 @@ get_forecast:
           min: 1
           max: 7
           mode: box
+
+calibrate_inertia:
+  name: Calibrate Thermal Inertia
+  description: Tests historical data to calculate the ideal thermal inertia profile (1-24 hours) for your house by finding the highest correlation (R²) to consumption without auxiliary or solar interference. Returns results as a response.
+  fields:
+    entity_id:
+      name: Entity
+      description: The Heating Analytics sensor to target (optional, defaults to primary instance).
+      selector:
+        entity:
+          integration: heating_analytics
+    days:
+      name: Days Back to Analyze
+      description: Number of days of historical data to evaluate (1-90).
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 90
+          mode: box
+    centered_energy_average:
+      name: Centered Energy Average
+      description: Smoothes the hourly energy consumption using a 3-hour centered moving average before calculating correlation. This helps reduce noise from heat pump defrost cycles or partial hour delays.
+      default: false
+      selector:
+        boolean:

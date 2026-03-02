@@ -36,6 +36,12 @@ SERVICE_REPLACE_SENSOR = "replace_sensor_source"
 SERVICE_COMPARE_PERIODS = "compare_periods"
 SERVICE_EXIT_COOLDOWN = "exit_cooldown"
 SERVICE_GET_FORECAST = "get_forecast"
+SERVICE_CALIBRATE_INERTIA = "calibrate_inertia"
+SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=90)),
+    vol.Optional("centered_energy_average", default=False): cv.boolean,
+})
 
 SERVICE_SCHEMA_IMPORT = vol.Schema({
     vol.Required("file_path"): cv.string,
@@ -293,6 +299,43 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         schema=vol.Schema({}),
     )
 
+    # Register Calibrate Inertia Service
+    async def handle_calibrate_inertia(call: ServiceCall) -> dict:
+        """Handle the calibrate inertia service call."""
+        entity_id = call.data.get("entity_id")
+        days = call.data.get("days", 30)
+        centered = call.data.get("centered_energy_average", False)
+
+        target_coordinator = None
+
+        if entity_id:
+            registry = er.async_get(hass)
+            entry = registry.async_get(entity_id)
+            if entry and entry.config_entry_id:
+                target_coordinator = hass.data[DOMAIN].get(entry.config_entry_id)
+
+        if not target_coordinator:
+            # Default to first available
+            coordinators = _get_coordinators(hass)
+            if coordinators:
+                target_coordinator = coordinators[0]
+
+        if not target_coordinator:
+             raise ValueError("No Heating Analytics instance found.")
+
+        _LOGGER.debug(f"Handling calibrate_inertia for {days} days (Coordinator: {target_coordinator.entry.entry_id})")
+
+        result = target_coordinator.statistics.calibrate_inertia(days=days, centered_energy_average=centered)
+        return result
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CALIBRATE_INERTIA,
+        handle_calibrate_inertia,
+        schema=SERVICE_SCHEMA_CALIBRATE_INERTIA,
+        supports_response=SupportsResponse.ONLY,
+    )
+
     # Register Get Forecast Service
     async def handle_get_forecast(call: ServiceCall) -> dict:
         """Handle the get forecast service call."""
@@ -394,5 +437,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_COMPARE_PERIODS)
             hass.services.async_remove(DOMAIN, SERVICE_EXIT_COOLDOWN)
             hass.services.async_remove(DOMAIN, SERVICE_GET_FORECAST)
+            hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_INERTIA)
 
     return unload_ok

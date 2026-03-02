@@ -47,9 +47,7 @@ from .const import (
     DEFAULT_FORECAST_CROSSOVER_DAY,
     CONF_AUX_AFFECTED_ENTITIES,
     CONF_THERMAL_INERTIA,
-    THERMAL_INERTIA_FAST,
-    THERMAL_INERTIA_NORMAL,
-    THERMAL_INERTIA_SLOW,
+    DEFAULT_THERMAL_INERTIA_HOURS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -113,6 +111,12 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return default
 
         current_unit = get_val(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
+
+        current_inertia = get_val(CONF_THERMAL_INERTIA, DEFAULT_THERMAL_INERTIA_HOURS)
+        if isinstance(current_inertia, str):
+            if current_inertia == "fast": current_inertia = 2
+            elif current_inertia == "slow": current_inertia = 12
+            else: current_inertia = 4
 
         # Display Conversions
         if is_reconfigure:
@@ -216,16 +220,8 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 selector.NumberSelectorConfig(min=10, max=25, step=0.5, unit_of_measurement="°C")
             ),
             # Thermal Inertia Profile (User Selectable)
-            vol.Required(CONF_THERMAL_INERTIA, default=get_val(CONF_THERMAL_INERTIA, THERMAL_INERTIA_NORMAL)): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=[
-                        THERMAL_INERTIA_FAST,
-                        THERMAL_INERTIA_NORMAL,
-                        THERMAL_INERTIA_SLOW
-                    ],
-                    mode=selector.SelectSelectorMode.DROPDOWN,
-                    translation_key="thermal_inertia"
-                )
+            vol.Required(CONF_THERMAL_INERTIA, default=int(current_inertia)): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=1, max=24, step=1, unit_of_measurement="h", mode="slider")
             ),
             # Learning Rate (Convert float back to percentage for display)
             vol.Required("learning_rate", default=round(get_val("learning_rate", DEFAULT_LEARNING_RATE) * 100, 1)): selector.NumberSelector(

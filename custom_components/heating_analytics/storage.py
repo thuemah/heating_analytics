@@ -350,6 +350,11 @@ class StorageManager:
                     # unconditional last_energy_values load below.
                     stale_energy_baselines = True
 
+            # Restore last_hour_processed unconditionally (used to detect missed hourly finalizations)
+            saved_last_hour = data.get("last_hour_processed")
+            if saved_last_hour is not None:
+                self.coordinator._last_hour_processed = int(saved_last_hour)
+
             # Load hourly aggregates (with hour validation)
             aggregates = data.get("hourly_aggregates", {})
             if aggregates and aggregates.get("hour_start"):
@@ -664,6 +669,7 @@ class StorageManager:
                     "hourly_delta_per_unit": self.coordinator._hourly_delta_per_unit,
                     "hourly_expected_per_unit": self.coordinator._hourly_expected_per_unit,
                     "last_minute_processed": self.coordinator._last_minute_processed,
+                    "last_hour_processed": self.coordinator._last_hour_processed,
                     # Persist critical state for robust gap filling (resolves race condition)
                     "current_model_rate": self.coordinator.data.get("current_model_rate", 0.0),
                     "current_unit_breakdown": self.coordinator.data.get("current_unit_breakdown", {}),
@@ -845,6 +851,9 @@ class StorageManager:
             self.coordinator._hourly_delta_per_unit = data.get("hourly_delta_per_unit", {})
             self.coordinator._hourly_expected_per_unit = data.get("hourly_expected_per_unit", {})
             self.coordinator._last_minute_processed = data.get("last_minute_processed")
+            saved_last_hour = data.get("last_hour_processed")
+            if saved_last_hour is not None:
+                self.coordinator._last_hour_processed = int(saved_last_hour)
 
             acc_start_str = data.get("accumulation_start_time")
             if acc_start_str:

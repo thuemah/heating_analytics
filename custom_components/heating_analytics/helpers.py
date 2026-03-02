@@ -1,6 +1,7 @@
 """Helper functions for Heating Analytics."""
 from __future__ import annotations
 import logging
+import math
 from datetime import date
 from homeassistant.const import UnitOfSpeed
 
@@ -46,3 +47,21 @@ def get_last_year_iso_date(date_obj: date) -> date:
     except ValueError:
         # Fallback to Week 52 if Week 53 doesn't exist in previous year
         return date.fromisocalendar(year - 1, 52, weekday)
+
+def generate_gaussian_kernel(hours: int) -> tuple[float, ...]:
+    """Generate a Gaussian/Bell-curve kernel for the given number of hours."""
+    if hours == 1:
+        return (1.0,)
+    if hours == 2:
+        return (0.5, 0.5)
+
+    weights = []
+    center = (hours - 1) / 2.0
+    sigma = hours / 4.0
+
+    for i in range(hours):
+        x = i - center
+        weights.append(math.exp(-(x**2) / (2 * sigma**2)))
+
+    total = sum(weights)
+    return tuple(w / total for w in weights)

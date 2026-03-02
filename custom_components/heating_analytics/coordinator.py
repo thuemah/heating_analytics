@@ -13,7 +13,7 @@ from homeassistant.helpers.update_coordinator import (
 from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfSpeed
 
-from .helpers import convert_speed_to_ms
+from .helpers import convert_speed_to_ms, generate_gaussian_kernel
 from .solar import SolarCalculator
 from .forecast import ForecastManager
 from .statistics import StatisticsManager
@@ -101,14 +101,8 @@ from .const import (
     CONF_SECONDARY_WEATHER_ENTITY,
     CONF_FORECAST_CROSSOVER_DAY,
     DEFAULT_FORECAST_CROSSOVER_DAY,
-    DEFAULT_INERTIA_WEIGHTS,
     CONF_THERMAL_INERTIA,
-    THERMAL_INERTIA_FAST,
-    THERMAL_INERTIA_NORMAL,
-    THERMAL_INERTIA_SLOW,
-    INERTIA_PROFILE_FAST,
-    INERTIA_PROFILE_NORMAL,
-    INERTIA_PROFILE_SLOW,
+    DEFAULT_THERMAL_INERTIA_HOURS,
     SOURCE_SENSOR,
     SOURCE_WEATHER,
     MODE_HEATING,
@@ -276,13 +270,19 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self.solar_correction_percent = DEFAULT_SOLAR_CORRECTION
 
         # Load Thermal Inertia Profile (Default to Normal/4h if missing)
-        inertia_setting = self.entry.data.get(CONF_THERMAL_INERTIA, THERMAL_INERTIA_NORMAL)
-        if inertia_setting == THERMAL_INERTIA_FAST:
-            self.inertia_weights = INERTIA_PROFILE_FAST
-        elif inertia_setting == THERMAL_INERTIA_SLOW:
-            self.inertia_weights = INERTIA_PROFILE_SLOW
-        else:
-            self.inertia_weights = INERTIA_PROFILE_NORMAL
+        inertia_setting = self.entry.data.get(CONF_THERMAL_INERTIA, DEFAULT_THERMAL_INERTIA_HOURS)
+
+        # Migration for old string values
+        if isinstance(inertia_setting, str):
+            if inertia_setting == "fast":
+                inertia_setting = 2
+            elif inertia_setting == "slow":
+                inertia_setting = 12
+            else:
+                inertia_setting = 4
+
+        # Generate weights dynamically
+        self.inertia_weights = generate_gaussian_kernel(int(inertia_setting))
 
         # Load Aux Affected Entities (Default to all energy sensors if missing)
         self.aux_affected_entities = self.entry.data.get(CONF_AUX_AFFECTED_ENTITIES)
@@ -1231,18 +1231,21 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Update daily energy budgets and forecasts."""
         expected_hour_so_far = self._accumulated_expected_energy_hour
 
-        # Sum of expected_kwh from today's hourly logs
         expected_today_sum = 0.0
-        forecasted_past_sum = 0.0  # New: "Frozen Plan" sum
+        forecasted_past_sum = 0.0
+        gross_past_sum = 0.0
+        has_past_aux = False
         solar_today_sum = 0.0
         today_date_str = current_time.date().isoformat()
 
         for entry in reversed(self._hourly_log):
              if entry["timestamp"].startswith(today_date_str):
-                 expected_today_sum += entry.get("expected_kwh", 0.0)
-                 # Use 'forecasted_kwh' (Plan) if available, fallback to expected (Legacy)
-                 forecasted_past_sum += entry.get("forecasted_kwh", entry.get("expected_kwh", 0.0))
-                 solar_today_sum += entry.get("solar_impact_kwh", 0.0)
+                 expected_today_sum += entry.get("expected_kwh") or 0.0
+                 forecasted_past_sum += entry.get("forecasted_kwh") or entry.get("expected_kwh") or 0.0
+                 gross_past_sum += entry.get("forecasted_kwh_gross") or entry.get("forecasted_kwh") or entry.get("expected_kwh") or 0.0
+                 solar_today_sum += entry.get("solar_impact_kwh") or 0.0
+                 if entry.get("auxiliary_active", False):
+                     has_past_aux = True
              else:
                  break
 
@@ -1271,6 +1274,24 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # = Locked Past + Stable Current Forecast (Reference) + Live Future Forecast
         budget_total = forecasted_past_sum + current_hour_plan_rate + future_forecast_kwh
         self.data[ATTR_PREDICTED] = round(budget_total, 2)
+
+        # Calculate Gross Daily Budget (aux-unaware) for deviation denominator.
+        if self.auxiliary_heating_active:
+             future_gross_kwh_budget, _, _ = self.forecast.calculate_future_energy(
+                 current_time, ignore_aux=True
+             )
+             current_hour_gross_rate_budget, _ = self.forecast.get_plan_for_hour(
+                 current_time, source='reference', ignore_aux=True
+             )
+             if current_hour_gross_rate_budget == 0.0:
+                  current_hour_gross_rate_budget = current_hour_plan_rate + self.data.get("current_aux_impact_rate", 0.0)
+             budget_total_gross = gross_past_sum + current_hour_gross_rate_budget + future_gross_kwh_budget
+        elif has_past_aux:
+             budget_total_gross = gross_past_sum + current_hour_plan_rate + future_forecast_kwh
+        else:
+             budget_total_gross = budget_total
+
+        self.data["predicted_gross"] = round(budget_total_gross, 2)
 
         # Calculate Thermodynamic Projection (The Reality Check)
         # = Actuals So Far + Live Forecast for Remaining Today
@@ -1450,7 +1471,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "secondary_entity_id": self.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY),
                 "crossover_day": self.entry.data.get(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY)
             },
-            "accuracy_by_source": self.forecast.calculate_per_source_uncertainty_stats()
+            "accuracy_by_source": {
+                source: {"daily": stats["daily"]}
+                for source, stats in self.forecast.calculate_per_source_uncertainty_stats().items()
+            }
         }
 
     def _update_tdd_calculations(self, temp: float | None, minutes_passed: int):
@@ -1468,10 +1492,17 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
     def _update_deviation_stats(self):
         """Update deviation statistics."""
         # Deviation (Today)
-        predicted = self.data.get(ATTR_PREDICTED, 0.0)
-        if predicted > ENERGY_GUARD_THRESHOLD:
-             diff = self.data.get(ATTR_FORECAST_TODAY, 0.0) - predicted
-             deviation = (diff / predicted) * 100
+        # Gross-domain comparison cancels live forecast drift from both sides of diff.
+        # Frozen midnight_forecast denominator prevents the percentage from scaling
+        # with weather forecast revisions.
+        predicted_gross = self.data.get("predicted_gross", 0.0)
+        forecast_today_gross = self.data.get("forecast_today_gross", 0.0)
+        midnight = self.data.get(ATTR_MIDNIGHT_FORECAST, 0.0)
+        denominator = midnight if midnight > ENERGY_GUARD_THRESHOLD else predicted_gross
+
+        if denominator > ENERGY_GUARD_THRESHOLD:
+             diff = forecast_today_gross - predicted_gross
+             deviation = (diff / denominator) * 100
              self.data[ATTR_DEVIATION] = round(deviation, 1)
         else:
              self.data[ATTR_DEVIATION] = 0.0
@@ -2427,7 +2458,12 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     if mode != MODE_HEATING
                 },
             }
-            self._hourly_log.append(log_entry)
+            # Guard against duplicate entries (e.g., crash-at-boundary + restart scenario)
+            entry_ts = log_entry["timestamp"]
+            if any(e.get("timestamp") == entry_ts for e in self._hourly_log):
+                _LOGGER.warning(f"Duplicate hourly entry detected for {entry_ts}, skipping append.")
+            else:
+                self._hourly_log.append(log_entry)
 
             # Retention Policy (keep last 2160 hours = 90 days)
             if len(self._hourly_log) > 2160:

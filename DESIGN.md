@@ -185,17 +185,43 @@ To maximize both short-term precision and long-term stability, the system implem
 ### B. Provenance Tracking (Accuracy Attribution)
 When mixing weather sources, it is critical to know *who* is responsible for a prediction error. The system logs **Provenance Metadata** for every hourly prediction:
 
-*   **`primary_entity` & `secondary_entity`:** The IDs of the providers active at the time of prediction.
-*   **`crossover_day`:** The configuration used.
+*   **`primary_entity` & `secondary_entity`:** The entity IDs of the providers active at the time of prediction.
+*   **`crossover_day`:** The crossover configuration used at prediction time.
 *   **`source`:** Which specific provider was used for *that specific hour* (Primary or Secondary).
 
-**Why?** When calculating accuracy statistics (MAE/MAPE), the system filters history based on this metadata. This prevents "Cross-Contamination" of statistics—e.g., if you switch from AccuWeather to Open-Meteo, the system won't blame Open-Meteo for AccuWeather's past errors.
+**Why?** When calculating accuracy statistics, the system filters history by `primary_entity` / `secondary_entity` and only includes entries where the recorded entity matches the *currently configured* entity. This prevents "Cross-Contamination"—e.g., if you switch from AccuWeather to Open-Meteo, the system will not attribute AccuWeather's past errors to Open-Meteo.
 
-### C. Shadow Forecasting
-A unique feature for power users. The system ingests forecasts from *two* sources:
-1.  **Active:** The Blended Forecast described above.
-2.  **Shadow:** Predictions are generated for *both* Primary and Secondary sources across the full time range in the background.
-*   **Result:** At the end of the day/week, the system reports accuracy metrics (MAE/MAPE) for *both* sources independently. This proves mathematically which weather provider is better for your specific location before you switch.
+### C. Shadow Forecasting & Per-Source Accuracy Metrics
+The system ingests forecasts from *both* sources simultaneously, regardless of which one is active for the blended output:
+
+1.  **Active:** The Blended Forecast described above (Primary for days 1–X, Secondary for days X+1–7).
+2.  **Shadow:** Energy predictions are generated for *both* Primary and Secondary across the full horizon in parallel.
+
+At the end of each day, both predictions are compared against actual consumption and stored in forecast history with full provenance metadata. This enables independent, contamination-free accuracy statistics per source.
+
+**Exposed attribute:** `forecast_accuracy_by_source` (on the Weather Plan Today sensor) reports the following metrics for each source (`primary` / `secondary`):
+
+#### Energy Accuracy (kWh/day)
+
+| Field | Definition |
+|---|---|
+| `mae_7d` | Mean Absolute Error over the last 7 days. Computed as the average of \|net daily error\| per day, where the daily error is the signed sum of hourly energy errors (kWh). Measures day-level accuracy. |
+| `mape_7d` | MAE expressed as a percentage of actual daily consumption. `(Σ\|daily_net_error\| / Σactual_kWh) × 100`. Scale-independent accuracy indicator. |
+| `mae_30d` | Same as `mae_7d` but over a 30-day rolling window. Provides a stable long-term baseline. |
+| `mape_30d` | Same as `mape_7d` over 30 days. |
+
+The daily net error is the *algebraic sum* of signed hourly errors within a day before taking absolute value. This deliberately ignores intra-day timing errors (e.g., a forecast that is +2 kWh in the morning and −2 kWh in the afternoon cancels to zero), which would otherwise penalize forecasters for temperature curves shifting a few hours, not for actual energy misjudgment.
+
+#### Temperature Accuracy (°C, net daily deviation)
+
+| Field | Definition |
+|---|---|
+| `weather_mae_7d` | Mean of \|net daily temperature error\| over 7 days. The daily temperature error is the signed sum of hourly (forecast_temp − actual_temp) differences for that day. Positive = forecaster ran too warm; negative = too cold. |
+| `weather_bias_7d` | Mean of the *signed* net daily temperature error over 7 days. A persistent non-zero bias indicates a systematic warm or cold offset in the weather source for this location. |
+| `weather_mae_30d` | Same as `weather_mae_7d` over 30 days. |
+| `weather_bias_30d` | Same as `weather_bias_7d` over 30 days. |
+
+**Role in blend logic:** `weather_mae` and `weather_bias` are the primary inputs used internally to rank and select the better weather source before the crossover decision is applied. They are temperature-domain metrics (°C), not energy-domain metrics, and are therefore more sensitive to systematic forecast drift than `mae_7d`. They are exposed in the attribute for transparency and diagnostics, not as end-user KPIs.
 
 ### D. Hybrid Projection ("The Funnel")
 The "Energy Forecast Today" sensor does not just show the morning forecast. It implements a **Hybrid Projection** that converges to reality.

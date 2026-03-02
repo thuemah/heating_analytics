@@ -72,8 +72,8 @@ class TestForecastOptimization(unittest.TestCase):
         current_time = datetime(2023, 10, 27, 12, 30)
         self.coordinator._update_daily_budgets(1.0, current_time, 30)
 
-        # Should be called 3 times (1 Reference Net, 1 Live Net, 1 Reference Gross)
-        self.assertEqual(self.coordinator.forecast.get_plan_for_hour.call_count, 3)
+        # Should be called 4 times (1 Reference Net, 1 Live Net, 2 Reference Gross [one for thermodynamic demand, one for budget_total_gross])
+        self.assertEqual(self.coordinator.forecast.get_plan_for_hour.call_count, 4)
         print(f"Call count (Aux Active): {self.coordinator.forecast.get_plan_for_hour.call_count}")
 
 if __name__ == '__main__':

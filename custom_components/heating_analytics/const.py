@@ -48,14 +48,7 @@ THERMAL_INERTIA_FAST = "fast"
 THERMAL_INERTIA_NORMAL = "normal"
 THERMAL_INERTIA_SLOW = "slow"
 
-# Predefined Weight Profiles
-# Fast (2 Hours): Highly responsive. (0.50, 0.50)
-INERTIA_PROFILE_FAST = (0.50, 0.50)
-# Normal (4 Hours): Standard House (Default)
-INERTIA_PROFILE_NORMAL = DEFAULT_INERTIA_WEIGHTS
-# Slow (12 Hours): Passive House / Concrete Foundation (0.05, ..., 0.06)
-# Smooth bell curve centered on H-6/H-5
-INERTIA_PROFILE_SLOW = (0.05, 0.05, 0.06, 0.08, 0.10, 0.12, 0.12, 0.12, 0.10, 0.08, 0.06, 0.06)
+DEFAULT_THERMAL_INERTIA_HOURS = 4
 
 # Solar Defaults
 DEFAULT_SOLAR_ENABLED = False

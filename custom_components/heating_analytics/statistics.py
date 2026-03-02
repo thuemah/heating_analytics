@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timedelta, date
 
 from homeassistant.util import dt as dt_util
 
-from .helpers import get_last_year_iso_date
+from .helpers import get_last_year_iso_date, generate_gaussian_kernel
 from .explanation import WeatherImpactAnalyzer, ExplanationFormatter
 from .const import (
     ATTR_TEMP_ACTUAL_TODAY,
@@ -1923,4 +1924,266 @@ class StatisticsManager:
             "characterization": analysis.get('characterization'),
             "hybrid_total_kwh": round(p1_hybrid_kwh, 1),
             "hybrid_reference_kwh": round(p2_hybrid_kwh, 1)
+        }
+
+    def calibrate_inertia(self, days: int = 30, centered_energy_average: bool = False) -> dict:
+        """Find the ideal thermal inertia profile (1-24 hours) for the house.
+
+        Filters history for 'Pure' hours (no aux, no solar, learning enabled).
+        Calculates R^2 and RMSE for different Gaussian kernels (1h to 24h).
+        Evaluates stability across weeks.
+        """
+        now = dt_util.now()
+        start_date = now - timedelta(days=days)
+        start_iso = start_date.isoformat()
+
+        # 1. Extract and Filter Logs
+        # We need continuous temperature history for the sliding window,
+        # but we only evaluate fitness on the "Pure" hours.
+        raw_temps = [] # To calculate effective temperature with sliding window
+        raw_kwh = []   # To calculate centered energy average
+        pure_logs = []
+
+        total_hours_evaluated = 0
+        discarded_reasons = {
+            "zero_or_negative_consumption": 0,
+            "solar_interference": 0,
+            "auxiliary_active": 0,
+            "learning_status_exclusion": 0
+        }
+
+        # Sort logs chronologically (oldest first)
+        sorted_logs = sorted(self.coordinator._hourly_log, key=lambda x: x["timestamp"])
+
+        for log in sorted_logs:
+            if log["timestamp"] < start_iso:
+                continue
+
+            total_hours_evaluated += 1
+            raw_temps.append(log["temp"])
+            raw_kwh.append(log.get("actual_kwh", 0.0))
+
+            # Filtration Criteria ("Pure" hours only)
+            actual_kwh = log.get("actual_kwh", 0.0)
+            if actual_kwh <= 0.0:
+                discarded_reasons["zero_or_negative_consumption"] += 1
+                continue
+
+            solar_impact = log.get("solar_impact_kwh", 0.0)
+            if solar_impact > 0.1: # Exclude if solar > 100W
+                discarded_reasons["solar_interference"] += 1
+                continue
+
+            aux_active = log.get("auxiliary_active", False)
+            if aux_active:
+                discarded_reasons["auxiliary_active"] += 1
+                continue
+
+            learning_status = log.get("learning_status", "active")
+            if learning_status not in ("active", "success", "model_updated"):
+                # Excludes mixed_mode, dual_interference, guest_mode, cooldown_post_aux
+                discarded_reasons["learning_status_exclusion"] += 1
+                continue
+
+            # Store the index in raw_temps so we can calculate the window later
+            pure_logs.append({
+                "index": len(raw_temps) - 1,
+                "timestamp": log["timestamp"],
+                "actual_kwh": actual_kwh,
+                "temp": log["temp"]
+            })
+
+        # Apply centered energy average if requested
+        if centered_energy_average and pure_logs:
+            for log in pure_logs:
+                idx = log["index"]
+
+                # Get surrounding hours, handling boundaries
+                prev_kwh = raw_kwh[idx - 1] if idx > 0 else raw_kwh[idx]
+                curr_kwh = raw_kwh[idx]
+                next_kwh = raw_kwh[idx + 1] if idx < len(raw_kwh) - 1 else raw_kwh[idx]
+
+                # Smoothed Y(t) = (Y(t-1) + Y(t) + Y(t+1)) / 3
+                log["actual_kwh"] = (prev_kwh + curr_kwh + next_kwh) / 3.0
+
+        if not pure_logs:
+            return {
+                "error": "Not enough pure data points to calibrate. Ensure you have historical data without Aux or Solar interference.",
+                "days_analyzed": days,
+                "total_hours_evaluated": total_hours_evaluated,
+                "discarded_hours": {
+                    "zero_or_negative_consumption": discarded_reasons["zero_or_negative_consumption"],
+                    "solar_interference": discarded_reasons["solar_interference"],
+                    "auxiliary_active": discarded_reasons["auxiliary_active"],
+                    "learning_status_exclusion": discarded_reasons["learning_status_exclusion"],
+                    "total_discarded": total_hours_evaluated - len(pure_logs)
+                }
+            }
+
+        # 2. Analyze Kernels (1 to 24 hours)
+        kernel_results = {}
+        for h in range(1, 25):
+            kernel = generate_gaussian_kernel(h)
+
+            x_vals = [] # Effective Temps
+            y_vals = [] # Actual kWh
+
+            for log in pure_logs:
+                idx = log["index"]
+                if idx < h - 1:
+                    continue # Not enough history for this kernel yet
+
+                # Get the window of temperatures for this log
+                window = raw_temps[idx - h + 1 : idx + 1]
+
+                # Apply kernel (window is oldest->newest, kernel is oldest->newest)
+                eff_temp = sum(t * w for t, w in zip(window, kernel))
+
+                x_vals.append(eff_temp)
+                y_vals.append(log["actual_kwh"])
+
+            if len(x_vals) < 10:
+                continue # Skip if too few points
+
+            # Calculate R^2 and RMSE
+            # Linear Regression: y = mx + c (where y is kwh, x is eff_temp)
+            # Actually, heating demand is proportional to (BalancePoint - eff_temp)
+            # So let's calculate TDD instead of direct temp for a better linear fit
+            bp = self.coordinator.balance_point
+            tdd_vals = [max(0.0, bp - t) / 24.0 for t in x_vals] # Daily TDD rate for the hour
+
+            mean_tdd = sum(tdd_vals) / len(tdd_vals)
+            mean_y = sum(y_vals) / len(y_vals)
+
+            numerator = sum((tdd - mean_tdd) * (y - mean_y) for tdd, y in zip(tdd_vals, y_vals))
+            denominator = sum((tdd - mean_tdd)**2 for tdd in tdd_vals)
+
+            if denominator == 0:
+                continue
+
+            slope = numerator / denominator
+            intercept = mean_y - slope * mean_tdd
+
+            # Predictions
+            y_pred = [slope * tdd + intercept for tdd in tdd_vals]
+
+            # R^2
+            ss_res = sum((y - p)**2 for y, p in zip(y_vals, y_pred))
+            ss_tot = sum((y - mean_y)**2 for y in y_vals)
+            r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+            # RMSE
+            rmse = math.sqrt(ss_res / len(y_vals))
+
+            kernel_results[h] = {
+                "hours": h,
+                "r2": round(r2, 4),
+                "rmse": round(rmse, 4),
+                "points": len(x_vals)
+            }
+
+        if not kernel_results:
+            return {"error": "Not enough data points after applying kernel history."}
+
+        # Find best overall
+        best_overall = max(kernel_results.values(), key=lambda k: k["r2"])
+
+        # 4. Stability Analysis (Weekly Breakdown)
+        weekly_results = []
+        if days >= 14:
+            # Group pure_logs by week
+            weeks = {}
+            for log in pure_logs:
+                dt = dt_util.parse_datetime(log["timestamp"])
+                if not dt:
+                    continue
+                # Week number
+                iso_year, iso_week, _ = dt.isocalendar()
+                week_key = f"{iso_year}-W{iso_week}"
+
+                if week_key not in weeks:
+                    weeks[week_key] = []
+                weeks[week_key].append(log)
+
+            for week_key, week_logs in weeks.items():
+                if len(week_logs) < 20: # Need enough points per week
+                    continue
+
+                week_best = None
+                max_week_r2 = -1.0
+
+                for h in range(1, 25):
+                    kernel = generate_gaussian_kernel(h)
+                    x_vals = []
+                    y_vals = []
+
+                    for log in week_logs:
+                        idx = log["index"]
+                        if idx < h - 1:
+                            continue
+                        window = raw_temps[idx - h + 1 : idx + 1]
+                        eff_temp = sum(t * w for t, w in zip(window, kernel))
+                        x_vals.append(max(0.0, bp - eff_temp) / 24.0)
+                        y_vals.append(log["actual_kwh"])
+
+                    if len(x_vals) < 10:
+                        continue
+
+                    mean_x = sum(x_vals) / len(x_vals)
+                    mean_y = sum(y_vals) / len(y_vals)
+                    den = sum((x - mean_x)**2 for x in x_vals)
+                    if den == 0: continue
+                    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_vals, y_vals)) / den
+                    intercept = mean_y - slope * mean_x
+                    y_pred = [slope * x + intercept for x in x_vals]
+
+                    ss_res = sum((y - p)**2 for y, p in zip(y_vals, y_pred))
+                    ss_tot = sum((y - mean_y)**2 for y in y_vals)
+                    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+                    if r2 > max_week_r2:
+                        max_week_r2 = r2
+                        week_best = h
+
+                if week_best is not None:
+                    weekly_results.append({
+                        "week": week_key,
+                        "best_hours": week_best,
+                        "r2": round(max_week_r2, 3),
+                        "points": len(week_logs)
+                    })
+
+        # Stability Score Calculation
+        stability_score = "Unknown (Need >= 14 days)"
+        if weekly_results:
+            best_hours_list = [w["best_hours"] for w in weekly_results]
+            if len(best_hours_list) > 1:
+                mean_h = sum(best_hours_list) / len(best_hours_list)
+                variance = sum((h - mean_h)**2 for h in best_hours_list) / len(best_hours_list)
+                std_dev = math.sqrt(variance)
+
+                if std_dev <= 1.5:
+                    stability_score = "High (Consistent thermal behavior)"
+                elif std_dev <= 3.0:
+                    stability_score = "Medium (Some variation, acceptable)"
+                else:
+                    stability_score = f"Low (High variation across weeks, std_dev={std_dev:.1f})"
+            else:
+                stability_score = "Insufficient weekly data"
+
+        return {
+            "days_analyzed": days,
+            "total_hours_evaluated": total_hours_evaluated,
+            "pure_hours_found": len(pure_logs),
+            "discarded_hours": {
+                "zero_or_negative_consumption": discarded_reasons["zero_or_negative_consumption"],
+                "solar_interference": discarded_reasons["solar_interference"],
+                "auxiliary_active": discarded_reasons["auxiliary_active"],
+                "learning_status_exclusion": discarded_reasons["learning_status_exclusion"],
+                "total_discarded": total_hours_evaluated - len(pure_logs)
+            },
+            "best_overall": best_overall,
+            "stability_score": stability_score,
+            "weekly_breakdown": weekly_results,
+            "top_5_profiles": sorted(list(kernel_results.values()), key=lambda k: k["r2"], reverse=True)[:5]
         }

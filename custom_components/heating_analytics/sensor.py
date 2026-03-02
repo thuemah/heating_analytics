@@ -726,6 +726,7 @@ class HeatingDeviationSensor(HeatingAnalyticsBaseSensor):
         # Raw coordinator data
         forecast = self.coordinator.data.get(ATTR_FORECAST_TODAY, 0.0)
         predicted = self.coordinator.data.get(ATTR_PREDICTED, 0.0)
+        midnight_forecast = self.coordinator.data.get(ATTR_MIDNIGHT_FORECAST, 0.0)
         actual = self.coordinator.data.get(ATTR_ENERGY_TODAY, 0.0)
         expected = self.coordinator.data.get(ATTR_EXPECTED_TODAY, 0.0)
 
@@ -768,7 +769,7 @@ class HeatingDeviationSensor(HeatingAnalyticsBaseSensor):
 
             # End-of-day projections
             "end_of_day_forecast_kwh": round(forecast, 1),  # Coordinator's EOD forecast
-            "model_prediction_kwh": round(predicted, 1),     # Model's EOD prediction
+            "model_prediction_kwh": round(midnight_forecast, 1),  # Frozen midnight budget (stable dagsbudsjett)
             "deviation_projected_kwh": round(forecast - predicted, 1),
 
             # Thermodynamic Projection (Model on Actuals So Far + Live Forecast)
