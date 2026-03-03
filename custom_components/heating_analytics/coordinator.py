@@ -420,6 +420,23 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         await self._async_save_data(force=True)
 
+    async def async_reset_solar_learning_data(self, entity_id: str | None = None):
+        """Reset solar learning data for a specific unit or all units."""
+        if entity_id:
+            if entity_id in self._solar_coefficients_per_unit:
+                del self._solar_coefficients_per_unit[entity_id]
+                _LOGGER.debug(f"Cleared solar coefficients for {entity_id}")
+            if entity_id in self._learning_buffer_solar_per_unit:
+                del self._learning_buffer_solar_per_unit[entity_id]
+                _LOGGER.debug(f"Cleared solar learning buffer for {entity_id}")
+            _LOGGER.info(f"Solar learning reset for unit: {entity_id}")
+        else:
+            self._solar_coefficients_per_unit.clear()
+            self._learning_buffer_solar_per_unit.clear()
+            _LOGGER.info("Solar learning reset for all units")
+
+        await self._async_save_data(force=True)
+
     async def async_migrate_aux_coefficients(self, new_aux_affected_entities: list[str]):
         """Migrate auxiliary coefficients when the affected entities list changes.
 

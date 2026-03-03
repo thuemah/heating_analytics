@@ -37,6 +37,7 @@ SERVICE_COMPARE_PERIODS = "compare_periods"
 SERVICE_EXIT_COOLDOWN = "exit_cooldown"
 SERVICE_GET_FORECAST = "get_forecast"
 SERVICE_CALIBRATE_INERTIA = "calibrate_inertia"
+SERVICE_RESET_SOLAR_LEARNING = "reset_solar_learning"
 SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=90)),
@@ -69,6 +70,10 @@ SERVICE_SCHEMA_RESET_UNIT = vol.Schema({
 })
 
 SERVICE_SCHEMA_RESET_ACCURACY = vol.Schema({})
+
+SERVICE_SCHEMA_RESET_SOLAR = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+})
 
 SERVICE_SCHEMA_BACKUP = vol.Schema({
     vol.Required("file_path"): cv.string,
@@ -204,6 +209,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         SERVICE_RESET_FORECAST_ACCURACY,
         handle_reset_forecast_accuracy,
         schema=SERVICE_SCHEMA_RESET_ACCURACY
+    )
+
+    # Register Reset Solar Learning Service
+    async def handle_reset_solar_learning(call: ServiceCall):
+        """Handle the reset solar learning service call."""
+        entity_id = call.data.get("entity_id")
+        if entity_id:
+            _LOGGER.info(f"Service called to reset solar learning for {entity_id}")
+        else:
+            _LOGGER.info("Service called to reset solar learning for all units")
+
+        for coord in _get_coordinators(hass):
+            await coord.async_reset_solar_learning_data(entity_id)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESET_SOLAR_LEARNING,
+        handle_reset_solar_learning,
+        schema=SERVICE_SCHEMA_RESET_SOLAR,
     )
 
     # Register Backup Service
@@ -438,5 +462,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_EXIT_COOLDOWN)
             hass.services.async_remove(DOMAIN, SERVICE_GET_FORECAST)
             hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_INERTIA)
+            hass.services.async_remove(DOMAIN, SERVICE_RESET_SOLAR_LEARNING)
 
     return unload_ok
