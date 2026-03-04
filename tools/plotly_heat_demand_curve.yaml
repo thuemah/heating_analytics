@@ -1,0 +1,176 @@
+type: custom:plotly-graph
+refresh_interval: 300
+raw_plotly_config: true
+config:
+  displayModeBar: false
+layout:
+  showlegend: true
+  legend:
+    orientation: h
+    "y": 1.1
+  xaxis:
+    title: Temperature (°C)
+    range: null
+    dtick: 5
+    gridcolor: rgba(128, 128, 128, 0.2)
+    zeroline: true
+    zerolinecolor: rgba(255, 255, 255, 0.3)
+  yaxis:
+    title: Heat Demand (kWh/day)
+    gridcolor: rgba(128, 128, 128, 0.2)
+    zeroline: true
+    zerolinecolor: rgba(255, 255, 255, 0.3)
+  paper_bgcolor: rgba(0,0,0,0)
+  plot_bgcolor: rgba(0,0,0,0)
+  font:
+    color: var(--primary-text-color)
+  margin:
+    l: 60
+    r: 20
+    t: 40
+    b: 60
+  hovermode: x unified
+entities:
+  - entity: sensor.heating_analytics_correlation_data
+    name: Normal
+    mode: lines
+    line:
+      color: "#2196F3"
+      width: 3
+      shape: spline
+    x: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_analytics_correlation_data'].attributes;
+        const SKIP_KEYS = ['normal_x', 'normal_y', 'high_wind_x', 'high_wind_y', 'extreme_wind_x', 'extreme_wind_y', 'auxiliary_heating_x', 'auxiliary_heating_y', 'friendly_name', 'icon'];
+        let temps = [];
+        Object.keys(data).forEach(key => {
+          if (SKIP_KEYS.includes(key)) return;
+          const temp = parseFloat(key);
+          if (!isNaN(temp) && data[key]?.normal !== undefined) {
+            temps.push(temp);
+          }
+        });
+        return temps.sort((a, b) => a - b);
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_analytics_correlation_data'].attributes;
+        const SKIP_KEYS = ['normal_x', 'normal_y', 'high_wind_x', 'high_wind_y', 'extreme_wind_x', 'extreme_wind_y', 'auxiliary_heating_x', 'auxiliary_heating_y', 'friendly_name', 'icon'];
+        let values = [];
+        Object.keys(data).forEach(key => {
+          if (SKIP_KEYS.includes(key)) return;
+          const temp = parseFloat(key);
+          if (!isNaN(temp) && data[key]?.normal !== undefined) {
+            values.push({ temp: temp, kwh: parseFloat(data[key].normal) * 24 });
+          }
+        });
+        return values.sort((a, b) => a.temp - b.temp).map(v => v.kwh);
+      }
+  - entity: sensor.heating_analytics_correlation_data
+    name: High Wind
+    mode: lines
+    line:
+      color: "#FF9800"
+      width: 3
+      shape: spline
+      dash: dot
+    x: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_analytics_correlation_data'].attributes;
+        const SKIP_KEYS = ['normal_x', 'normal_y', 'high_wind_x', 'high_wind_y', 'extreme_wind_x', 'extreme_wind_y', 'auxiliary_heating_x', 'auxiliary_heating_y', 'friendly_name', 'icon'];
+        let temps = [];
+        Object.keys(data).forEach(key => {
+          if (SKIP_KEYS.includes(key)) return;
+          const temp = parseFloat(key);
+          if (!isNaN(temp) && data[key]?.high_wind !== undefined) {
+            temps.push(temp);
+          }
+        });
+        return temps.sort((a, b) => a - b);
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_analytics_correlation_data'].attributes;
+        const SKIP_KEYS = ['normal_x', 'normal_y', 'high_wind_x', 'high_wind_y', 'extreme_wind_x', 'extreme_wind_y', 'auxiliary_heating_x', 'auxiliary_heating_y', 'friendly_name', 'icon'];
+        let values = [];
+        Object.keys(data).forEach(key => {
+          if (SKIP_KEYS.includes(key)) return;
+          const temp = parseFloat(key);
+          if (!isNaN(temp) && data[key]?.high_wind !== undefined) {
+            values.push({ temp: temp, kwh: parseFloat(data[key].high_wind) * 24 });
+          }
+        });
+        return values.sort((a, b) => a.temp - b.temp).map(v => v.kwh);
+      }
+  - entity: sensor.heating_analytics_correlation_data
+    name: Extreme Wind
+    mode: lines
+    line:
+      color: "#F44336"
+      width: 3
+      shape: spline
+      dash: dash
+    x: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_analytics_correlation_data'].attributes;
+        const SKIP_KEYS = ['normal_x', 'normal_y', 'high_wind_x', 'high_wind_y', 'extreme_wind_x', 'extreme_wind_y', 'auxiliary_heating_x', 'auxiliary_heating_y', 'friendly_name', 'icon'];
+        let temps = [];
+        Object.keys(data).forEach(key => {
+          if (SKIP_KEYS.includes(key)) return;
+          const temp = parseFloat(key);
+          if (!isNaN(temp) && data[key]?.extreme_wind !== undefined && data[key]?.extreme_wind !== null) {
+            temps.push(temp);
+          }
+        });
+        return temps.sort((a, b) => a - b);
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_analytics_correlation_data'].attributes;
+        const SKIP_KEYS = ['normal_x', 'normal_y', 'high_wind_x', 'high_wind_y', 'extreme_wind_x', 'extreme_wind_y', 'auxiliary_heating_x', 'auxiliary_heating_y', 'friendly_name', 'icon'];
+        let values = [];
+        Object.keys(data).forEach(key => {
+          if (SKIP_KEYS.includes(key)) return;
+          const temp = parseFloat(key);
+          if (!isNaN(temp) && data[key]?.extreme_wind !== undefined && data[key]?.extreme_wind !== null) {
+            values.push({ temp: temp, kwh: parseFloat(data[key].extreme_wind) * 24 });
+          }
+        });
+        return values.sort((a, b) => a.temp - b.temp).map(v => v.kwh);
+      }
+  - entity: sensor.heating_analytics_correlation_data
+    name: With Auxiliary Heating
+    mode: lines
+    line:
+      color: "#4CAF50"
+      width: 3
+      shape: spline
+      dash: longdash
+    x: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_analytics_correlation_data'].attributes;
+        const SKIP_KEYS = ['normal_x', 'normal_y', 'high_wind_x', 'high_wind_y', 'extreme_wind_x', 'extreme_wind_y', 'auxiliary_heating_x', 'auxiliary_heating_y', 'friendly_name', 'icon'];
+        let temps = [];
+        Object.keys(data).forEach(key => {
+          if (SKIP_KEYS.includes(key)) return;
+          const temp = parseFloat(key);
+          if (!isNaN(temp) && data[key]?.with_auxiliary_heating !== undefined) {
+            temps.push(temp);
+          }
+        });
+        return temps.sort((a, b) => a - b);
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_analytics_correlation_data'].attributes;
+        const SKIP_KEYS = ['normal_x', 'normal_y', 'high_wind_x', 'high_wind_y', 'extreme_wind_x', 'extreme_wind_y', 'auxiliary_heating_x', 'auxiliary_heating_y', 'friendly_name', 'icon'];
+        let values = [];
+        Object.keys(data).forEach(key => {
+          if (SKIP_KEYS.includes(key)) return;
+          const temp = parseFloat(key);
+          if (!isNaN(temp) && data[key]?.with_auxiliary_heating !== undefined) {
+            values.push({ temp: temp, kwh: parseFloat(data[key].with_auxiliary_heating) * 24 });
+          }
+        });
+        return values.sort((a, b) => a.temp - b.temp).map(v => v.kwh);
+      }

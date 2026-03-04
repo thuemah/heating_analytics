@@ -99,8 +99,9 @@ If you have past energy/weather data, jump-start the learning process:
 - Track per-room efficiency and solar distribution
 
 **Dashboard & Visualizations:**
-- See [dashboard_heating.md](dashboard_heating.md) for ready-made Lovelace YAML
+- See [dashboard_heating.md](https://github.com/thuemah/heating_analytics/blob/main/tools/dashboard_heating.md) for ready-made Lovelace YAML
 - Includes Plotly charts, efficiency cards, and forecast breakdowns
+- [plotly_heat_demand_curve.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_heat_demand_curve.yaml) – standalone heat demand curve (temperature vs kWh/day)
 
 ---
 
@@ -243,7 +244,7 @@ The system stores **Hourly Data Vectors** (Temp, Wind, Actual Load) for every da
 
 ## Dashboard & Visualizations
 
-A complete dashboard configuration is available in [dashboard_heating.md](dashboard_heating.md).
+A complete dashboard configuration is available in [dashboard_heating.md](https://github.com/thuemah/heating_analytics/blob/main/tools/dashboard_heating.md).
 
 **Includes:**
 
@@ -253,13 +254,18 @@ A complete dashboard configuration is available in [dashboard_heating.md](dashbo
 - Weather & solar impact
 - Week-ahead forecast
 
-<img width="626" height="417" alt="tmp" src="https://github.com/user-attachments/assets/7d9c91be-8d21-426d-9ccb-ea6b75df20a8" />
-
 
 <img width="682" height="1326" alt="week_ahead" src="https://github.com/user-attachments/assets/0666e162-e64f-4b49-b7c9-a82a12223692" />
 
 
 <img width="677" height="941" alt="model_comparison" src="https://github.com/user-attachments/assets/ea956d36-d809-470d-bcf3-3a08aa6d29e3" />
+
+### Heat Demand Curve
+
+The learned heat demand curve (temperature vs kWh/day across wind conditions) is available as a standalone Plotly card in [plotly_heat_demand_curve.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_heat_demand_curve.yaml).
+
+<img width="611" height="605" alt="image" src="https://github.com/user-attachments/assets/4af1f748-3b0a-4d42-a0c1-3a84ab617c99" />
+
 
 
 **Required HACS Integrations:**
