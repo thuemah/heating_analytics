@@ -46,6 +46,7 @@ def coordinator(mock_hass):
     coord.solar.apply_correction.side_effect = lambda base, impact, val: base
 
     coord.solar_enabled = False
+    coord.solar_azimuth = 180
 
     # Init internal structures
     coord._hourly_delta_per_unit = {"sensor.heater_1": 0.0, "sensor.heater_2": 0.0}

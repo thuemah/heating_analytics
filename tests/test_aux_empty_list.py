@@ -11,6 +11,7 @@ def mock_coordinator_empty_aux():
     coord.aux_affected_entities = []
     coord._aux_affected_set = set() # Empty set
     coord.solar_enabled = False
+    coord.solar_azimuth = 180
     coord.balance_point = 18.0
 
     # Mock Models

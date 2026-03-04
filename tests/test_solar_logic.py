@@ -44,7 +44,7 @@ def mock_coordinator():
         # Use simple coefficient of 1.0 for unit such that impact = factor * 1.0
         # If we set factor=0.4 (from current state test below), and we want result 0.4, coeff should be 1.0?
         # Or if we want specific result.
-        coord._solar_coefficients_per_unit = {"sensor.heater1": {"10": 1.0}}
+        coord._solar_coefficients_per_unit = {"sensor.heater1": {"10": {"s": 1.0, "e": 0.0}}}
 
         return coord
 
@@ -77,6 +77,8 @@ def test_deviation_breakdown_solar_logic(mock_coordinator):
         coord.data["effective_wind"] = 0.0
         coord.data[ATTR_SOLAR_IMPACT] = 0.4 # Global Impact
         coord.data["solar_factor"] = 0.4 # Need factor for new calc
+        coord.data["solar_vector_s"] = 0.4
+        coord.data["solar_vector_e"] = 0.0
 
         # New logic uses solar_factor * unit_coeff to get impact.
         # We set coeff=1.0 in fixture.

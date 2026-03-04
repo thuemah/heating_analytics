@@ -98,6 +98,39 @@ class SolarCalculator:
 
         return elev_factor * az_factor * cloud_factor
 
+    def calculate_solar_vector(self, elevation: float, azimuth: float, cloud_coverage: float) -> tuple[float, float]:
+        """Calculate 2D solar vector (South, East) components."""
+        if elevation <= 0.0:
+            return 0.0, 0.0
+
+        # Elevation Factor
+        safe_elev = max(1.0, elevation)
+        elev_rad = math.radians(safe_elev)
+
+        am = 1.0 / math.sin(elev_rad)
+        intensity = 0.7 ** am
+
+        raw_elev_factor = max(0.0, math.cos(elev_rad))
+        elev_factor = raw_elev_factor * intensity
+
+        # Cloud Factor
+        cloud_factor = 1.0 - (cloud_coverage / 100.0)
+
+        base_intensity = elev_factor * cloud_factor
+
+        # 2D Decomposition
+        # South is positive (-cos), East is positive (+sin)
+        solar_south = base_intensity * (-math.cos(math.radians(azimuth)))
+        solar_east = base_intensity * math.sin(math.radians(azimuth))
+
+        return solar_south, solar_east
+
+    def calculate_effective_solar_vector(self, potential_solar_vector: tuple[float, float], correction_percent: float) -> tuple[float, float]:
+        """Calculate effective solar vector after applying screens/correction."""
+        s, e = potential_solar_vector
+        factor = correction_percent / 100.0
+        return s * factor, e * factor
+
     def calculate_effective_solar_factor(self, potential_solar_factor: float, correction_percent: float) -> float:
         """Calculate effective solar factor after applying screens/correction.
 
@@ -112,16 +145,20 @@ class SolarCalculator:
         """
         return potential_solar_factor * (correction_percent / 100.0)
 
-    def calculate_unit_solar_impact(self, global_solar_factor: float, unit_coeff: float) -> float:
-        """Calculate solar impact in kW for a specific unit using its learned coefficient.
+    def calculate_unit_solar_impact(self, global_solar_vector: tuple[float, float], unit_coeff: dict[str, float]) -> float:
+        """Calculate solar impact in kW for a specific unit using its learned 2D coefficient vector.
 
-        Formula: Impact = Global_Factor * Unit_Coeff
-        The Unit_Coeff absorbs the "Effective Window Area" and "Efficiency".
+        Formula: Impact = Coeff_S * Solar_S + Coeff_E * Solar_E
         """
-        return global_solar_factor * unit_coeff
+        solar_s, solar_e = global_solar_vector
+        coeff_s = unit_coeff.get("s", 0.0)
+        coeff_e = unit_coeff.get("e", 0.0)
 
-    def calculate_unit_coefficient(self, entity_id: str, temp_key: str) -> float:
-        """Calculate solar coefficient for a specific unit and temp.
+        impact = coeff_s * solar_s + coeff_e * solar_e
+        return max(0.0, impact)
+
+    def calculate_unit_coefficient(self, entity_id: str, temp_key: str) -> dict[str, float]:
+        """Calculate 2D solar coefficient vector for a specific unit and temp.
 
         Uses the following priority:
         1. Exact match for unit and temperature bucket.
@@ -159,7 +196,10 @@ class SolarCalculator:
                 t_plus = target_t + 1
 
                 if t_minus in mode_coeffs and t_plus in mode_coeffs:
-                    return (mode_coeffs[t_minus] + mode_coeffs[t_plus]) / 2.0
+                    return {
+                        "s": (mode_coeffs[t_minus].get("s", 0.0) + mode_coeffs[t_plus].get("s", 0.0)) / 2.0,
+                        "e": (mode_coeffs[t_minus].get("e", 0.0) + mode_coeffs[t_plus].get("e", 0.0)) / 2.0
+                    }
 
                 # Find closest temperature bucket in the same mode
                 closest_t = min(mode_coeffs.keys(), key=lambda t: abs(t - target_t))
@@ -179,12 +219,18 @@ class SolarCalculator:
         except ValueError:
             mode = self.coordinator.get_unit_mode(entity_id)
 
+        default_scalar = 0.0
         if mode in (MODE_HEATING, MODE_GUEST_HEATING):
-            return DEFAULT_SOLAR_COEFF_HEATING
-        if mode in (MODE_COOLING, MODE_GUEST_COOLING):
-            return DEFAULT_SOLAR_COEFF_COOLING
+            default_scalar = DEFAULT_SOLAR_COEFF_HEATING
+        elif mode in (MODE_COOLING, MODE_GUEST_COOLING):
+            default_scalar = DEFAULT_SOLAR_COEFF_COOLING
 
-        return 0.0
+        # Decompose global scalar default along the configured primary azimuth
+        az_rad = math.radians(self.coordinator.solar_azimuth)
+        return {
+            "s": default_scalar * (-math.cos(az_rad)),
+            "e": default_scalar * math.sin(az_rad)
+        }
 
     def apply_correction(self, base_kwh: float, solar_impact: float, val: str | float) -> float:
         """Apply solar correction to predicted energy.

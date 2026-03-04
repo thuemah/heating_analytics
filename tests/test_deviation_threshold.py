@@ -4,6 +4,7 @@ from custom_components.heating_analytics.statistics import StatisticsManager
 
 class MockCoordinator:
     def __init__(self):
+        self.solar_azimuth = 180
         self.data = {}
         self.hass = None
         self.energy_sensors = []

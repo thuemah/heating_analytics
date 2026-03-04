@@ -65,6 +65,7 @@ def test_coordinator_data_flow_to_sensor(hass, mock_entry):
     # We define a MockCoordinator that behaves enough like real one
     class MockCoordinator:
         def __init__(self, hass, entry):
+            self.solar_azimuth = 180
             self.hass = hass
             self.data = {"test_key": "test_val"}
             self.energy_sensors = []
@@ -83,6 +84,7 @@ def test_coordinator_data_flow_to_sensor(hass, mock_entry):
 
     class TestSensor(HeatingAnalyticsBaseSensor):
         def __init__(self, coordinator, entry):
+            self.solar_azimuth = 180
             super().__init__(coordinator, entry)
             self._attr_unique_id = "test_id"
 

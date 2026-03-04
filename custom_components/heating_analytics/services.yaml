@@ -155,6 +155,26 @@ get_forecast:
           max: 7
           mode: box
 
+calibrate_wind_thresholds:
+  name: Calibrate Wind Thresholds
+  description: Tests historical data to calculate the optimal wind thresholds (high wind and extreme wind) by reclassifying historical hours and comparing existing model expected consumption against actual consumption to minimize Mean Absolute Error (MAE). Returns recommended thresholds.
+  fields:
+    entity_id:
+      name: Entity
+      description: The Heating Analytics sensor to target (optional, defaults to primary instance).
+      selector:
+        entity:
+          integration: heating_analytics
+    days:
+      name: Days Back to Analyze
+      description: Number of days of historical data to evaluate (1-180).
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 180
+          mode: box
+
 calibrate_inertia:
   name: Calibrate Thermal Inertia
   description: Tests historical data to calculate the ideal thermal inertia profile (1-24 hours) for your house by finding the highest correlation (R²) to consumption without auxiliary or solar interference. Returns results as a response.

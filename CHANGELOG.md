@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-03-05
+
+### Added
+- Added `calibrate_wind_thresholds` service that analyses historical "pure" hours (no aux, no solar) and performs a brute-force grid search over `high_wind` (3–10 m/s) and `extreme_wind` (high+2 to high+8 m/s) threshold pairs. For each candidate pair, hours are reclassified and compared against the existing global model's expected consumption to compute MAE. Returns the recommended thresholds, current MAE, a warning if fewer than 30 windy hours were found, and the top-10 candidates. Accepts an optional `days` parameter (default 60, max 180).
+
+### Fixed
+- Fixed `TypeError: cannot unpack non-iterable float object` on startup when calculating potential solar impact. The coordinator was passing `potential_solar_factor` (scalar) instead of `potential_solar_vector` (tuple) to `calculate_unit_solar_impact()`.
+- Fixed solar optimizer model (screen recommendations) being silently reset to empty on every restart. `async_load_data` was missing the call to `solar_optimizer.set_data()`, so the learned insulate/maximize_solar model was discarded and overwritten on first save.
+
+### Changed
+- Removed **Window Orientation (Azimuth)** from the configuration UI. With the 2D solar vector system, window orientation is learned empirically through per-unit `(s, e)` coefficient vectors and no longer requires manual input. The internal 180° south default is retained for cold-start initialization and historical log reconstruction.
+
 ## [1.2.2] - 2026-03-03
 
 ### Added

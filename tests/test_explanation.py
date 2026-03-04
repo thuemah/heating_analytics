@@ -9,6 +9,9 @@ from custom_components.heating_analytics.explanation import (
 
 # Dummy Coordinator for testing (mocking _get_wind_bucket)
 class MockCoordinator:
+    def __init__(self):
+        self.solar_azimuth = 180
+
     def _get_wind_bucket(self, wind_speed, ignore_aux=False):
         if wind_speed >= 10.8:
             return 'extreme_wind'

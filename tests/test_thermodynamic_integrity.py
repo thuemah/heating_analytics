@@ -28,6 +28,7 @@ def mock_coordinator():
     coord = MagicMock()
     coord.balance_point = 15.0
     coord.solar_enabled = False
+    coord.solar_azimuth = 180
     # Use a lambda to pass the arguments correctly from the MagicMock call to the standalone mock function
     coord._get_predicted_kwh.side_effect = lambda tk, b, at: mock_get_predicted_kwh(tk, b, at)
     coord.energy_sensors = ["sensor.heater_1", "sensor.heater_2"]

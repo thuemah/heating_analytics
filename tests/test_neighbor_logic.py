@@ -85,17 +85,18 @@ def test_solar_coefficient_neighbor_logic(mock_coordinator):
     """Test neighbor lookup for solar coefficients."""
     mock_coordinator._solar_coefficients_per_unit = {
         "unit_1": {
-            "9": 0.5,
-            "11": 0.7
+            "9": {"s": 0.5, "e": 0.0},
+            "11": {"s": 0.7, "e": 0.0}
         }
     }
     # Target "10". Average of 0.5 and 0.7 is 0.6.
-    assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "10") == 0.6
+    assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "10")["s"] == 0.6
 
     # Target "12". With balance_point=12.0, target_t=12 is MODE_COOLING.
     # Learned data (9 and 11) are MODE_HEATING.
     # Should fall back to DEFAULT_SOLAR_COEFF_COOLING = 0.40.
-    assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "12") == 0.40
+    mock_coordinator.solar_azimuth = 180
+    assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "12")["s"] == 0.40
 
 def test_per_unit_neighbor_logic(mock_coordinator):
     """Test neighbor lookup for per-unit predictions."""

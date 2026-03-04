@@ -78,6 +78,7 @@ class StatisticsManager:
         is_aux_active: bool,
         unit_modes: dict[str, str] | None = None,
         override_solar_factor: float | None = None,
+        override_solar_vector: tuple[float, float] | None = None,
         detailed: bool = True,
         known_aux_impact_kwh: float | None = None,
     ) -> dict:
@@ -124,11 +125,21 @@ class StatisticsManager:
         correlation_per_unit = self.coordinator._correlation_data_per_unit
         aux_coeffs_per_unit = self.coordinator._aux_coefficients_per_unit
 
-        # Pre-calculate Solar Factor if needed for unit distribution
-        if override_solar_factor is not None:
-            curr_solar_factor = override_solar_factor
+        # Pre-calculate Solar Vector if needed for unit calculation
+        if override_solar_vector is not None:
+            curr_solar_vector = override_solar_vector
         else:
-            curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
+            # Fallback to reconstructing from scalar if vector isn't provided (e.g. historical data)
+            if override_solar_factor is not None:
+                curr_solar_factor = override_solar_factor
+            else:
+                curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
+
+            az_rad = math.radians(self.coordinator.solar_azimuth)
+            curr_solar_vector = (
+                curr_solar_factor * (-math.cos(az_rad)),
+                curr_solar_factor * math.sin(az_rad)
+            )
 
         # --- Track A: Global Model (Top-Down / Master) ---
         # 1. Global Base Prediction
@@ -195,7 +206,7 @@ class StatisticsManager:
             unit_solar_reduction = 0.0
             if self.coordinator.solar_enabled:
                  unit_coeff = self.coordinator.solar.calculate_unit_coefficient(entity_id, temp_key)
-                 unit_solar_reduction = self.coordinator.solar.calculate_unit_solar_impact(curr_solar_factor, unit_coeff)
+                 unit_solar_reduction = self.coordinator.solar.calculate_unit_solar_impact(curr_solar_vector, unit_coeff)
 
             # Determine Mode
             mode = MODE_HEATING
@@ -1178,6 +1189,15 @@ class StatisticsManager:
                         else:
                             unit_modes = modes_cooling
 
+                    # Provide an estimated vector for historical data
+                    s_vector = None
+                    if s_factor is not None:
+                        az_rad = math.radians(self.coordinator.solar_azimuth)
+                        s_vector = (
+                            s_factor * (-math.cos(az_rad)),
+                            s_factor * math.sin(az_rad)
+                        )
+
                     res = self.calculate_total_power(
                         temp=calc_temp,
                         effective_wind=wind,
@@ -1185,6 +1205,7 @@ class StatisticsManager:
                         is_aux_active=False,
                         unit_modes=unit_modes,
                         override_solar_factor=s_factor,
+                        override_solar_vector=s_vector,
                         detailed=False,
                     )
 
@@ -1298,7 +1319,20 @@ class StatisticsManager:
         temp = log["temp"]
         eff_wind = log.get("effective_wind", 0.0)
         s_factor = log.get("solar_factor") # Can be None
+        s_vector_s = log.get("solar_vector_s")
+        s_vector_e = log.get("solar_vector_e")
         unit_modes = log.get("unit_modes")
+
+        if s_vector_s is not None and s_vector_e is not None:
+            s_vector = (s_vector_s, s_vector_e)
+        elif s_factor is not None:
+            az_rad = math.radians(self.coordinator.solar_azimuth)
+            s_vector = (
+                s_factor * (-math.cos(az_rad)),
+                s_factor * math.sin(az_rad)
+            )
+        else:
+            s_vector = None
 
         # For pure model reconstruction, ALWAYS assume aux is inactive.
         res = self.calculate_total_power(
@@ -1308,6 +1342,7 @@ class StatisticsManager:
             is_aux_active=False, # CRUCIAL for pure model
             unit_modes=unit_modes,
             override_solar_factor=s_factor,
+            override_solar_vector=s_vector,
             detailed=False,
         )
 
@@ -1650,7 +1685,11 @@ class StatisticsManager:
         if self.coordinator.solar_enabled:
              curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
              unit_coeff = self.coordinator.solar.calculate_unit_coefficient(entity_id, temp_key)
-             unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(curr_solar_factor, unit_coeff)
+             curr_solar_vector = (
+                 self.coordinator.data.get("solar_vector_s", 0.0),
+                 self.coordinator.data.get("solar_vector_e", 0.0)
+             )
+             unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(curr_solar_vector, unit_coeff)
 
              mode = MODE_HEATING if current_temp < self.coordinator.balance_point else MODE_COOLING
              unit_rate_curr = self.coordinator.solar.apply_correction(unit_base_curr, unit_solar_curr_kw, mode)
@@ -2186,4 +2225,174 @@ class StatisticsManager:
             "stability_score": stability_score,
             "weekly_breakdown": weekly_results,
             "top_5_profiles": sorted(list(kernel_results.values()), key=lambda k: k["r2"], reverse=True)[:5]
+        }
+
+    def calibrate_wind_thresholds(self, days: int = 60) -> dict:
+        """Find the optimal wind thresholds (high_wind, extreme_wind) to minimize model error.
+
+        Filters history for 'Pure' hours (no aux, no solar).
+        Iterates over a grid of threshold candidates. Reclassifies hours based on effective_wind.
+        Compares actual consumption against the EXISTING global model's expected consumption.
+        """
+        now = dt_util.now()
+        start_date = now - timedelta(days=days)
+        start_iso = start_date.isoformat()
+
+        # 1. Extract and Filter Logs ("Pure" hours only)
+        pure_logs = []
+        total_hours_evaluated = 0
+
+        sorted_logs = sorted(self.coordinator._hourly_log, key=lambda x: x["timestamp"])
+
+        for log in sorted_logs:
+            if log["timestamp"] < start_iso:
+                continue
+
+            total_hours_evaluated += 1
+
+            actual_kwh = log.get("actual_kwh", 0.0)
+            if actual_kwh <= 0.0:
+                continue
+
+            solar_impact = log.get("solar_impact_kwh", 0.0)
+            if solar_impact > 0.1:
+                continue
+
+            aux_active = log.get("auxiliary_active", False)
+            if aux_active:
+                continue
+
+            # Need effective_wind and temp_key to map to model
+            eff_wind = log.get("effective_wind")
+            if eff_wind is None:
+                continue
+
+            temp_key = log.get("temp_key")
+            if temp_key is None:
+                continue
+
+            pure_logs.append({
+                "timestamp": log["timestamp"],
+                "actual_kwh": actual_kwh,
+                "effective_wind": eff_wind,
+                "temp_key": temp_key,
+                "temp": log["temp"]
+            })
+
+        if not pure_logs:
+            return {
+                "error": "Not enough pure data points to calibrate wind thresholds. Ensure you have historical data without Aux or Solar interference.",
+                "days_analyzed": days,
+                "total_hours_evaluated": total_hours_evaluated,
+                "pure_hours_found": 0
+            }
+
+        # 2. Brute-Force Grid Search
+        candidates = []
+        current_high = self.coordinator.wind_threshold
+        current_extreme = self.coordinator.extreme_wind_threshold
+        correlation_data = self.coordinator._correlation_data
+
+        # Build candidate grid
+        h_cand = 3.0
+        while h_cand <= 10.0:
+            e_cand = h_cand + 2.0
+            while e_cand <= h_cand + 8.0:
+                candidates.append((h_cand, e_cand))
+                e_cand += 0.5
+            h_cand += 0.5
+
+        # Include the current thresholds in case they fall off-grid
+        if (current_high, current_extreme) not in candidates:
+            candidates.append((current_high, current_extreme))
+
+        results = []
+
+        for high_cand, extreme_cand in candidates:
+            total_error = 0.0
+            valid_hours = 0
+            windy_hours = 0
+
+            for log in pure_logs:
+                eff_wind = log["effective_wind"]
+
+                # Reclassify bucket
+                if eff_wind >= extreme_cand:
+                    bucket = "extreme_wind"
+                elif eff_wind >= high_cand:
+                    bucket = "high_wind"
+                else:
+                    bucket = "normal"
+
+                temp_key = log["temp_key"]
+
+                # Read expected value strictly from EXISTING global model
+                # Skip hour if model has no data for this temp and bucket
+                if temp_key not in correlation_data or bucket not in correlation_data[temp_key]:
+                    continue
+
+                expected_kwh = correlation_data[temp_key][bucket]
+
+                # Check for 0 to handle sparse model edges safely
+                if expected_kwh <= 0.0:
+                    continue
+
+                actual_kwh = log["actual_kwh"]
+                error = abs(actual_kwh - expected_kwh)
+
+                total_error += error
+                valid_hours += 1
+
+                if bucket in ("high_wind", "extreme_wind"):
+                    windy_hours += 1
+
+            if valid_hours > 0:
+                mae = total_error / valid_hours
+                results.append({
+                    "high_wind": round(high_cand, 1),
+                    "extreme_wind": round(extreme_cand, 1),
+                    "mae": round(mae, 4),
+                    "windy_hours": windy_hours,
+                    "valid_hours": valid_hours
+                })
+
+        if not results:
+            return {
+                "error": "Could not evaluate any thresholds. Ensure global correlation data exists for the selected timeframe.",
+                "days_analyzed": days,
+                "total_hours_evaluated": total_hours_evaluated,
+                "pure_hours_found": len(pure_logs)
+            }
+
+        # 3. Finalize Response
+        results.sort(key=lambda x: x["mae"])
+
+        best_result = results[0]
+        recommended_high = best_result["high_wind"]
+        recommended_extreme = best_result["extreme_wind"]
+        recommended_mae = best_result["mae"]
+
+        current_mae = None
+        for r in results:
+            if r["high_wind"] == current_high and r["extreme_wind"] == current_extreme:
+                current_mae = r["mae"]
+                break
+
+        # Check for insufficient windy hours
+        insufficient_windy_hours = False
+        if best_result["windy_hours"] < 30:
+            insufficient_windy_hours = True
+
+        return {
+            "days_analyzed": days,
+            "total_hours_evaluated": total_hours_evaluated,
+            "pure_hours_found": len(pure_logs),
+            "current_high": current_high,
+            "current_extreme": current_extreme,
+            "current_mae": current_mae,
+            "recommended_high": recommended_high,
+            "recommended_extreme": recommended_extreme,
+            "recommended_mae": recommended_mae,
+            "insufficient_windy_hours": insufficient_windy_hours,
+            "top_10_candidates": results[:10]
         }

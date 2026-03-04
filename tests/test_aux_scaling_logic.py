@@ -6,6 +6,7 @@ from custom_components.heating_analytics.const import DOMAIN
 
 class MockCoordinator:
     def __init__(self):
+        self.solar_azimuth = 180
         self.hass = MagicMock()
         self.data = {}
         self.energy_sensors = ["sensor.heater"]

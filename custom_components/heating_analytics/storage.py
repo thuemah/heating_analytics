@@ -123,7 +123,23 @@ class StorageManager:
             # Load unit solar coefficients
             loaded_solar_coefficients_per_unit = data.get("solar_coefficients_per_unit", {})
             if isinstance(loaded_solar_coefficients_per_unit, dict):
-                self.coordinator._solar_coefficients_per_unit = loaded_solar_coefficients_per_unit
+                import math
+                self.coordinator._solar_coefficients_per_unit = {}
+                az_rad = math.radians(self.coordinator.solar_azimuth)
+
+                for entity_id, temps in loaded_solar_coefficients_per_unit.items():
+                    self.coordinator._solar_coefficients_per_unit[entity_id] = {}
+                    for temp_key, coeff in temps.items():
+                        if isinstance(coeff, (int, float)):
+                            # Migrate scalar float to 2D dictionary
+                            self.coordinator._solar_coefficients_per_unit[entity_id][temp_key] = {
+                                "s": round(coeff * (-math.cos(az_rad)), 5),
+                                "e": round(coeff * math.sin(az_rad), 5)
+                            }
+                            _LOGGER.info(f"Migrated legacy solar coefficient for unit {entity_id} T={temp_key}: {coeff} -> {self.coordinator._solar_coefficients_per_unit[entity_id][temp_key]}")
+                        elif isinstance(coeff, dict):
+                            self.coordinator._solar_coefficients_per_unit[entity_id][temp_key] = coeff
+
                 self._cleanup_removed_sensors(self.coordinator._solar_coefficients_per_unit)
             else:
                 self.coordinator._solar_coefficients_per_unit = {}
@@ -155,10 +171,34 @@ class StorageManager:
             # Load learning buffer solar per unit
             loaded_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
             if isinstance(loaded_buffer_solar, dict):
-                self.coordinator._learning_buffer_solar_per_unit = loaded_buffer_solar
+                self.coordinator._learning_buffer_solar_per_unit = {}
+
+                # Check for legacy floats and discard if present (can't reconstruct vectors for old buffers)
+                for entity_id, temps in loaded_buffer_solar.items():
+                    self.coordinator._learning_buffer_solar_per_unit[entity_id] = {}
+                    for temp_key, buffer_list in temps.items():
+                        if not isinstance(buffer_list, list):
+                            continue
+
+                        # If list contains scalars, drop the buffer completely for this temp
+                        if any(isinstance(item, (int, float)) for item in buffer_list):
+                            _LOGGER.info(f"Cleared legacy scalar solar buffer for unit {entity_id} T={temp_key}")
+                            self.coordinator._learning_buffer_solar_per_unit[entity_id][temp_key] = []
+                        else:
+                            # It's already tuples/lists of (s, e, impact), preserve it
+                            # Note: JSON decodes tuples as lists, we convert them back
+                            self.coordinator._learning_buffer_solar_per_unit[entity_id][temp_key] = [
+                                tuple(item) if isinstance(item, list) else item for item in buffer_list
+                            ]
+
                 self._cleanup_removed_sensors(self.coordinator._learning_buffer_solar_per_unit)
             else:
                 self.coordinator._learning_buffer_solar_per_unit = {}
+
+            # Load solar optimizer model
+            loaded_solar_optimizer = data.get("solar_optimizer_data", {})
+            if loaded_solar_optimizer:
+                self.coordinator.solar_optimizer.set_data(loaded_solar_optimizer)
 
             # Load global learning buffer
             loaded_buffer_global = data.get("learning_buffer_global", {})

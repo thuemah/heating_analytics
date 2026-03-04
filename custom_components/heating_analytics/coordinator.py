@@ -224,6 +224,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self._hourly_wind_values = []  # For 90th percentile calculation
         self._hourly_temp_sum = 0.0
         self._hourly_solar_sum = 0.0
+        self._hourly_solar_vector_s_sum = 0.0
+        self._hourly_solar_vector_e_sum = 0.0
         self._hourly_bucket_counts = {"normal": 0, "high_wind": 0, "extreme_wind": 0}
         self._hourly_aux_count = 0
         self._hourly_sample_count = 0
@@ -1090,7 +1092,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         avg_temp: float = 0.0,
         avg_wind: float = 0.0,
         avg_solar: float = 0.0,
-        is_aux_active: bool = False
+        is_aux_active: bool = False,
+        avg_solar_vector: tuple[float, float] | None = None
     ):
         """Close the gap at hour boundary by filling missing minutes.
 
@@ -1120,6 +1123,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             0.0, # solar_impact (ignored when override is used)
             is_aux_active=is_aux_active,
             override_solar_factor=avg_solar,
+            override_solar_vector=avg_solar_vector,
             detailed=True
         )
 
@@ -1188,6 +1192,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             # Use 'effective_wind' from log
             eff_wind = log.get("effective_wind", 0.0)
 
+            s_vector_s = log.get("solar_vector_s")
+            s_vector_e = log.get("solar_vector_e")
+            s_vector = (s_vector_s, s_vector_e) if s_vector_s is not None and s_vector_e is not None else None
+
             res_actual = self.statistics.calculate_total_power(
                 temp=temp,
                 effective_wind=eff_wind,
@@ -1195,6 +1203,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 is_aux_active=aux_active,
                 unit_modes=unit_modes,
                 override_solar_factor=s_factor,
+                override_solar_vector=s_vector,
                 detailed=False
             )
 
@@ -1206,6 +1215,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 is_aux_active=aux_active,
                 unit_modes=unit_modes,
                 override_solar_factor=s_factor,
+                override_solar_vector=s_vector,
                 detailed=False
             )
 
@@ -1647,6 +1657,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Fetch Solar Data
         potential_solar_factor = 0.0
         solar_factor = 0.0
+        solar_vector = (0.0, 0.0)
         if self.solar_enabled:
              elev, azim = self._get_sun_info_now()
              cloud = self._get_cloud_coverage()
@@ -1655,6 +1666,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                  potential_solar_factor, self.solar_correction_percent
              )
              self.data[ATTR_SOLAR_FACTOR] = round(solar_factor, 2)
+
+             potential_solar_vector = self.solar.calculate_solar_vector(elev, azim, cloud)
+             solar_vector = self.solar.calculate_effective_solar_vector(
+                 potential_solar_vector, self.solar_correction_percent
+             )
 
              if ATTR_SOLAR_IMPACT not in self.data:
                  self.data[ATTR_SOLAR_IMPACT] = 0.0
@@ -1680,7 +1696,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
              total_potential = 0.0
              for entity_id in self.energy_sensors:
                  unit_coeff = self.solar.calculate_unit_coefficient(entity_id, temp_key)
-                 total_potential += self.solar.calculate_unit_solar_impact(potential_solar_factor, unit_coeff)
+                 total_potential += self.solar.calculate_unit_solar_impact(potential_solar_vector, unit_coeff)
              potential_impact_kw = total_potential
 
         self.data[ATTR_SOLAR_POTENTIAL] = round(potential_impact_kw, 3)
@@ -1705,6 +1721,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             self._hourly_wind_values.append(effective_wind)
             self._hourly_temp_sum += temp
             self._hourly_solar_sum += solar_factor
+            self._hourly_solar_vector_s_sum += solar_vector[0]
+            self._hourly_solar_vector_e_sum += solar_vector[1]
             self._hourly_bucket_counts[wind_bucket] += 1
             if self.auxiliary_heating_active:
                 self._hourly_aux_count += 1
@@ -2115,6 +2133,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         avg_temp = 0.0
         calculated_effective_wind = 0.0
         avg_solar_factor = 0.0
+        avg_solar_vector = (0.0, 0.0)
         wind_bucket = "normal"
         aux_fraction = 0.0
         is_aux_dominant = False  # For learning purposes
@@ -2131,6 +2150,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
              # Determine bucket for the passed hour
              if self.solar_enabled:
                  avg_solar_factor = self._hourly_solar_sum / self._hourly_sample_count
+                 avg_solar_vector = (
+                     self._hourly_solar_vector_s_sum / self._hourly_sample_count,
+                     self._hourly_solar_vector_e_sum / self._hourly_sample_count
+                 )
 
              # Determine base wind bucket (always physical now)
              wind_bucket = self._get_wind_bucket(calculated_effective_wind)
@@ -2281,6 +2304,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             is_aux_active=is_aux_dominant,
             detailed=False,
             override_solar_factor=avg_solar_factor,
+            override_solar_vector=avg_solar_vector,
             known_aux_impact_kwh=aux_impact_kwh,
         )
 
@@ -2341,7 +2365,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 total_energy_kwh=learning_energy_kwh,
                 base_expected_kwh=base_expected_kwh,
                 solar_impact=solar_impact,
-                avg_solar_factor=avg_solar_factor,
+                avg_solar_vector=avg_solar_vector,
                 is_aux_active=is_aux_dominant,
                 aux_impact=self._get_aux_impact_kw(temp_key, wind_bucket),
                 # Configuration
@@ -2451,6 +2475,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "aux_impact_kwh": aux_impact_kwh,
                 "guest_impact_kwh": round(guest_impact_kwh, 3),
                 "solar_factor": round(avg_solar_factor, 3),
+                "solar_vector_s": round(avg_solar_vector[0], 3),
+                "solar_vector_e": round(avg_solar_vector[1], 3),
                 "solar_impact_kwh": round(solar_impact, 3),
                 "primary_entity": self.weather_entity,
                 "secondary_entity": self.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY),
@@ -2509,6 +2535,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self._hourly_wind_values = []
         self._hourly_temp_sum = 0.0
         self._hourly_solar_sum = 0.0
+        self._hourly_solar_vector_s_sum = 0.0
+        self._hourly_solar_vector_e_sum = 0.0
         self._hourly_bucket_counts = {"normal": 0, "high_wind": 0, "extreme_wind": 0}
         self._hourly_aux_count = 0
         self._hourly_sample_count = 0

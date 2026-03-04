@@ -136,6 +136,7 @@ def test_csv_import_solar_disabled(storage_manager, mock_coordinator):
 
     # Disable solar
     mock_coordinator.solar_enabled = False
+    mock_coordinator.solar_azimuth = 180
 
     csv_content = """timestamp,temperature,energy,cloud_coverage
 2023-01-01T00:00:00,5.0,1.5,80.0"""

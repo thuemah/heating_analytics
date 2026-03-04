@@ -62,7 +62,7 @@ async def test_plan_revision_impact_calculation():
         coordinator.auxiliary_heating_active = False
 
         # --- Mock the Model ---
-        def mock_calculate_total_power(temp, effective_wind, solar_impact, is_aux_active, override_solar_factor, **kwargs):
+        def mock_calculate_total_power(temp, effective_wind, solar_impact, is_aux_active, override_solar_factor, override_solar_vector=None, **kwargs):
             # Planned Scenarios (is_aux_active is always False)
             if temp == 0.0: return {"total_kwh": 10.0}  # Cold forecast
             if temp == 10.0: return {"total_kwh": 5.0} # Mild forecast

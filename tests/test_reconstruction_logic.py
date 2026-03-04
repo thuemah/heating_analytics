@@ -8,6 +8,7 @@ from custom_components.heating_analytics.const import ATTR_SOLAR_FACTOR
 
 class MockCoordinator:
     def __init__(self):
+        self.solar_azimuth = 180
         self.balance_point = 20.0
         self.energy_sensors = ["sensor.test_energy"]
         self._daily_history = {}

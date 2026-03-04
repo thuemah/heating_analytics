@@ -41,6 +41,7 @@ def mock_coordinator():
 
     coord._get_predicted_kwh.return_value = 1.0
     coord.solar_enabled = False
+    coord.solar_azimuth = 180
     return coord
 
 def test_future_forecast_ignores_aux(mock_coordinator, mock_dt_util):

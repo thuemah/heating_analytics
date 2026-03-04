@@ -8,6 +8,7 @@ from custom_components.heating_analytics.const import MODE_HEATING, MODE_COOLING
 # Mock Coordinator
 class MockCoordinator:
     def __init__(self, sensors):
+        self.solar_azimuth = 180
         self.energy_sensors = sensors
         self.balance_point = 15.0
         self.solar_enabled = True

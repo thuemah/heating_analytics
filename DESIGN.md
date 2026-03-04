@@ -105,7 +105,7 @@ When calculating "Typical Daily Consumption" (Median) for a given temperature, t
 ### D. Solar Modeling (The Kelvin Twist)
 Standard solar integration is difficult because "1000W of sun" doesn't mean "1000W of heat" inside. The system employs a sophisticated 3-Zone Geometric Model known as the **Kelvin Twist**:
 
-1.  **Geometric Zones:**
+1.  **Geometric Zones (scalar recommendation path):**
     *   **Direct Zone (+/- 45°):** Full solar gain. The sun is shining directly into the windows.
     *   **Glancing Zone (+/- 90°):** Partial gain. The sun is hitting at an oblique angle, reducing penetration.
     *   **Backside Zone (> 90°):** Zero gain. The sun is behind the building (shadow side).
@@ -118,9 +118,12 @@ Standard solar integration is difficult because "1000W of sun" doesn't mean "100
     *   The Base Model continues to learn during sunny periods by using **Normalized Energy** (Actual + Estimated Solar).
     *   **Solar Coefficient Learning:** If `Solar_Factor > 0.1`, the system specifically trains the solar coefficients to improve future normalization.
 
-4.  **Learned Coefficient:**
-    *   `Unit_Solar_Gain = Global_Factor * Learned_Coefficient`
-    *   The coefficient represents the effective window area and transmittance for each specific room.
+4.  **2D Solar Vector Model:**
+    *   The sun's position is decomposed into a **South** (`S`) and **East** (`E`) component using pure geometry — no manual azimuth input required.
+    *   Each unit learns a matching 2D coefficient vector `(Coeff_S, Coeff_E)` that captures its effective window orientation and transmittance empirically.
+    *   `Unit_Solar_Gain = Coeff_S × Solar_S + Coeff_E × Solar_E`
+    *   This dot-product formula means that a south-facing room learns a large `Coeff_S` and near-zero `Coeff_E`, while an east-facing room learns the opposite — without any user configuration.
+    *   During cold-start (no learned coefficients yet), an initial scalar default is decomposed along a 180° (south) assumption until real data replaces it.
 
 ### E. Auxiliary Heating (Dynamic Coefficients)
 For hybrid systems (Heat Pump + Fireplace/Heater), the system does not use a separate "Fireplace Mode" curve. Instead, it learns an **Auxiliary Coefficient**.

@@ -237,7 +237,7 @@ async def test_per_unit_aux_learning(hass):
                  "total_energy_kwh": 3.5, # 1.5 + 2.0
                  "base_expected_kwh": 5.0, # 2.0 + 3.0 (Global base)
                  "solar_impact": 0.0,
-                 "avg_solar_factor": 0.0,
+                 "avg_solar_vector": (0.0, 0.0),
                  "is_aux_active": True,
                  "aux_impact": 0.0, # Current global aux impact
                  "learning_enabled": True,

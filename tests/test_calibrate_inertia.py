@@ -6,6 +6,7 @@ from custom_components.heating_analytics.statistics import StatisticsManager
 
 class MockCoordinator:
     def __init__(self):
+        self.solar_azimuth = 180
         self.balance_point = 17.0
         self._hourly_log = []
 

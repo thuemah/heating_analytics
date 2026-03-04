@@ -75,9 +75,9 @@ Once you have basic data flowing, enhance accuracy:
 - **Supported Units:** `m/s`, `km/h`, `mph`, `kn` (knots)
 
 **Solar Configuration:**
-- Enter your total window area (m²)
-- Set window orientation (azimuth: 0°=North, 90°=East, 180°=South, 270°=West)
-- The system calculates "free heat" from sunlight to avoid false efficiency readings
+- Enable solar correction to let the system account for "free heat" from sunlight
+- Window orientation is learned automatically — no manual azimuth or area input needed
+- Adjust `Solar Correction` (0–100) to reflect typical blind/screen usage
 
 **Balance Point:**
 - Adjust the temperature where heating kicks in (default: 17°C)
@@ -314,10 +314,8 @@ If you have a hidden consumer (like a bathroom floor heater) that isn't tracked,
 | Setting | Default | Description |
 |---------|---------|-------------|
 | **Solar Enabled** | `false` | Enable solar correction |
-| **Window Area** | 10 m² | Total window area facing outside |
-| **Azimuth** | 180° | Window orientation (South = 180°) |
-| **Initial Heating Coefficient** | 0.15 | Starting solar coefficient for heating, optimized for heat pumps. The model will auto-tune this. |
-| **Initial Cooling Coefficient** | 0.17 | Starting solar coefficient for cooling. The model will auto-tune this. |
+| **Initial Heating Coefficient** | 0.35 | Starting solar coefficient for heating. The model will auto-tune this. |
+| **Initial Cooling Coefficient** | 0.40 | Starting solar coefficient for cooling. The model will auto-tune this. |
 
 ### Auxiliary Settings
 
@@ -704,7 +702,7 @@ data:
 - Sensor reappears when heating resumes
 
 **"Solar correction seems wrong"**
-- Verify window area and azimuth settings
+- Check the `Solar Correction` slider (0–100) matches your typical blind/screen usage
 - Check that weather entity provides cloud coverage
 - Consider using Open-Meteo for more accurate solar data
 

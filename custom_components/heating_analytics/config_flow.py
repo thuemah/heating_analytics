@@ -26,11 +26,11 @@ from .const import (
     CONF_WIND_UNIT,
     CONF_ENABLE_LIFETIME_TRACKING,
     CONF_SOLAR_ENABLED,
-    CONF_SOLAR_AZIMUTH,
+
     CONF_HAS_AC_UNITS,
     DEFAULT_WIND_UNIT,
     DEFAULT_SOLAR_ENABLED,
-    DEFAULT_SOLAR_AZIMUTH,
+
     WIND_UNIT_MS,
     WIND_UNIT_KMH,
     WIND_UNIT_KNOTS,
@@ -240,9 +240,6 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             # Solar Correction
             vol.Optional(CONF_SOLAR_ENABLED, default=get_val(CONF_SOLAR_ENABLED, DEFAULT_SOLAR_ENABLED)): selector.BooleanSelector(),
-            vol.Optional(CONF_SOLAR_AZIMUTH, default=get_val(CONF_SOLAR_AZIMUTH, DEFAULT_SOLAR_AZIMUTH)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=0, max=360, step=5, unit_of_measurement="°")
-            ),
             # CSV Auto-logging
             vol.Optional("csv_auto_logging", default=get_val("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING)): selector.BooleanSelector(),
             vol.Optional("csv_hourly_path", default=get_val("csv_hourly_path", DEFAULT_CSV_HOURLY_PATH)): selector.TextSelector(),

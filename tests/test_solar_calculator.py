@@ -10,6 +10,7 @@ from custom_components.heating_analytics.const import (
 
 class MockCoordinator:
     def __init__(self):
+        self.solar_azimuth = 180
         self.balance_point = 15.0
         self.solar_azimuth = 180  # Default South
         self._solar_coefficients_per_unit = {}
@@ -110,52 +111,56 @@ def test_calculate_solar_factor_azimuth_config(calculator, coordinator):
 
 def test_calculate_unit_solar_impact(calculator, coordinator):
     # Setup
-    unit_coeff = 2.5
-    global_factor = 1.0
+    unit_coeff = {'s': 2.5, 'e': 0.0}
+    global_factor = (1.0, 0.0)
 
     # Impact = Factor * Coeff
     assert calculator.calculate_unit_solar_impact(global_factor, unit_coeff) == 2.5
 
     # Factor 0.5
-    assert calculator.calculate_unit_solar_impact(0.5, unit_coeff) == 1.25
+    assert calculator.calculate_unit_solar_impact((0.5, 0.0), unit_coeff) == 1.25
 
 def test_calculate_unit_coefficient(calculator, coordinator):
     # 1. Global Default Fallback (Heating)
     # Target 10, BP 15 -> Heating
-    assert calculator.calculate_unit_coefficient("unit_1", "10") == DEFAULT_SOLAR_COEFF_HEATING
+    coeff = calculator.calculate_unit_coefficient("unit_1", "10")
+    assert coeff['s'] == DEFAULT_SOLAR_COEFF_HEATING
 
     # 2. Global Default Fallback (Cooling)
     # Target 20, BP 15 -> Cooling
-    assert calculator.calculate_unit_coefficient("unit_1", "20") == DEFAULT_SOLAR_COEFF_COOLING
+    coeff_cooling = calculator.calculate_unit_coefficient("unit_1", "20")
+    assert coeff_cooling['s'] == DEFAULT_SOLAR_COEFF_COOLING
 
     # 3. Exact Match
-    coordinator._solar_coefficients_per_unit["unit_1"] = {"10": 0.08}
-    assert calculator.calculate_unit_coefficient("unit_1", "10") == 0.08
+    coordinator._solar_coefficients_per_unit["unit_1"] = {"10": {"s": 0.08, "e": 0.0}}
+    assert calculator.calculate_unit_coefficient("unit_1", "10")["s"] == 0.08
 
     # 4. Closest Neighbor (Same Mode)
     # T=10 exists (0.08). T=12 should use T=10.
-    assert calculator.calculate_unit_coefficient("unit_1", "12") == 0.08
+    assert calculator.calculate_unit_coefficient("unit_1", "12")["s"] == 0.08
 
     # 5. Broad Neighbor (Same Mode)
-    coordinator._solar_coefficients_per_unit["unit_1"]["0"] = 0.12
+    coordinator._solar_coefficients_per_unit["unit_1"]["0"] = {"s": 0.12, "e": 0.0}
     # Current state: {10: 0.08, 0: 0.12}. Target 2. Closest is 0.
-    assert calculator.calculate_unit_coefficient("unit_1", "2") == 0.12
+    assert calculator.calculate_unit_coefficient("unit_1", "2")["s"] == 0.12
     # Target 8. Closest is 10.
-    assert calculator.calculate_unit_coefficient("unit_1", "8") == 0.08
+    assert calculator.calculate_unit_coefficient("unit_1", "8")["s"] == 0.08
 
     # 6. Mode Separation
     # T=10 exists (Heating). T=20 (Cooling) should still use Cooling Default if no cooling learned.
-    assert calculator.calculate_unit_coefficient("unit_1", "20") == DEFAULT_SOLAR_COEFF_COOLING
+    coeff_cooling = calculator.calculate_unit_coefficient("unit_1", "20")
+    assert coeff_cooling['s'] == DEFAULT_SOLAR_COEFF_COOLING
 
     # 7. Learned Cooling Neighbor
-    coordinator._solar_coefficients_per_unit["unit_1"]["25"] = 0.30
+    coordinator._solar_coefficients_per_unit["unit_1"]["25"] = {"s": 0.30, "e": 0.0}
     # Now T=20 should use T=25 (Closest cooling neighbor)
-    assert calculator.calculate_unit_coefficient("unit_1", "20") == 0.30
+    assert calculator.calculate_unit_coefficient("unit_1", "20")["s"] == 0.30
 
 def test_calculate_unit_coefficient_non_numeric(calculator, coordinator):
     # Mock coordinator get_unit_mode
     coordinator.get_unit_mode = MagicMock(return_value="cooling")
-    assert calculator.calculate_unit_coefficient("unit_1", "invalid") == DEFAULT_SOLAR_COEFF_COOLING
+    coeff = calculator.calculate_unit_coefficient("unit_1", "invalid")
+    assert coeff['s'] == DEFAULT_SOLAR_COEFF_COOLING
 
 def test_apply_correction(calculator, coordinator):
     # Heating (Temp 10 < 15): Subtract solar

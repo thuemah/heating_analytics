@@ -13,6 +13,8 @@ def test_select_missing_device_info(hass):
 
     # Mock Coordinator
     mock_coordinator = MagicMock()
+    mock_coordinator.solar_azimuth = 180
+    mock_coordinator.solar_azimuth = 180
     mock_coordinator.hass = hass
     mock_coordinator.entry = MagicMock()
     mock_coordinator.entry.entry_id = "test_entry_id"

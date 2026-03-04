@@ -25,7 +25,7 @@ def base_learning_params():
         "total_energy_kwh": 1.0,  # Clean energy (guest excluded)
         "base_expected_kwh": 0.8,
         "solar_impact": 0.0,
-        "avg_solar_factor": 0.0,
+        "avg_solar_vector": (0.0, 0.0),
         "is_aux_active": True,
         "aux_impact": 0.5,
         "learning_enabled": True,

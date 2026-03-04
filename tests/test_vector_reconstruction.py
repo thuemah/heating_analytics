@@ -42,7 +42,7 @@ def test_calculate_modeled_energy_uses_vectors(stats_manager, mock_coordinator):
 
     # Mock calculate_total_power to return simple linear model: Load = (15 - Temp)
     # Night: 15-0 = 15. Day: 15-20 = -5 -> 0.
-    def side_effect(temp, effective_wind, solar_impact, is_aux_active, unit_modes=None, override_solar_factor=None, detailed=True):
+    def side_effect(temp, effective_wind, solar_impact, is_aux_active, unit_modes=None, override_solar_factor=None, detailed=True, override_solar_vector=None):
         base = max(0.0, 15.0 - temp)
         return {
             "total_kwh": base,
@@ -83,7 +83,7 @@ def test_calculate_modeled_energy_fallback_legacy(stats_manager, mock_coordinato
         }
     }
 
-    def side_effect(temp, effective_wind, solar_impact, is_aux_active, unit_modes=None, override_solar_factor=None, detailed=True):
+    def side_effect(temp, effective_wind, solar_impact, is_aux_active, unit_modes=None, override_solar_factor=None, detailed=True, override_solar_vector=None):
         base = max(0.0, 15.0 - temp)
         return {
             "total_kwh": base,
@@ -125,7 +125,7 @@ def test_calculate_modeled_energy_fallback_all_none_vectors(stats_manager, mock_
     }
 
     # Mock calculate_total_power to return simple linear model: Load = (15 - Temp)
-    def side_effect(temp, effective_wind, solar_impact, is_aux_active, unit_modes=None, override_solar_factor=None, detailed=True):
+    def side_effect(temp, effective_wind, solar_impact, is_aux_active, unit_modes=None, override_solar_factor=None, detailed=True, override_solar_vector=None):
         base = max(0.0, 15.0 - temp)
         return {
             "total_kwh": base,
