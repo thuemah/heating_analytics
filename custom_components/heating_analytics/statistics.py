@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, date
 
 from homeassistant.util import dt as dt_util
 
-from .helpers import get_last_year_iso_date, generate_gaussian_kernel
+from .helpers import get_last_year_iso_date, generate_gaussian_kernel, generate_exponential_kernel, calculate_asymmetric_inertia
 from .explanation import WeatherImpactAnalyzer, ExplanationFormatter
 from .const import (
     ATTR_TEMP_ACTUAL_TODAY,
@@ -1965,12 +1965,13 @@ class StatisticsManager:
             "hybrid_reference_kwh": round(p2_hybrid_kwh, 1)
         }
 
-    def calibrate_inertia(self, days: int = 30, centered_energy_average: bool = False) -> dict:
+    def calibrate_inertia(self, days: int = 30, centered_energy_average: bool = False, test_asymmetric: bool = False, test_delta_t_scaling: bool = False, test_exponential_kernel: bool = False) -> dict:
         """Find the ideal thermal inertia profile (1-24 hours) for the house.
 
         Filters history for 'Pure' hours (no aux, no solar, learning enabled).
-        Calculates R^2 and RMSE for different Gaussian kernels (1h to 24h).
-        Evaluates stability across weeks.
+        Primary result uses the causal exponential decay kernel (tau=1..24h), matching
+        the coordinator's runtime model. Gaussian sweep is retained as a comparison.
+        Evaluates stability across weeks using the exponential kernel.
         """
         now = dt_util.now()
         start_date = now - timedelta(days=days)
@@ -2029,7 +2030,8 @@ class StatisticsManager:
                 "index": len(raw_temps) - 1,
                 "timestamp": log["timestamp"],
                 "actual_kwh": actual_kwh,
-                "temp": log["temp"]
+                "temp": log["temp"],
+                "wind_bucket": log.get("wind_bucket", "normal")
             })
 
         # Apply centered energy average if requested
@@ -2059,148 +2061,124 @@ class StatisticsManager:
                 }
             }
 
-        # 2. Analyze Kernels (1 to 24 hours)
-        kernel_results = {}
-        for h in range(1, 25):
-            kernel = generate_gaussian_kernel(h)
+        # 2. Shared kernel evaluation helper (TDD linear regression → R², RMSE)
+        correlation_data = self.coordinator._correlation_data
+        bp = self.coordinator.balance_point
 
-            x_vals = [] # Effective Temps
-            y_vals = [] # Actual kWh
-
-            for log in pure_logs:
+        def _eval_kernel_on_logs(kernel: tuple, kernel_window: int, logs: list) -> tuple:
+            """Evaluate a kernel on a list of logs; return (r2, rmse, n_points)."""
+            x_vals = []
+            y_vals = []
+            for log in logs:
                 idx = log["index"]
-                if idx < h - 1:
-                    continue # Not enough history for this kernel yet
-
-                # Get the window of temperatures for this log
-                window = raw_temps[idx - h + 1 : idx + 1]
-
-                # Apply kernel (window is oldest->newest, kernel is oldest->newest)
+                window = raw_temps[idx - kernel_window + 1 : idx + 1]
                 eff_temp = sum(t * w for t, w in zip(window, kernel))
 
-                x_vals.append(eff_temp)
-                y_vals.append(log["actual_kwh"])
+                wind_premium = 0.0
+                wind_bucket = log.get("wind_bucket", "normal")
+                if wind_bucket != "normal":
+                    temp_key = str(int(round(eff_temp)))
+                    if temp_key in correlation_data:
+                        bucket_data = correlation_data[temp_key]
+                        if wind_bucket in bucket_data and "normal" in bucket_data:
+                            wind_premium = bucket_data[wind_bucket] - bucket_data["normal"]
 
-            if len(x_vals) < 10:
-                continue # Skip if too few points
+                wind_neutral_kwh = max(0.0, log["actual_kwh"] - wind_premium)
+                tdd = max(0.0, bp - eff_temp) / 24.0
+                x_vals.append(tdd)
+                y_vals.append(wind_neutral_kwh)
 
-            # Calculate R^2 and RMSE
-            # Linear Regression: y = mx + c (where y is kwh, x is eff_temp)
-            # Actually, heating demand is proportional to (BalancePoint - eff_temp)
-            # So let's calculate TDD instead of direct temp for a better linear fit
-            bp = self.coordinator.balance_point
-            tdd_vals = [max(0.0, bp - t) / 24.0 for t in x_vals] # Daily TDD rate for the hour
-
-            mean_tdd = sum(tdd_vals) / len(tdd_vals)
-            mean_y = sum(y_vals) / len(y_vals)
-
-            numerator = sum((tdd - mean_tdd) * (y - mean_y) for tdd, y in zip(tdd_vals, y_vals))
-            denominator = sum((tdd - mean_tdd)**2 for tdd in tdd_vals)
-
-            if denominator == 0:
-                continue
-
-            slope = numerator / denominator
-            intercept = mean_y - slope * mean_tdd
-
-            # Predictions
-            y_pred = [slope * tdd + intercept for tdd in tdd_vals]
-
-            # R^2
-            ss_res = sum((y - p)**2 for y, p in zip(y_vals, y_pred))
-            ss_tot = sum((y - mean_y)**2 for y in y_vals)
+            n = len(x_vals)
+            if n < 10:
+                return None, None, n
+            mean_x = sum(x_vals) / n
+            mean_y = sum(y_vals) / n
+            den = sum((x - mean_x) ** 2 for x in x_vals)
+            if den == 0:
+                return None, None, n
+            slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_vals, y_vals)) / den
+            intercept = mean_y - slope * mean_x
+            y_pred = [slope * x + intercept for x in x_vals]
+            ss_res = sum((y - p) ** 2 for y, p in zip(y_vals, y_pred))
+            ss_tot = sum((y - mean_y) ** 2 for y in y_vals)
             r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+            rmse = math.sqrt(ss_res / n)
+            return round(r2, 4), round(rmse, 4), n
 
-            # RMSE
-            rmse = math.sqrt(ss_res / len(y_vals))
+        # 3. Primary: Exponential sweep tau=1..24 with window=min(5*tau, 168)
+        # Each tau uses its own eligible subset (matching coordinator behavior).
+        exp_primary = {}
+        for tau in range(1, 25):
+            exp_window = min(int(tau * 5), 168)
+            kernel = generate_exponential_kernel(tau, exp_window)
+            eligible = [log for log in pure_logs if log["index"] >= exp_window - 1]
+            r2, rmse, n = _eval_kernel_on_logs(kernel, exp_window, eligible)
+            if r2 is not None:
+                exp_primary[tau] = {"tau": tau, "r2": r2, "rmse": rmse, "points": n}
 
-            kernel_results[h] = {
-                "hours": h,
-                "r2": round(r2, 4),
-                "rmse": round(rmse, 4),
-                "points": len(x_vals)
-            }
+        if not exp_primary:
+            return {"error": "Not enough data points after applying exponential kernel history."}
 
-        if not kernel_results:
-            return {"error": "Not enough data points after applying kernel history."}
+        best_exp = max(exp_primary.values(), key=lambda k: k["r2"])
+        recommended_tau = best_exp["tau"]
 
-        # Find best overall
-        best_overall = max(kernel_results.values(), key=lambda k: k["r2"])
+        # 4. Gaussian sweep h=1..24 – retained as comparison
+        gaussian_results = {}
+        for h in range(1, 25):
+            kernel = generate_gaussian_kernel(h)
+            eligible = [log for log in pure_logs if log["index"] >= h - 1]
+            r2, rmse, n = _eval_kernel_on_logs(kernel, h, eligible)
+            if r2 is not None:
+                gaussian_results[h] = {"hours": h, "r2": r2, "rmse": rmse, "points": n}
 
-        # 4. Stability Analysis (Weekly Breakdown)
+        best_gauss = max(gaussian_results.values(), key=lambda k: k["r2"]) if gaussian_results else None
+
+        # 5. Stability Analysis (Weekly Breakdown) – uses exponential kernel
         weekly_results = []
         if days >= 14:
-            # Group pure_logs by week
             weeks = {}
             for log in pure_logs:
                 dt = dt_util.parse_datetime(log["timestamp"])
                 if not dt:
                     continue
-                # Week number
                 iso_year, iso_week, _ = dt.isocalendar()
                 week_key = f"{iso_year}-W{iso_week}"
-
                 if week_key not in weeks:
                     weeks[week_key] = []
                 weeks[week_key].append(log)
 
             for week_key, week_logs in weeks.items():
-                if len(week_logs) < 20: # Need enough points per week
+                if len(week_logs) < 20:
                     continue
 
-                week_best = None
+                week_best_tau = None
                 max_week_r2 = -1.0
 
-                for h in range(1, 25):
-                    kernel = generate_gaussian_kernel(h)
-                    x_vals = []
-                    y_vals = []
-
-                    for log in week_logs:
-                        idx = log["index"]
-                        if idx < h - 1:
-                            continue
-                        window = raw_temps[idx - h + 1 : idx + 1]
-                        eff_temp = sum(t * w for t, w in zip(window, kernel))
-                        x_vals.append(max(0.0, bp - eff_temp) / 24.0)
-                        y_vals.append(log["actual_kwh"])
-
-                    if len(x_vals) < 10:
-                        continue
-
-                    mean_x = sum(x_vals) / len(x_vals)
-                    mean_y = sum(y_vals) / len(y_vals)
-                    den = sum((x - mean_x)**2 for x in x_vals)
-                    if den == 0: continue
-                    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_vals, y_vals)) / den
-                    intercept = mean_y - slope * mean_x
-                    y_pred = [slope * x + intercept for x in x_vals]
-
-                    ss_res = sum((y - p)**2 for y, p in zip(y_vals, y_pred))
-                    ss_tot = sum((y - mean_y)**2 for y in y_vals)
-                    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-
-                    if r2 > max_week_r2:
+                for tau in range(1, 25):
+                    exp_window = min(int(tau * 5), 168)
+                    kernel = generate_exponential_kernel(tau, exp_window)
+                    eligible = [log for log in week_logs if log["index"] >= exp_window - 1]
+                    r2, _, _ = _eval_kernel_on_logs(kernel, exp_window, eligible)
+                    if r2 is not None and r2 > max_week_r2:
                         max_week_r2 = r2
-                        week_best = h
+                        week_best_tau = tau
 
-                if week_best is not None:
+                if week_best_tau is not None:
                     weekly_results.append({
                         "week": week_key,
-                        "best_hours": week_best,
+                        "best_tau": week_best_tau,
                         "r2": round(max_week_r2, 3),
                         "points": len(week_logs)
                     })
 
-        # Stability Score Calculation
+        # Stability Score
         stability_score = "Unknown (Need >= 14 days)"
         if weekly_results:
-            best_hours_list = [w["best_hours"] for w in weekly_results]
-            if len(best_hours_list) > 1:
-                mean_h = sum(best_hours_list) / len(best_hours_list)
-                variance = sum((h - mean_h)**2 for h in best_hours_list) / len(best_hours_list)
+            best_tau_list = [w["best_tau"] for w in weekly_results]
+            if len(best_tau_list) > 1:
+                mean_t = sum(best_tau_list) / len(best_tau_list)
+                variance = sum((t - mean_t) ** 2 for t in best_tau_list) / len(best_tau_list)
                 std_dev = math.sqrt(variance)
-
                 if std_dev <= 1.5:
                     stability_score = "High (Consistent thermal behavior)"
                 elif std_dev <= 3.0:
@@ -2210,7 +2188,65 @@ class StatisticsManager:
             else:
                 stability_score = "Insufficient weekly data"
 
-        return {
+        # 5. Asymmetric Inertia Evaluation (optional)
+        asymmetric_result = None
+        if test_asymmetric:
+            asym_x_vals = []
+            asym_y_vals = []
+            regime_counts = {"shedding": 0, "gaining": 0, "stable": 0}
+
+            for log in pure_logs:
+                idx = log["index"]
+                if idx < 1:
+                    continue  # Need at least 2 temps for asymmetric
+
+                # Use up to 8 hours of history for trend detection + weighting
+                window_start = max(0, idx - 7)
+                window = raw_temps[window_start : idx + 1]
+
+                eff_temp, regime = calculate_asymmetric_inertia(window)
+                regime_counts[regime] += 1
+
+                wind_premium = 0.0
+                wind_bucket = log.get("wind_bucket", "normal")
+                if wind_bucket != "normal":
+                    temp_key = str(int(round(eff_temp)))
+                    if temp_key in correlation_data:
+                        bucket_data = correlation_data[temp_key]
+                        if wind_bucket in bucket_data and "normal" in bucket_data:
+                            wind_premium = bucket_data[wind_bucket] - bucket_data["normal"]
+
+                wind_neutral_kwh = max(0.0, log["actual_kwh"] - wind_premium)
+
+                tdd = max(0.0, bp - eff_temp) / 24.0
+                asym_x_vals.append(tdd)
+                asym_y_vals.append(wind_neutral_kwh)
+
+            if len(asym_x_vals) >= 10:
+                mean_x = sum(asym_x_vals) / len(asym_x_vals)
+                mean_y = sum(asym_y_vals) / len(asym_y_vals)
+                den = sum((x - mean_x) ** 2 for x in asym_x_vals)
+                if den > 0:
+                    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(asym_x_vals, asym_y_vals)) / den
+                    intercept = mean_y - slope * mean_x
+                    y_pred = [slope * x + intercept for x in asym_x_vals]
+                    ss_res = sum((y - p) ** 2 for y, p in zip(asym_y_vals, y_pred))
+                    ss_tot = sum((y - mean_y) ** 2 for y in asym_y_vals)
+                    asym_r2 = round(1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0, 4)
+                    asym_rmse = round(math.sqrt(ss_res / len(asym_y_vals)), 4)
+                    asymmetric_result = {
+                        "r2": asym_r2,
+                        "rmse": asym_rmse,
+                        "points": len(asym_x_vals),
+                        "delta_r2": round(asym_r2 - best_exp["r2"], 4),
+                        "regime_breakdown": regime_counts,
+                    }
+                else:
+                    asymmetric_result = {"error": "Insufficient TDD variance for regression."}
+            else:
+                asymmetric_result = {"error": "Too few data points after asymmetric filtering."}
+
+        result = {
             "days_analyzed": days,
             "total_hours_evaluated": total_hours_evaluated,
             "pure_hours_found": len(pure_logs),
@@ -2221,11 +2257,99 @@ class StatisticsManager:
                 "learning_status_exclusion": discarded_reasons["learning_status_exclusion"],
                 "total_discarded": total_hours_evaluated - len(pure_logs)
             },
-            "best_overall": best_overall,
+            "recommended_tau": recommended_tau,
+            "recommended_tau_r2": best_exp["r2"],
+            "recommended_tau_rmse": best_exp["rmse"],
+            "recommended_tau_points": best_exp["points"],
+            "gaussian_best_hours": best_gauss["hours"] if best_gauss else None,
+            "gaussian_best_r2": best_gauss["r2"] if best_gauss else None,
+            "gaussian_best_rmse": best_gauss["rmse"] if best_gauss else None,
             "stability_score": stability_score,
             "weekly_breakdown": weekly_results,
-            "top_5_profiles": sorted(list(kernel_results.values()), key=lambda k: k["r2"], reverse=True)[:5]
         }
+        if test_asymmetric:
+            result["asymmetric"] = asymmetric_result
+
+        # 6. ΔT-scaling Evaluation (optional)
+        # Tests whether optimal thermal inertia grows with temperature differential.
+        # Bins pure_logs by (balance_point - outdoor_temp) in 5°C steps and finds
+        # the best exponential tau per bin using window=min(5*tau, 168).
+        if test_delta_t_scaling:
+            bin_size = 5.0
+            bins: dict[str, list] = {}
+            for log in pure_logs:
+                delta_t = bp - raw_temps[log["index"]]
+                if delta_t < 0:
+                    bucket = "<0"
+                else:
+                    low = int(delta_t // bin_size) * bin_size
+                    bucket = f"{int(low)}-{int(low + bin_size)}"
+                if bucket not in bins:
+                    bins[bucket] = []
+                bins[bucket].append(log)
+
+            delta_t_scaling = []
+
+            for bucket, bin_logs in sorted(bins.items(), key=lambda x: (x[0] == "<0", x[0])):
+                if len(bin_logs) < 10:
+                    delta_t_scaling.append({
+                        "delta_t_range": bucket,
+                        "points": len(bin_logs),
+                        "skipped": "Too few points"
+                    })
+                    continue
+
+                bin_best_tau = None
+                bin_best_r2 = -1.0
+                bin_best_rmse = None
+
+                for tau in range(1, 25):
+                    exp_window = min(int(tau * 5), 168)
+                    kernel = generate_exponential_kernel(tau, exp_window)
+                    eligible = [log for log in bin_logs if log["index"] >= exp_window - 1]
+                    r2, rmse, _ = _eval_kernel_on_logs(kernel, exp_window, eligible)
+                    if r2 is not None and r2 > bin_best_r2:
+                        bin_best_r2 = r2
+                        bin_best_tau = tau
+                        bin_best_rmse = rmse
+
+                if bin_best_tau is not None:
+                    delta_t_scaling.append({
+                        "delta_t_range": bucket,
+                        "best_tau": bin_best_tau,
+                        "r2": round(bin_best_r2, 4),
+                        "rmse": round(bin_best_rmse, 4),
+                        "points": len(bin_logs)
+                    })
+
+            result["delta_t_scaling"] = delta_t_scaling
+
+        # 8. Extended Exponential Sweep (optional) – tau=1..72h beyond config-flow range
+        # Uses the same window=min(5*tau, 168) logic as the coordinator and the primary sweep.
+        # Useful for exploring whether very large tau values (>24h) improve fit.
+        if test_exponential_kernel:
+            ext_tau_values = [1, 2, 3, 4, 6, 8, 12, 18, 24, 36, 48, 72]
+            ext_results = []
+            for tau in ext_tau_values:
+                ext_window = min(int(tau * 5), 168)
+                kernel = generate_exponential_kernel(tau, ext_window)
+                eligible = [log for log in pure_logs if log["index"] >= ext_window - 1]
+                r2, rmse, n = _eval_kernel_on_logs(kernel, ext_window, eligible)
+                if r2 is not None:
+                    ext_results.append({"tau": tau, "r2": r2, "rmse": rmse, "points": n})
+                else:
+                    ext_results.append({"tau": tau, "skipped": "Too few points", "points": n})
+
+            best_ext = max((r for r in ext_results if "r2" in r), key=lambda r: r["r2"], default=None)
+            result["extended_tau_sweep"] = {
+                "tau_sweep": ext_results,
+                "best_tau": best_ext["tau"] if best_ext else None,
+                "best_r2": best_ext["r2"] if best_ext else None,
+                "best_rmse": best_ext["rmse"] if best_ext else None,
+                "note": "Extended sweep tau=1..72h, window=min(5*tau, 168). Explore tau values beyond the 24h config-flow range.",
+            }
+
+        return result
 
     def calibrate_wind_thresholds(self, days: int = 60) -> dict:
         """Find the optimal wind thresholds (high_wind, extreme_wind) to minimize model error.

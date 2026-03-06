@@ -48,6 +48,63 @@ def get_last_year_iso_date(date_obj: date) -> date:
         # Fallback to Week 52 if Week 53 doesn't exist in previous year
         return date.fromisocalendar(year - 1, 52, weekday)
 
+def calculate_asymmetric_inertia(window: list[float]) -> tuple[float, str]:
+    """Calculate effective temperature using asymmetric thermal inertia.
+
+    Uses a slow profile (4h) when temperature is falling (heat shedding),
+    a fast profile (2h) when temperature is rising (heat gaining),
+    and a stable 3h profile otherwise.
+
+    window: temperatures in chronological order (oldest first), same convention
+            as the Gaussian kernel windows used in calibration.
+
+    Returns a tuple of (effective_temperature, regime) where regime is one of
+    'shedding', 'gaining', or 'stable'.
+    """
+    if not window:
+        return 0.0, "stable"
+    if len(window) == 1:
+        return window[-1], "stable"
+
+    current_temp = window[-1]
+    trend_index = max(0, len(window) - 1 - 4)
+    past_temp = window[trend_index]
+
+    if current_temp < (past_temp - 0.5):
+        weights = [0.20, 0.30, 0.30, 0.20]
+        regime = "shedding"
+    elif current_temp > (past_temp + 0.5):
+        weights = [0.50, 0.50]
+        regime = "gaining"
+    else:
+        weights = [0.34, 0.33, 0.33]
+        regime = "stable"
+
+    usable_window = window[-len(weights):]
+    usable_weights = weights[-len(usable_window):]
+    weight_sum = sum(usable_weights)
+    eff_temp = sum(t * w for t, w in zip(usable_window, usable_weights)) / weight_sum
+    return round(eff_temp, 2), regime
+
+
+def generate_exponential_kernel(tau: float, window_hours: int = 168) -> tuple[float, ...]:
+    """Generate a causal exponential decay kernel with time constant tau.
+
+    Physically motivated by first-order thermal dynamics (RC-circuit analogy).
+    Weights decay as e^(-t/tau) going back in time, giving a long tail with
+    low but non-zero influence from days-old temperatures.
+
+    tau: time constant in hours (higher = longer thermal memory)
+    window_hours: how far back to look (default 7 days / 168 hours)
+    Returns weights in oldest-to-newest order (same convention as Gaussian kernel).
+    """
+    # t=0 is most recent hour, t=window_hours-1 is oldest
+    weights = [math.exp(-t / tau) for t in range(window_hours)]
+    total = sum(weights)
+    # Reverse to oldest-to-newest order
+    return tuple(w / total for w in reversed(weights))
+
+
 def generate_gaussian_kernel(hours: int) -> tuple[float, ...]:
     """Generate a Gaussian/Bell-curve kernel for the given number of hours."""
     if hours == 1:

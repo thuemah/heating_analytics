@@ -158,58 +158,22 @@ class SolarCalculator:
         return max(0.0, impact)
 
     def calculate_unit_coefficient(self, entity_id: str, temp_key: str) -> dict[str, float]:
-        """Calculate 2D solar coefficient vector for a specific unit and temp.
+        """Calculate 2D solar coefficient vector for a specific unit.
+
+        Solar gain is a physical property of the window (area, orientation, shading) and is
+        independent of outdoor temperature. The coefficient is therefore stored and looked up
+        globally per unit rather than stratified by temperature bucket.
 
         Uses the following priority:
-        1. Exact match for unit and temperature bucket.
-        2. Closest learned neighbor within the same thermal mode (Heating/Cooling).
-        3. Mode-appropriate global default (optimized for heat pumps).
+        1. Learned coefficient for this unit (global, not temp-stratified).
+        2. Mode-appropriate global default (optimized for heat pumps).
         """
-        # Check storage structure: {unit: {temp_key: coeff}}
-        coeffs = self.coordinator._solar_coefficients_per_unit.get(entity_id, {})
+        # Check storage structure: {unit: {"s": float, "e": float}}
+        coeff = self.coordinator._solar_coefficients_per_unit.get(entity_id)
+        if coeff is not None:
+            return coeff
 
-        # 1. Exact Match
-        if temp_key in coeffs:
-            return coeffs[temp_key]
-
-        # 2. Mode-aware Neighborhood Search
-        try:
-            target_t = int(temp_key)
-            bp = self.coordinator.balance_point
-            # Determine target mode for the requested temp
-            target_mode = MODE_HEATING if target_t < bp else MODE_COOLING
-
-            # Find all learned coeffs for this unit and filter by mode
-            mode_coeffs: dict[int, float] = {}
-            for t_str, val in coeffs.items():
-                try:
-                    t = int(t_str)
-                    m = MODE_HEATING if t < bp else MODE_COOLING
-                    if m == target_mode:
-                        mode_coeffs[t] = val
-                except ValueError:
-                    continue
-
-            if mode_coeffs:
-                # Check for +/- 1 neighbors for averaging
-                t_minus = target_t - 1
-                t_plus = target_t + 1
-
-                if t_minus in mode_coeffs and t_plus in mode_coeffs:
-                    return {
-                        "s": (mode_coeffs[t_minus].get("s", 0.0) + mode_coeffs[t_plus].get("s", 0.0)) / 2.0,
-                        "e": (mode_coeffs[t_minus].get("e", 0.0) + mode_coeffs[t_plus].get("e", 0.0)) / 2.0
-                    }
-
-                # Find closest temperature bucket in the same mode
-                closest_t = min(mode_coeffs.keys(), key=lambda t: abs(t - target_t))
-                return mode_coeffs[closest_t]
-
-        except ValueError:
-            # Handle non-numeric temp_key gracefully
-            pass
-
-        # 3. Mode-appropriate Default
+        # 2. Mode-appropriate Default
         # If no coefficients learned yet for this mode, use global defaults.
         # We derive the mode from temp_key or fall back to current unit mode.
         mode = None

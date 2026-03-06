@@ -83,6 +83,7 @@ MS_TO_KNOTS = 1.94384
 # Learning Constants
 PER_UNIT_LEARNING_RATE_CAP = 0.03   # 3% max EMA rate to prevent oscillation
 SOLAR_COEFF_CAP = 5.0               # Max solar coefficient (kW per full sun)
+COLD_START_SOLAR_DAMPING = 0.5      # Dampen cold-start solar estimates; base model noise inflates early samples
 LEARNING_BUFFER_THRESHOLD = 4
 TARGET_TDD_WINDOW = 0.5  # Minimum TDD accumulation for seamless rolling window efficiency
 MIN_EXTRAPOLATION_DELTA_T = 0.5  # Minimum Delta T (Degrees) required to trust extrapolation source
@@ -97,7 +98,7 @@ MIXED_MODE_HIGH = 0.80  # Above this = mostly aux heating
 # Aux Cooldown / Decay Mechanism (Prevent Thermal Lag Sampling Bias)
 COOLDOWN_MIN_HOURS = 2              # Minimum hours to lock learning after Aux turns off
 COOLDOWN_MAX_HOURS = 6              # Maximum safety timeout for the lock
-COOLDOWN_CONVERGENCE_THRESHOLD = 0.95 # Convergence ratio (Actual/Expected) to exit early
+COOLDOWN_CONVERGENCE_THRESHOLD = 0.92 # Convergence ratio (Actual/Expected) to exit early
 
 # Dual Interference Guard (kWh threshold for both solar and aux)
 DUAL_INTERFERENCE_THRESHOLD = 0.1

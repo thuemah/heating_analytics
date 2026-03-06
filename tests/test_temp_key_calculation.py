@@ -56,9 +56,10 @@ async def test_inertia_temp_calculation(hass, mock_time):
             {"temp": 5.0, "timestamp": (now - timedelta(hours=2)).isoformat()},
             {"temp": 5.0, "timestamp": (now - timedelta(hours=1)).isoformat()} # Last 3
         ]
-        # Expect: Weighted Avg. Weights=(0.20, 0.30, 0.30, 0.20)
-        # 0.20*0 + 0.30*5 + 0.30*5 + 0.20*10 = 0 + 1.5 + 1.5 + 2 = 5.0
-        assert coordinator._calculate_inertia_temp() == 5.0
+        # Exponential kernel (tau=4): more recent samples get higher weight.
+        # [0@H-3, 5@H-2, 5@H-1, 10@current] → biased toward recent → result in (5, 10)
+        inertia = coordinator._calculate_inertia_temp()
+        assert 5.0 < inertia < 10.0
 
         # 3. Partial History (e.g., just started)
         coordinator._hourly_log = [{"temp": 6.0, "timestamp": (now - timedelta(hours=1)).isoformat()}]

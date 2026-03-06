@@ -121,24 +121,34 @@ class StorageManager:
                 self._cleanup_removed_sensors(self.coordinator._aux_coefficients_per_unit)
 
             # Load unit solar coefficients
+            # New format: {entity_id: {"s": float, "e": float}}  (global per unit, not temp-stratified)
+            # Old format: {entity_id: {temp_key: {"s": float, "e": float}}} or {entity_id: {temp_key: float}}
             loaded_solar_coefficients_per_unit = data.get("solar_coefficients_per_unit", {})
             if isinstance(loaded_solar_coefficients_per_unit, dict):
                 import math
                 self.coordinator._solar_coefficients_per_unit = {}
                 az_rad = math.radians(self.coordinator.solar_azimuth)
 
-                for entity_id, temps in loaded_solar_coefficients_per_unit.items():
-                    self.coordinator._solar_coefficients_per_unit[entity_id] = {}
-                    for temp_key, coeff in temps.items():
-                        if isinstance(coeff, (int, float)):
-                            # Migrate scalar float to 2D dictionary
-                            self.coordinator._solar_coefficients_per_unit[entity_id][temp_key] = {
-                                "s": round(coeff * (-math.cos(az_rad)), 5),
-                                "e": round(coeff * math.sin(az_rad), 5)
-                            }
-                            _LOGGER.info(f"Migrated legacy solar coefficient for unit {entity_id} T={temp_key}: {coeff} -> {self.coordinator._solar_coefficients_per_unit[entity_id][temp_key]}")
-                        elif isinstance(coeff, dict):
-                            self.coordinator._solar_coefficients_per_unit[entity_id][temp_key] = coeff
+                for entity_id, value in loaded_solar_coefficients_per_unit.items():
+                    if isinstance(value, dict) and ("s" in value or "e" in value):
+                        # New format: already a flat coefficient dict
+                        self.coordinator._solar_coefficients_per_unit[entity_id] = value
+                    elif isinstance(value, dict):
+                        # Old format: nested by temp_key — flatten by picking the first valid entry
+                        migrated = None
+                        for temp_key, coeff in value.items():
+                            if isinstance(coeff, dict) and ("s" in coeff or "e" in coeff):
+                                migrated = coeff
+                                break
+                            elif isinstance(coeff, (int, float)):
+                                migrated = {
+                                    "s": round(coeff * (-math.cos(az_rad)), 5),
+                                    "e": round(coeff * math.sin(az_rad), 5)
+                                }
+                                break
+                        if migrated is not None:
+                            self.coordinator._solar_coefficients_per_unit[entity_id] = migrated
+                            _LOGGER.info(f"Migrated temp-stratified solar coefficient for unit {entity_id} to global: {migrated}")
 
                 self._cleanup_removed_sensors(self.coordinator._solar_coefficients_per_unit)
             else:
@@ -169,27 +179,33 @@ class StorageManager:
                 self.coordinator._learning_buffer_aux_per_unit = {}
 
             # Load learning buffer solar per unit
+            # New format: {entity_id: [(s, e, impact), ...]}  (flat list, not nested by temp_key)
+            # Old format: {entity_id: {temp_key: [(s, e, impact), ...]}}
             loaded_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
             if isinstance(loaded_buffer_solar, dict):
                 self.coordinator._learning_buffer_solar_per_unit = {}
 
-                # Check for legacy floats and discard if present (can't reconstruct vectors for old buffers)
-                for entity_id, temps in loaded_buffer_solar.items():
-                    self.coordinator._learning_buffer_solar_per_unit[entity_id] = {}
-                    for temp_key, buffer_list in temps.items():
-                        if not isinstance(buffer_list, list):
-                            continue
-
-                        # If list contains scalars, drop the buffer completely for this temp
-                        if any(isinstance(item, (int, float)) for item in buffer_list):
-                            _LOGGER.info(f"Cleared legacy scalar solar buffer for unit {entity_id} T={temp_key}")
-                            self.coordinator._learning_buffer_solar_per_unit[entity_id][temp_key] = []
+                for entity_id, value in loaded_buffer_solar.items():
+                    if isinstance(value, list):
+                        # New format: already a flat list of (s, e, impact) tuples
+                        self.coordinator._learning_buffer_solar_per_unit[entity_id] = [
+                            tuple(item) if isinstance(item, list) else item for item in value
+                            if isinstance(item, (list, tuple)) and len(item) == 3
+                        ]
+                    elif isinstance(value, dict):
+                        # Old format: nested by temp_key — flatten all samples into one list
+                        merged = []
+                        for temp_key, buffer_list in value.items():
+                            if not isinstance(buffer_list, list):
+                                continue
+                            for item in buffer_list:
+                                if isinstance(item, (list, tuple)) and len(item) == 3 and not any(isinstance(x, (int, float)) and isinstance(x, bool) for x in item):
+                                    merged.append(tuple(item) if isinstance(item, list) else item)
+                        if merged:
+                            self.coordinator._learning_buffer_solar_per_unit[entity_id] = merged
+                            _LOGGER.info(f"Migrated temp-stratified solar buffer for unit {entity_id}: {len(merged)} samples merged")
                         else:
-                            # It's already tuples/lists of (s, e, impact), preserve it
-                            # Note: JSON decodes tuples as lists, we convert them back
-                            self.coordinator._learning_buffer_solar_per_unit[entity_id][temp_key] = [
-                                tuple(item) if isinstance(item, list) else item for item in buffer_list
-                            ]
+                            self.coordinator._learning_buffer_solar_per_unit[entity_id] = []
 
                 self._cleanup_removed_sensors(self.coordinator._learning_buffer_solar_per_unit)
             else:

@@ -5,6 +5,7 @@ import logging
 from typing import Callable
 
 from .const import (
+    COLD_START_SOLAR_DAMPING,
     ENERGY_GUARD_THRESHOLD,
     LEARNING_BUFFER_THRESHOLD,
     MODE_HEATING,
@@ -434,20 +435,15 @@ class LearningManager:
         if vector_magnitude <= 0.01:
             return
 
-        # Get Current Coefficient Vector
-        current_coeff = None
-        if entity_id in solar_coefficients_per_unit:
-            if temp_key in solar_coefficients_per_unit[entity_id]:
-                current_coeff = solar_coefficients_per_unit[entity_id][temp_key]
+        # Get Current Coefficient Vector (global per unit — solar gain is temperature-independent)
+        current_coeff = solar_coefficients_per_unit.get(entity_id)
 
         # --- Buffered Learning Logic (Cold Start) ---
         if current_coeff is None:
             if entity_id not in learning_buffer_solar_per_unit:
-                learning_buffer_solar_per_unit[entity_id] = {}
-            if temp_key not in learning_buffer_solar_per_unit[entity_id]:
-                learning_buffer_solar_per_unit[entity_id][temp_key] = []
+                learning_buffer_solar_per_unit[entity_id] = []
 
-            buffer_list = learning_buffer_solar_per_unit[entity_id][temp_key]
+            buffer_list = learning_buffer_solar_per_unit[entity_id]
             # Store tuple of (s, e, impact)
             buffer_list.append((solar_s, solar_e, actual_impact))
 
@@ -470,8 +466,8 @@ class LearningManager:
                     new_coeff_s = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_s))
                     new_coeff_e = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_e))
 
-                    new_coeff = {"s": new_coeff_s, "e": new_coeff_e}
-                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start]: {entity_id} T={temp_key} -> {new_coeff} (2D Least Squares, {len(buffer_list)} samples)")
+                    new_coeff = {"s": new_coeff_s * COLD_START_SOLAR_DAMPING, "e": new_coeff_e * COLD_START_SOLAR_DAMPING}
+                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start]: {entity_id} -> {new_coeff} (2D Least Squares, {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
                 else:
                     # Collinear fallback: sun observed from a narrow angle range (e.g. winter).
                     # We can only identify the coefficient along the dominant direction.
@@ -482,7 +478,7 @@ class LearningManager:
                     dir_norm = (dir_s**2 + dir_e**2) ** 0.5
 
                     if dir_norm < 1e-6:
-                        _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} T={temp_key} -> zero-magnitude vectors, skipping.")
+                        _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> zero-magnitude vectors, skipping.")
                         return
 
                     d_s = dir_s / dir_norm
@@ -492,17 +488,17 @@ class LearningManager:
                     sum_proj2 = sum((item[0] * d_s + item[1] * d_e) ** 2 for item in buffer_list)
 
                     if sum_proj2 < 1e-6:
-                        _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} T={temp_key} -> degenerate projection, skipping.")
+                        _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> degenerate projection, skipping.")
                         return
 
                     c_scalar = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, sum_proj_I / sum_proj2))
-                    new_coeff = {"s": c_scalar * d_s, "e": c_scalar * d_e}
-                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start 1D]: {entity_id} T={temp_key} -> {new_coeff} (collinear fallback, dir=({d_s:.2f},{d_e:.2f}), {len(buffer_list)} samples)")
+                    new_coeff = {"s": c_scalar * d_s * COLD_START_SOLAR_DAMPING, "e": c_scalar * d_e * COLD_START_SOLAR_DAMPING}
+                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start 1D]: {entity_id} -> {new_coeff} (collinear fallback, dir=({d_s:.2f},{d_e:.2f}), {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
 
-                self._update_unit_solar_coefficient(entity_id, temp_key, new_coeff, solar_coefficients_per_unit)
+                self._update_unit_solar_coefficient(entity_id, new_coeff, solar_coefficients_per_unit)
                 buffer_list.clear()
             else:
-                 _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} T={temp_key} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({actual_impact:.3f} kW)")
+                 _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({actual_impact:.3f} kW)")
 
         else:
             # Post-Jump Start: LMS Gradient Descent
@@ -525,8 +521,8 @@ class LearningManager:
 
             new_coeff = {"s": new_coeff_s, "e": new_coeff_e}
 
-            _LOGGER.debug(f"Per-Unit Solar Learning [LMS EMA]: {entity_id} T={temp_key} -> {new_coeff} (was {current_coeff})")
-            self._update_unit_solar_coefficient(entity_id, temp_key, new_coeff, solar_coefficients_per_unit)
+            _LOGGER.debug(f"Per-Unit Solar Learning [LMS EMA]: {entity_id} -> {new_coeff} (was {current_coeff})")
+            self._update_unit_solar_coefficient(entity_id, new_coeff, solar_coefficients_per_unit)
 
     def _learn_unit_model(
         self,
@@ -691,12 +687,9 @@ class LearningManager:
 
         aux_coefficients_per_unit[entity_id][temp_key][wind_bucket] = round(value, 3)
 
-    def _update_unit_solar_coefficient(self, entity_id, temp_key, value: dict[str, float], solar_coefficients_per_unit):
-        """Update the solar coefficient data structure."""
-        if entity_id not in solar_coefficients_per_unit:
-            solar_coefficients_per_unit[entity_id] = {}
-
-        solar_coefficients_per_unit[entity_id][temp_key] = {
+    def _update_unit_solar_coefficient(self, entity_id, value: dict[str, float], solar_coefficients_per_unit):
+        """Update the solar coefficient data structure (global per unit, not temp-stratified)."""
+        solar_coefficients_per_unit[entity_id] = {
             "s": round(value.get("s", 0.0), 5),
             "e": round(value.get("e", 0.0), 5)
         }

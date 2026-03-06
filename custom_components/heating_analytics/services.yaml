@@ -16,7 +16,11 @@ import_from_csv:
         object:
     update_model:
       name: Update Learning Model
-      description: If true, the learning model will be trained on the imported data. If false, only history and graphs are updated.
+      description: >-
+        Controls whether the imported data is used to train the energy consumption model.
+        true (default): imports data into history/graphs AND trains the correlation model — use this for a full cold-start import.
+        false: imports data into history and graphs ONLY, leaving your existing learned model completely untouched.
+        Set to false when filling in missing historical periods (e.g. weather reference data for the Model Comparison sensor) so that the import does not overwrite correlations your model has already learned from live data.
       default: true
       selector:
         boolean:
@@ -177,7 +181,7 @@ calibrate_wind_thresholds:
 
 calibrate_inertia:
   name: Calibrate Thermal Inertia
-  description: Tests historical data to calculate the ideal thermal inertia profile (1-24 hours) for your house by finding the highest correlation (R²) to consumption without auxiliary or solar interference. Returns results as a response.
+  description: "Tests historical data to find the ideal thermal inertia (tau, 1-24h) for your house. Primary result uses a causal exponential decay kernel (matching the coordinator's RC-circuit model) — set your config-flow slider to recommended_tau. Gaussian sweep is included as a comparison. Returns results as a response."
   fields:
     entity_id:
       name: Entity
@@ -197,6 +201,24 @@ calibrate_inertia:
     centered_energy_average:
       name: Centered Energy Average
       description: Smoothes the hourly energy consumption using a 3-hour centered moving average before calculating correlation. This helps reduce noise from heat pump defrost cycles or partial hour delays.
+      default: false
+      selector:
+        boolean:
+    test_asymmetric:
+      name: Test Asymmetric Inertia
+      description: Also evaluates an asymmetric inertia model that uses a slow profile (4h) when outdoor temperature is falling (heat shedding) and a fast profile (2h) when rising (heat gaining). Returns comparative R² and RMSE alongside the standard symmetric results.
+      default: false
+      selector:
+        boolean:
+    test_delta_t_scaling:
+      name: Test ΔT-dependent Inertia Scaling
+      description: "Tests whether optimal thermal inertia grows with the temperature differential (balance_point − outdoor_temp). Bins pure hours into 5°C ΔT buckets and finds the best exponential τ per bin (window=min(5τ, 168)). Results carry best_tau instead of best_hours. A monotonic trend (low ΔT → short τ, high ΔT → long τ) supports using a ΔT-scaled inertia model."
+      default: false
+      selector:
+        boolean:
+    test_exponential_kernel:
+      name: Extended Tau Sweep (1–72h)
+      description: "Runs an extended exponential sweep beyond the standard 1-24h range, covering τ = 1, 2, 3, 4, 6, 8, 12, 18, 24, 36, 48, 72 hours. Useful for exploring whether a very large time constant improves fit for heavy-mass buildings. Results are returned under extended_tau_sweep."
       default: false
       selector:
         boolean:

@@ -43,6 +43,9 @@ SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=90)),
     vol.Optional("centered_energy_average", default=False): cv.boolean,
+    vol.Optional("test_asymmetric", default=False): cv.boolean,
+    vol.Optional("test_delta_t_scaling", default=False): cv.boolean,
+    vol.Optional("test_exponential_kernel", default=False): cv.boolean,
 })
 
 SERVICE_SCHEMA_CALIBRATE_WIND = vol.Schema({
@@ -371,6 +374,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entity_id = call.data.get("entity_id")
         days = call.data.get("days", 30)
         centered = call.data.get("centered_energy_average", False)
+        test_asymmetric = call.data.get("test_asymmetric", False)
+        test_delta_t_scaling = call.data.get("test_delta_t_scaling", False)
+        test_exponential_kernel = call.data.get("test_exponential_kernel", False)
 
         target_coordinator = None
 
@@ -391,7 +397,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         _LOGGER.debug(f"Handling calibrate_inertia for {days} days (Coordinator: {target_coordinator.entry.entry_id})")
 
-        result = target_coordinator.statistics.calibrate_inertia(days=days, centered_energy_average=centered)
+        result = target_coordinator.statistics.calibrate_inertia(days=days, centered_energy_average=centered, test_asymmetric=test_asymmetric, test_delta_t_scaling=test_delta_t_scaling, test_exponential_kernel=test_exponential_kernel)
         return result
 
     hass.services.async_register(

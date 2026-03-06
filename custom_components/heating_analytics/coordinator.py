@@ -13,7 +13,7 @@ from homeassistant.helpers.update_coordinator import (
 from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfSpeed
 
-from .helpers import convert_speed_to_ms, generate_gaussian_kernel
+from .helpers import convert_speed_to_ms, generate_exponential_kernel
 from .solar import SolarCalculator
 from .forecast import ForecastManager
 from .statistics import StatisticsManager
@@ -283,8 +283,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             else:
                 inertia_setting = 4
 
-        # Generate weights dynamically
-        self.inertia_weights = generate_gaussian_kernel(int(inertia_setting))
+        # Store tau for use in gap detection (_get_inertia_parameters)
+        self.inertia_tau = float(inertia_setting)
+        # Generate weights dynamically; cap window at 5×tau (captures 99.3% of weight)
+        # to avoid requesting hundreds of hours of history for large tau values.
+        self.inertia_weights = generate_exponential_kernel(
+            tau=self.inertia_tau,
+            window_hours=min(int(inertia_setting * 5), 168),
+        )
 
         # Load Aux Affected Entities (Default to all energy sensors if missing)
         self.aux_affected_entities = self.entry.data.get(CONF_AUX_AFFECTED_ENTITIES)
@@ -760,9 +766,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
     def _get_inertia_parameters(self) -> tuple[int, int]:
         """Helper to derive requirements from weights."""
-        total_needed = len(self.inertia_weights)
-        hours_back = total_needed - 1
-        max_gap = total_needed
+        hours_back = len(self.inertia_weights) - 1
+        # max_gap is the stale-data cutoff (gap detection), tied to tau – not the kernel window.
+        # Logs older than tau hours are considered a thermal discontinuity and discarded.
+        max_gap = int(self.inertia_tau)
         return hours_back, max_gap
 
     def _calculate_weighted_inertia(self, temps: list[float]) -> float:
@@ -903,13 +910,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if not temps:
             return None
 
-        # Graceful degradation logging
-        required_len = len(self.inertia_weights)
+        # Short-circuit: no history available, return current temp directly
+        # (avoids floating-point rounding from kernel normalisation)
         if len(temps) == 1:
-            pass # Normal start-up or only current available
-        elif len(temps) < required_len:
-            # Not an error, but worth noting in debug if strictly tracking
-            pass
+            return temps[0]
 
         return self._calculate_weighted_inertia(temps)
 
@@ -1788,11 +1792,16 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # (inertia_list and inertia_temp calculated earlier in Step 1)
 
         # Calculate Thermal State Attributes
+        # Normalize weights to the active subset so they sum to 1.0,
+        # allowing direct verification: sum(history[i] * weights[i]) == effective_temperature.
+        _active_w = list(self.inertia_weights[-len(inertia_list):]) if inertia_list else []
+        _w_sum = sum(_active_w)
+        _display_weights = [round(w / _w_sum, 4) for w in _active_w] if _w_sum > 0 else _active_w
         thermal_state = {
              "raw_temperature": round(temp, 1) if temp is not None else None,
              "effective_temperature": round(inertia_temp, 1) if inertia_temp is not None else None,
              "inertia_history": [round(t, 1) for t in inertia_list],
-             "weights": list(self.inertia_weights[-len(inertia_list):]) if inertia_list else [],
+             "weights": _display_weights,
              "samples_used": len(inertia_list),
              "last_updated": current_time.isoformat(),
              "balance_point": self.balance_point,
