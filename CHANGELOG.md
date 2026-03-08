@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.5] - 2026-03-08
+## [1.2.6] - 2026-03-08
 
 ### Added
 - **DHW mode support for air-to-water heat pumps.** Units that periodically switch to domestic hot water production now have a dedicated `MODE_DHW` state. During a DHW cycle the heat pump delivers zero heat to the space; the model correctly observes this as zero contribution and learns accordingly. The previous behaviour treated DHW like `MODE_OFF` (skipping the learning update entirely), which caused systematic upward drift in the learned coefficient proportional to the DHW duty cycle — equivalent to a heating-cable hysteresis error. Setting a unit to `MODE_DHW` eliminates the drift at all learning rates. At the default learning rate (1%) the steady-state oscillation amplitude stays within ±7% of the true coefficient even in extreme DHW-heavy operating profiles.

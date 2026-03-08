@@ -67,7 +67,12 @@ class StorageManager:
                 # belongs to a different instance — start fresh instead of importing foreign data.
                 legacy_data = await self._legacy_store.async_load()
                 if legacy_data:
-                    stored_sensors = set(legacy_data.get("daily_history", {}).keys())
+                    # Use correlation_data_per_unit or observation_counts — both are keyed
+                    # by entity_id — to determine if this legacy file belongs to this instance.
+                    stored_sensors = (
+                        set(legacy_data.get("correlation_data_per_unit", {}).keys())
+                        or set(legacy_data.get("observation_counts", {}).keys())
+                    )
                     instance_sensors = set(self.coordinator.energy_sensors or [])
                     if not stored_sensors or stored_sensors & instance_sensors:
                         _LOGGER.info(
