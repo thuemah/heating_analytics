@@ -110,6 +110,7 @@ from .const import (
     MODE_OFF,
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
+    MODE_DHW,
     DEFAULT_CSV_AUTO_LOGGING,
     DEFAULT_CSV_HOURLY_PATH,
     DEFAULT_CSV_DAILY_PATH,
@@ -335,8 +336,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         await self.storage.async_save_data(force)
 
     async def async_reset_learning_data(self):
-        """Reset the learning data (correlation model)."""
+        """Reset the learning data (correlation model) and refresh all sensors."""
         await self.storage.async_reset_learning_data()
+        await self.async_refresh()
 
     async def async_reset_forecast_accuracy(self):
         """Reset the forecast accuracy history."""
@@ -2228,7 +2230,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Total Energy (for logging & display)
         total_energy_kwh = self._accumulated_energy_hour
 
-        # Energy for Global Model Learning (exclude guest modes)
+        # Energy for Global Model Learning (exclude guest and DHW modes)
         learning_energy_kwh = 0.0
         guest_impact_kwh = 0.0
         for entity_id, actual_kwh in self._hourly_delta_per_unit.items():
@@ -2236,7 +2238,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             if unit_mode in (MODE_GUEST_HEATING, MODE_GUEST_COOLING):
                 # Guest units are not tracked in expected - their full consumption is the impact
                 guest_impact_kwh += actual_kwh
-            elif unit_mode not in (MODE_OFF,):
+            elif unit_mode in (MODE_OFF, MODE_DHW):
+                # Off and DHW energy do not inform the space-heating model
+                pass
+            else:
                 learning_energy_kwh += actual_kwh
 
 

@@ -270,6 +270,56 @@ To prevent slow convergence on new installations:
 2.  **Injection:** Once the buffer is full, it calculates the average and "Jump Starts" the model value directly to this average, bypassing the slow EMA warmup.
 3.  **Result:** Useable predictions appear within hours, not weeks.
 
+### DHW Mode — Air-to-Water Heat Pump Hysteresis
+
+Air-to-water heat pumps periodically switch from space-heating to producing domestic hot water (DHW). During a DHW cycle the compressor runs at full power, but all energy is diverted to the hot-water tank — zero heat is delivered to the space. The building cools slightly, and the subsequent space-heating phase must compensate for the lost time.
+
+This is physically identical to a thermostat-hysteresis cycle on a direct-electric heating cable:
+
+| Phase | Heating cable | Air-to-water HP |
+|---|---|---|
+| Active | Delivers P_heat until thermostat setpoint | Space-heating |
+| Pause | Hysteresis cutoff, no heat to space | DHW cycle, no space heat |
+
+In both cases the space-heating model observes an inflated reading during the active phase:
+
+```
+obs_active = TRUE_B × (t_active + t_pause) / t_active   [cycle-ratio inflation]
+obs_pause  = 0
+```
+
+#### Strategy A — Skip (old `MODE_OFF` behaviour, incorrect for DHW)
+
+If DHW hours are simply skipped (no model update), the EMA converges to `obs_active`, not `TRUE_B`. This produces permanent upward drift proportional to the DHW duty cycle:
+
+| DHW scenario | Duty cycle | Coefficient drift |
+|---|---|---|
+| Light (1 h DHW / 11 h heat) | 8% | +9% |
+| Medium (2 h DHW / 6 h heat) | 25% | +33% |
+| Heavy (2 h DHW / 4 h heat) | 33% | +50% |
+| Standby (14 h DHW / 10 h heat) | 58% | +140% |
+
+#### Strategy B — Observe Zero (`MODE_DHW`, current behaviour, correct)
+
+Setting a unit to `MODE_DHW` causes the model to update with `actual = 0` during DHW hours — the physically correct observation (zero space-heat contribution). The EMA converges to `TRUE_B` at all learning rates. No drift.
+
+#### Oscillation Amplitude and Learning Rate
+
+Strategy B eliminates mean drift but introduces a within-cycle oscillation: the coefficient is pulled toward `obs_active` during heating and toward 0 during DHW. The amplitude grows with learning rate. Analytically simulated steady-state amplitudes (half peak-to-peak as % of TRUE_B, stability criterion ≤ ±10%):
+
+| Scenario | LR 1% | LR 2% | LR 3% |
+|---|---|---|---|
+| DHW light (8% ratio) | ±0.1% ✓ | ±0.2% ✓ | ±0.3% ✓ |
+| DHW medium (25% ratio) | ±0.4% ✓ | ±0.8% ✓ | ±1.2% ✓ |
+| DHW heavy (33% ratio) | ±1.0% ✓ | ±2.0% ✓ | ±3.0% ✓ |
+| DHW standby (58% ratio) | ±7.0% ✓ | ±14% borderline | ±21% ✗ |
+
+The default global learning rate (1%) remains within the stability threshold even in the most extreme DHW standby scenario. Learning rates above 2–3% are not recommended for installations with high DHW duty cycles.
+
+#### Interaction with Aux Learning
+
+If `is_aux_active` and `unit_mode == MODE_DHW` are simultaneously true, aux-coefficient learning is skipped for that unit. The zero space-heat contribution is caused by the DHW cycle, not the aux system — attributing it to aux would corrupt the per-unit aux coefficient.
+
 ### Guest Mode & Purity Guards
 The "Guest Mode" is a critical feature for model integrity.
 *   **Problem:** Guests crank the heat to 25°C, ruining the "Normal" model for the homeowner (21°C).

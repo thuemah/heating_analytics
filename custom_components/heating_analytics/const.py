@@ -63,6 +63,16 @@ DEFAULT_AUX_LEARNING_RATE = 0.01
 DEFAULT_SOLAR_COEFF_HEATING = 0.35
 DEFAULT_SOLAR_COEFF_COOLING = 0.40
 
+# Minimum solar transmittance when screens are fully closed.
+# Models two physical realities:
+#   1. Screen G-value (SHGC): fabric lets through ~10-15 % of solar irradiance.
+#   2. Unmonitored windows: windows without screens always contribute baseline gain.
+# Net effect: even at correction_percent = 0, the building still receives ~20 %
+# of the potential solar gain.  Without this floor the effective solar vector
+# collapses to zero, solar-coefficient learning is suppressed, and the base
+# thermal model absorbs the residual solar variance as a systematic bias.
+DEFAULT_SOLAR_MIN_TRANSMITTANCE = 0.20
+
 CONF_WIND_UNIT = "wind_unit"
 CONF_ENABLE_LIFETIME_TRACKING = "enable_lifetime_tracking"
 CONF_SOLAR_ENABLED = "solar_enabled"
@@ -301,4 +311,5 @@ MODE_COOLING = "cooling"
 MODE_OFF = "off"
 MODE_GUEST_HEATING = "guest_heating"
 MODE_GUEST_COOLING = "guest_cooling"
+MODE_DHW = "dhw"
 CONF_HAS_AC_UNITS = "has_ac_units"

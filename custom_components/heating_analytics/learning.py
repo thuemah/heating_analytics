@@ -13,6 +13,7 @@ from .const import (
     MODE_OFF,
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
+    MODE_DHW,
     PER_UNIT_LEARNING_RATE_CAP,
     SOLAR_COEFF_CAP,
 )
@@ -322,12 +323,19 @@ class LearningManager:
                     # Skip this unit
                     continue
 
-            # Only update model if sensor actually reported during this hour
-            if entity_id not in hourly_delta_per_unit:
-                # Sensor was offline/unavailable entire hour - skip learning
-                continue
-
-            actual_unit = hourly_delta_per_unit[entity_id]
+            # DHW mode: unit is active but not contributing to space heating.
+            # Force actual_unit = 0 so the per-unit model learns the correct
+            # zero contribution rather than skipping the update entirely.
+            # This also covers heat pump idle/standby cycles mapped to DHW by
+            # the heat_pump_mode_sync blueprint.
+            if unit_mode == MODE_DHW:
+                actual_unit = 0.0
+            else:
+                # Only update model if sensor actually reported during this hour
+                if entity_id not in hourly_delta_per_unit:
+                    # Sensor was offline/unavailable entire hour - skip learning
+                    continue
+                actual_unit = hourly_delta_per_unit[entity_id]
             # Dual-Track Learning: prefer the per-unit baseline from Track B calculations
             if entity_id in hourly_expected_base_per_unit:
                 expected_unit_base = hourly_expected_base_per_unit[entity_id]
@@ -366,31 +374,37 @@ class LearningManager:
 
             # Step 3: Learn Base or Aux Model
             if is_aux_active:
-                # Learn Individual Aux Reduction (kW)
-                # Check Exclusion: Only learn if unit is affected by aux
-                is_affected = True
-                if aux_affected_entities is not None:
-                    if entity_id not in aux_affected_entities:
-                        is_affected = False
-
-                if is_affected:
-                    self._learn_unit_aux_coefficient(
-                        entity_id, temp_key, wind_bucket,
-                        expected_unit_base, unit_normalized,
-                        learning_rate,  # Use global rate
-                        aux_coefficients_per_unit, learning_buffer_aux_per_unit,
-                        correlation_data_per_unit
-                    )
+                # DHW + Aux simultaneously: the zero contribution is caused by DHW,
+                # not by the aux system. Skip aux-coefficient learning to avoid
+                # corrupting the per-unit aux coefficient.
+                if unit_mode == MODE_DHW:
+                    pass
                 else:
-                    # Excluded unit: Not affected by aux, so learn Base Model normally.
-                    # Note: This does NOT require Global Base to update - Global is locked
-                    # during aux (see process_learning). The models are independent.
-                    self._learn_unit_model(
-                        entity_id, temp_key, wind_bucket,
-                        expected_unit_base, unit_normalized,
-                        learning_rate,
-                        learning_buffer_per_unit, correlation_data_per_unit, observation_counts
-                    )
+                    # Learn Individual Aux Reduction (kW)
+                    # Check Exclusion: Only learn if unit is affected by aux
+                    is_affected = True
+                    if aux_affected_entities is not None:
+                        if entity_id not in aux_affected_entities:
+                            is_affected = False
+
+                    if is_affected:
+                        self._learn_unit_aux_coefficient(
+                            entity_id, temp_key, wind_bucket,
+                            expected_unit_base, unit_normalized,
+                            learning_rate,  # Use global rate
+                            aux_coefficients_per_unit, learning_buffer_aux_per_unit,
+                            correlation_data_per_unit
+                        )
+                    else:
+                        # Excluded unit: Not affected by aux, so learn Base Model normally.
+                        # Note: This does NOT require Global Base to update - Global is locked
+                        # during aux (see process_learning). The models are independent.
+                        self._learn_unit_model(
+                            entity_id, temp_key, wind_bucket,
+                            expected_unit_base, unit_normalized,
+                            learning_rate,
+                            learning_buffer_per_unit, correlation_data_per_unit, observation_counts
+                        )
             else:
                 # Learn Normal Model
                 self._learn_unit_model(

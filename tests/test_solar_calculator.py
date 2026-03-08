@@ -131,30 +131,19 @@ def test_calculate_unit_coefficient(calculator, coordinator):
     coeff_cooling = calculator.calculate_unit_coefficient("unit_1", "20")
     assert coeff_cooling['s'] == DEFAULT_SOLAR_COEFF_COOLING
 
-    # 3. Exact Match
-    coordinator._solar_coefficients_per_unit["unit_1"] = {"10": {"s": 0.08, "e": 0.0}}
+    # 3. Learned Coefficient (Global per Unit, Not Temp-Stratified)
+    # Setting a learned coefficient for the unit returns it for any temp key.
+    coordinator._solar_coefficients_per_unit["unit_1"] = {"s": 0.08, "e": 0.0}
     assert calculator.calculate_unit_coefficient("unit_1", "10")["s"] == 0.08
 
-    # 4. Closest Neighbor (Same Mode)
-    # T=10 exists (0.08). T=12 should use T=10.
+    # 4. Same global coefficient returned for all temp keys regardless of mode.
     assert calculator.calculate_unit_coefficient("unit_1", "12")["s"] == 0.08
+    assert calculator.calculate_unit_coefficient("unit_1", "20")["s"] == 0.08
 
-    # 5. Broad Neighbor (Same Mode)
-    coordinator._solar_coefficients_per_unit["unit_1"]["0"] = {"s": 0.12, "e": 0.0}
-    # Current state: {10: 0.08, 0: 0.12}. Target 2. Closest is 0.
-    assert calculator.calculate_unit_coefficient("unit_1", "2")["s"] == 0.12
-    # Target 8. Closest is 10.
-    assert calculator.calculate_unit_coefficient("unit_1", "8")["s"] == 0.08
-
-    # 6. Mode Separation
-    # T=10 exists (Heating). T=20 (Cooling) should still use Cooling Default if no cooling learned.
+    # 5. Remove learned coefficient -> falls back to mode-appropriate default.
+    del coordinator._solar_coefficients_per_unit["unit_1"]
     coeff_cooling = calculator.calculate_unit_coefficient("unit_1", "20")
     assert coeff_cooling['s'] == DEFAULT_SOLAR_COEFF_COOLING
-
-    # 7. Learned Cooling Neighbor
-    coordinator._solar_coefficients_per_unit["unit_1"]["25"] = {"s": 0.30, "e": 0.0}
-    # Now T=20 should use T=25 (Closest cooling neighbor)
-    assert calculator.calculate_unit_coefficient("unit_1", "20")["s"] == 0.30
 
 def test_calculate_unit_coefficient_non_numeric(calculator, coordinator):
     # Mock coordinator get_unit_mode

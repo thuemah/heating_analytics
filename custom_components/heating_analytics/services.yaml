@@ -47,11 +47,25 @@ export_to_csv:
 
 reset_learning_data:
   name: Reset Learning Data
-  description: Reset all learned correlation data and start fresh.
+  description: Reset all learned correlation data and start fresh. If no entity is selected the first available instance is targeted.
+  fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to reset. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
 
 reset_forecast_accuracy:
   name: Reset Forecast Accuracy
-  description: Reset the forecast accuracy tracking history (forecast vs actual). This clears the "Forecast History" tab but preserves energy logs.
+  description: Reset the forecast accuracy tracking history (forecast vs actual). This clears the "Forecast History" tab but preserves energy logs. If no entity is selected the first available instance is targeted.
+  fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to reset. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
 
 backup_data:
   name: Full System Backup

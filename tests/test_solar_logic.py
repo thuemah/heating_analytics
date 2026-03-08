@@ -44,7 +44,7 @@ def mock_coordinator():
         # Use simple coefficient of 1.0 for unit such that impact = factor * 1.0
         # If we set factor=0.4 (from current state test below), and we want result 0.4, coeff should be 1.0?
         # Or if we want specific result.
-        coord._solar_coefficients_per_unit = {"sensor.heater1": {"10": {"s": 1.0, "e": 0.0}}}
+        coord._solar_coefficients_per_unit = {"sensor.heater1": {"s": 1.0, "e": 0.0}}
 
         return coord
 

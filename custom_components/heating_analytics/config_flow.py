@@ -88,6 +88,9 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input.get(CONF_WIND_SOURCE) == SOURCE_WEATHER:
              if "wind_speed" not in weather_state.attributes:
                 errors[CONF_WIND_SOURCE] = "weather_missing_wind_speed"
+        elif user_input.get(CONF_WIND_SOURCE) == SOURCE_SENSOR:
+             if not user_input.get("wind_speed_sensor"):
+                errors["wind_speed_sensor"] = "required"
 
         # Wind Gust (Optional/Info)
         if user_input.get(CONF_WIND_GUST_SOURCE) == SOURCE_WEATHER:
@@ -167,7 +170,11 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         )
         if temp_source == SOURCE_SENSOR:
-             schema[vol.Required("outdoor_temp_sensor", default=get_val("outdoor_temp_sensor"))] = selector.EntitySelector(
+            _temp_val = get_val("outdoor_temp_sensor")
+            # vol.Optional so HA frontend does not block submission when user switches
+            # the source dropdown to Weather Entity before the form reloads. Required
+            # validation is enforced in _validate_weather_fallback instead.
+            schema[vol.Optional("outdoor_temp_sensor", **({'default': _temp_val} if _temp_val else {}))] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
             )
 
@@ -183,7 +190,9 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         )
         if wind_source == SOURCE_SENSOR:
-             schema[vol.Required("wind_speed_sensor", default=get_val("wind_speed_sensor"))] = selector.EntitySelector(
+            _wind_val = get_val("wind_speed_sensor")
+            # vol.Optional — same reason as outdoor_temp_sensor above.
+            schema[vol.Optional("wind_speed_sensor", **({'default': _wind_val} if _wind_val else {}))] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor", device_class="wind_speed")
             )
 
@@ -199,7 +208,8 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         )
         if gust_source == SOURCE_SENSOR:
-             schema[vol.Optional("wind_gust_sensor", default=get_val("wind_gust_sensor"))] = selector.EntitySelector(
+            _gust_val = get_val("wind_gust_sensor")
+            schema[vol.Optional("wind_gust_sensor", **({'default': _gust_val} if _gust_val else {}))] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor", device_class="wind_speed")
             )
 
@@ -250,7 +260,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Optional(CONF_HAS_AC_UNITS, default=get_val(CONF_HAS_AC_UNITS, False)): selector.BooleanSelector(),
 
             # Advanced Forecast Settings
-            vol.Optional(CONF_SECONDARY_WEATHER_ENTITY, default=get_val(CONF_SECONDARY_WEATHER_ENTITY)): selector.EntitySelector(
+            vol.Optional(CONF_SECONDARY_WEATHER_ENTITY, description={"suggested_value": get_val(CONF_SECONDARY_WEATHER_ENTITY)}): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="weather")
             ),
             vol.Optional(CONF_FORECAST_CROSSOVER_DAY, default=get_val(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY)): selector.NumberSelector(
@@ -284,19 +294,17 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # If Source is SENSOR but key missing -> Reload to show it
             reload_needed = False
 
+            # Reload to show required sensor field when switching TO SOURCE_SENSOR
             if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_SENSOR and "outdoor_temp_sensor" not in user_input:
                 reload_needed = True
             if user_input.get(CONF_WIND_SOURCE) == SOURCE_SENSOR and "wind_speed_sensor" not in user_input:
                 reload_needed = True
-            # Gust is optional, so we do NOT force reload if it is missing,
-            # allowing users to select Sensor Source but leave the sensor empty (effectively "No Gust Data").
-            # if user_input.get(CONF_WIND_GUST_SOURCE) == SOURCE_SENSOR and "wind_gust_sensor" not in user_input:
-            #     reload_needed = True
-
-            # Also if Source is WEATHER but sensor key IS present (switched back?), we might want to reload to hide it?
-            # Standard HA form usually submits all visible fields. If field was visible, it's in input.
-            # If we switch to Weather, next reload hides it.
-            # BUT: If we switch to Weather, we can also just Proceed if valid.
+            # Reload to hide required sensor field when switching TO SOURCE_WEATHER.
+            # Without this reload the field remains visible and vol.Required blocks submission.
+            if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_WEATHER and "outdoor_temp_sensor" in user_input:
+                reload_needed = True
+            if user_input.get(CONF_WIND_SOURCE) == SOURCE_WEATHER and "wind_speed_sensor" in user_input:
+                reload_needed = True
 
             if not reload_needed:
                 # Validate input
@@ -304,13 +312,12 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 if validation_errors:
                     errors.update(validation_errors)
                 else:
-                    # Explicitly set optional sensors to None if not used (Source = Weather)
-                    if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_WEATHER:
-                        user_input["outdoor_temp_sensor"] = None
-                    if user_input.get(CONF_WIND_SOURCE) == SOURCE_WEATHER:
-                        user_input["wind_speed_sensor"] = None
-                    if user_input.get(CONF_WIND_GUST_SOURCE) == SOURCE_WEATHER:
-                        user_input["wind_gust_sensor"] = None
+                    # Remove sensor keys that are not in use rather than storing None.
+                    # Storing None causes EntitySelector to display "Entity None is not a valid
+                    # entity ID" on the next reconfigure when the source is switched back.
+                    for key in ["outdoor_temp_sensor", "wind_speed_sensor", "wind_gust_sensor"]:
+                        if not user_input.get(key):
+                            user_input.pop(key, None)
 
                     # Check unit selected
                     unit = user_input.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
@@ -359,19 +366,17 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
              # If user switched Source to Sensor, but didn't provide sensor (because it was hidden), we must reload.
 
              reload_needed = False
+             # Reload to show required sensor field when switching TO SOURCE_SENSOR
              if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_SENSOR and "outdoor_temp_sensor" not in user_input:
                  reload_needed = True
              if user_input.get(CONF_WIND_SOURCE) == SOURCE_SENSOR and "wind_speed_sensor" not in user_input:
                  reload_needed = True
-             # Gust is optional - no reload needed if missing
-             # if user_input.get(CONF_WIND_GUST_SOURCE) == SOURCE_SENSOR and "wind_gust_sensor" not in user_input:
-             #     reload_needed = True
-
-             # Also reload if switching TO Weather, to hide the fields cleanly?
-             # User expectation: "Disappearing would suffice".
-             # If I select Weather and click submit, and it just saves -> That's fine.
-             # If I select Weather and click submit, and it reloads -> That's weird.
-             # So ONLY reload if we are MISSING required data for the chosen mode.
+             # Reload to hide required sensor field when switching TO SOURCE_WEATHER.
+             # Without this reload the field remains visible and vol.Required blocks submission.
+             if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_WEATHER and "outdoor_temp_sensor" in user_input:
+                 reload_needed = True
+             if user_input.get(CONF_WIND_SOURCE) == SOURCE_WEATHER and "wind_speed_sensor" in user_input:
+                 reload_needed = True
 
              if not reload_needed:
                 # Validate input
@@ -395,14 +400,6 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             # The reload below will then load this fresh data.
                             await coordinator.async_migrate_aux_coefficients(new_aux_list)
 
-                    # Clean up unused sensors
-                    if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_WEATHER:
-                        user_input["outdoor_temp_sensor"] = None
-                    if user_input.get(CONF_WIND_SOURCE) == SOURCE_WEATHER:
-                        user_input["wind_speed_sensor"] = None
-                    if user_input.get(CONF_WIND_GUST_SOURCE) == SOURCE_WEATHER:
-                        user_input["wind_gust_sensor"] = None
-
                     # Determine which unit was chosen in THIS form submission
                     # (user_input has priority)
                     new_unit = user_input.get(CONF_WIND_UNIT, default_data.get(CONF_WIND_UNIT))
@@ -416,8 +413,24 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     if "learning_rate" in user_input:
                         user_input["learning_rate"] = user_input["learning_rate"] / 100.0
 
+                    # Build merged data, then remove all optional entity keys that are
+                    # absent or falsy. Two failure modes that affect ALL entity selectors:
+                    # 1. Voluptuous drops Optional+None key entirely → key absent from
+                    #    user_input but old value lingers in entry.data after merge.
+                    # 2. HA/frontend sends None → merge stores falsy value → EntitySelector
+                    #    displays "None" as invalid entity ID on next reconfigure.
+                    new_data = {**entry.data, **user_input}
+                    for _key in [
+                        "outdoor_temp_sensor",
+                        "wind_speed_sensor",
+                        "wind_gust_sensor",
+                        CONF_SECONDARY_WEATHER_ENTITY,
+                    ]:
+                        if _key not in user_input or not user_input.get(_key):
+                            new_data.pop(_key, None)
+
                     return self.async_update_reload_and_abort(
-                        entry, data={**entry.data, **user_input}
+                        entry, data=new_data
                     )
 
         # Generate Schema

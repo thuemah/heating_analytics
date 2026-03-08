@@ -15,6 +15,7 @@ from .const import (
     MODE_OFF,
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
+    MODE_DHW,
     CONF_HAS_AC_UNITS,
 )
 from .coordinator import HeatingDataCoordinator
@@ -65,6 +66,7 @@ class HeatingAnalyticsModeSelect(CoordinatorEntity, SelectEntity):
 
         self._attr_options = [
             MODE_HEATING,
+            MODE_DHW,
             MODE_COOLING,
             MODE_OFF,
             MODE_GUEST_HEATING,

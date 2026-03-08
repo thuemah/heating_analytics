@@ -1,0 +1,114 @@
+blueprint:
+  name: Heating Analytics - Heat Pump Mode Sync
+  description: >
+    Synchronizes a heat pump's operation mode sensor to a Heating Analytics
+    mode select helper. Handles Heating, DHW, and Defrost states.
+
+    Defrost is intentionally transparent: the mode helper retains its previous
+    state (heating or dhw) so that defrost energy is attributed to the active
+    cycle rather than creating a separate mode transition. 
+    
+    This automation will also sync the state automatically on Home Assistant 
+    start or when manually triggered.
+
+  domain: automation
+
+  source_url: https://github.com/thuemah/heating_analytics/blob/main/blueprints/heat_pump_mode_sync.yaml
+
+  input:
+    operation_mode_sensor:
+      name: Operation Mode Sensor
+      description: >
+        The sensor reporting the heat pump's current operation mode
+        (e.g. "Heating", "Domestic Hot Water", "Defrost").
+      selector:
+        entity:
+          domain: sensor
+
+    mode_helper:
+      name: Mode Helper Entity
+      description: The Heating Analytics select helper to update.
+      selector:
+        entity:
+          domain: select
+
+    heating_mode_value:
+      name: Heating Mode Value
+      description: >
+        The sensor state string that represents space heating.
+      default: "Heating"
+      selector:
+        text:
+
+    dhw_mode_value:
+      name: DHW Mode Value
+      description: >
+        The sensor state string that represents domestic hot water production.
+      default: "Domestic Hot Water"
+      selector:
+        text:
+
+    defrost_mode_value:
+      name: Defrost Mode Value
+      description: >
+        The sensor state string that represents defrost. No mode transition
+        will be triggered — the previous heating or DHW mode is preserved.
+      default: "Defrost"
+      selector:
+        text:
+
+# Queued to handle rapid cycling gracefully (e.g. defrost followed immediately by heating)
+mode: queued
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: !input operation_mode_sensor
+  - platform: homeassistant
+    event: start
+
+variables:
+  _sensor: !input operation_mode_sensor
+  _heating_val: !input heating_mode_value
+  _dhw_val: !input dhw_mode_value
+  _defrost_val: !input defrost_mode_value
+  # Evaluates the actual state rather than relying on the trigger object
+  _new_state: "{{ states(_sensor) }}"
+
+action:
+  - choose:
+      # Space heating
+      - conditions:
+          - "{{ _new_state == _heating_val }}"
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input mode_helper
+            data:
+              option: "heating"
+
+      # Domestic hot water
+      - conditions:
+          - "{{ _new_state == _dhw_val }}"
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input mode_helper
+            data:
+              option: "dhw"
+
+      # Defrost: intentionally no action — previous mode is preserved
+      - conditions:
+          - "{{ _new_state == _defrost_val }}"
+        sequence: []
+
+    # Default: treat unknown states (idle, standby, etc.) as DHW so the
+    # per-unit space-heating model learns zero contribution rather than
+    # skipping the update entirely. MODE_OFF is reserved for units that
+    # are deliberately disabled by the user.
+    default:
+      - service: select.select_option
+        target:
+          entity_id: !input mode_helper
+        data:
+          option: "dhw"

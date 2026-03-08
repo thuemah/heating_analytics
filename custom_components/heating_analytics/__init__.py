@@ -72,13 +72,17 @@ SERVICE_SCHEMA_EXPORT = vol.Schema({
     vol.Required("export_type", default="daily"): vol.In(["daily", "hourly"]),
 })
 
-SERVICE_SCHEMA_RESET = vol.Schema({})
+SERVICE_SCHEMA_RESET = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+})
 
 SERVICE_SCHEMA_RESET_UNIT = vol.Schema({
     vol.Required("entity_id"): cv.entity_id,
 })
 
-SERVICE_SCHEMA_RESET_ACCURACY = vol.Schema({})
+SERVICE_SCHEMA_RESET_ACCURACY = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+})
 
 SERVICE_SCHEMA_RESET_SOLAR = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
@@ -111,6 +115,25 @@ def _get_coordinators(hass: HomeAssistant) -> list[HeatingDataCoordinator]:
         for coord in hass.data.get(DOMAIN, {}).values()
         if isinstance(coord, HeatingDataCoordinator)
     ]
+
+def _get_target_coordinator(
+    hass: HomeAssistant, entity_id: str | None
+) -> HeatingDataCoordinator:
+    """Return the coordinator for entity_id, or the first available one.
+
+    Raises ValueError when no coordinator is found.
+    """
+    if entity_id:
+        registry = er.async_get(hass)
+        entry = registry.async_get(entity_id)
+        if entry and entry.config_entry_id:
+            coord = hass.data[DOMAIN].get(entry.config_entry_id)
+            if coord:
+                return coord
+    coordinators = _get_coordinators(hass)
+    if coordinators:
+        return coordinators[0]
+    raise ValueError("No Heating Analytics instance found.")
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Heating Analytics from a config entry."""
@@ -177,10 +200,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register Reset Service
     async def handle_reset_learning(call: ServiceCall):
         """Handle the reset learning data service call."""
-        _LOGGER.info("Service called to reset learning data.")
-
-        for coord in _get_coordinators(hass):
-            await coord.async_reset_learning_data()
+        entity_id = call.data.get("entity_id")
+        coord = _get_target_coordinator(hass, entity_id)
+        _LOGGER.info("Service called to reset learning data (coordinator: %s).", coord.entry.entry_id)
+        await coord.async_reset_learning_data()
 
     hass.services.async_register(
         DOMAIN,
@@ -208,10 +231,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register Reset Forecast Accuracy Service
     async def handle_reset_forecast_accuracy(call: ServiceCall):
         """Handle the reset forecast accuracy service call."""
-        _LOGGER.info("Service called to reset forecast accuracy history.")
-
-        for coord in _get_coordinators(hass):
-            await coord.async_reset_forecast_accuracy()
+        entity_id = call.data.get("entity_id")
+        coord = _get_target_coordinator(hass, entity_id)
+        _LOGGER.info("Service called to reset forecast accuracy (coordinator: %s).", coord.entry.entry_id)
+        await coord.async_reset_forecast_accuracy()
 
     hass.services.async_register(
         DOMAIN,
@@ -338,25 +361,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entity_id = call.data.get("entity_id")
         days = call.data.get("days", 60)
 
-        target_coordinator = None
-
-        if entity_id:
-            registry = er.async_get(hass)
-            entry = registry.async_get(entity_id)
-            if entry and entry.config_entry_id:
-                target_coordinator = hass.data[DOMAIN].get(entry.config_entry_id)
-
-        if not target_coordinator:
-            # Default to first available
-            coordinators = _get_coordinators(hass)
-            if coordinators:
-                target_coordinator = coordinators[0]
-
-        if not target_coordinator:
-            raise ValueError("No Heating Analytics instance found.")
-
-        _LOGGER.debug(f"Handling calibrate_wind_thresholds for {days} days (Coordinator: {target_coordinator.entry.entry_id})")
-
+        target_coordinator = _get_target_coordinator(hass, entity_id)
+        _LOGGER.debug("Handling calibrate_wind_thresholds for %d days (coordinator: %s)", days, target_coordinator.entry.entry_id)
         result = target_coordinator.statistics.calibrate_wind_thresholds(days=days)
         return result
 
@@ -378,25 +384,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         test_delta_t_scaling = call.data.get("test_delta_t_scaling", False)
         test_exponential_kernel = call.data.get("test_exponential_kernel", False)
 
-        target_coordinator = None
-
-        if entity_id:
-            registry = er.async_get(hass)
-            entry = registry.async_get(entity_id)
-            if entry and entry.config_entry_id:
-                target_coordinator = hass.data[DOMAIN].get(entry.config_entry_id)
-
-        if not target_coordinator:
-            # Default to first available
-            coordinators = _get_coordinators(hass)
-            if coordinators:
-                target_coordinator = coordinators[0]
-
-        if not target_coordinator:
-             raise ValueError("No Heating Analytics instance found.")
-
-        _LOGGER.debug(f"Handling calibrate_inertia for {days} days (Coordinator: {target_coordinator.entry.entry_id})")
-
+        target_coordinator = _get_target_coordinator(hass, entity_id)
+        _LOGGER.debug("Handling calibrate_inertia for %d days (coordinator: %s)", days, target_coordinator.entry.entry_id)
         result = target_coordinator.statistics.calibrate_inertia(days=days, centered_energy_average=centered, test_asymmetric=test_asymmetric, test_delta_t_scaling=test_delta_t_scaling, test_exponential_kernel=test_exponential_kernel)
         return result
 
@@ -414,24 +403,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entity_id = call.data.get("entity_id")
         days = call.data.get("days", 1)
 
-        target_coordinator = None
-
-        if entity_id:
-            registry = er.async_get(hass)
-            entry = registry.async_get(entity_id)
-            if entry and entry.config_entry_id:
-                target_coordinator = hass.data[DOMAIN].get(entry.config_entry_id)
-
-        if not target_coordinator:
-            # Default to first available
-            coordinators = _get_coordinators(hass)
-            if coordinators:
-                target_coordinator = coordinators[0]
-
-        if not target_coordinator:
-             raise ValueError("No Heating Analytics instance found.")
-
-        _LOGGER.debug(f"Handling get_forecast for {days} days (Coordinator: {target_coordinator.entry.entry_id})")
+        target_coordinator = _get_target_coordinator(hass, entity_id)
+        _LOGGER.debug("Handling get_forecast for %d days (coordinator: %s)", days, target_coordinator.entry.entry_id)
 
         now = dt_util.now()
         start_time = now

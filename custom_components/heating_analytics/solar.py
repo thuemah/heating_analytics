@@ -17,6 +17,7 @@ except ImportError:
 from .const import (
     DEFAULT_SOLAR_COEFF_HEATING,
     DEFAULT_SOLAR_COEFF_COOLING,
+    DEFAULT_SOLAR_MIN_TRANSMITTANCE,
     ENERGY_GUARD_THRESHOLD,
     MODE_HEATING,
     MODE_COOLING,
@@ -125,10 +126,31 @@ class SolarCalculator:
 
         return solar_south, solar_east
 
+    @staticmethod
+    def _screen_transmittance(correction_percent: float) -> float:
+        """Map screen open-percentage to effective transmittance fraction.
+
+        Applies a physically-motivated floor (DEFAULT_SOLAR_MIN_TRANSMITTANCE)
+        so that a fully-closed screen (correction_percent = 0) still passes a
+        baseline of solar energy through:
+
+            effective = MIN + (1 - MIN) * (correction_percent / 100)
+
+        At 0 %:   effective = MIN   (~screen G-value + unmonitored windows)
+        At 100 %: effective = 1.0   (fully open, unchanged behaviour)
+
+        The floor keeps the effective solar vector non-zero even when all
+        screens are down, which prevents solar-coefficient learning from
+        stalling (vector_magnitude guard in _learn_unit_solar_coefficient)
+        and stops the base thermal model from absorbing residual solar gain.
+        """
+        mn = DEFAULT_SOLAR_MIN_TRANSMITTANCE
+        return mn + (1.0 - mn) * (correction_percent / 100.0)
+
     def calculate_effective_solar_vector(self, potential_solar_vector: tuple[float, float], correction_percent: float) -> tuple[float, float]:
         """Calculate effective solar vector after applying screens/correction."""
         s, e = potential_solar_vector
-        factor = correction_percent / 100.0
+        factor = self._screen_transmittance(correction_percent)
         return s * factor, e * factor
 
     def calculate_effective_solar_factor(self, potential_solar_factor: float, correction_percent: float) -> float:
@@ -143,7 +165,7 @@ class SolarCalculator:
         Returns:
             The effective solar factor used for impact calculations.
         """
-        return potential_solar_factor * (correction_percent / 100.0)
+        return potential_solar_factor * self._screen_transmittance(correction_percent)
 
     def calculate_unit_solar_impact(self, global_solar_vector: tuple[float, float], unit_coeff: dict[str, float]) -> float:
         """Calculate solar impact in kW for a specific unit using its learned 2D coefficient vector.

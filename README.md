@@ -198,6 +198,24 @@ To prevent this, the system enters a **Cooldown State** automatically when Auxil
 - **Exit Condition:** The system monitors real-time consumption. Once the affected units' usage returns to expected levels (convergence), the lock is released.
 - **Benefit:** Ensures your "Normal Heating Model" remains pure and unpolluted by residual heat from the fireplace.
 
+### Air-to-Water Heat Pump Support (DHW Mode)
+
+Air-to-water heat pumps regularly switch to producing domestic hot water (DHW). During this cycle the pump runs at full power but delivers zero heat to the space — the building cools slightly, and the next space-heating phase must make up for the gap.
+
+Without explicit DHW tracking, the learning model sees inflated consumption during heating phases and attributes it to the base coefficient, causing the predicted baseline to drift upward. The effect scales with your DHW duty cycle: a system spending 25% of its time in DHW will drift approximately +33%; a high-demand household at 33% DHW will drift +50%.
+
+**Fix:** Set your heat pump unit to `DHW` mode in the Heating Analytics mode selector whenever the pump is in DHW cycle. The model then correctly observes zero space-heat contribution during those hours, and the base coefficient converges to the true value without drift.
+
+#### Automatic Mode Mapping with Blueprints
+
+The repository includes ready-made blueprints that automate the mode transitions — no manual helper management needed:
+
+- **`blueprints/heat_pump_mode_sync.yaml`** — For heat pumps exposing an operation mode sensor (e.g. `"Heating"` / `"Domestic Hot Water"` / `"Defrost"`). Import this blueprint, select your mode sensor and mode helper, and all transitions are handled automatically. Defrost is transparent: the previous heating or DHW mode is preserved so defrost energy is attributed correctly rather than creating a spurious mode flip.
+
+- **`blueprints/climate_sync.yaml`** — For units exposed as standard HA climate entities (`heat` / `cool` / `off`). Optionally enable the guest mode prefix to track occupancy spikes separately from the main model.
+
+Import via: **Settings → Automations & Scenes → Blueprints → Import Blueprint**, and paste the raw GitHub URL.
+
 ### Smart Solar Tracking & Recommendations (Kelvin Twist)
 
 The system employs a sophisticated 3-zone geometric model ("The Kelvin Twist") to distinguish between direct sunlight, glancing angles, and shadow.

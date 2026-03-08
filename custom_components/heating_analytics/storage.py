@@ -36,7 +36,12 @@ class StorageManager:
     def __init__(self, coordinator) -> None:
         """Initialize with reference to coordinator."""
         self.coordinator = coordinator
-        self._store = Store(coordinator.hass, STORAGE_VERSION, STORAGE_KEY)
+        # Per-instance storage key avoids data collision when multiple Heating Analytics
+        # instances are configured on the same HA installation.
+        _instance_key = f"{STORAGE_KEY}_{coordinator.entry.entry_id}"
+        self._store = Store(coordinator.hass, STORAGE_VERSION, _instance_key)
+        # Legacy store used once for migration from the old shared key (< 1.2.5).
+        self._legacy_store = Store(coordinator.hass, STORAGE_VERSION, STORAGE_KEY)
         self._last_save_time = None
         self._save_debounce_seconds = 60
         self._save_lock = asyncio.Lock()
@@ -55,6 +60,31 @@ class StorageManager:
         """Load data from storage."""
         try:
             data = await self._store.async_load()
+            if not data:
+                # One-time migration from the legacy shared storage key used before 1.2.5.
+                # Guard: only migrate if the stored daily_history contains at least one sensor
+                # that is also configured for this instance. A mismatch means the old file
+                # belongs to a different instance — start fresh instead of importing foreign data.
+                legacy_data = await self._legacy_store.async_load()
+                if legacy_data:
+                    stored_sensors = set(legacy_data.get("daily_history", {}).keys())
+                    instance_sensors = set(self.coordinator.energy_sensors or [])
+                    if not stored_sensors or stored_sensors & instance_sensors:
+                        _LOGGER.info(
+                            "Heating Analytics: migrating data from shared storage key to "
+                            "per-instance key for entry %s. This happens once.",
+                            self.coordinator.entry.entry_id,
+                        )
+                        await self._store.async_save(legacy_data)
+                        data = legacy_data
+                    else:
+                        _LOGGER.info(
+                            "Heating Analytics: legacy storage belongs to a different instance "
+                            "(sensors %s not in %s) — starting fresh for entry %s.",
+                            instance_sensors,
+                            stored_sensors,
+                            self.coordinator.entry.entry_id,
+                        )
             if not data:
                 _LOGGER.warning("No data loaded from storage. Starting with fresh state.")
                 # Notify user if storage was corrupt (HA moves to .corrupt file)
