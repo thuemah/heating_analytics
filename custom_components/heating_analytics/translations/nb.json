@@ -9,11 +9,31 @@
         "step": {
             "user": {
                 "title": "Oppsett av Heating Analytics",
-                "description": "Konfigurer oppvarmingsanalyse. Du kan bruke spesifikke sensorer eller falle tilbake på en værintegrasjon."
+                "description": "Konfigurer oppvarmingsanalyse. Du kan bruke spesifikke sensorer eller falle tilbake på en værintegrasjon.",
+                "data": {
+                    "daily_learning_mode": "Daglig læringsmodus",
+                    "indoor_temp_sensor": "Innetemperatursensor",
+                    "thermal_mass_kwh_per_degree": "Termisk masse-faktor (kWh/°C)"
+                },
+                "data_description": {
+                    "daily_learning_mode": "Når aktivert, lærer modellen én gang per dag ved midnatt (Track B) i stedet for hver time (Track A). Anbefales for boliger med høy termisk masse eller varmepumper med høy minimumsmodulering. Track A deaktiveres fullstendig når dette er aktivt.",
+                    "indoor_temp_sensor": "Valgfri. Gir innetemperaturen ved midnatt for termisk massekorreksjon. Brukeren er selv ansvarlig for at sensoren reflekterer faktisk temperatur ved midnatt. La stå tom for å deaktivere korreksjon.",
+                    "thermal_mass_kwh_per_degree": "Termisk massekorreksjon (kWh/°C). Kompenserer for varme lagret i bygningsmassen ved endring i innetemperatur. Tommelfingerregel: (Areal_m² × 35) / 1000 / antatt_COP. Eksempel: 250m² hus med COP 3 = ~2.9 kWh/°C. Sett til 0.0 for å deaktivere."
+                }
             },
             "reconfigure": {
                 "title": "Rekonfigurer Heating Analytics",
-                "description": "Oppdater din konfigurasjon."
+                "description": "Oppdater din konfigurasjon.",
+                "data": {
+                    "daily_learning_mode": "Daglig læringsmodus",
+                    "indoor_temp_sensor": "Innetemperatursensor",
+                    "thermal_mass_kwh_per_degree": "Termisk masse-faktor (kWh/°C)"
+                },
+                "data_description": {
+                    "daily_learning_mode": "Når aktivert, lærer modellen én gang per dag ved midnatt (Track B) i stedet for hver time (Track A). Anbefales for boliger med høy termisk masse eller varmepumper med høy minimumsmodulering. Track A deaktiveres fullstendig når dette er aktivt.",
+                    "indoor_temp_sensor": "Valgfri. Gir innetemperaturen ved midnatt for termisk massekorreksjon. Brukeren er selv ansvarlig for at sensoren reflekterer faktisk temperatur ved midnatt. La stå tom for å deaktivere korreksjon.",
+                    "thermal_mass_kwh_per_degree": "Termisk massekorreksjon (kWh/°C). Kompenserer for varme lagret i bygningsmassen ved endring i innetemperatur. Tommelfingerregel: (Areal_m² × 35) / 1000 / antatt_COP. Eksempel: 250m² hus med COP 3 = ~2.9 kWh/°C. Sett til 0.0 for å deaktivere."
+                }
             }
         },
         "abort": {

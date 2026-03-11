@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.7] - 2026-03-08
+
+### Added
+- **Daily Learning Mode (Track B).** A new optional config flag (`Daily Learning Mode`) switches the model from hourly learning (Track A) to a single nightly update at midnight. Designed for homes where hourly observations are unreliable: high thermal mass buildings (concrete, stone, passive house) and heat pumps with a high minimum modulation floor. When enabled, Track A is completely blocked from writing to the correlation table — Track B owns it exclusively. The daily bucket EMA uses the user's configured learning rate, consistent with Track A behaviour. Requires at least 22 of 24 hours to be present in the day log before any update is applied (raised from 20). An optional **Indoor Temperature Sensor** can be added to apply thermal mass correction before learning (`q_adjusted = daily_kWh − thermal_mass_factor × ΔT_indoor`); the sensor is not required — users who benefit from daily aggregation without load-shifting can leave it empty. A new **Daily Learning diagnostic sensor** (`heating_analytics_daily_learning`) is registered automatically when the mode is active, exposing the learned U-coefficient (kWh/TDD) as the state value and `last_midnight_indoor_temp`, `thermal_mass_kwh_per_degree`, `indoor_temp_sensor`, and `learning_rate` as attributes.
+
+### Fixed
+- DHW energy consumption is now fully excluded from heating totals. Previously, energy consumed during DHW cycles was still accumulating in _accumulated_energy_hour, _accumulated_energy_today, _hourly_delta_per_unit, and _daily_individual — even though the learning model correctly treated the heat contribution as zero. This resulted in inflated daily totals, incorrect thermodynamic variance, and skewed forecasts during DHW-heavy periods. The exclusion logic is now applied during the 2-minute accumulation tick (evaluating the state 30 times per hour), ensuring that mid-hour mode switches are tracked accurately. _last_energy_values continues to update independently of the current mode, guaranteeing a correct delta baseline when the unit switches back to heating.
+
 ## [1.2.6] - 2026-03-08
 
 ### Added

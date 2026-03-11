@@ -9,6 +9,8 @@ from homeassistant.util import dt as dt_util
 @pytest.fixture
 def mock_coordinator():
     coord = MagicMock(spec=HeatingDataCoordinator)
+    coord.entry = MagicMock()
+    coord.entry.entry_id = "test_entry"
     coord.hass = MagicMock()
     # Mock executor to run immediately
     async def async_add_executor_job(fn, *args, **kwargs):

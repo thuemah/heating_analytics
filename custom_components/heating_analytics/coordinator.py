@@ -103,6 +103,11 @@ from .const import (
     DEFAULT_FORECAST_CROSSOVER_DAY,
     CONF_THERMAL_INERTIA,
     DEFAULT_THERMAL_INERTIA_HOURS,
+    CONF_INDOOR_TEMP_SENSOR,
+    CONF_THERMAL_MASS,
+    DEFAULT_THERMAL_MASS,
+    DEFAULT_DAILY_LEARNING_RATE,
+    CONF_DAILY_LEARNING_MODE,
     SOURCE_SENSOR,
     SOURCE_WEATHER,
     MODE_HEATING,
@@ -219,6 +224,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self._last_hour_processed = None
         self._last_day_processed = None
         self._last_energy_values = {} # { entity_id: value_at_last_update }
+        self._learned_u_coefficient = None
+        self._last_midnight_indoor_temp = None
 
         # Hourly aggregates (replaces _hourly_samples for efficient persistence)
         self._hourly_wind_sum = 0.0
@@ -245,6 +252,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         # Configuration parameters
         self.outdoor_temp_sensor = entry.data.get("outdoor_temp_sensor")
+        self.indoor_temp_sensor = entry.data.get(CONF_INDOOR_TEMP_SENSOR)
+        self.thermal_mass_kwh_per_degree = entry.data.get(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS)
+        self.daily_learning_mode = entry.data.get(CONF_DAILY_LEARNING_MODE, False)
         self.wind_speed_sensor = entry.data.get("wind_speed_sensor")
         self.wind_gust_sensor = entry.data.get("wind_gust_sensor")
 
@@ -1766,20 +1776,26 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                         self._last_energy_values[entity_id] = val
                         continue
 
-                    hourly_delta += delta
+                    # DHW mode: energy goes to hot water tank, not space heating.
+                    # Exclude from all heating totals. _last_energy_values is still
+                    # updated below so the delta baseline is correct when mode switches back.
+                    if self.get_unit_mode(entity_id) == MODE_DHW:
+                        pass
+                    else:
+                        hourly_delta += delta
 
-                    if entity_id not in self._daily_individual:
-                        self._daily_individual[entity_id] = 0.0
-                    self._daily_individual[entity_id] += delta
+                        if entity_id not in self._daily_individual:
+                            self._daily_individual[entity_id] = 0.0
+                        self._daily_individual[entity_id] += delta
 
-                    if entity_id not in self._hourly_delta_per_unit:
-                        self._hourly_delta_per_unit[entity_id] = 0.0
-                    self._hourly_delta_per_unit[entity_id] += delta
+                        if entity_id not in self._hourly_delta_per_unit:
+                            self._hourly_delta_per_unit[entity_id] = 0.0
+                        self._hourly_delta_per_unit[entity_id] += delta
 
-                    if self.enable_lifetime_tracking:
-                        if entity_id not in self._lifetime_individual:
-                            self._lifetime_individual[entity_id] = 0.0
-                        self._lifetime_individual[entity_id] += delta
+                        if self.enable_lifetime_tracking:
+                            if entity_id not in self._lifetime_individual:
+                                self._lifetime_individual[entity_id] = 0.0
+                            self._lifetime_individual[entity_id] += delta
 
                 self._last_energy_values[entity_id] = val
 
@@ -2353,8 +2369,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if self._hourly_sample_count > 0:
             # Determine Learning Eligibility
             # Skip learning if Mixed Mode to avoid model corruption
+            # Skip entirely if Daily Learning Mode is active (Track B owns correlation_data)
             is_mixed_mode = (MIXED_MODE_LOW < aux_fraction < MIXED_MODE_HIGH)
-            should_learn = self.learning_enabled and not is_mixed_mode
+            should_learn = self.learning_enabled and not is_mixed_mode and not self.daily_learning_mode
 
             # Dual Interference Guard:
             # If both Solar and Aux are significant, we cannot reliably attribute deviation.
@@ -2801,6 +2818,54 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             }
 
         self._daily_history[key] = daily_stats
+
+        # Daily Learning Mode & Thermal Mass Correction
+        current_indoor_temp = None
+        if self.indoor_temp_sensor:
+            current_indoor_temp = self._get_float_state(self.indoor_temp_sensor)
+
+        q_adjusted = daily_stats["kwh"]
+        if self.thermal_mass_kwh_per_degree > 0.0 and current_indoor_temp is not None and self._last_midnight_indoor_temp is not None:
+            delta_t_indoor = current_indoor_temp - self._last_midnight_indoor_temp
+            q_adjusted = daily_stats["kwh"] - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
+            _LOGGER.debug(f"Daily Learning: Adjusted kWh from {daily_stats['kwh']:.2f} to {q_adjusted:.2f} based on indoor delta T {delta_t_indoor:.2f}°C")
+
+        if self.daily_learning_mode and self.learning_enabled and daily_stats["tdd"] >= 0.5 and q_adjusted > 0:
+            if len(day_logs) >= 22:
+                observed_u = q_adjusted / daily_stats["tdd"]
+                if self._learned_u_coefficient is None:
+                    self._learned_u_coefficient = observed_u
+                else:
+                    self._learned_u_coefficient = self._learned_u_coefficient + DEFAULT_DAILY_LEARNING_RATE * (observed_u - self._learned_u_coefficient)
+                _LOGGER.info(f"Daily Learning: Updated U-coefficient to {self._learned_u_coefficient:.4f} (Observed: {observed_u:.4f})")
+
+                # Daily Track B: Flattened Bucket Learning
+                q_hourly_avg = q_adjusted / 24.0
+                avg_temp = daily_stats["temp"]
+                daily_wind = daily_stats["wind"]
+                temp_key = str(int(round(avg_temp)))
+                wind_bucket = self._get_wind_bucket(daily_wind)
+
+                if temp_key not in self._correlation_data:
+                    self._correlation_data[temp_key] = {}
+                current_pred = self._correlation_data[temp_key].get(wind_bucket, 0.0)
+
+                if current_pred == 0.0:
+                    # Cold Start
+                    self._correlation_data[temp_key][wind_bucket] = round(q_hourly_avg, 5)
+                    _LOGGER.info(f"Daily Learning (Cold Start): T={temp_key} W={wind_bucket} -> {q_hourly_avg:.3f} kWh")
+                else:
+                    # EMA Update — uses user's global learning rate
+                    new_pred = current_pred + self.learning_rate * (q_hourly_avg - current_pred)
+                    self._correlation_data[temp_key][wind_bucket] = round(new_pred, 5)
+                    _LOGGER.info(f"Daily Learning (EMA): T={temp_key} W={wind_bucket} -> {new_pred:.3f} kWh (was {current_pred:.3f}, actual avg {q_hourly_avg:.3f})")
+            else:
+                _LOGGER.info(f"Daily Learning skipped: Incomplete day ({len(day_logs)}/24 hours)")
+
+        self.data["learned_u_coefficient"] = self._learned_u_coefficient
+
+        if current_indoor_temp is not None:
+            self._last_midnight_indoor_temp = current_indoor_temp
 
         # Forecast Accuracy Tracking
         # Kelvin Protocol: Skip accuracy evaluation if learning is disabled (e.g. Vacation).

@@ -79,6 +79,8 @@ from .const import (
     SENSOR_WEEK_AHEAD_FORECAST,
     SENSOR_PERIOD_COMPARISON,
     SENSOR_THERMAL_STATE,
+    SENSOR_DAILY_LEARNING,
+    CONF_DAILY_LEARNING_MODE,
 
     # Forecast Attributes
     ATTR_FORECAST_DETAILS,
@@ -178,6 +180,10 @@ async def async_setup_entry(
         HeatingAnalyticsComparisonSensor(coordinator, entry),
         HeatingThermalStateSensor(coordinator, entry),
     ]
+
+    # Add Daily Learning sensor only when Daily Learning Mode is enabled
+    if entry.data.get(CONF_DAILY_LEARNING_MODE, False):
+        entities.append(HeatingDailyLearningSensor(coordinator, entry))
 
     # Add individual device sensors
     for entity_id in coordinator.energy_sensors:
@@ -511,6 +517,7 @@ class HeatingEfficiencySensor(HeatingAnalyticsBaseSensor):
             "efficiency_last_7d_avg": self.coordinator.data.get(ATTR_EFFICIENCY_LAST_7D),
             "efficiency_last_30d_avg": self.coordinator.data.get(ATTR_EFFICIENCY_LAST_30D),
             "efficiency_forecast_today": self.coordinator.data.get(ATTR_EFFICIENCY_FORECAST_TODAY),
+            "learned_u_coefficient": self.coordinator.data.get("learned_u_coefficient"),
         }
 
 class HeatingPredictedSensor(HeatingAnalyticsBaseSensor):
@@ -1677,3 +1684,35 @@ class HeatingAnalyticsComparisonSensor(HeatingAnalyticsBaseSensor):
     def unique_id(self) -> str:
         """Return a unique ID."""
         return f"{self.entry.entry_id}_period_comparison"
+
+
+class HeatingDailyLearningSensor(HeatingAnalyticsBaseSensor):
+    """Diagnostic sensor exposing Daily Learning Mode state and the learned U-coefficient."""
+
+    _attr_name = SENSOR_DAILY_LEARNING
+    _attr_icon = "mdi:calendar-sync"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def native_value(self):
+        u = self.coordinator._learned_u_coefficient
+        if u is None:
+            return None
+        return round(u, 4)
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        return "kWh/TDD"
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            "last_midnight_indoor_temp": self.coordinator._last_midnight_indoor_temp,
+            "thermal_mass_kwh_per_degree": self.coordinator.thermal_mass_kwh_per_degree,
+            "indoor_temp_sensor": self.coordinator.indoor_temp_sensor,
+            "learning_rate": self.coordinator.learning_rate,
+        }
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self.entry.entry_id}_daily_learning"

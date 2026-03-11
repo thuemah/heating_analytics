@@ -48,6 +48,10 @@ from .const import (
     CONF_AUX_AFFECTED_ENTITIES,
     CONF_THERMAL_INERTIA,
     DEFAULT_THERMAL_INERTIA_HOURS,
+    CONF_INDOOR_TEMP_SENSOR,
+    CONF_THERMAL_MASS,
+    DEFAULT_THERMAL_MASS,
+    CONF_DAILY_LEARNING_MODE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -196,6 +200,20 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 selector.EntitySelectorConfig(domain="sensor", device_class="wind_speed")
             )
 
+        # Daily Learning Mode
+        schema[vol.Optional(CONF_DAILY_LEARNING_MODE, default=get_val(CONF_DAILY_LEARNING_MODE, False))] = selector.BooleanSelector()
+
+        # Indoor Temp (Optional, used for thermal mass correction in daily learning mode)
+        _indoor_temp_val = get_val(CONF_INDOOR_TEMP_SENSOR)
+        schema[vol.Optional(CONF_INDOOR_TEMP_SENSOR, **({'default': _indoor_temp_val} if _indoor_temp_val else {}))] = selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
+        )
+
+        # Thermal Mass
+        schema[vol.Required(CONF_THERMAL_MASS, default=get_val(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS))] = selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0.0, max=50.0, step=0.1, unit_of_measurement="kWh/°C")
+        )
+
         # Wind Gust
         gust_source = get_val(CONF_WIND_GUST_SOURCE, SOURCE_SENSOR)
         schema[vol.Required(CONF_WIND_GUST_SOURCE, default=gust_source)] = selector.SelectSelector(
@@ -315,7 +333,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     # Remove sensor keys that are not in use rather than storing None.
                     # Storing None causes EntitySelector to display "Entity None is not a valid
                     # entity ID" on the next reconfigure when the source is switched back.
-                    for key in ["outdoor_temp_sensor", "wind_speed_sensor", "wind_gust_sensor"]:
+                    for key in ["outdoor_temp_sensor", "wind_speed_sensor", "wind_gust_sensor", CONF_INDOOR_TEMP_SENSOR]:
                         if not user_input.get(key):
                             user_input.pop(key, None)
 
@@ -425,6 +443,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         "wind_speed_sensor",
                         "wind_gust_sensor",
                         CONF_SECONDARY_WEATHER_ENTITY,
+                        CONF_INDOOR_TEMP_SENSOR,
                     ]:
                         if _key not in user_input or not user_input.get(_key):
                             new_data.pop(_key, None)

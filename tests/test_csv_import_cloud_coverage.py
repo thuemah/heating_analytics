@@ -9,6 +9,8 @@ from custom_components.heating_analytics.coordinator import HeatingDataCoordinat
 @pytest.fixture
 def mock_coordinator():
     coord = MagicMock(spec=HeatingDataCoordinator)
+    coord.entry = MagicMock()
+    coord.entry.entry_id = "test_entry"
     coord.hass = MagicMock()
     coord.hass.async_add_executor_job = lambda fn: fn()
     coord.balance_point = 15.0

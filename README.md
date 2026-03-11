@@ -129,6 +129,7 @@ This is optional but highly recommended for maximum accuracy.
 ### Machine Learning That Just Works
 
 - **Automatic Learning:** No manual calibration needed—the system learns your home's thermal characteristics
+- **Daily Learning Mode (Track B):** An optional config flag for homes where hourly learning is unreliable — typically high thermal mass buildings (concrete, stone) or heat pumps with a high minimum modulation level. When enabled, Track A (hourly) is completely disabled and the model learns once per day at midnight instead, updating the correlation table from a full daily energy budget. The indoor temperature sensor is optional even with this mode; thermal mass correction is applied only when the sensor is configured.
 - **Regime-Aware Prediction:**
     - **Cold Regime:** Uses thermodynamic scaling for accurate extrapolation in deep winter.
     - **Mild Regime:** Prioritizes neighbor averaging and wind fallbacks for stability in variable transition seasons.
@@ -305,6 +306,24 @@ The learned heat demand curve (temperature vs kWh/day across wind conditions) is
 | **Wind Threshold** | 5.5 m/s | Threshold for 'High Wind' conditions. |
 | **Extreme Wind Threshold** | 10.8 m/s | Threshold for 'Extreme Wind' conditions. |
 | **Thermal Inertia** | Normal | Building thermal mass profile (Fast, Normal, Slow) |
+
+### Thermal Mass Correction
+
+When **Daily Learning Mode** is active and an **Indoor Temperature Sensor** is configured, the system applies **Thermal Mass Correction** to the daily energy budget before updating the model.
+
+If the indoor temperature rises over a day, some energy went into heating the building mass itself rather than escaping outside. Without correction, the model would underestimate the building's heat loss coefficient on warming days and overestimate it on cooling days. The correction removes this stored-heat component before learning:
+
+`q_adjusted = daily_kWh − (Thermal Mass Factor × ΔT_indoor)`
+
+**Indoor temperature sensor:** Optional. It is your responsibility to ensure this sensor reflects the actual indoor temperature at midnight (e.g., a centrally placed, non-draft-affected sensor). If the sensor is unavailable or not configured, daily learning still runs — thermal mass correction is simply skipped.
+
+**How to set the Thermal Mass Factor:**
+`(Area_m² × 35) / 1000 / avg_COP`
+
+- A typical 250m² house with a heat pump (COP ~3) ≈ `2.9 kWh/°C`
+- Lightweight construction (timber frame, thin walls): use a lower value.
+- Heavy construction (passive house, concrete, stone): use a higher value.
+- Set to `0.0` to disable correction entirely (equivalent to not having a sensor).
 
 ### Thermal Inertia Profiles
 

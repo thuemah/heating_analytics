@@ -6,6 +6,7 @@ DOMAIN = "heating_analytics"
 DEFAULT_NAME = "Heating Analytics"
 DEFAULT_WIND_GUST_FACTOR = 0.6
 DEFAULT_LEARNING_RATE = 0.01
+DEFAULT_DAILY_LEARNING_RATE = 0.005
 DEFAULT_BALANCE_POINT = 17.0
 DEFAULT_WIND_THRESHOLD = 5.5
 DEFAULT_EXTREME_WIND_THRESHOLD = 10.8
@@ -274,6 +275,7 @@ SENSOR_MODEL_COMPARISON_WEEK = "Model Comparison Week"
 SENSOR_MODEL_COMPARISON_MONTH = "Model Comparison Month"
 SENSOR_WEEK_AHEAD_FORECAST = "Week Ahead Forecast"
 SENSOR_PERIOD_COMPARISON = "Period Comparison"
+SENSOR_DAILY_LEARNING = "Daily Learning"
 
 ATTR_SOLAR_PREDICTED = "solar_predicted_kwh"
 ATTR_DAILY_FORECAST = "daily_forecast"
@@ -299,6 +301,10 @@ CONF_WIND_GUST_SOURCE = "wind_gust_source"
 CONF_SECONDARY_WEATHER_ENTITY = "secondary_weather_entity"
 CONF_FORECAST_CROSSOVER_DAY = "forecast_crossover_day"
 CONF_AUX_AFFECTED_ENTITIES = "aux_affected_entities"
+CONF_INDOOR_TEMP_SENSOR = "indoor_temp_sensor"
+CONF_THERMAL_MASS = "thermal_mass_kwh_per_degree"
+DEFAULT_THERMAL_MASS = 0.0
+CONF_DAILY_LEARNING_MODE = "daily_learning_mode"
 
 SOURCE_SENSOR = "sensor"
 SOURCE_WEATHER = "weather"

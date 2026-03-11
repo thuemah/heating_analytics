@@ -505,6 +505,10 @@ class StorageManager:
             if "temp_forecast_today" in data:
                 self.coordinator.data[ATTR_TEMP_FORECAST_TODAY] = data["temp_forecast_today"]
 
+            self.coordinator._learned_u_coefficient = data.get("learned_u_coefficient")
+            self.coordinator.data["learned_u_coefficient"] = self.coordinator._learned_u_coefficient
+            self.coordinator._last_midnight_indoor_temp = data.get("last_midnight_indoor_temp")
+
             # Load cached forecast (Restore to Long Term Cache immediately)
             cached_daily_raw = data.get("cached_daily_forecast")
             cached_long_term_daily = data.get("cached_long_term_daily")
@@ -780,6 +784,8 @@ class StorageManager:
                     "last_energy_values": self.coordinator._last_energy_values,
                     "last_save_date": dt_util.now().date().isoformat(),
                     "last_updated": dt_util.now().isoformat(),
+                    "learned_u_coefficient": self.coordinator._learned_u_coefficient,
+                    "last_midnight_indoor_temp": self.coordinator._last_midnight_indoor_temp,
                     "tdd_accumulated": self.coordinator.data.get(ATTR_TDD, 0.0),
                     "forecast_today": self.coordinator.data.get(ATTR_FORECAST_TODAY, 0.0),
                     "predicted_kwh": self.coordinator.data.get(ATTR_PREDICTED, 0.0),
@@ -958,6 +964,10 @@ class StorageManager:
             self.coordinator.data[ATTR_FORECAST_TODAY] = data.get("forecast_today", 0.0)
             self.coordinator.data[ATTR_TDD_DAILY_STABLE] = data.get("tdd_daily_stable", data.get("hdd_daily_stable", 0.0))
             self.coordinator.data[ATTR_TEMP_FORECAST_TODAY] = data.get("temp_forecast_today")
+
+            self.coordinator._learned_u_coefficient = data.get("learned_u_coefficient")
+            self.coordinator.data["learned_u_coefficient"] = self.coordinator._learned_u_coefficient
+            self.coordinator._last_midnight_indoor_temp = data.get("last_midnight_indoor_temp")
 
             self.coordinator.forecast._cached_long_term_hourly = data.get("cached_long_term_hourly")
             self.coordinator.forecast._cached_long_term_daily = data.get("cached_long_term_daily")

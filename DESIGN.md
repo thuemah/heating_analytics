@@ -167,7 +167,53 @@ To prevent dangerous under-estimation during storms (where data might be sparse)
 *   **Direct Fallback:** If *Extreme* data is missing, it looks down to *High*, then *Normal*.
 *   **Extrapolation:** When extrapolating from a neighbor temperature (thermodynamic scaling), the system uses the best available wind bucket for that neighbor, prioritizing the requested bucket but accepting *harsher* conditions if necessary to avoid returning zero.
 
-### G. Thermodynamic Reconstruction
+### G. Thermal Mass Correction
+The daily energy consumption sent to the `LearningManager` is not always a pure reflection of heat loss — some energy may have been used to heat the building mass itself, or the mass may have released stored heat. Without correcting for this, the U-model would learn incorrectly on days with indoor temperature fluctuations.
+
+To solve this, the system calculates a correction once per day before the U-update:
+
+`delta_kwh = thermal_mass_kwh_per_degree * (T_indoor_end - T_indoor_start)`
+`adjusted_consumption = measured_consumption - delta_kwh`
+
+- **Rising Indoor Temp:** Heat was bound in the mass. We add it back to the consumption.
+- **Falling Indoor Temp:** Mass provided "free" heat. We subtract it.
+
+The user configures `thermal_mass_kwh_per_degree` (electric kWh/°C) using a rule of thumb based on area and an assumed average COP. Because we only have raw electrical kWh and no dynamic COP curve, a fixed factor is the most pragmatic solution. The error is non-systematic (some days over, some under) and averages out in the long-term U-estimate. Setting this to `0.0` disables the correction.
+
+### H. Daily Learning Mode
+
+The primary learning system (Track A) updates the detailed `temp_key × wind_bucket` correlation table every hour. However, hourly learning is unsuitable for some homes:
+
+- **High thermal mass:** Concrete/stone buildings store heat across many hours. An hourly observation window captures too much lag noise for reliable learning.
+- **High minimum modulation:** Heat pumps with a high floor on output power cycle on and off at the minimum rate, making any single hour an unreliable sample.
+
+For these cases, the user can enable **Daily Learning Mode** (`daily_learning_mode = True` in config) to activate **Track B** as the exclusive update path.
+
+**When active:**
+- Track A is completely blocked from writing to `_correlation_data`. Track B owns the correlation table exclusively.
+- Learning fires once per day at midnight, after `_process_daily_data()` has assembled the full day's statistics.
+- The completeness guard requires at least **22 of 24 hours** to be present in the day log before any update is applied.
+
+**Inputs:**
+1. Total measured consumption for the day (`daily_stats["kwh"]`)
+2. Total TDD for the day (`daily_stats["tdd"]`)
+3. ΔT_indoor (T_indoor at midnight − T_indoor at the previous midnight) — **optional**, only applied when `indoor_temp_sensor` is configured and the readings are available at both midnight boundaries.
+
+**Process:**
+If the indoor temperature correction is active, measured consumption is adjusted before use:
+`q_adjusted = daily_kwh − (thermal_mass_kWh_per_°C × ΔT_indoor)`
+
+The system then calculates an observed average hourly consumption and writes it into the bucket for the day's (temp, wind) pair using the same EMA formula as Track A, at the user's configured `learning_rate`:
+- Cold start: `bucket = q_adjusted / 24`
+- Subsequent: `bucket = bucket + learning_rate × (q_adjusted/24 − bucket)`
+
+In parallel, a single global **U-Coefficient** (kWh_el / TDD / day) is updated via EMA at `DEFAULT_DAILY_LEARNING_RATE` (a lower, fixed rate) for long-term drift tracking. This value is exposed by the **Daily Learning diagnostic sensor** (`heating_analytics_daily_learning`) together with `last_midnight_indoor_temp`, `thermal_mass_kwh_per_degree`, `indoor_temp_sensor`, and `learning_rate` as attributes.
+
+**Purity Guards:** Days with Guest Mode, mixed-mode auxiliary usage (20–80%), or active Cooldown are excluded from Track B learning, identical to Track A's guards.
+
+**Indoor temperature sensor:** The sensor is always optional, even in Daily Learning Mode. Users who do not load-shift but still benefit from daily aggregation (due to high thermal mass or minimum modulation) can enable the mode without providing an indoor sensor — thermal mass correction is simply skipped.
+
+### I. Thermodynamic Reconstruction
 When reconstructing historical data (e.g., for model comparison), the system prioritizes **Hourly Vectors** (see Section 5). If vectors are missing (legacy data), it performs **Thermodynamic Reconstruction**:
 
 *   It recovers the **Effective Temperature** from the stored TDD value.
