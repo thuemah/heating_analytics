@@ -192,7 +192,8 @@ For these cases, the user can enable **Daily Learning Mode** (`daily_learning_mo
 **When active:**
 - Track A is completely blocked from writing to `_correlation_data`. Track B owns the correlation table exclusively.
 - Learning fires once per day at midnight, after `_process_daily_data()` has assembled the full day's statistics.
-- The completeness guard requires at least **22 of 24 hours** to be present in the day log before any update is applied.
+- **Completeness Guard:** Requires at least **22 of 24 hours** to be present in the day log before any update is applied (raised from 20 in v1.2.7).
+- **Diagnostic Output:** A dedicated sensor (`heating_analytics_daily_learning`) exposes the learned U-Coefficient (kWh/TDD/day) as its state. This allows for long-term tracking of the building's overall thermal health independent of specific temperature buckets.
 
 **Inputs:**
 1. Total measured consumption for the day (`daily_stats["kwh"]`)
@@ -363,6 +364,8 @@ If DHW hours are simply skipped (no model update), the EMA converges to `obs_act
 
 Setting a unit to `MODE_DHW` causes the model to update with `actual = 0` during DHW hours — the physically correct observation (zero space-heat contribution). The EMA converges to `TRUE_B` at all learning rates. No drift.
 
+**Sampling Precision:** Starting in v1.2.7, the exclusion logic is applied during a 2-minute accumulation tick (evaluating the state 30 times per hour). This ensures that mid-hour mode switches (e.g., a 10-minute shower at 14:45) are tracked with high temporal resolution, preventing DHW energy from bleeding into the hourly heating total.
+
 #### Oscillation Amplitude and Learning Rate
 
 Strategy B eliminates mean drift but introduces a within-cycle oscillation: the coefficient is pulled toward `obs_active` during heating and toward 0 during DHW. The amplitude grows with learning rate. Analytically simulated steady-state amplitudes (half peak-to-peak as % of TRUE_B, stability criterion ≤ ±10%):
@@ -458,6 +461,14 @@ These principles guide all development on this integration:
     *   No hard logic jumps based on time of day.
 3.  **Fail-Forward:** If a sensor fails, the system falls back to the best available estimate (e.g., Reference Forecast -> Semantic Average -> 0), rather than crashing.
 4.  **Metric-Driven Development:** Optimization tasks are prioritized by `Value = (Impact × Urgency) / Effort`.
+
+### A. The Feed-Forward Mandate (Analytics vs. Control)
+
+Heating Analytics is strictly a **Feed-Forward Analysis Engine**. It is architecturally prohibited from performing direct closed-loop control (e.g., writing setpoints or triggering relays).
+
+- **Reason 1 — Feedback Loop Corruption:** If the model controls the heating that produces the data it learns from, the training signal becomes a function of the model's own decisions. This leads to *Model Drift*, where the system learns its own behaviour rather than the building's thermodynamics.
+- **Reason 2 — Subjective Comfort:** Control requires subjective trade-offs between cost and comfort. This integration provides the Ground Truth (the physics), allowing the user to build their own "Moral" layer (automations) on top of it.
+- **Implementation:** All outputs are provided as diagnostic sensors or service responses (`get_forecast`), intended as inputs for external logic (EMHASS, Node-RED, or standard HA Automations).
 
 ---
 

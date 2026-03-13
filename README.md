@@ -29,6 +29,8 @@ Think of it as a fitness tracker for your home's heating system.
 
 The integration continuously learns the relationship between outdoor conditions (temperature, wind, solar) and your heating consumption. Once trained, it predicts what you *should* use and compares it to reality—alerting you to unexpected deviations.
 
+> **Architecture note:** Heating Analytics is a *feed-forward* engine — it produces diagnostics and predictions, but never writes setpoints or controls your heating directly. The outputs are designed to feed external logic (HA Automations, EMHASS, Node-RED) so you retain full control and the model's training data stays uncontaminated by its own decisions.
+
 ---
 
 ## Quick Start
@@ -129,7 +131,7 @@ This is optional but highly recommended for maximum accuracy.
 ### Machine Learning That Just Works
 
 - **Automatic Learning:** No manual calibration needed—the system learns your home's thermal characteristics
-- **Daily Learning Mode (Track B):** An optional configuration flag for homes where hourly learning is unreliable — typically high thermal mass buildings (concrete, stone) or heat pumps with a high minimum modulation level. When enabled, Track A (hourly) is completely disabled and the model learns once per day at midnight instead, updating the correlation table from a full daily energy budget. The indoor temperature sensor is optional; thermal mass correction is applied only when the sensor is configured.
+- **Daily Learning Mode (Track B):** An optional configuration flag for homes where hourly learning is unreliable — typically high thermal mass buildings (concrete, stone) or heat pumps with a high minimum modulation level. When enabled, Track A (hourly) is completely disabled and the model learns once per day at midnight instead, updating the correlation table from a full daily energy budget. The indoor temperature sensor is optional; thermal mass correction is applied only when the sensor is configured. A dedicated `heating_analytics_daily_learning` sensor exposes the learned U-Coefficient (kWh/TDD/day) as its state, enabling long-term monitoring of the building's overall thermal health independent of specific temperature buckets.
 
   **Note — Significantly Slower Learning Curve:** By aggregating 24 hours into a single daily average, Track B loses the diurnal temperature variance that makes hourly learning efficient. Where Track A may populate 10 distinct temperature buckets in a single day (e.g., 4°C at night through 14°C at noon), Track B records a single data point at the daily mean. Building a complete heating curve will therefore take significantly longer — on the order of months rather than weeks. Daily Learning Mode should be reserved for setups where the physical building dynamics genuinely render hourly observations thermodynamically unreliable. Hourly learning is the recommended path for the large majority of users.
 - **Regime-Aware Prediction:**
@@ -208,6 +210,8 @@ Air-to-water heat pumps regularly switch to producing domestic hot water (DHW). 
 Without explicit DHW tracking, the learning model sees inflated consumption during heating phases and attributes it to the base coefficient, causing the predicted baseline to drift upward. The effect scales with your DHW duty cycle: a system spending 25% of its time in DHW will drift approximately +33%; a high-demand household at 33% DHW will drift +50%.
 
 **Fix:** Set your heat pump unit to `DHW` mode in the Heating Analytics mode selector whenever the pump is in DHW cycle. The model then correctly observes zero space-heat contribution during those hours, and the base coefficient converges to the true value without drift.
+
+> **v1.2.7 — Sampling precision:** The DHW exclusion is applied every 2 minutes (30 evaluations per hour), so a mid-hour DHW cycle — such as a 10-minute shower at 14:45 — is detected and excluded with high temporal resolution. This prevents DHW energy from bleeding into the hourly heating total.
 
 #### Automatic Mode Mapping with Blueprints
 
