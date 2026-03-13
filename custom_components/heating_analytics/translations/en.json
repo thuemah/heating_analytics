@@ -1,155 +1,160 @@
 {
     "config": {
         "error": {
+            "sensor_swap_detected": "It looks like you are replacing a sensor. Revert this change and use the 'Heating Analytics: Replace Sensor' service call instead — this is the only way to preserve the learned history for the removed sensor.",
             "weather_entity_required": "Please select a weather provider to continue.",
             "weather_entity_not_found": "The selected weather provider is no longer available. Please select another one.",
-            "weather_missing_temperature": "This weather provider is missing 'temperature' data. Please choose a different provider or use a dedicated sensor.",
-            "weather_missing_wind_speed": "This weather provider is missing 'wind_speed' data. Please choose a different provider or use a dedicated sensor."
+            "weather_missing_temperature": "This weather provider does not supply current temperature data. Please choose a different provider or connect a dedicated outdoor temperature sensor.",
+            "weather_missing_wind_speed": "This weather provider does not supply current wind speed data. Please choose a different provider or connect a dedicated wind sensor."
         },
         "step": {
             "user": {
-                "title": "Heating Analytics Setup",
-                "description": "Welcome to Heating Analytics! 🎨 Let's get your home's thermal model set up. You can use specific sensors for precision, or simply use your weather provider to get started.",
+                "title": "The Basics",
+                "description": "Connect your energy meters and weather provider. This is all that is required to get started.",
                 "data": {
                     "name": "Integration Name",
                     "weather_entity": "Weather Provider",
-                    "wind_unit": "Wind Speed Unit",
-                    "outdoor_temp_source": "Outdoor Temperature Source",
-                    "outdoor_temp_sensor": "Outdoor Temperature Sensor",
-                    "wind_source": "Wind Speed Source",
-                    "wind_speed_sensor": "Wind Speed Sensor",
-                    "wind_gust_source": "Wind Gust Source",
-                    "wind_gust_sensor": "Wind Gust Sensor",
                     "energy_sensors": "Heating Energy Meters",
-                    "aux_affected_entities": "Auxiliary Affected Units",
-                    "wind_gust_factor": "Wind Gust Factor",
+                    "outdoor_temp_sensor": "Outdoor Temperature Sensor"
+                },
+                "data_description": {
+                    "name": "A name for this integration instance.",
+                    "weather_entity": "Used for forecasts, wind data, and as a fallback temperature source.",
+                    "energy_sensors": "All sensors measuring energy consumption (kWh) for your heating devices.",
+                    "outdoor_temp_sensor": "Recommended. A local sensor improves accuracy. If left blank, the weather provider's current temperature is used as a fallback."
+                }
+            },
+            "physics": {
+                "title": "Sensor Overrides & Building Physics",
+                "description": "Optionally connect local wind sensors and configure the physical characteristics of your home. The defaults work well for most standard houses.",
+                "data": {
+                    "wind_unit": "Wind Speed Unit",
+                    "has_ac_units": "Show Cooling Modes",
                     "balance_point": "Balance Point Temperature",
                     "thermal_inertia": "Thermal Inertia Profile",
+                    "wind_speed_sensor": "Wind Speed Sensor",
+                    "wind_gust_sensor": "Wind Gust Sensor",
+                    "indoor_temp_sensor": "Indoor Temperature Sensor"
+                },
+                "data_description": {
+                    "wind_unit": "The unit for wind speed settings on the next page.",
+                    "has_ac_units": "Enable if you use this system for cooling to access cooling modes.",
+                    "balance_point": "The outdoor temperature at which your home stops needing heat. Typically 15-17°C for well-insulated homes, up to 18°C for older buildings.",
+                    "thermal_inertia": "How many hours of outdoor temperature history the model considers. Use a low value for lightweight wood-frame structures, higher for heavy concrete or stone buildings.",
+                    "wind_speed_sensor": "Optional. A local anemometer improves wind modelling accuracy. If left blank, the weather provider is used.",
+                    "wind_gust_sensor": "Optional. Leave blank to use the weather provider's gust data.",
+                    "indoor_temp_sensor": "Optional. Required for thermal mass correction in Daily Learning Mode (Track B). Leave blank if not using Track B."
+                }
+            },
+            "advanced": {
+                "title": "Advanced Options",
+                "description": "Fine-tune the learning model and enable optional features. The defaults are appropriate for most installations.",
+                "data": {
+                    "daily_learning_mode": "Daily Learning Mode (Track B)",
                     "thermal_mass_kwh_per_degree": "Thermal Mass Factor (kWh/°C)",
-                    "daily_learning_mode": "Daily Learning Mode",
-                    "indoor_temp_sensor": "Indoor Temperature Sensor",
-                    "learning_rate": "Model Learning Rate",
+                    "wind_gust_factor": "Wind Gust Factor",
                     "wind_threshold": "High Wind Threshold",
                     "extreme_wind_threshold": "Extreme Wind Threshold",
                     "max_energy_delta": "Spike Protection Threshold",
-                    "solar_enabled": "Enable Solar Tracking",
+                    "aux_affected_entities": "Auxiliary Affected Units",
                     "csv_auto_logging": "Enable CSV Logging",
                     "csv_hourly_path": "Hourly Log Path",
                     "csv_daily_path": "Daily Log Path",
                     "enable_lifetime_tracking": "Track Lifetime Statistics",
-                    "has_ac_units": "Show Cooling Modes",
                     "secondary_weather_entity": "Secondary Weather Provider",
                     "forecast_crossover_day": "Forecast Crossover Day"
                 },
                 "data_description": {
-                    "name": "The name for this integration instance.",
-                    "weather_entity": "The primary weather integration used for forecasts.",
-                    "wind_unit": "The unit of measurement for wind speed settings below.",
-                    "outdoor_temp_source": "Choose whether to use a dedicated sensor or the weather provider for current temperature.",
-                    "outdoor_temp_sensor": "The sensor providing outdoor temperature data.",
-                    "wind_source": "Choose whether to use a dedicated sensor or the weather provider for wind speed.",
-                    "wind_speed_sensor": "The sensor providing wind speed data.",
-                    "wind_gust_source": "Choose whether to use a dedicated sensor or the weather provider for wind gusts.",
-                    "wind_gust_sensor": "The sensor providing wind gust data.",
-                    "wind_gust_factor": "Controls the impact of wind gusts on heat loss. 0.0 ignores gusts; 1.0 treats them fully. **Tip:** Older, drafty houses often need 0.5+.",
-                    "balance_point": "The temperature where your home starts needing heat. Typically 15°C for well-insulated modern homes, up to 18°C for older buildings.",
-                    "thermal_inertia": "Adjusts how quickly the model reacts to outside temperature changes. Use 'Fast' for lightweight structures, 'Slow' for heavy thermal mass.",
-                    "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Recommended for homes with high thermal mass or a heat pump with a high minimum modulation. Track A is completely disabled when this is active.",
-                    "indoor_temp_sensor": "Optional. Provides the indoor temperature at midnight for thermal mass correction. The user is responsible for ensuring this sensor reflects the actual temperature at midnight. Leave empty to disable correction.",
-                    "thermal_mass_kwh_per_degree": "Thermal Mass Correction (kWh/°C). Compensates for heat stored in the building mass during indoor temperature changes. Rule of thumb: (Area_m² × 35) / 1000 / avg_COP. Example: 250m² house with COP 3 = ~2.9 kWh/°C. Leave at 0.0 to disable.",
-                    "learning_rate": "Controls how fast the model learns. Keep low (0.5-1.0%) for stability, or increase (2.0%+) to adapt faster to recent renovations or changes.",
-                    "wind_threshold": "Wind speed above which the 'High Wind' model is used.",
-                    "extreme_wind_threshold": "Wind speed above which the 'Extreme Wind' model is used.",
-                    "solar_enabled": "Enable solar gain calculations to account for sun heating your home.",
-                    "aux_affected_entities": "Select which heating units are helped by auxiliary heat (e.g. fireplace). Defaults to all if empty.",
-                    "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting).",
-                    "forecast_crossover_day": "Days to use the Primary weather source before switching to Secondary (long-term). Example: Set to 3 to use Primary for days 1-3.",
-                    "max_energy_delta": "Ignore hourly readings above this value (kWh) to prevent sensor glitches from ruining your stats.",
-                    "has_ac_units": "Enable this if you use your system for cooling (AC) to see cooling modes.",
-                    "energy_sensors": "Select all sensors measuring energy consumption (kWh) for your heating devices.",
-                    "csv_auto_logging": "Automatically write detailed hourly logs to CSV files for external analysis.",
+                    "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Only recommended for homes with very high thermal mass (concrete/stone) or heat pumps with a high minimum modulation level. Significantly slows down the learning curve — full model characterisation may take an entire heating season.",
+                    "thermal_mass_kwh_per_degree": "Compensates for heat stored in the building structure during indoor temperature changes. Rule of thumb: (Floor_m² × 35) / 1000 / avg_COP. Example: 250 m² house with COP 3.0 ≈ 2.9 kWh/°C. Leave at 0.0 to disable.",
+                    "wind_gust_factor": "Controls the impact of wind gusts on heat loss calculations. 0.0 ignores gusts entirely; 1.0 applies them fully. Older or draughty buildings often benefit from a higher value.",
+                    "wind_threshold": "Outdoor wind speed above which the high-wind correction model is applied.",
+                    "extreme_wind_threshold": "Outdoor wind speed above which the extreme-wind correction model is applied.",
+                    "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
+                    "aux_affected_entities": "Which heating units are supplemented by auxiliary heat sources (e.g. a wood stove). Defaults to all units if left empty.",
+                    "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
                     "csv_hourly_path": "File path for the hourly CSV log.",
                     "csv_daily_path": "File path for the daily CSV log.",
-                    "enable_lifetime_tracking": "Keep a cumulative history of energy usage for all time. (Increases database size)."
+                    "enable_lifetime_tracking": "Maintain a cumulative history of total energy usage. Increases storage usage over time.",
+                    "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting). Useful for validating a new weather source before switching.",
+                    "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions."
                 }
             },
             "reconfigure": {
-                "title": "Settings",
-                "description": "Adjust your system settings. **Note:** Changing the Learning Rate or adding new sensors may temporarily fluctuate your prediction accuracy while the model adapts.",
+                "title": "Edit: The Basics",
+                "description": "Update your primary sensors and weather provider.",
                 "data": {
                     "name": "Integration Name",
                     "weather_entity": "Weather Provider",
-                    "wind_unit": "Wind Speed Unit",
-                    "outdoor_temp_source": "Outdoor Temperature Source",
-                    "outdoor_temp_sensor": "Outdoor Temperature Sensor",
-                    "wind_source": "Wind Speed Source",
-                    "wind_speed_sensor": "Wind Speed Sensor",
-                    "wind_gust_source": "Wind Gust Source",
-                    "wind_gust_sensor": "Wind Gust Sensor",
                     "energy_sensors": "Heating Energy Meters",
-                    "aux_affected_entities": "Auxiliary Affected Units",
-                    "wind_gust_factor": "Wind Gust Factor",
+                    "outdoor_temp_sensor": "Outdoor Temperature Sensor"
+                },
+                "data_description": {
+                    "name": "A name for this integration instance.",
+                    "weather_entity": "Used for forecasts, wind data, and as a fallback temperature source.",
+                    "energy_sensors": "Add new heaters or permanently remove old ones. Do not use this field to replace a renamed or broken sensor — removing and re-adding a sensor destroys its learned history. Use the 'Heating Analytics: Replace Sensor' service call for that instead.",
+                    "outdoor_temp_sensor": "Recommended. A local sensor improves accuracy. If left blank, the weather provider's current temperature is used as a fallback."
+                }
+            },
+            "reconfigure_physics": {
+                "title": "Edit: Sensor Overrides & Building Physics",
+                "description": "Update local wind sensors and physical home characteristics.",
+                "data": {
+                    "wind_unit": "Wind Speed Unit",
+                    "has_ac_units": "Show Cooling Modes",
                     "balance_point": "Balance Point Temperature",
                     "thermal_inertia": "Thermal Inertia Profile",
+                    "wind_speed_sensor": "Wind Speed Sensor",
+                    "wind_gust_sensor": "Wind Gust Sensor",
+                    "indoor_temp_sensor": "Indoor Temperature Sensor"
+                },
+                "data_description": {
+                    "wind_unit": "The unit for wind speed settings on the next page.",
+                    "has_ac_units": "Enable if you use this system for cooling to access cooling modes.",
+                    "balance_point": "The outdoor temperature at which your home stops needing heat. Typically 15-17°C for well-insulated homes, up to 18°C for older buildings.",
+                    "thermal_inertia": "How many hours of outdoor temperature history the model considers. Use a low value for lightweight wood-frame structures, higher for heavy concrete or stone buildings.",
+                    "wind_speed_sensor": "Optional. A local anemometer improves wind modelling accuracy. If left blank, the weather provider is used.",
+                    "wind_gust_sensor": "Optional. Leave blank to use the weather provider's gust data.",
+                    "indoor_temp_sensor": "Optional. Required for thermal mass correction in Daily Learning Mode (Track B). Leave blank if not using Track B."
+                }
+            },
+            "reconfigure_advanced": {
+                "title": "Edit: Advanced Options",
+                "description": "Adjust model tuning and optional features.",
+                "data": {
+                    "daily_learning_mode": "Daily Learning Mode (Track B)",
                     "thermal_mass_kwh_per_degree": "Thermal Mass Factor (kWh/°C)",
-                    "daily_learning_mode": "Daily Learning Mode",
-                    "indoor_temp_sensor": "Indoor Temperature Sensor",
-                    "learning_rate": "Model Learning Rate",
+                    "wind_gust_factor": "Wind Gust Factor",
                     "wind_threshold": "High Wind Threshold",
                     "extreme_wind_threshold": "Extreme Wind Threshold",
                     "max_energy_delta": "Spike Protection Threshold",
-                    "solar_enabled": "Enable Solar Tracking",
+                    "aux_affected_entities": "Auxiliary Affected Units",
                     "csv_auto_logging": "Enable CSV Logging",
                     "csv_hourly_path": "Hourly Log Path",
                     "csv_daily_path": "Daily Log Path",
                     "enable_lifetime_tracking": "Track Lifetime Statistics",
-                    "has_ac_units": "Show Cooling Modes",
                     "secondary_weather_entity": "Secondary Weather Provider",
                     "forecast_crossover_day": "Forecast Crossover Day"
                 },
                 "data_description": {
-                    "name": "The name for this integration instance.",
-                    "weather_entity": "The primary weather integration used for forecasts.",
-                    "wind_unit": "The unit of measurement for wind speed settings below.",
-                    "outdoor_temp_source": "Choose whether to use a dedicated sensor or the weather provider for current temperature.",
-                    "outdoor_temp_sensor": "The sensor providing outdoor temperature data.",
-                    "wind_source": "Choose whether to use a dedicated sensor or the weather provider for wind speed.",
-                    "wind_speed_sensor": "The sensor providing wind speed data.",
-                    "wind_gust_source": "Choose whether to use a dedicated sensor or the weather provider for wind gusts.",
-                    "wind_gust_sensor": "The sensor providing wind gust data.",
-                    "wind_gust_factor": "Controls the impact of wind gusts on heat loss. 0.0 ignores gusts; 1.0 treats them fully. **Tip:** Older, drafty houses often need 0.5+.",
-                    "balance_point": "The temperature where your home starts needing heat. Typically 15°C for well-insulated modern homes, up to 18°C for older buildings.",
-                    "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Recommended for homes with high thermal mass or a heat pump with a high minimum modulation. Track A is completely disabled when this is active.",
-                    "indoor_temp_sensor": "Optional. Provides the indoor temperature at midnight for thermal mass correction. The user is responsible for ensuring this sensor reflects the actual temperature at midnight. Leave empty to disable correction.",
-                    "thermal_mass_kwh_per_degree": "Thermal Mass Correction (kWh/°C). Compensates for heat stored in the building mass during indoor temperature changes. Rule of thumb: (Area_m² × 35) / 1000 / avg_COP. Example: 250m² house with COP 3 = ~2.9 kWh/°C. Leave at 0.0 to disable.",
-                    "learning_rate": "Controls how fast the model learns. Keep low (0.5-1.0%) for stability, or increase (2.0%+) to adapt faster to recent renovations or changes.",
-                    "wind_threshold": "Wind speed above which the 'High Wind' model is used.",
-                    "extreme_wind_threshold": "Wind speed above which the 'Extreme Wind' model is used.",
-                    "solar_enabled": "Enable solar gain calculations to account for sun heating your home.",
-                    "aux_affected_entities": "Select which heating units are helped by auxiliary heat (e.g. fireplace). Defaults to all if empty.",
-                    "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting).",
-                    "forecast_crossover_day": "Days to use the Primary weather source before switching to Secondary (long-term). Example: Set to 3 to use Primary for days 1-3.",
-                    "max_energy_delta": "Ignore hourly readings above this value (kWh) to prevent sensor glitches from ruining your stats.",
-                    "has_ac_units": "Enable this if you use your system for cooling (AC) to see cooling modes.",
-                    "energy_sensors": "Select all sensors measuring energy consumption (kWh) for your heating devices.",
-                    "csv_auto_logging": "Automatically write detailed hourly logs to CSV files for external analysis.",
+                    "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Only recommended for homes with very high thermal mass (concrete/stone) or heat pumps with a high minimum modulation level. Significantly slows down the learning curve — full model characterisation may take an entire heating season.",
+                    "thermal_mass_kwh_per_degree": "Compensates for heat stored in the building structure during indoor temperature changes. Rule of thumb: (Floor_m² × 35) / 1000 / avg_COP. Example: 250 m² house with COP 3.0 ≈ 2.9 kWh/°C. Leave at 0.0 to disable.",
+                    "wind_gust_factor": "Controls the impact of wind gusts on heat loss calculations. 0.0 ignores gusts entirely; 1.0 applies them fully. Older or draughty buildings often benefit from a higher value.",
+                    "wind_threshold": "Outdoor wind speed above which the high-wind correction model is applied.",
+                    "extreme_wind_threshold": "Outdoor wind speed above which the extreme-wind correction model is applied.",
+                    "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
+                    "aux_affected_entities": "Which heating units are supplemented by auxiliary heat sources (e.g. a wood stove). Defaults to all units if left empty.",
+                    "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
                     "csv_hourly_path": "File path for the hourly CSV log.",
                     "csv_daily_path": "File path for the daily CSV log.",
-                    "enable_lifetime_tracking": "Keep a cumulative history of energy usage for all time. (Increases database size)."
+                    "enable_lifetime_tracking": "Maintain a cumulative history of total energy usage. Increases storage usage over time.",
+                    "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting). Useful for validating a new weather source before switching.",
+                    "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions."
                 }
             }
         },
         "abort": {
             "already_configured": "Device is already configured"
-        }
-    },
-    "selector": {
-        "thermal_inertia": {
-            "options": {
-                "fast": "Fast (Smaller wooden house, low insulation)",
-                "normal": "Normal (Standard house)",
-                "slow": "Slow (Passive house / Concrete foundation)"
-            }
         }
     }
 }

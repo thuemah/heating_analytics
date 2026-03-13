@@ -8,7 +8,6 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
-from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
@@ -16,7 +15,6 @@ from .const import (
     DOMAIN,
     DEFAULT_NAME,
     DEFAULT_WIND_GUST_FACTOR,
-    DEFAULT_LEARNING_RATE,
     DEFAULT_BALANCE_POINT,
     DEFAULT_WIND_THRESHOLD,
     DEFAULT_EXTREME_WIND_THRESHOLD,
@@ -26,11 +24,8 @@ from .const import (
     CONF_WIND_UNIT,
     CONF_ENABLE_LIFETIME_TRACKING,
     CONF_SOLAR_ENABLED,
-
     CONF_HAS_AC_UNITS,
     DEFAULT_WIND_UNIT,
-    DEFAULT_SOLAR_ENABLED,
-
     WIND_UNIT_MS,
     WIND_UNIT_KMH,
     WIND_UNIT_KNOTS,
@@ -56,408 +51,339 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
 class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Heating Analytics."""
 
     VERSION = 2
 
-    def _validate_weather_fallback(self, user_input: dict[str, Any]) -> dict[str, str]:
-        """Validate that weather entity has required attributes if sensors are missing."""
-        errors = {}
-        weather_entity_id = user_input.get("weather_entity")
+    def __init__(self):
+        self._flow_data: dict[str, Any] = {}
+        self._entry = None  # populated during reconfigure
 
-        if not weather_entity_id:
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _v(user_input, defaults, key, default=None):
+        """Return value: user_input > defaults > default."""
+        if user_input and key in user_input:
+            return user_input[key]
+        if defaults and key in defaults:
+            return defaults[key]
+        return default
+
+    def _validate_basics(self, user_input: dict) -> dict[str, str]:
+        """Validate step 1: weather entity exists and has temperature if no sensor."""
+        errors: dict[str, str] = {}
+        weather_id = user_input.get("weather_entity")
+        if not weather_id:
             errors["base"] = "weather_entity_required"
             return errors
-
-        weather_state = self.hass.states.get(weather_entity_id)
-        if not weather_state:
+        state = self.hass.states.get(weather_id)
+        if not state:
             errors["base"] = "weather_entity_not_found"
             return errors
-
-        # Validation relies on Source selection now
-        # If Source is SENSOR, we expect a sensor.
-        # If Source is WEATHER, we expect the weather entity to have the attribute.
-
-        # Temp
-        if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_WEATHER:
-             if "temperature" not in weather_state.attributes:
-                errors[CONF_OUTDOOR_TEMP_SOURCE] = "weather_missing_temperature"
-        elif user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_SENSOR:
-             if not user_input.get("outdoor_temp_sensor"):
-                  # This is handled by required field in schema, but good to double check
-                  errors["outdoor_temp_sensor"] = "required"
-
-        # Wind Speed
-        if user_input.get(CONF_WIND_SOURCE) == SOURCE_WEATHER:
-             if "wind_speed" not in weather_state.attributes:
-                errors[CONF_WIND_SOURCE] = "weather_missing_wind_speed"
-        elif user_input.get(CONF_WIND_SOURCE) == SOURCE_SENSOR:
-             if not user_input.get("wind_speed_sensor"):
-                errors["wind_speed_sensor"] = "required"
-
-        # Wind Gust (Optional/Info)
-        if user_input.get(CONF_WIND_GUST_SOURCE) == SOURCE_WEATHER:
-            if "wind_gust_speed" not in weather_state.attributes:
-                 _LOGGER.info(
-                     f"Selected weather entity {weather_entity_id} does not have 'wind_gust_speed'. "
-                     "Wind gusts will be assumed 0 unless provided by forecast."
-                 )
-
+        if not user_input.get("outdoor_temp_sensor"):
+            if "temperature" not in state.attributes:
+                errors["weather_entity"] = "weather_missing_temperature"
         return errors
 
-    def _get_schema(self, user_input: dict[str, Any], default_data: dict[str, Any], is_reconfigure: bool = False) -> vol.Schema:
-        """Generate schema based on current selection."""
+    def _validate_physics(self, user_input: dict) -> dict[str, str]:
+        """Validate step 2: weather entity has wind_speed if no sensor."""
+        if not user_input.get("wind_speed_sensor"):
+            weather_id = self._flow_data.get("weather_entity")
+            if weather_id:
+                state = self.hass.states.get(weather_id)
+                if state and "wind_speed" not in state.attributes:
+                    return {"base": "weather_missing_wind_speed"}
+        return {}
 
-        # Helper to get current value (User Input > Default Data > Default Constant)
-        def get_val(key, default=None):
-            if user_input and key in user_input:
-                return user_input[key]
-            if default_data and key in default_data:
-                return default_data[key]
-            return default
+    def _clear_absent_entity_keys(self, user_input: dict, keys: list) -> None:
+        """Pop optional entity keys from flow_data when the user has cleared them.
 
-        current_unit = get_val(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
+        HA/voluptuous drops absent Optional keys from user_input entirely rather
+        than sending None. Without this, a previously saved value in self._flow_data
+        survives .update(user_input) unchanged even though the user cleared the field.
+        """
+        for key in keys:
+            if not user_input.get(key):
+                self._flow_data.pop(key, None)
 
-        current_inertia = get_val(CONF_THERMAL_INERTIA, DEFAULT_THERMAL_INERTIA_HOURS)
-        if isinstance(current_inertia, str):
-            if current_inertia == "fast": current_inertia = 2
-            elif current_inertia == "slow": current_inertia = 12
-            else: current_inertia = 4
+    def _needs_reload_advanced(self, user_input: dict) -> bool:
+        """Return True when step 3 must re-render to show/hide the Thermal Mass field."""
+        daily = user_input.get(CONF_DAILY_LEARNING_MODE, False)
+        if daily and CONF_THERMAL_MASS not in user_input:
+            return True   # Track B just enabled — show the field
+        if not daily and CONF_THERMAL_MASS in user_input:
+            return True   # Track B just disabled — hide the field
+        return False
 
-        # Display Conversions
-        if is_reconfigure:
-            # Stored as m/s
-            current_wind_threshold = get_val("wind_threshold", DEFAULT_WIND_THRESHOLD)
-            current_extreme = get_val("extreme_wind_threshold", DEFAULT_EXTREME_WIND_THRESHOLD)
-            display_wind_threshold = convert_from_ms(current_wind_threshold, current_unit)
-            display_extreme = convert_from_ms(current_extreme, current_unit)
-        else:
-            # Default or input
-            display_wind_threshold = get_val("wind_threshold", DEFAULT_WIND_THRESHOLD)
-            display_extreme = get_val("extreme_wind_threshold", DEFAULT_EXTREME_WIND_THRESHOLD)
+    def _build_final_data(self, step3_input: dict) -> dict:
+        """Merge all steps and normalise values for storage."""
+        data = {**self._flow_data, **step3_input}
 
-        # Max Values for Sliders
-        max_val = 20.0
-        max_extreme = 30.0
-        if current_unit == WIND_UNIT_KMH:
-            max_val = 80.0
-            max_extreme = 120.0
-        elif current_unit == WIND_UNIT_KNOTS:
-            max_val = 40.0
-            max_extreme = 60.0
+        # Derive source constants from sensor presence (no more source dropdowns)
+        data[CONF_OUTDOOR_TEMP_SOURCE] = SOURCE_SENSOR if data.get("outdoor_temp_sensor") else SOURCE_WEATHER
+        data[CONF_WIND_SOURCE] = SOURCE_SENSOR if data.get("wind_speed_sensor") else SOURCE_WEATHER
+        data[CONF_WIND_GUST_SOURCE] = SOURCE_SENSOR if data.get("wind_gust_sensor") else SOURCE_WEATHER
 
-        schema = {
-            vol.Required(CONF_NAME, default=get_val(CONF_NAME, DEFAULT_NAME)): str,
-            vol.Required(CONF_WIND_UNIT, default=current_unit): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=[WIND_UNIT_MS, WIND_UNIT_KMH, WIND_UNIT_KNOTS],
-                    mode=selector.SelectSelectorMode.DROPDOWN
-                )
-            ),
-            vol.Required("weather_entity", default=get_val("weather_entity")): selector.EntitySelector(
+        # Solar gain is always enabled
+        data[CONF_SOLAR_ENABLED] = True
+
+        # Strip absent/falsy optional entity keys so EntitySelector never shows "None".
+        # Step-3 keys must also be checked against step3_input directly: if the user
+        # cleared the field, the key is absent from step3_input but may still be
+        # present (truthy) in self._flow_data from a previous save.
+        if not step3_input.get(CONF_SECONDARY_WEATHER_ENTITY):
+            data.pop(CONF_SECONDARY_WEATHER_ENTITY, None)
+        for key in [
+            "outdoor_temp_sensor", "wind_speed_sensor", "wind_gust_sensor",
+            CONF_INDOOR_TEMP_SENSOR,
+        ]:
+            if not data.get(key):
+                data.pop(key, None)
+
+        # Convert wind thresholds from display unit to m/s for storage
+        unit = data.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
+        if unit != WIND_UNIT_MS:
+            data["wind_threshold"] = convert_to_ms(data["wind_threshold"], unit)
+            data["extreme_wind_threshold"] = convert_to_ms(data["extreme_wind_threshold"], unit)
+
+        # Ensure thermal mass is always present (Track B field may not have been shown)
+        data.setdefault(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS)
+
+        # Default aux_affected_entities to all energy sensors when left empty
+        if not data.get(CONF_AUX_AFFECTED_ENTITIES):
+            data[CONF_AUX_AFFECTED_ENTITIES] = data.get("energy_sensors", [])
+
+        return data
+
+    # ------------------------------------------------------------------ #
+    # Schema builders                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _schema_basics(self, user_input, defaults) -> vol.Schema:
+        g = lambda k, d=None: self._v(user_input, defaults, k, d)
+        schema: dict = {
+            vol.Required(CONF_NAME, default=g(CONF_NAME, DEFAULT_NAME)): str,
+            vol.Required("weather_entity", default=g("weather_entity")): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="weather")
             ),
+            vol.Required("energy_sensors", default=g("energy_sensors", [])): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
+            ),
         }
-
-        # Dynamic Fields for Sources
-
-        # Outdoor Temp
-        temp_source = get_val(CONF_OUTDOOR_TEMP_SOURCE, SOURCE_SENSOR)
-        schema[vol.Required(CONF_OUTDOOR_TEMP_SOURCE, default=temp_source)] = selector.SelectSelector(
-            selector.SelectSelectorConfig(
-                options=[
-                    selector.SelectOptionDict(value=SOURCE_SENSOR, label="Dedicated Sensor"),
-                    selector.SelectOptionDict(value=SOURCE_WEATHER, label="Weather Entity"),
-                ],
-                mode=selector.SelectSelectorMode.DROPDOWN
-            )
+        schema[vol.Optional("outdoor_temp_sensor", description={"suggested_value": g("outdoor_temp_sensor")})] = (
+            selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", device_class="temperature"))
         )
-        if temp_source == SOURCE_SENSOR:
-            _temp_val = get_val("outdoor_temp_sensor")
-            # vol.Optional so HA frontend does not block submission when user switches
-            # the source dropdown to Weather Entity before the form reloads. Required
-            # validation is enforced in _validate_weather_fallback instead.
-            schema[vol.Optional("outdoor_temp_sensor", **({'default': _temp_val} if _temp_val else {}))] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
-            )
+        return vol.Schema(schema)
 
-        # Wind Speed
-        wind_source = get_val(CONF_WIND_SOURCE, SOURCE_SENSOR)
-        schema[vol.Required(CONF_WIND_SOURCE, default=wind_source)] = selector.SelectSelector(
-            selector.SelectSelectorConfig(
-                options=[
-                    selector.SelectOptionDict(value=SOURCE_SENSOR, label="Dedicated Sensor"),
-                    selector.SelectOptionDict(value=SOURCE_WEATHER, label="Weather Entity"),
-                ],
-                mode=selector.SelectSelectorMode.DROPDOWN
-            )
-        )
-        if wind_source == SOURCE_SENSOR:
-            _wind_val = get_val("wind_speed_sensor")
-            # vol.Optional — same reason as outdoor_temp_sensor above.
-            schema[vol.Optional("wind_speed_sensor", **({'default': _wind_val} if _wind_val else {}))] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor", device_class="wind_speed")
-            )
-
-        # Daily Learning Mode
-        schema[vol.Optional(CONF_DAILY_LEARNING_MODE, default=get_val(CONF_DAILY_LEARNING_MODE, False))] = selector.BooleanSelector()
-
-        # Indoor Temp (Optional, used for thermal mass correction in daily learning mode)
-        _indoor_temp_val = get_val(CONF_INDOOR_TEMP_SENSOR)
-        schema[vol.Optional(CONF_INDOOR_TEMP_SENSOR, **({'default': _indoor_temp_val} if _indoor_temp_val else {}))] = selector.EntitySelector(
-            selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
-        )
-
-        # Thermal Mass
-        schema[vol.Required(CONF_THERMAL_MASS, default=get_val(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS))] = selector.NumberSelector(
-            selector.NumberSelectorConfig(min=0.0, max=50.0, step=0.1, unit_of_measurement="kWh/°C")
-        )
-
-        # Wind Gust
-        gust_source = get_val(CONF_WIND_GUST_SOURCE, SOURCE_SENSOR)
-        schema[vol.Required(CONF_WIND_GUST_SOURCE, default=gust_source)] = selector.SelectSelector(
-            selector.SelectSelectorConfig(
-                options=[
-                    selector.SelectOptionDict(value=SOURCE_SENSOR, label="Dedicated Sensor"),
-                    selector.SelectOptionDict(value=SOURCE_WEATHER, label="Weather Entity"),
-                ],
-                mode=selector.SelectSelectorMode.DROPDOWN
-            )
-        )
-        if gust_source == SOURCE_SENSOR:
-            _gust_val = get_val("wind_gust_sensor")
-            schema[vol.Optional("wind_gust_sensor", **({'default': _gust_val} if _gust_val else {}))] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor", device_class="wind_speed")
-            )
-
-        # Rest of Schema
-        schema.update({
-            vol.Required("energy_sensors", default=get_val("energy_sensors", [])): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
+    def _schema_physics(self, user_input, defaults) -> vol.Schema:
+        g = lambda k, d=None: self._v(user_input, defaults, k, d)
+        inertia = g(CONF_THERMAL_INERTIA, DEFAULT_THERMAL_INERTIA_HOURS)
+        if isinstance(inertia, str):
+            inertia = {"fast": 2, "slow": 12}.get(inertia, 4)
+        schema: dict = {
+            vol.Required(CONF_WIND_UNIT, default=g(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[WIND_UNIT_MS, WIND_UNIT_KMH, WIND_UNIT_KNOTS],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
             ),
-            # Aux Affected Entities (Optional - Defaults to All)
-            vol.Optional(CONF_AUX_AFFECTED_ENTITIES, default=get_val(CONF_AUX_AFFECTED_ENTITIES, get_val("energy_sensors", []))): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
-            ),
-            # Parameters
-            vol.Required("wind_gust_factor", default=get_val("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.05, mode="slider")
-            ),
-            vol.Required("balance_point", default=get_val("balance_point", DEFAULT_BALANCE_POINT)): selector.NumberSelector(
+            vol.Optional(CONF_HAS_AC_UNITS, default=g(CONF_HAS_AC_UNITS, False)): selector.BooleanSelector(),
+            vol.Required("balance_point", default=g("balance_point", DEFAULT_BALANCE_POINT)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=25, step=0.5, unit_of_measurement="°C")
             ),
-            # Thermal Inertia Profile (User Selectable)
-            vol.Required(CONF_THERMAL_INERTIA, default=int(current_inertia)): selector.NumberSelector(
+            vol.Required(CONF_THERMAL_INERTIA, default=int(inertia)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=1, max=24, step=1, unit_of_measurement="h", mode="slider")
             ),
-            # Learning Rate (Convert float back to percentage for display)
-            vol.Required("learning_rate", default=round(get_val("learning_rate", DEFAULT_LEARNING_RATE) * 100, 1)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=0.1, max=10.0, step=0.1, unit_of_measurement="%")
+        }
+        for field, device_class in [
+            ("wind_speed_sensor", "wind_speed"),
+            ("wind_gust_sensor", "wind_speed"),
+            (CONF_INDOOR_TEMP_SENSOR, "temperature"),
+        ]:
+            schema[vol.Optional(field, description={"suggested_value": g(field)})] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor", device_class=device_class)
+            )
+        return vol.Schema(schema)
+
+    def _schema_advanced(self, user_input, defaults) -> vol.Schema:
+        g = lambda k, d=None: self._v(user_input, defaults, k, d)
+        current_unit = self._flow_data.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
+        daily = g(CONF_DAILY_LEARNING_MODE, False)
+
+        # Wind thresholds: stored in m/s, displayed in the unit chosen in step 2
+        if user_input is not None and "wind_threshold" in user_input:
+            display_threshold = user_input["wind_threshold"]
+            display_extreme = user_input["extreme_wind_threshold"]
+        else:
+            stored_t = self._flow_data.get("wind_threshold", DEFAULT_WIND_THRESHOLD)
+            stored_e = self._flow_data.get("extreme_wind_threshold", DEFAULT_EXTREME_WIND_THRESHOLD)
+            if current_unit != WIND_UNIT_MS:
+                display_threshold = convert_from_ms(stored_t, current_unit)
+                display_extreme = convert_from_ms(stored_e, current_unit)
+            else:
+                display_threshold = stored_t
+                display_extreme = stored_e
+
+        max_wind = {WIND_UNIT_KMH: 80.0, WIND_UNIT_KNOTS: 40.0}.get(current_unit, 20.0)
+        max_extreme = {WIND_UNIT_KMH: 120.0, WIND_UNIT_KNOTS: 60.0}.get(current_unit, 30.0)
+
+        schema: dict = {
+            vol.Optional(CONF_DAILY_LEARNING_MODE, default=daily): selector.BooleanSelector(),
+        }
+        if daily:
+            schema[vol.Required(CONF_THERMAL_MASS, default=g(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS))] = (
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.0, max=50.0, step=0.1, unit_of_measurement="kWh/°C")
+                )
+            )
+        schema.update({
+            vol.Required("wind_gust_factor", default=g("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.05, mode="slider")
             ),
-            # Thresholds
-            vol.Required("wind_threshold", default=round(display_wind_threshold, 1)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=0.0, max=max_val, step=0.1, unit_of_measurement=current_unit)
+            vol.Required("wind_threshold", default=round(display_threshold, 1)): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0.0, max=max_wind, step=0.1, unit_of_measurement=current_unit)
             ),
             vol.Required("extreme_wind_threshold", default=round(display_extreme, 1)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=0.0, max=max_extreme, step=0.1, unit_of_measurement=current_unit)
             ),
-            # Spike Protection
-            vol.Optional("max_energy_delta", default=get_val("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA)): selector.NumberSelector(
+            vol.Optional("max_energy_delta", default=g("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=0.5, max=15.0, step=0.5, unit_of_measurement="kWh")
             ),
-            # Solar Correction
-            vol.Optional(CONF_SOLAR_ENABLED, default=get_val(CONF_SOLAR_ENABLED, DEFAULT_SOLAR_ENABLED)): selector.BooleanSelector(),
-            # CSV Auto-logging
-            vol.Optional("csv_auto_logging", default=get_val("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING)): selector.BooleanSelector(),
-            vol.Optional("csv_hourly_path", default=get_val("csv_hourly_path", DEFAULT_CSV_HOURLY_PATH)): selector.TextSelector(),
-            vol.Optional("csv_daily_path", default=get_val("csv_daily_path", DEFAULT_CSV_DAILY_PATH)): selector.TextSelector(),
-            # Lifetime Energy Tracking
-            vol.Optional(CONF_ENABLE_LIFETIME_TRACKING, default=get_val(CONF_ENABLE_LIFETIME_TRACKING, False)): selector.BooleanSelector(),
-            # Global AC Capability Checkbox (To show/hide Mode Selects)
-            vol.Optional(CONF_HAS_AC_UNITS, default=get_val(CONF_HAS_AC_UNITS, False)): selector.BooleanSelector(),
-
-            # Advanced Forecast Settings
-            vol.Optional(CONF_SECONDARY_WEATHER_ENTITY, description={"suggested_value": get_val(CONF_SECONDARY_WEATHER_ENTITY)}): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="weather")
+            vol.Optional(
+                CONF_AUX_AFFECTED_ENTITIES,
+                default=g(CONF_AUX_AFFECTED_ENTITIES, self._flow_data.get("energy_sensors", [])),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
             ),
-            vol.Optional(CONF_FORECAST_CROSSOVER_DAY, default=get_val(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY)): selector.NumberSelector(
+            vol.Optional("csv_auto_logging", default=g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING)): selector.BooleanSelector(),
+            vol.Optional("csv_hourly_path", default=g("csv_hourly_path", DEFAULT_CSV_HOURLY_PATH)): selector.TextSelector(),
+            vol.Optional("csv_daily_path", default=g("csv_daily_path", DEFAULT_CSV_DAILY_PATH)): selector.TextSelector(),
+            vol.Optional(CONF_ENABLE_LIFETIME_TRACKING, default=g(CONF_ENABLE_LIFETIME_TRACKING, False)): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_SECONDARY_WEATHER_ENTITY,
+                description={"suggested_value": g(CONF_SECONDARY_WEATHER_ENTITY)},
+            ): selector.EntitySelector(selector.EntitySelectorConfig(domain="weather")),
+            vol.Optional(CONF_FORECAST_CROSSOVER_DAY, default=g(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=1, max=7, step=1, mode="slider")
             ),
         })
-
         return vol.Schema(schema)
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the initial step."""
+    # ------------------------------------------------------------------ #
+    # Setup flow: user → physics → advanced → create_entry               #
+    # ------------------------------------------------------------------ #
+
+    async def async_step_user(self, user_input=None) -> FlowResult:
         errors: dict[str, str] = {}
-
-        # For initial step, we don't have existing config, so default_data is empty
-        # However, we want to start with SENSOR sources by default
-        default_data = {
-            CONF_OUTDOOR_TEMP_SOURCE: SOURCE_SENSOR,
-            CONF_WIND_SOURCE: SOURCE_SENSOR,
-            CONF_WIND_GUST_SOURCE: SOURCE_SENSOR,
-        }
-
         if user_input is not None:
-            # Check for Mode Changes (Reload form if mode changed)
-            # Logic: If user input has a source as 'sensor' but NO sensor key in input,
-            # it means the field wasn't shown (or they cleared it? No, if hidden it's not in input).
-            # If we simply reload, the _get_schema will use user_input to show/hide fields.
-
-            # Detect if we need to reload due to visibility change
-            # If Source is SENSOR but key missing -> Reload to show it
-            reload_needed = False
-
-            # Reload to show required sensor field when switching TO SOURCE_SENSOR
-            if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_SENSOR and "outdoor_temp_sensor" not in user_input:
-                reload_needed = True
-            if user_input.get(CONF_WIND_SOURCE) == SOURCE_SENSOR and "wind_speed_sensor" not in user_input:
-                reload_needed = True
-            # Reload to hide required sensor field when switching TO SOURCE_WEATHER.
-            # Without this reload the field remains visible and vol.Required blocks submission.
-            if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_WEATHER and "outdoor_temp_sensor" in user_input:
-                reload_needed = True
-            if user_input.get(CONF_WIND_SOURCE) == SOURCE_WEATHER and "wind_speed_sensor" in user_input:
-                reload_needed = True
-
-            if not reload_needed:
-                # Validate input
-                validation_errors = self._validate_weather_fallback(user_input)
-                if validation_errors:
-                    errors.update(validation_errors)
-                else:
-                    # Remove sensor keys that are not in use rather than storing None.
-                    # Storing None causes EntitySelector to display "Entity None is not a valid
-                    # entity ID" on the next reconfigure when the source is switched back.
-                    for key in ["outdoor_temp_sensor", "wind_speed_sensor", "wind_gust_sensor", CONF_INDOOR_TEMP_SENSOR]:
-                        if not user_input.get(key):
-                            user_input.pop(key, None)
-
-                    # Check unit selected
-                    unit = user_input.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
-
-                    # Convert thresholds to m/s for storage
-                    if unit != WIND_UNIT_MS:
-                        user_input["wind_threshold"] = convert_to_ms(user_input["wind_threshold"], unit)
-                        user_input["extreme_wind_threshold"] = convert_to_ms(user_input["extreme_wind_threshold"], unit)
-
-                    # Convert learning rate from % to float
-                    if "learning_rate" in user_input:
-                        user_input["learning_rate"] = user_input["learning_rate"] / 100.0
-
-                    # Ensure aux_affected_entities defaults to ALL if empty/missing on fresh setup
-                    # (This prevents accidental 0-reduction if user ignores the optional field)
-                    aux_entities = user_input.get(CONF_AUX_AFFECTED_ENTITIES)
-                    if aux_entities is None:
-                         user_input[CONF_AUX_AFFECTED_ENTITIES] = user_input.get("energy_sensors", [])
-
-                    return self.async_create_entry(title=user_input[CONF_NAME], data=user_input)
-
-        # Generate Schema
-        schema = self._get_schema(user_input, default_data, is_reconfigure=False)
-
+            errors = self._validate_basics(user_input)
+            if not errors:
+                self._flow_data.update(user_input)
+                self._clear_absent_entity_keys(user_input, ["outdoor_temp_sensor"])
+                return await self.async_step_physics()
         return self.async_show_form(
             step_id="user",
-            data_schema=schema,
+            data_schema=self._schema_basics(user_input, self._flow_data),
             errors=errors,
         )
 
-    async def async_step_reconfigure(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle reconfiguration."""
+    async def async_step_physics(self, user_input=None) -> FlowResult:
         errors: dict[str, str] = {}
-        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
-
-        # Prepare existing data (handling migration implied if keys missing)
-        default_data = {**entry.data}
-        if CONF_OUTDOOR_TEMP_SOURCE not in default_data: default_data[CONF_OUTDOOR_TEMP_SOURCE] = SOURCE_SENSOR
-        if CONF_WIND_SOURCE not in default_data: default_data[CONF_WIND_SOURCE] = SOURCE_SENSOR
-        if CONF_WIND_GUST_SOURCE not in default_data: default_data[CONF_WIND_GUST_SOURCE] = SOURCE_SENSOR
-
         if user_input is not None:
-             # Logic to detect "Source Change" vs "Submission"
-             # If user switched Source to Sensor, but didn't provide sensor (because it was hidden), we must reload.
+            errors = self._validate_physics(user_input)
+            if not errors:
+                self._flow_data.update(user_input)
+                self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor", CONF_INDOOR_TEMP_SENSOR])
+                return await self.async_step_advanced()
+        return self.async_show_form(
+            step_id="physics",
+            data_schema=self._schema_physics(user_input, self._flow_data),
+            errors=errors,
+        )
 
-             reload_needed = False
-             # Reload to show required sensor field when switching TO SOURCE_SENSOR
-             if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_SENSOR and "outdoor_temp_sensor" not in user_input:
-                 reload_needed = True
-             if user_input.get(CONF_WIND_SOURCE) == SOURCE_SENSOR and "wind_speed_sensor" not in user_input:
-                 reload_needed = True
-             # Reload to hide required sensor field when switching TO SOURCE_WEATHER.
-             # Without this reload the field remains visible and vol.Required blocks submission.
-             if user_input.get(CONF_OUTDOOR_TEMP_SOURCE) == SOURCE_WEATHER and "outdoor_temp_sensor" in user_input:
-                 reload_needed = True
-             if user_input.get(CONF_WIND_SOURCE) == SOURCE_WEATHER and "wind_speed_sensor" in user_input:
-                 reload_needed = True
+    async def async_step_advanced(self, user_input=None) -> FlowResult:
+        if user_input is not None:
+            if self._needs_reload_advanced(user_input):
+                return self.async_show_form(
+                    step_id="advanced",
+                    data_schema=self._schema_advanced(user_input, self._flow_data),
+                )
+            return self.async_create_entry(
+                title=self._flow_data[CONF_NAME],
+                data=self._build_final_data(user_input),
+            )
+        return self.async_show_form(
+            step_id="advanced",
+            data_schema=self._schema_advanced(None, self._flow_data),
+        )
 
-             if not reload_needed:
-                # Validate input
-                validation_errors = self._validate_weather_fallback(user_input)
-                if validation_errors:
-                    errors.update(validation_errors)
-                else:
-                    # Handle Data Migration (Conservation Strategy)
-                    # If aux_affected_entities changed, we must migrate coefficients BEFORE reload
-                    # because reload destroys the coordinator in memory.
-                    new_aux_list = user_input.get(CONF_AUX_AFFECTED_ENTITIES)
+    # ------------------------------------------------------------------ #
+    # Reconfigure flow: reconfigure → reconfigure_physics →              #
+    #                   reconfigure_advanced → update_reload_and_abort    #
+    # ------------------------------------------------------------------ #
 
-                    # Ensure we have a valid list comparison
-                    if new_aux_list is not None:
-                        # Access the running coordinator
-                        coordinator = self.hass.data.get(DOMAIN, {}).get(self.context["entry_id"])
-                        if coordinator:
-                            # Trigger migration
-                            # This will redistribute coefficients from removed units to remaining ones
-                            # and save the data to disk.
-                            # The reload below will then load this fresh data.
-                            await coordinator.async_migrate_aux_coefficients(new_aux_list)
-
-                    # Determine which unit was chosen in THIS form submission
-                    # (user_input has priority)
-                    new_unit = user_input.get(CONF_WIND_UNIT, default_data.get(CONF_WIND_UNIT))
-
-                    # Convert inputs back to m/s for storage
-                    if new_unit != WIND_UNIT_MS:
-                        user_input["wind_threshold"] = convert_to_ms(user_input["wind_threshold"], new_unit)
-                        user_input["extreme_wind_threshold"] = convert_to_ms(user_input["extreme_wind_threshold"], new_unit)
-
-                    # Convert learning rate from % to float
-                    if "learning_rate" in user_input:
-                        user_input["learning_rate"] = user_input["learning_rate"] / 100.0
-
-                    # Build merged data, then remove all optional entity keys that are
-                    # absent or falsy. Two failure modes that affect ALL entity selectors:
-                    # 1. Voluptuous drops Optional+None key entirely → key absent from
-                    #    user_input but old value lingers in entry.data after merge.
-                    # 2. HA/frontend sends None → merge stores falsy value → EntitySelector
-                    #    displays "None" as invalid entity ID on next reconfigure.
-                    new_data = {**entry.data, **user_input}
-                    for _key in [
-                        "outdoor_temp_sensor",
-                        "wind_speed_sensor",
-                        "wind_gust_sensor",
-                        CONF_SECONDARY_WEATHER_ENTITY,
-                        CONF_INDOOR_TEMP_SENSOR,
-                    ]:
-                        if _key not in user_input or not user_input.get(_key):
-                            new_data.pop(_key, None)
-
-                    return self.async_update_reload_and_abort(
-                        entry, data=new_data
-                    )
-
-        # Generate Schema
-        # Pass user_input so the schema reflects the LATEST dropdown choice (e.g. if we are reloading)
-        schema = self._get_schema(user_input, default_data, is_reconfigure=True)
-
+    async def async_step_reconfigure(self, user_input=None) -> FlowResult:
+        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        if user_input is None:
+            self._entry = entry
+            self._flow_data = {**entry.data}
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors = self._validate_basics(user_input)
+            if not errors:
+                # Sensor swap guard: simultaneous removal + addition almost always
+                # means the user is trying to replace a broken/renamed sensor inline.
+                # This destroys the learned history for the removed sensor.
+                # The correct path is the 'replace_sensor' service call.
+                old_sensors = set(self._flow_data.get("energy_sensors", []))
+                new_sensors = set(user_input.get("energy_sensors", []))
+                if (old_sensors - new_sensors) and (new_sensors - old_sensors):
+                    errors["energy_sensors"] = "sensor_swap_detected"
+            if not errors:
+                self._flow_data.update(user_input)
+                self._clear_absent_entity_keys(user_input, ["outdoor_temp_sensor"])
+                return await self.async_step_reconfigure_physics()
         return self.async_show_form(
             step_id="reconfigure",
-            data_schema=schema,
+            data_schema=self._schema_basics(user_input, self._flow_data),
             errors=errors,
+        )
+
+    async def async_step_reconfigure_physics(self, user_input=None) -> FlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors = self._validate_physics(user_input)
+            if not errors:
+                self._flow_data.update(user_input)
+                self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor", CONF_INDOOR_TEMP_SENSOR])
+                return await self.async_step_reconfigure_advanced()
+        return self.async_show_form(
+            step_id="reconfigure_physics",
+            data_schema=self._schema_physics(user_input, self._flow_data),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_advanced(self, user_input=None) -> FlowResult:
+        if user_input is not None:
+            if self._needs_reload_advanced(user_input):
+                return self.async_show_form(
+                    step_id="reconfigure_advanced",
+                    data_schema=self._schema_advanced(user_input, self._flow_data),
+                )
+            new_aux = user_input.get(CONF_AUX_AFFECTED_ENTITIES)
+            if new_aux is not None:
+                coord = self.hass.data.get(DOMAIN, {}).get(self.context["entry_id"])
+                if coord:
+                    await coord.async_migrate_aux_coefficients(new_aux)
+            return self.async_update_reload_and_abort(
+                self._entry, data=self._build_final_data(user_input)
+            )
+        return self.async_show_form(
+            step_id="reconfigure_advanced",
+            data_schema=self._schema_advanced(None, self._flow_data),
         )

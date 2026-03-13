@@ -39,6 +39,7 @@ SERVICE_GET_FORECAST = "get_forecast"
 SERVICE_CALIBRATE_INERTIA = "calibrate_inertia"
 SERVICE_CALIBRATE_WIND_THRESHOLDS = "calibrate_wind_thresholds"
 SERVICE_RESET_SOLAR_LEARNING = "reset_solar_learning"
+SERVICE_RETRAIN_FROM_HISTORY = "retrain_from_history"
 SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=90)),
@@ -54,6 +55,7 @@ SERVICE_SCHEMA_CALIBRATE_WIND = vol.Schema({
 })
 
 SERVICE_SCHEMA_IMPORT = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
     vol.Required("file_path"): cv.string,
     vol.Optional("update_model", default=True): cv.boolean,
     vol.Required("column_mapping"): vol.Schema({
@@ -68,6 +70,7 @@ SERVICE_SCHEMA_IMPORT = vol.Schema({
 })
 
 SERVICE_SCHEMA_EXPORT = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
     vol.Required("file_path"): cv.string,
     vol.Required("export_type", default="daily"): vol.In(["daily", "hourly"]),
 })
@@ -89,10 +92,12 @@ SERVICE_SCHEMA_RESET_SOLAR = vol.Schema({
 })
 
 SERVICE_SCHEMA_BACKUP = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
     vol.Required("file_path"): cv.string,
 })
 
 SERVICE_SCHEMA_RESTORE = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
     vol.Required("file_path"): cv.string,
 })
 
@@ -101,7 +106,14 @@ SERVICE_SCHEMA_REPLACE_SENSOR = vol.Schema({
     vol.Required("new_entity_id"): cv.entity_id,
 })
 
+SERVICE_SCHEMA_RETRAIN = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("days_back"): vol.All(vol.Coerce(int), vol.Range(min=1, max=730)),
+    vol.Optional("reset_first", default=False): cv.boolean,
+})
+
 SERVICE_SCHEMA_COMPARE_PERIODS = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
     vol.Required("period_1_start"): cv.date,
     vol.Required("period_1_end"): cv.date,
     vol.Required("period_2_start"): cv.date,
@@ -163,14 +175,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register Import Service
     async def handle_import_csv(call: ServiceCall):
         """Handle the CSV import service call."""
+        entity_id = call.data.get("entity_id")
         file_path = call.data.get("file_path")
         mapping = call.data.get("column_mapping")
         update_model = call.data.get("update_model", True)
 
         _LOGGER.info(f"Service called to import CSV from {file_path} (Update Model: {update_model})")
 
-        for coord in _get_coordinators(hass):
-            await coord.import_csv_data(file_path, mapping, update_model)
+        coord = _get_target_coordinator(hass, entity_id)
+        await coord.import_csv_data(file_path, mapping, update_model)
 
     hass.services.async_register(
         DOMAIN,
@@ -182,13 +195,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register Export Service
     async def handle_export_csv(call: ServiceCall):
         """Handle the CSV export service call."""
+        entity_id = call.data.get("entity_id")
         file_path = call.data.get("file_path")
         export_type = call.data.get("export_type")
 
         _LOGGER.info(f"Service called to export CSV ({export_type}) to {file_path}")
 
-        for coord in _get_coordinators(hass):
-            await coord.export_csv_data(file_path, export_type)
+        coord = _get_target_coordinator(hass, entity_id)
+        await coord.export_csv_data(file_path, export_type)
 
     hass.services.async_register(
         DOMAIN,
@@ -262,14 +276,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         schema=SERVICE_SCHEMA_RESET_SOLAR,
     )
 
+    # Register Retrain From History Service
+    async def handle_retrain_from_history(call: ServiceCall) -> dict:
+        """Handle the retrain from history service call."""
+        entity_id = call.data.get("entity_id")
+        days_back = call.data.get("days_back")
+        reset_first = call.data.get("reset_first", False)
+
+        coord = _get_target_coordinator(hass, entity_id)
+        _LOGGER.info(
+            f"Service called: retrain_from_history (days_back={days_back}, reset_first={reset_first}, "
+            f"coordinator={coord.entry.entry_id})"
+        )
+        return await coord.retrain_from_history(days_back=days_back, reset_first=reset_first)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RETRAIN_FROM_HISTORY,
+        handle_retrain_from_history,
+        schema=SERVICE_SCHEMA_RETRAIN,
+        supports_response=SupportsResponse.ONLY,
+    )
+
     # Register Backup Service
     async def handle_backup_data(call: ServiceCall):
         """Handle the backup data service call."""
+        entity_id = call.data.get("entity_id")
         file_path = call.data.get("file_path")
         _LOGGER.info(f"Service called to backup data to {file_path}")
 
-        for coord in _get_coordinators(hass):
-            await coord.async_backup_data(file_path)
+        coord = _get_target_coordinator(hass, entity_id)
+        await coord.async_backup_data(file_path)
 
     hass.services.async_register(
         DOMAIN,
@@ -281,11 +318,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register Restore Service
     async def handle_restore_data(call: ServiceCall):
         """Handle the restore data service call."""
+        entity_id = call.data.get("entity_id")
         file_path = call.data.get("file_path")
         _LOGGER.info(f"Service called to restore data from {file_path}")
 
-        for coord in _get_coordinators(hass):
-            await coord.async_restore_data(file_path)
+        coord = _get_target_coordinator(hass, entity_id)
+        await coord.async_restore_data(file_path)
 
     hass.services.async_register(
         DOMAIN,
@@ -323,6 +361,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register Compare Periods Service
     async def handle_compare_periods(call: ServiceCall):
         """Handle the compare periods service call."""
+        entity_id = call.data.get("entity_id")
         p1_start = call.data.get("period_1_start")
         p1_end = call.data.get("period_1_end")
         p2_start = call.data.get("period_2_start")
@@ -330,8 +369,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         _LOGGER.info(f"Service called to compare periods: {p1_start}-{p1_end} vs {p2_start}-{p2_end}")
 
-        for coord in _get_coordinators(hass):
-            await coord.async_compare_periods(p1_start, p1_end, p2_start, p2_end)
+        coord = _get_target_coordinator(hass, entity_id)
+        await coord.async_compare_periods(p1_start, p1_end, p2_start, p2_end)
 
     hass.services.async_register(
         DOMAIN,
@@ -343,16 +382,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register Exit Cooldown Service
     async def handle_exit_cooldown(call: ServiceCall):
         """Handle the exit cooldown service call."""
+        entity_id = call.data.get("entity_id")
         _LOGGER.info("Service called to exit auxiliary cooldown.")
 
-        for coord in _get_coordinators(hass):
-            await coord.async_exit_cooldown()
+        coord = _get_target_coordinator(hass, entity_id)
+        await coord.async_exit_cooldown()
 
     hass.services.async_register(
         DOMAIN,
         SERVICE_EXIT_COOLDOWN,
         handle_exit_cooldown,
-        schema=vol.Schema({}),
+        schema=vol.Schema({vol.Optional("entity_id"): cv.entity_id}),
     )
 
     # Register Calibrate Wind Thresholds Service
@@ -485,5 +525,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_INERTIA)
             hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_WIND_THRESHOLDS)
             hass.services.async_remove(DOMAIN, SERVICE_RESET_SOLAR_LEARNING)
+            hass.services.async_remove(DOMAIN, SERVICE_RETRAIN_FROM_HISTORY)
 
     return unload_ok

@@ -700,6 +700,187 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Import historical data from CSV."""
         await self.storage.import_csv_data(file_path, mapping, update_model)
 
+    async def retrain_from_history(self, days_back: int | None = None, reset_first: bool = False) -> dict:
+        """Retrain the learning model from existing hourly log data.
+
+        Track A (daily_learning_mode=False): replays each logged hour through
+        learn_from_historical_import(), honouring aux/base routing.
+
+        Track B (daily_learning_mode=True): groups hours by day and applies the
+        same midnight EMA logic as the live calibration. Thermal mass correction
+        is applied when an indoor_temp_sensor is configured AND the hourly log
+        contains 'indoor_temp' entries; otherwise it is skipped gracefully.
+        """
+        if reset_first:
+            self._correlation_data = {}
+            self._aux_coefficients = {}
+            self._learned_u_coefficient = None
+            _LOGGER.info("retrain_from_history: Model reset before retraining.")
+
+        if days_back is not None:
+            from homeassistant.util import dt as dt_util
+            from datetime import timedelta
+            cutoff_str = (dt_util.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            entries = [e for e in self._hourly_log if e.get("timestamp", "") >= cutoff_str]
+        else:
+            entries = list(self._hourly_log)
+
+        if not entries:
+            return {"status": "no_data", "entries_processed": 0, "days_processed": 0, "learning_count": 0}
+
+        learning_count = 0
+
+        def _is_poisoned(entry: dict) -> bool:
+            s = entry.get("learning_status", "unknown")
+            return s == "disabled" or s.startswith("skipped_") or s == "cooldown_post_aux"
+
+        if self.daily_learning_mode:
+            # Track B: batch aggregation per calendar day.
+            # Poisoned hours (disabled/skipped_*/cooldown_post_aux) are excluded before
+            # grouping so the existing <22-hour guard automatically rejects days with
+            # too many bad hours (e.g. vacation days where learning was disabled).
+            daily_batches: dict[str, list] = {}
+            for entry in entries:
+                if not _is_poisoned(entry):
+                    daily_batches.setdefault(entry["timestamp"][:10], []).append(entry)
+
+            days_processed = 0
+            for date_str, day_entries in sorted(daily_batches.items()):
+                if len(day_entries) < 22:
+                    _LOGGER.debug(f"retrain_from_history Track B: Skipping {date_str} — {len(day_entries)}/24 hours")
+                    continue
+
+                total_kwh = sum(e.get("actual_kwh", 0.0) for e in day_entries)
+                daily_tdd = sum(e.get("tdd", 0.0) for e in day_entries)
+                avg_temp = sum(e.get("temp", 0.0) for e in day_entries) / len(day_entries)
+                avg_wind = sum(e.get("effective_wind", 0.0) for e in day_entries) / len(day_entries)
+
+                if daily_tdd < 0.5 or total_kwh <= 0:
+                    continue
+
+                # Thermal mass correction using midnight_indoor_temp stored in daily_history.
+                # day_str = midnight ending this day (= start of next day).
+                # previous day's midnight_indoor_temp = start of this day.
+                # ΔT = daily_history[day_str]["midnight_indoor_temp"]
+                #    - daily_history[prev_day]["midnight_indoor_temp"]
+                q_adjusted = total_kwh
+                if self.thermal_mass_kwh_per_degree > 0.0:
+                    from datetime import date as _date, timedelta as _td
+                    prev_day_str = (
+                        _date.fromisoformat(date_str) - _td(days=1)
+                    ).isoformat()
+                    end_temp = self._daily_history.get(date_str, {}).get("midnight_indoor_temp")
+                    start_temp = self._daily_history.get(prev_day_str, {}).get("midnight_indoor_temp")
+                    if end_temp is not None and start_temp is not None:
+                        delta_t_indoor = end_temp - start_temp
+                        q_adjusted = total_kwh - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
+                        _LOGGER.debug(
+                            f"retrain_from_history Track B {date_str}: thermal mass correction "
+                            f"{total_kwh:.2f} -> {q_adjusted:.2f} kWh (ΔT={delta_t_indoor:.2f}°C)"
+                        )
+
+                if q_adjusted <= 0:
+                    continue
+
+                q_hourly_avg = q_adjusted / 24.0
+                temp_key = str(int(round(avg_temp)))
+                wind_bucket = self._get_wind_bucket(avg_wind)
+
+                observed_u = q_adjusted / daily_tdd
+                if self._learned_u_coefficient is None:
+                    self._learned_u_coefficient = observed_u
+                else:
+                    self._learned_u_coefficient += DEFAULT_DAILY_LEARNING_RATE * (
+                        observed_u - self._learned_u_coefficient
+                    )
+
+                if temp_key not in self._correlation_data:
+                    self._correlation_data[temp_key] = {}
+                current_pred = self._correlation_data[temp_key].get(wind_bucket, 0.0)
+                if current_pred == 0.0:
+                    self._correlation_data[temp_key][wind_bucket] = round(q_hourly_avg, 5)
+                else:
+                    new_pred = current_pred + self.learning_rate * (q_hourly_avg - current_pred)
+                    self._correlation_data[temp_key][wind_bucket] = round(new_pred, 5)
+
+                learning_count += 1
+                days_processed += 1
+
+            self.data["learned_u_coefficient"] = self._learned_u_coefficient
+            await self.storage.async_save_data(force=True)
+
+            _LOGGER.info(
+                f"retrain_from_history Track B: Completed. "
+                f"{days_processed} days learned, U-coefficient={self._learned_u_coefficient}"
+            )
+            return {
+                "status": "completed",
+                "mode": "track_b_daily",
+                "entries_processed": len(entries),
+                "days_processed": days_processed,
+                "learning_count": learning_count,
+                "learned_u_coefficient": round(self._learned_u_coefficient, 4) if self._learned_u_coefficient is not None else None,
+            }
+
+        else:
+            # Track A: per-hour replay
+            temp_history: list[float] = []
+            skipped = 0
+
+            for entry in entries:
+                actual_kwh = entry.get("actual_kwh")
+                if actual_kwh is None:
+                    skipped += 1
+                    continue
+
+                temp = entry.get("temp", 0.0)
+                wind_bucket = entry.get("wind_bucket", "normal")
+                is_aux = entry.get("auxiliary_active", False)
+
+                if len(temp_history) >= 4:
+                    temp_history.pop(0)
+                temp_history.append(temp)
+
+                # Skip poisoned hours — but only after updating temp_history so the
+                # inertia sliding window stays accurate for subsequent hours.
+                if _is_poisoned(entry):
+                    skipped += 1
+                    continue
+
+                inertia_avg = sum(temp_history) / len(temp_history)
+                temp_key = str(int(round(inertia_avg)))
+
+                status = self.learning.learn_from_historical_import(
+                    temp_key=temp_key,
+                    wind_bucket=wind_bucket,
+                    actual_kwh=actual_kwh,
+                    is_aux_active=is_aux,
+                    correlation_data=self._correlation_data,
+                    aux_coefficients=self._aux_coefficients,
+                    learning_rate=self.learning_rate,
+                    get_predicted_kwh_fn=self._get_predicted_kwh,
+                    actual_temp=temp,
+                )
+                if "skipped" not in status:
+                    learning_count += 1
+                else:
+                    skipped += 1
+
+            await self.storage.async_save_data(force=True)
+
+            _LOGGER.info(
+                f"retrain_from_history Track A: Completed. "
+                f"{learning_count} entries learned, {skipped} skipped."
+            )
+            return {
+                "status": "completed",
+                "mode": "track_a_hourly",
+                "entries_processed": len(entries),
+                "days_processed": len({e["timestamp"][:10] for e in entries}),
+                "learning_count": learning_count,
+                "skipped": skipped,
+            }
+
     def _get_float_state(self, entity_id: str) -> float | None:
         """Helper to get float state from an entity."""
         if not entity_id:
@@ -2866,6 +3047,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         if current_indoor_temp is not None:
             self._last_midnight_indoor_temp = current_indoor_temp
+            # Store midnight indoor temp per day so retrain_from_history can apply
+            # thermal mass correction historically without a live sensor read.
+            self._daily_history[key]["midnight_indoor_temp"] = round(current_indoor_temp, 1)
 
         # Forecast Accuracy Tracking
         # Kelvin Protocol: Skip accuracy evaluation if learning is disabled (e.g. Vacation).

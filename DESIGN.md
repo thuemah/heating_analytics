@@ -213,6 +213,20 @@ In parallel, a single global **U-Coefficient** (kWh_el / TDD / day) is updated v
 
 **Indoor temperature sensor:** The sensor is always optional, even in Daily Learning Mode. Users who do not load-shift but still benefit from daily aggregation (due to high thermal mass or minimum modulation) can enable the mode without providing an indoor sensor — thermal mass correction is simply skipped.
 
+**The Data Resolution Trade-off (Diurnal Collapse):**
+
+While Track B resolves the load-shifting and thermal mass phase-shift problems of Track A, it introduces a severe penalty to learning rate across the temperature spectrum.
+
+Track A exploits the natural diurnal temperature swing: a day ranging from 4°C at night to 14°C at noon will populate up to 10 distinct temperature buckets in a single 24-hour period, delivering a broad, well-sampled slice of the heating curve every day.
+
+Track B mathematically collapses this entire swing into a single daily average (e.g., 9°C), yielding one data point per day regardless of the day's thermal range. To populate the bucket for deep-winter conditions (e.g., −10°C), the model must wait for a calendar day whose 24-hour mean reaches −10°C — an event that may occur only a handful of times per season, compared to the many individual overnight hours that reach that temperature under Track A.
+
+In practice this means:
+- **Track A:** The heating curve is broadly characterised within 2–4 weeks of varied weather.
+- **Track B:** Full characterisation of the heating curve may require an entire heating season.
+
+Track B should therefore be strictly reserved for setups where the underlying building physics — significant load shifting or very high concrete/stone thermal mass — render hourly observations thermodynamically invalid as individual learning samples.
+
 ### I. Thermodynamic Reconstruction
 When reconstructing historical data (e.g., for model comparison), the system prioritizes **Hourly Vectors** (see Section 5). If vectors are missing (legacy data), it performs **Thermodynamic Reconstruction**:
 

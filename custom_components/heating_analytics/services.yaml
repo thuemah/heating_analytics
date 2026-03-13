@@ -2,6 +2,12 @@ import_from_csv:
   name: Import from CSV
   description: Import historical data from a CSV file into the learning model.
   fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to import into. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
     file_path:
       name: File path
       description: The absolute path to the CSV file on the server.
@@ -29,6 +35,12 @@ export_to_csv:
   name: Export to CSV
   description: Export data (Daily History or Hourly Log) to a CSV file.
   fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to export from. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
     file_path:
       name: File path
       description: The absolute path where the CSV file will be saved (e.g., /config/heating_data.csv).
@@ -44,6 +56,43 @@ export_to_csv:
           options:
             - daily
             - hourly
+
+retrain_from_history:
+  name: Retrain Model from History
+  description: >-
+    Retrains the learning model using the existing hourly log — no CSV file required.
+    In Track A mode (standard hourly learning), each logged hour is replayed through
+    the same per-hour EMA path used during live operation.
+    In Track B mode (Daily Learning Mode), hours are grouped by calendar day and the
+    same nightly batch EMA is applied; thermal mass correction is applied automatically
+    when an Indoor Temperature Sensor is configured and indoor_temp values are present
+    in the log.
+    Useful after changing learning_rate, balance_point, wind thresholds, or after a
+    manual model reset.
+  fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to retrain. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    days_back:
+      name: Days Back
+      description: Limit retraining to the most recent N days of logged data. Leave empty to use all available history (up to 90 days in log).
+      selector:
+        number:
+          min: 1
+          max: 730
+          mode: box
+    reset_first:
+      name: Reset Model First
+      description: >-
+        If true, clears all existing learned correlation data and the U-coefficient before
+        retraining. Use this for a full cold-start rebuild from history.
+        If false (default), retraining refines the existing model via EMA.
+      default: false
+      selector:
+        boolean:
 
 reset_learning_data:
   name: Reset Learning Data
@@ -71,6 +120,12 @@ backup_data:
   name: Full System Backup
   description: Create a full backup of the system state (Learning Model, History, Logs, Settings) to a JSON file.
   fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to back up. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
     file_path:
       name: File path
       description: The absolute path where the backup JSON file will be saved (e.g., /config/heating_backup.json).
@@ -80,8 +135,14 @@ backup_data:
 
 restore_data:
   name: Full System Restore
-  description: "Restore the system state from a full backup JSON file. WARNING: This will overwrite all current data!"
+  description: "Restore the system state from a full backup JSON file. WARNING: This will overwrite all current data for the targeted instance!"
   fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to restore into. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
     file_path:
       name: File path
       description: The absolute path to the backup JSON file.
@@ -124,6 +185,12 @@ compare_periods:
   name: Compare Periods
   description: "Compare two historical periods. Period 1 is the current/recent period, Period 2 is the reference/baseline. Deltas show P1 relative to P2 (positive = P1 is higher)."
   fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to compare. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
     period_1_start:
       name: Period 1 Start (Current)
       description: "Start date for the current/recent period (e.g., '2026-01-01')."
@@ -152,6 +219,13 @@ compare_periods:
 exit_cooldown:
   name: Exit Auxiliary Cooldown
   description: Manually force the system to exit the auxiliary cooldown/decay state. Use this if you want to resume normal model learning immediately after an auxiliary event, bypassing the thermal settling period.
+  fields:
+    entity_id:
+      name: Entity
+      description: A Heating Analytics sensor belonging to the instance you want to affect. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
 
 get_forecast:
   name: Get Forecast Data

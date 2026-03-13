@@ -26,6 +26,7 @@ from .const import (
     ATTR_MIDNIGHT_FORECAST,
     ATTR_MIDNIGHT_UNIT_ESTIMATES,
     ATTR_MIDNIGHT_UNIT_MODES,
+    DEFAULT_DAILY_LEARNING_RATE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -1406,8 +1407,8 @@ class StorageManager:
                         }
                         new_log_entries.append(entry)
 
-                        # Model learning only for full mode
-                        if update_model and kwh is not None:
+                        # Track A: per-hour learning (only when daily_learning_mode is off)
+                        if update_model and kwh is not None and not self.coordinator.daily_learning_mode:
                             if len(temp_history) >= 4:
                                 temp_history.pop(0)
                             temp_history.append(temp)
@@ -1431,6 +1432,53 @@ class StorageManager:
                 except (ValueError, KeyError) as e:
                     _LOGGER.warning(f"Skipping row in CSV due to processing error: {e}. Row: {row}")
                     continue
+
+            # Track B: batch daily aggregation (daily_learning_mode only)
+            # Groups all imported full-mode entries by day and applies the same EMA
+            # logic as the live midnight calibration. Thermal mass correction is skipped
+            # because historical indoor temperatures are not available in the CSV.
+            if update_model and self.coordinator.daily_learning_mode and new_log_entries:
+                daily_batches: dict[str, list] = {}
+                for entry in new_log_entries:
+                    date_str = entry["timestamp"][:10]
+                    daily_batches.setdefault(date_str, []).append(entry)
+
+                for date_str, day_entries in sorted(daily_batches.items()):
+                    if len(day_entries) < 22:
+                        _LOGGER.debug(f"CSV Track B: Skipping {date_str} — only {len(day_entries)}/24 hours")
+                        continue
+
+                    total_kwh = sum(e["actual_kwh"] for e in day_entries)
+                    daily_tdd = sum(e["tdd"] for e in day_entries)
+                    avg_temp = sum(e["temp"] for e in day_entries) / len(day_entries)
+                    avg_wind = sum(e["effective_wind"] for e in day_entries) / len(day_entries)
+
+                    if daily_tdd < 0.5 or total_kwh <= 0:
+                        continue
+
+                    q_hourly_avg = total_kwh / 24.0
+                    temp_key = str(int(round(avg_temp)))
+                    wind_bucket = self.coordinator._get_wind_bucket(avg_wind)
+
+                    observed_u = total_kwh / daily_tdd
+                    if self.coordinator._learned_u_coefficient is None:
+                        self.coordinator._learned_u_coefficient = observed_u
+                    else:
+                        self.coordinator._learned_u_coefficient += DEFAULT_DAILY_LEARNING_RATE * (
+                            observed_u - self.coordinator._learned_u_coefficient
+                        )
+
+                    if temp_key not in self.coordinator._correlation_data:
+                        self.coordinator._correlation_data[temp_key] = {}
+                    current_pred = self.coordinator._correlation_data[temp_key].get(wind_bucket, 0.0)
+                    if current_pred == 0.0:
+                        self.coordinator._correlation_data[temp_key][wind_bucket] = round(q_hourly_avg, 5)
+                    else:
+                        new_pred = current_pred + self.coordinator.learning_rate * (q_hourly_avg - current_pred)
+                        self.coordinator._correlation_data[temp_key][wind_bucket] = round(new_pred, 5)
+                    learning_count += 1
+
+                _LOGGER.info(f"CSV Track B: Learned from {learning_count} days (daily_learning_mode active).")
 
             return new_log_entries, learning_count
 

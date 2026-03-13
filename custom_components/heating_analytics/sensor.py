@@ -124,6 +124,7 @@ from .const import (
     WIND_UNIT_KNOTS,
     WIND_UNIT_MS,
     convert_from_ms,
+    CONF_SECONDARY_WEATHER_ENTITY,
     ENERGY_GUARD_THRESHOLD,
     STRESS_INDEX_LIGHT,
     STRESS_INDEX_MODERATE,
@@ -932,14 +933,28 @@ class HeatingEffectiveWindSensor(HeatingAnalyticsBaseSensor):
         weather_wind_unit = self.coordinator._get_weather_wind_unit()
         wind_unit = self.coordinator.wind_unit
 
-        def _forecast_effective_wind(source):
+        def _get_wind_unit_for_source(source: str) -> str | None:
+            """Return the wind_speed_unit reported by the weather entity for this source."""
+            if source == 'secondary_reference':
+                secondary_entity_id = self.coordinator.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY)
+                if secondary_entity_id:
+                    sec_state = self.coordinator.hass.states.get(secondary_entity_id)
+                    if sec_state:
+                        return sec_state.attributes.get("wind_speed_unit")
+            return weather_wind_unit
+
+        def _forecast_effective_wind(source: str) -> float | None:
             item = self.coordinator.forecast.get_forecast_for_hour(now, source=source)
             if not item:
                 return None
             try:
-                w_speed_ms = convert_speed_to_ms(float(item.get("wind_speed", 0.0)), weather_wind_unit)
+                raw_speed = item.get("wind_speed")
+                if raw_speed is None:
+                    return None
+                source_wind_unit = _get_wind_unit_for_source(source)
+                w_speed_ms = convert_speed_to_ms(float(raw_speed), source_wind_unit)
                 w_gust = item.get("wind_gust_speed")
-                w_gust_ms = convert_speed_to_ms(float(w_gust), weather_wind_unit) if w_gust is not None else None
+                w_gust_ms = convert_speed_to_ms(float(w_gust), source_wind_unit) if w_gust is not None else None
                 eff = self.coordinator._calculate_effective_wind(w_speed_ms, w_gust_ms)
                 return round(convert_from_ms(eff, wind_unit), 1)
             except (ValueError, TypeError):
