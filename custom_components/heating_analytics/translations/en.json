@@ -51,6 +51,7 @@
                 "description": "Fine-tune the learning model and enable optional features. The defaults are appropriate for most installations.",
                 "data": {
                     "daily_learning_mode": "Daily Learning Mode (Track B)",
+                    "overnight_load_shift_correction": "Overnight Load Shift Correction",
                     "thermal_mass_kwh_per_degree": "Thermal Mass Factor (kWh/°C)",
                     "wind_gust_factor": "Wind Gust Factor",
                     "wind_threshold": "High Wind Threshold",
@@ -66,6 +67,7 @@
                 },
                 "data_description": {
                     "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Only recommended for homes with very high thermal mass (concrete/stone) or heat pumps with a high minimum modulation level. Significantly slows down the learning curve — full model characterisation may take an entire heating season.",
+                    "overnight_load_shift_correction": "WARNING: Only enable if you actively pre-heat or pre-cool across the midnight boundary (e.g. cheap-rate overnight charging). This corrects the daily energy total for heat stored in the building structure before midnight. If you do not do deliberate overnight load shifting, leave this OFF — enabling it incorrectly will skew the learned model.",
                     "thermal_mass_kwh_per_degree": "Compensates for heat stored in the building structure during indoor temperature changes. Rule of thumb: (Floor_m² × 35) / 1000 / avg_COP. Example: 250 m² house with COP 3.0 ≈ 2.9 kWh/°C. Leave at 0.0 to disable.",
                     "wind_gust_factor": "Controls the impact of wind gusts on heat loss calculations. 0.0 ignores gusts entirely; 1.0 applies them fully. Older or draughty buildings often benefit from a higher value.",
                     "wind_threshold": "Outdoor wind speed above which the high-wind correction model is applied.",
@@ -123,6 +125,7 @@
                 "description": "Adjust model tuning and optional features.",
                 "data": {
                     "daily_learning_mode": "Daily Learning Mode (Track B)",
+                    "overnight_load_shift_correction": "Overnight Load Shift Correction",
                     "thermal_mass_kwh_per_degree": "Thermal Mass Factor (kWh/°C)",
                     "wind_gust_factor": "Wind Gust Factor",
                     "wind_threshold": "High Wind Threshold",
@@ -138,6 +141,7 @@
                 },
                 "data_description": {
                     "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Only recommended for homes with very high thermal mass (concrete/stone) or heat pumps with a high minimum modulation level. Significantly slows down the learning curve — full model characterisation may take an entire heating season.",
+                    "overnight_load_shift_correction": "WARNING: Only enable if you actively pre-heat or pre-cool across the midnight boundary (e.g. cheap-rate overnight charging). This corrects the daily energy total for heat stored in the building structure before midnight. If you do not do deliberate overnight load shifting, leave this OFF — enabling it incorrectly will skew the learned model.",
                     "thermal_mass_kwh_per_degree": "Compensates for heat stored in the building structure during indoor temperature changes. Rule of thumb: (Floor_m² × 35) / 1000 / avg_COP. Example: 250 m² house with COP 3.0 ≈ 2.9 kWh/°C. Leave at 0.0 to disable.",
                     "wind_gust_factor": "Controls the impact of wind gusts on heat loss calculations. 0.0 ignores gusts entirely; 1.0 applies them fully. Older or draughty buildings often benefit from a higher value.",
                     "wind_threshold": "Outdoor wind speed above which the high-wind correction model is applied.",

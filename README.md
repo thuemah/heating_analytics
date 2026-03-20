@@ -131,9 +131,7 @@ This is optional but highly recommended for maximum accuracy.
 ### Machine Learning That Just Works
 
 - **Automatic Learning:** No manual calibration needed—the system learns your home's thermal characteristics
-- **Daily Learning Mode (Track B):** An optional configuration flag for homes where hourly learning is unreliable — typically high thermal mass buildings (concrete, stone) or heat pumps with a high minimum modulation level. When enabled, Track A (hourly) is completely disabled and the model learns once per day at midnight instead, updating the correlation table from a full daily energy budget. The indoor temperature sensor is optional; thermal mass correction is applied only when the sensor is configured. A dedicated `heating_analytics_daily_learning` sensor exposes the learned U-Coefficient (kWh/TDD/day) as its state, enabling long-term monitoring of the building's overall thermal health independent of specific temperature buckets.
-
-  **Note — Significantly Slower Learning Curve:** By aggregating 24 hours into a single daily average, Track B loses the diurnal temperature variance that makes hourly learning efficient. Where Track A may populate 10 distinct temperature buckets in a single day (e.g., 4°C at night through 14°C at noon), Track B records a single data point at the daily mean. Building a complete heating curve will therefore take significantly longer — on the order of months rather than weeks. Daily Learning Mode should be reserved for setups where the physical building dynamics genuinely render hourly observations thermodynamically unreliable. Hourly learning is the recommended path for the large majority of users.
+- **Daily Learning Mode (Track B):** For homes where hourly learning is unreliable — typically high thermal mass buildings (concrete, stone) or heat pumps with a high minimum modulation level. The model learns once per day at midnight instead of every hour. **Note:** Building a complete heating curve takes months rather than weeks. Only use this if your building dynamics genuinely make hourly observations unreliable — hourly learning (Track A) is the right choice for the large majority of installations.
 - **Regime-Aware Prediction:**
     - **Cold Regime:** Uses thermodynamic scaling for accurate extrapolation in deep winter.
     - **Mild Regime:** Prioritizes neighbor averaging and wind fallbacks for stability in variable transition seasons.
@@ -211,8 +209,6 @@ Without explicit DHW tracking, the learning model sees inflated consumption duri
 
 **Fix:** Set your heat pump unit to `DHW` mode in the Heating Analytics mode selector whenever the pump is in DHW cycle. The model then correctly observes zero space-heat contribution during those hours, and the base coefficient converges to the true value without drift.
 
-> **v1.2.7 — Sampling precision:** The DHW exclusion is applied every 2 minutes (30 evaluations per hour), so a mid-hour DHW cycle — such as a 10-minute shower at 14:45 — is detected and excluded with high temporal resolution. This prevents DHW energy from bleeding into the hourly heating total.
-
 #### Automatic Mode Mapping with Blueprints
 
 The repository includes ready-made blueprints that automate the mode transitions — no manual helper management needed:
@@ -264,6 +260,11 @@ A helper entity (`number.heating_analytics_solar_correction`) allows you to info
 The system stores **Hourly Data Vectors** (Temp, Wind, Actual Load) for every day in history. This enables:
 - **Precise Re-simulation:** "What if" scenarios use the exact weather/load profile of the past, not just daily averages.
 - **Thermodynamic Reconstruction:** Accurate recovery of effective temperatures even from years ago.
+
+> [!NOTE]
+> **Design Philosophy: Where are the advanced data points?**
+>
+> To keep your entity registry clean and uncluttered, Heating Analytics does not create a separate sensor for every metric. Instead, rich secondary data — confidence grades, recommendation states, and hourly data vectors — is exposed as **attributes** on the primary sensors. The main `state` value of each sensor remains a simple scalar, ideal for automations and template math, while the full dataset is available as attributes for template sensors, advanced dashboard cards, and developer tooling.
 
 ---
 
@@ -330,6 +331,17 @@ If the indoor temperature rises over a day, some energy went into heating the bu
 - Lightweight construction (timber frame, thin walls): use a lower value.
 - Heavy construction (passive house, concrete, stone): use a higher value.
 - Set to `0.0` to disable correction entirely (equivalent to not having a sensor).
+
+### Overnight Load Shift Correction
+
+> [!WARNING]
+> **This setting is intended for a narrow group of advanced users.** Enable it only if you actively pre-heat or pre-cool your home across the midnight boundary — for example, by deliberately drawing cheap overnight electricity to store heat in your building structure before a high-tariff morning period. If you do not intentionally load-shift across midnight, leave this **off**. Enabling it incorrectly will cause the model to systematically misattribute stored heat as daytime consumption, progressively biasing the learned heat loss coefficient.
+
+When enabled (requires Daily Learning Mode + Indoor Temperature Sensor), the system applies an additional correction to account for thermal energy loaded into the building mass *before* midnight that would otherwise be counted against the following day's energy budget. The adjustment is symmetric with the standard Thermal Mass Correction but applied across the day boundary:
+
+`q_adjusted = daily_kWh − (Thermal Mass Factor × ΔT_midnight_crossover)`
+
+This setting is UI-only and is not stored in the integration's configuration. It is derived automatically from the presence of a configured indoor temperature sensor on subsequent reconfiguration.
 
 ### Thermal Inertia Profiles
 
@@ -471,54 +483,49 @@ To ensure stability and prevent slow learning, especially for devices that cycle
 
 </details>
 
-<details>
-<summary><b>Learning Model Architecture</b></summary>
-
-**Temperature Buckets:**
-- Rounds temperatures to nearest integer (18.3°C → "18")
-- Uses **inertia temperature** (4-hour rolling average) to account for thermal lag
-- Prevents reactivity to short-term fluctuations
-
-**Hourly Learning Updates:**
-- Triggered every hour at the hour boundary
-- Calculates average conditions for completed hour
-- Updates model using **Exponential Moving Average (EMA):**
-  ```
-  new_prediction = old_prediction + learning_rate × (actual - old_prediction)
-  ```
-- Tracks observation counts per (temperature, wind) combo for confidence metrics
-
-**Purity Guard (Learning Quality Control):**
-- Only learns from hours that are >95% in one heating mode (normal or auxiliary)
-- Mixed hours are skipped to prevent model pollution
-- Example: If you used auxiliary heating for 58 minutes and normal heating for 2 minutes in one hour, the system learns from that hour (96.6% purity)
-- Example: If you switched modes (e.g. 50/50 split or even 90/10), the hour is skipped to ensure model integrity
-- Ensures clean learning data by avoiding hours where energy consumption can't be clearly attributed
-
-**Daily Processing:**
-- At midnight, logs daily statistics
-- Does **not** retrain model (hourly updates only)
-- Captures forecast snapshot for deviation baseline
-
-</details>
-
-<details>
-<summary><b>Performance Optimization</b></summary>
-
-Even with years of data, the system remains fast:
-
-- **O(1) Efficiency Calculations:** Uses rolling accumulators instead of re-scanning logs
-- **Cached Comparisons:** Model comparisons cache past periods (95% reduction in recalculation)
-- **Optimized Deviation Analysis:** Pre-calculates global factors once per update
-- **Batched Forecast Baselines:** Week-ahead forecasts pre-fetch historical baselines in a single batch (O(1) lookup vs O(N) iterative search)
-
-</details>
+For a detailed description of the learning algorithm, EMA update logic, Purity Guard, and internal data structures, see [DESIGN.md](DESIGN.md).
 
 ---
 
 ## Services & Automation
 
 The integration provides several services for managing learning data, backups, and system state.
+
+### Replace Sensor Source
+
+**Service:** `heating_analytics.replace_sensor_source`
+
+> [!IMPORTANT]
+> This is the **only supported method** for replacing or renaming a heating energy sensor. Removing the old sensor and adding the new one via Reconfigure will permanently delete all learned history for that unit. Always use this service instead.
+
+Use this when a sensor entity ID changes — for example, after a hardware replacement, a meter firmware update that renames the entity, or a manual entity ID change in Home Assistant.
+
+**Parameters:**
+- `old_entity_id`: The entity ID currently configured in the integration (must exist in the integration's sensor list)
+- `new_entity_id`: The replacement entity ID (must exist in Home Assistant; must not already be configured in the integration)
+
+**What gets migrated:**
+- All learned correlation data and temperature/wind bucket history
+- Learning buffers (warm-start data)
+- Auxiliary and solar coefficients
+- Unit operating modes
+- Observation counts and hourly delta/expected vectors
+- Daily and lifetime individual statistics
+- Full hourly log history
+
+**What gets reset:**
+- The energy baseline for the replaced sensor. The new sensor will establish its own baseline on the next update cycle, preventing consumption spikes caused by differing cumulative totals between the old and new meter.
+
+The integration reloads automatically after the migration completes.
+
+```yaml
+action: heating_analytics.replace_sensor_source
+data:
+  old_entity_id: sensor.heat_pump_energy_old
+  new_entity_id: sensor.heat_pump_energy_new
+```
+
+---
 
 ### Backup & Restore Learning Data
 

@@ -1,0 +1,261 @@
+# ==============================================================================
+# HEATING ANALYTICS — FORECAST SENSOR & DASHBOARD EXAMPLE
+# ==============================================================================
+#
+# This file contains two independent sections:
+#
+#   SECTION 1 — Template sensor (goes in configuration.yaml / template blocks)
+#   SECTION 2 — Plotly-graph dashboard card (goes in your HA dashboard YAML)
+#
+# Both sections rely on the heating_analytics integration being installed and
+# the service heating_analytics.get_forecast being available.
+#
+# CUSTOMISATION CHECKLIST:
+#   [ ] Section 1: adjust the sensor name and unique_id if needed
+#   [ ] Section 1: update the replace() filters in unit_breakdown to match
+#       the entity-ID patterns used in your installation (see inline comments)
+#   [ ] Section 2: update every reference to sensor.heating_forecast_data if
+#       you changed the sensor name above
+#
+# ==============================================================================
+
+
+# ==============================================================================
+# SECTION 1: TEMPLATE SENSOR — HEATING FORECAST DATA
+# ==============================================================================
+# A trigger-based sensor that fetches a 2-day heating forecast from the
+# heating_analytics integration and stores the result as a compact forecast
+# attribute for use in dashboards and automations.
+#
+# TRIGGER:  At minute :05 every hour (time_pattern) to avoid race conditions
+#           with other sensors that update on the full hour. An additional
+#           homeassistant start trigger ensures the sensor is populated
+#           immediately when HA starts, rather than waiting up to 55 minutes
+#           for the first scheduled run.
+#
+# STATE:    Time of last update (HH:MM).
+#
+# ATTRIBUTE forecast — list of hourly objects with the following short keys:
+#   t:   Datetime of the hour
+#   tot: Total heat demand (kWh, rounded to 2 decimals)
+#   tmp: Estimated indoor temperature based on thermal inertia (°C, 1 decimal)
+#   sol: Solar contribution (kWh, 2 decimals)
+#   brk: Per-unit breakdown — only units with consumption > 0.01 kWh,
+#        with entity-ID prefixes/suffixes stripped for readability
+#
+# DATA COMPRESSION:
+#   - Units with net_kwh <= 0.01 are excluded from the breakdown
+#   - Entity-ID prefixes (sensor.) and common suffixes are stripped
+#   - Field names are abbreviated (t, tot, tmp, sol, brk) to keep the
+#     attribute small enough to fit within HA's state attribute limits
+#
+# PLACEMENT: Add this block inside a `template:` section in configuration.yaml,
+#            or in a dedicated template YAML file included via !include.
+#
+# Example configuration.yaml structure:
+#   template:
+#     - trigger: ...          # ← paste the block below starting here
+#       sensor: ...
+# ==============================================================================
+
+  - trigger:
+      - platform: time_pattern
+        minutes: 5
+      - platform: homeassistant
+        event: start
+    action:
+      - action: heating_analytics.get_forecast
+        data:
+          days: 2
+        response_variable: raw_data
+    sensor:
+      - name: "Heating Forecast Data"
+        unique_id: heating_forecast_data
+        state: "{{ now().strftime('%H:%M') }}"
+        attributes:
+          forecast: >
+            {% set ns = namespace(clean_list=[]) %}
+            {% for f in raw_data.forecast %}
+              {# ------------------------------------------------------------------
+                 Build a compact unit_breakdown — only units with real consumption.
+                 Adjust the replace() calls below to match the entity-ID naming
+                 conventions in YOUR installation.
+                 Examples of suffixes to strip:
+                   '_electric_consumption_kwh_4'  (Tibber / Zaptec style)
+                   '_daily_consumption'
+                   '_energy_usage'
+                 Add or remove lines as needed.
+              ------------------------------------------------------------------ #}
+              {% set units = namespace(u={}) %}
+              {% for k, v in f.unit_breakdown.items() %}
+                {% if v.net_kwh > 0.01 %}
+                  {% set short_name = k
+                    | replace('sensor.', '')
+                    | replace('_electric_consumption_kwh_4', '')
+                    | replace('_daily_consumption', '')
+                    | replace('_energy_usage', '') %}
+                  {% set units.u = dict(units.u, **{short_name: (v.net_kwh | round(2))}) %}
+                {% endif %}
+              {% endfor %}
+              {% set item = {
+                't':   f.datetime,
+                'tot': f.kwh | round(2),
+                'tmp': f.inertia_temp | round(1),
+                'sol': f.solar_kwh | round(2),
+                'brk': units.u
+              } %}
+              {% set ns.clean_list = ns.clean_list + [item] %}
+            {% endfor %}
+            {{ ns.clean_list }}
+
+
+# ==============================================================================
+# SECTION 2: PLOTLY-GRAPH DASHBOARD CARD — 48-HOUR HEAT DEMAND FORECAST
+# ==============================================================================
+# Visualises the forecast attribute produced by the sensor in Section 1.
+#
+# Displays:
+#   - Red bars:    Total heat demand per hour (left y-axis, kWh)
+#   - Yellow bars: Solar contribution as a negative bar (left y-axis, kWh)
+#   - Blue line:   Estimated indoor temperature via thermal inertia (right y-axis, °C)
+#
+# Hover tooltip on the red bars shows the full per-unit breakdown.
+#
+# REQUIREMENTS:
+#   - custom:plotly-graph card installed via HACS
+#   - The sensor from Section 1 must be active (entity shown below)
+#
+# CUSTOMISATION:
+#   ► If you renamed the sensor, replace every occurrence of
+#     sensor.heating_forecast_data with your sensor's entity ID.
+#
+# PLACEMENT: Add this block as a card in your Lovelace dashboard YAML.
+# ==============================================================================
+
+type: custom:plotly-graph
+title: Heat Demand Forecast (48 Hours)
+hours_to_show: 48
+raw_plotly_config: true
+config:
+  displayModeBar: false
+layout:
+  barmode: relative
+  margin:
+    t: 40
+    b: 40
+    l: 50
+    r: 50
+  hovermode: x unified
+  yaxis:
+    title: Energy (kWh)
+    tickformat: .1f
+    zeroline: true
+    zerolinecolor: rgba(255, 255, 255, 0.3)
+  yaxis2:
+    title: Temperature (°C)
+    overlaying: "y"
+    side: right
+  paper_bgcolor: rgba(0,0,0,0)
+  plot_bgcolor: rgba(0,0,0,0)
+entities:
+  # ► Replace sensor.heating_forecast_data below if you used a different name.
+
+  - entity: sensor.heating_forecast_data
+    name: Heat demand
+    type: bar
+    marker:
+      color: "#E45E65"
+    x: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item => new Date(item.t));
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item => parseFloat(item.tot) || 0);
+      }
+    text: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item => {
+          let tooltip = `<b>Total: ${(parseFloat(item.tot) || 0).toFixed(2)} kWh</b><br>`;
+          const units = Object.entries(item.brk || {}).sort((a, b) => b[1] - a[1]);
+          if (units.length > 0) {
+            tooltip += `<br><i>Breakdown:</i><br>`;
+            for (const [key, val] of units) {
+              const niceName = key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, ' ');
+              tooltip += `${niceName}: <b>${(parseFloat(val) || 0).toFixed(2)}</b> kWh<br>`;
+            }
+          }
+          return tooltip;
+        });
+      }
+    hoverinfo: text
+    showlegend: false
+
+  - entity: sensor.heating_forecast_data
+    name: Solar contribution
+    type: bar
+    marker:
+      color: "#F9D05A"
+    x: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item => new Date(item.t));
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item => -(parseFloat(item.sol) || 0));
+      }
+    text: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item => {
+          const sol = parseFloat(item.sol) || 0;
+          return sol > 0 ? `Solar contribution: <b>${sol.toFixed(2)}</b> kWh` : "";
+        });
+      }
+    hoverinfo: text
+    showlegend: false
+
+  - entity: sensor.heating_forecast_data
+    name: Temperature
+    type: scatter
+    mode: lines+markers
+    yaxis: y2
+    line:
+      color: "#4285F4"
+      shape: spline
+      width: 3
+    marker:
+      size: 6
+    x: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item => new Date(item.t));
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item => parseFloat(item.tmp) || 0);
+      }
+    text: |
+      $fn ({ hass }) => {
+        const data = hass.states['sensor.heating_forecast_data'].attributes.forecast;
+        if (!data) return [];
+        return data.map(item =>
+          `Indoor temp (inertia): <b>${(parseFloat(item.tmp) || 0).toFixed(1)}</b> °C`
+        );
+      }
+    hoverinfo: text
+    showlegend: false

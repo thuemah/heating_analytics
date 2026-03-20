@@ -2365,6 +2365,12 @@ class StatisticsManager:
         # 1. Extract and Filter Logs ("Pure" hours only)
         pure_logs = []
         total_hours_evaluated = 0
+        discarded = {
+            "zero_or_negative_consumption": 0,
+            "solar_interference": 0,
+            "auxiliary_active": 0,
+            "missing_wind_or_temp": 0,
+        }
 
         sorted_logs = sorted(self.coordinator._hourly_log, key=lambda x: x["timestamp"])
 
@@ -2376,23 +2382,24 @@ class StatisticsManager:
 
             actual_kwh = log.get("actual_kwh", 0.0)
             if actual_kwh <= 0.0:
+                discarded["zero_or_negative_consumption"] += 1
                 continue
 
             solar_impact = log.get("solar_impact_kwh", 0.0)
             if solar_impact > 0.1:
+                discarded["solar_interference"] += 1
                 continue
 
             aux_active = log.get("auxiliary_active", False)
             if aux_active:
+                discarded["auxiliary_active"] += 1
                 continue
 
             # Need effective_wind and temp_key to map to model
             eff_wind = log.get("effective_wind")
-            if eff_wind is None:
-                continue
-
             temp_key = log.get("temp_key")
-            if temp_key is None:
+            if eff_wind is None or temp_key is None:
+                discarded["missing_wind_or_temp"] += 1
                 continue
 
             pure_logs.append({
@@ -2403,12 +2410,15 @@ class StatisticsManager:
                 "temp": log["temp"]
             })
 
+        discarded["total_discarded"] = sum(v for k, v in discarded.items() if k != "total_discarded")
+
         if not pure_logs:
             return {
                 "error": "Not enough pure data points to calibrate wind thresholds. Ensure you have historical data without Aux or Solar interference.",
                 "days_analyzed": days,
                 "total_hours_evaluated": total_hours_evaluated,
-                "pure_hours_found": 0
+                "pure_hours_found": 0,
+                "discarded_hours": discarded,
             }
 
         # 2. Brute-Force Grid Search
@@ -2485,7 +2495,8 @@ class StatisticsManager:
                 "error": "Could not evaluate any thresholds. Ensure global correlation data exists for the selected timeframe.",
                 "days_analyzed": days,
                 "total_hours_evaluated": total_hours_evaluated,
-                "pure_hours_found": len(pure_logs)
+                "pure_hours_found": len(pure_logs),
+                "discarded_hours": discarded,
             }
 
         # 3. Finalize Response
@@ -2502,21 +2513,73 @@ class StatisticsManager:
                 current_mae = r["mae"]
                 break
 
-        # Check for insufficient windy hours
-        insufficient_windy_hours = False
-        if best_result["windy_hours"] < 30:
-            insufficient_windy_hours = True
+        # 4. Per-bucket analysis: distribution and MAE for current and recommended thresholds
+        cur_distribution = {"normal": 0, "high_wind": 0, "extreme_wind": 0}
+        rec_distribution = {"normal": 0, "high_wind": 0, "extreme_wind": 0}
+        rec_bucket_errors: dict[str, float] = {"normal": 0.0, "high_wind": 0.0, "extreme_wind": 0.0}
+        rec_bucket_counts: dict[str, int] = {"normal": 0, "high_wind": 0, "extreme_wind": 0}
+
+        for log in pure_logs:
+            eff_wind = log["effective_wind"]
+
+            # Current threshold distribution (based on raw wind speed, not model lookup)
+            if eff_wind >= current_extreme:
+                cur_distribution["extreme_wind"] += 1
+            elif eff_wind >= current_high:
+                cur_distribution["high_wind"] += 1
+            else:
+                cur_distribution["normal"] += 1
+
+            # Recommended threshold distribution + per-bucket MAE
+            if eff_wind >= recommended_extreme:
+                rb = "extreme_wind"
+            elif eff_wind >= recommended_high:
+                rb = "high_wind"
+            else:
+                rb = "normal"
+            rec_distribution[rb] += 1
+
+            temp_key = log["temp_key"]
+            if temp_key in correlation_data and rb in correlation_data[temp_key]:
+                expected = correlation_data[temp_key][rb]
+                if expected > 0.0:
+                    rec_bucket_errors[rb] += abs(log["actual_kwh"] - expected)
+                    rec_bucket_counts[rb] += 1
+
+        recommended_per_bucket_mae = {
+            b: (round(rec_bucket_errors[b] / rec_bucket_counts[b], 4) if rec_bucket_counts[b] > 0 else None)
+            for b in ("normal", "high_wind", "extreme_wind")
+        }
+
+        # 5. Improvement percentage
+        improvement_pct = None
+        if current_mae is not None and current_mae > 0:
+            improvement_pct = round((current_mae - recommended_mae) / current_mae * 100, 1)
+
+        # 6. Data quality (replaces boolean insufficient_windy_hours)
+        windy_h = best_result["windy_hours"]
+        if windy_h >= 100:
+            data_quality = f"High ({windy_h} windy hours)"
+        elif windy_h >= 30:
+            data_quality = f"Medium ({windy_h} windy hours — borderline reliable)"
+        else:
+            data_quality = f"Low ({windy_h} windy hours — treat as advisory, more wind data needed)"
 
         return {
             "days_analyzed": days,
             "total_hours_evaluated": total_hours_evaluated,
             "pure_hours_found": len(pure_logs),
+            "discarded_hours": discarded,
             "current_high": current_high,
             "current_extreme": current_extreme,
             "current_mae": current_mae,
+            "current_distribution": cur_distribution,
             "recommended_high": recommended_high,
             "recommended_extreme": recommended_extreme,
             "recommended_mae": recommended_mae,
-            "insufficient_windy_hours": insufficient_windy_hours,
+            "recommended_distribution": rec_distribution,
+            "recommended_per_bucket_mae": recommended_per_bucket_mae,
+            "improvement_pct": improvement_pct,
+            "data_quality": data_quality,
             "top_10_candidates": results[:10]
         }

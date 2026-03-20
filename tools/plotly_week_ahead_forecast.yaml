@@ -1,0 +1,122 @@
+# ==============================================================================
+# WEEK AHEAD FORECAST — BAR + LINE DASHBOARD CARD
+# ==============================================================================
+#
+# Combined bar + line chart showing the 7-day heating energy forecast alongside
+# the predicted outdoor temperature and wind speed.
+#
+# Displays:
+#   - Orange bars:  Predicted daily heat demand (left y-axis, kWh)
+#   - Blue line:    Predicted average daily temperature (right y-axis, °C)
+#   - Hover:        Wind speed (m/s) from customdata
+#
+# The card title shows the weekly summary text produced by the integration
+# (e.g. "Cold week, ~15 % above typical") when available.
+#
+# SOURCE SENSOR:  sensor.heating_analytics_week_ahead_forecast
+# ATTRIBUTES:
+#   daily_forecast  — list of { date, kwh, temp, wind, solar_impact, reliability }
+#   weekly_summary  — short human-readable summary string
+#
+# REQUIREMENTS:
+#   - custom:plotly-graph card installed via HACS
+#
+# CUSTOMISATION:
+#   ► refresh_interval: 60 is sufficient — the sensor updates hourly.
+#   ► Adjust bar colour, line colour, and axis titles as desired.
+#   ► xaxis.tickformat "%a" shows short weekday names; use "%a %d" for date too.
+#
+# PLACEMENT: Add this block as a card in your Lovelace dashboard YAML.
+# ==============================================================================
+
+type: custom:plotly-graph
+refresh_interval: 60
+raw_plotly_config: true
+layout:
+  title:
+    text: |
+      $fn ({ hass }) => {
+        const attr = hass.states["sensor.heating_analytics_week_ahead_forecast"]?.attributes || {};
+        if (attr.weekly_summary) {
+          return "<b>Week Ahead Forecast</b><br><span style='font-size:10px;color:gray;'>"
+            + attr.weekly_summary + "</span>";
+        }
+        return "<b>Week Ahead Forecast</b>";
+      }
+    font:
+      size: 16
+  showlegend: true
+  legend:
+    orientation: h
+    "y": -0.2
+    x: 0.5
+    xanchor: center
+  paper_bgcolor: rgba(0,0,0,0)
+  plot_bgcolor: rgba(0,0,0,0)
+  font:
+    color: var(--primary-text-color)
+  yaxis:
+    title: kWh
+    showgrid: true
+    gridcolor: rgba(128,128,128,0.1)
+    zeroline: false
+  yaxis2:
+    title: °C
+    overlaying: "y"
+    side: right
+    showgrid: false
+    zeroline: true
+    zerolinecolor: rgba(128,128,128,0.3)
+  xaxis:
+    tickformat: "%a"
+    showgrid: false
+  margin:
+    l: 40
+    r: 40
+    t: 60
+    b: 50
+entities:
+  - entity: sensor.heating_analytics_week_ahead_forecast
+    type: bar
+    name: Energy (kWh)
+    marker:
+      color: "#ff9800"
+    hovertemplate: "<b>%{x|%A %d.%m}</b><br>Energy: %{y:.1f} kWh<extra></extra>"
+    x: |
+      $fn ({ hass }) => {
+        const forecast = hass.states["sensor.heating_analytics_week_ahead_forecast"]?.attributes?.daily_forecast || [];
+        return forecast.map(d => d.date);
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const forecast = hass.states["sensor.heating_analytics_week_ahead_forecast"]?.attributes?.daily_forecast || [];
+        return forecast.map(d => d.kwh);
+      }
+
+  - entity: sensor.heating_analytics_week_ahead_forecast
+    type: scatter
+    mode: lines+markers
+    name: Temperature (°C)
+    yaxis: y2
+    line:
+      color: "#2980b9"
+      width: 3
+      shape: spline
+    marker:
+      size: 6
+    hovertemplate: "Temp: %{y:.1f} °C<br>Wind: %{customdata} m/s<extra></extra>"
+    x: |
+      $fn ({ hass }) => {
+        const forecast = hass.states["sensor.heating_analytics_week_ahead_forecast"]?.attributes?.daily_forecast || [];
+        return forecast.map(d => d.date);
+      }
+    "y": |
+      $fn ({ hass }) => {
+        const forecast = hass.states["sensor.heating_analytics_week_ahead_forecast"]?.attributes?.daily_forecast || [];
+        return forecast.map(d => d.temp);
+      }
+    customdata: |
+      $fn ({ hass }) => {
+        const forecast = hass.states["sensor.heating_analytics_week_ahead_forecast"]?.attributes?.daily_forecast || [];
+        return forecast.map(d => d.wind);
+      }

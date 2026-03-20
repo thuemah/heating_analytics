@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.8] - 2026-03-20
+
+### Changed
+- **`calibrate_wind_thresholds` response aligned with `calibrate_inertia` quality.** Five new fields have been added to the return object to bring it to the same information density as the inertia service:
+  - **`discarded_hours`** — dict with a per-reason count of filtered-out hours (`zero_or_negative_consumption`, `solar_interference`, `auxiliary_active`, `missing_wind_or_temp`, `total_discarded`). Previously only `pure_hours_found` was available, making it impossible to diagnose why data was missing.
+  - **`current_distribution` / `recommended_distribution`** — hour count per bucket (`normal`, `high_wind`, `extreme_wind`) for the current and recommended threshold pair respectively. Critical for judging whether enough wind observations exist for the recommendation to be statistically meaningful.
+  - **`recommended_per_bucket_mae`** — MAE broken down per bucket for the recommended pair. Aggregate MAE can hide a poorly-fitted `extreme_wind` bucket when that bucket contains few hours.
+  - **`improvement_pct`** — MAE improvement from the current to the recommended threshold pair, expressed as a percentage (`(current_mae − recommended_mae) / current_mae × 100`), making it easy to judge whether the change is worth applying.
+  - **`data_quality`** — human-readable string replacing the binary `insufficient_windy_hours` flag: `"High (N windy hours)"` at ≥ 100 hours, `"Medium (N windy hours — borderline reliable)"` at 30–99, `"Low (N windy hours — treat as advisory, more wind data needed)"` below 30.
+
+- **Overnight load shift correction moved and gated in the setup wizard.** The majority of support questions about thermal mass correction ("am I calculating this correctly?") come from users who are not actually load-shifting energy across midnight — the correction does not apply to them. The config flow has been restructured to make this clear:
+  - **`indoor_temp_sensor` removed from step 2** (physics). It had no semantic connection to the other physics fields; its only purpose is thermal mass correction.
+  - **New `Overnight load shift correction` toggle added in step 3**, nested under `Daily Learning Mode`. It is off by default and shown only when Track B is active. Enabling it reveals `indoor_temp_sensor` and `thermal_mass_kwh_per_degree`. The toggle is UI-only and is not stored in `entry.data`; on reconfigure its default state is derived from whether `indoor_temp_sensor` is already configured.
+  - The coupling is now explicit: load shift correction requires Track B (daily learning). Users running Track B for high-thermal-mass or modulation-floor reasons — who do not load-shift — are no longer prompted to configure fields that do not apply to them.
+
 ## [1.2.7] - 2026-03-13
 
 ### Added

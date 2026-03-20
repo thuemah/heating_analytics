@@ -1,0 +1,87 @@
+# ==============================================================================
+# TODAY'S ENERGY BREAKDOWN — PIE CHART DASHBOARD CARD
+# ==============================================================================
+#
+# Plotly donut chart that shows the share of today's heating energy per unit.
+# Units with zero consumption are automatically excluded.
+#
+# SOURCE SENSOR:  sensor.heating_analytics_energy_consumption_today
+# ATTRIBUTE USED: unit_breakdown_kwh  — dict of { friendly_name: kwh }
+#
+# REQUIREMENTS:
+#   - custom:plotly-graph card installed via HACS
+#
+# CUSTOMISATION:
+#   ► The clean() function strips common suffixes from entity friendly names
+#     to keep labels short. Adjust or remove the replace() calls to match
+#     the naming conventions used in your installation.
+#   ► refresh_interval: 30 keeps the chart roughly in sync with the
+#     coordinator update cycle. Increase to reduce HA load on slow hardware.
+#
+# PLACEMENT: Add this block as a card in your Lovelace dashboard YAML.
+# ==============================================================================
+
+type: custom:plotly-graph
+refresh_interval: 30
+raw_plotly_config: true
+layout:
+  showlegend: false
+  paper_bgcolor: rgba(0,0,0,0)
+  plot_bgcolor: rgba(0,0,0,0)
+  font:
+    color: var(--primary-text-color)
+  margin:
+    l: 10
+    r: 10
+    t: 20
+    b: 20
+entities:
+  - entity: sensor.heating_analytics_energy_consumption_today
+    type: pie
+    hole: 0.65
+    sort: false
+    direction: clockwise
+    textposition: outside
+    textinfo: label+percent
+    automargin: true
+    hovertemplate: "%{label}<br>%{value:.2f} kWh<br>%{percent}<extra></extra>"
+    labels: |
+      $fn ({ hass }) => {
+        const d = hass.states["sensor.heating_analytics_energy_consumption_today"]?.attributes?.unit_breakdown_kwh || {};
+
+        // Strip common suffixes from friendly names to keep pie labels readable.
+        // Adjust or extend these replace() calls to match your installation.
+        const clean = (s) => {
+          let str = String(s)
+            .replace(/\s+Energy consumption$/i, "")
+            .replace(/\s+Energy$/i, "")
+            .replace(/\s+Daily consumption$/i, "")
+            .replace(/\s+Summation delivered$/i, "")
+            .replace(/\s+/g, " ")
+            .trim();
+
+          // Wrap long names (>15 chars) at a word boundary for readability
+          if (str.length > 15 && str.includes(" ")) {
+            const mid = Math.floor(str.length / 2);
+            const space = str.lastIndexOf(" ", mid);
+            if (space > 0) {
+              return str.substring(0, space) + "<br>" + str.substring(space + 1);
+            }
+          }
+          return str;
+        };
+
+        return Object.entries(d)
+          .map(([k, v]) => [clean(k), Number(v) || 0])
+          .filter(([, v]) => v > 0)
+          .sort((a, b) => b[1] - a[1])
+          .map(([k]) => k);
+      }
+    values: |
+      $fn ({ hass }) => {
+        const d = hass.states["sensor.heating_analytics_energy_consumption_today"]?.attributes?.unit_breakdown_kwh || {};
+        return Object.entries(d)
+          .map(([, v]) => Number(v) || 0)
+          .filter(v => v > 0)
+          .sort((a, b) => b - a);
+      }

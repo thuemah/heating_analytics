@@ -51,6 +51,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# UI-only key — not stored in entry.data. Derived from indoor_temp_sensor presence on load.
+_CONF_LOAD_SHIFT = "overnight_load_shift_correction"
+
 
 class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Heating Analytics."""
@@ -112,12 +115,21 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._flow_data.pop(key, None)
 
     def _needs_reload_advanced(self, user_input: dict) -> bool:
-        """Return True when step 3 must re-render to show/hide the Thermal Mass field."""
+        """Return True when step 3 must re-render to show/hide dynamic fields."""
         daily = user_input.get(CONF_DAILY_LEARNING_MODE, False)
-        if daily and CONF_THERMAL_MASS not in user_input:
-            return True   # Track B just enabled — show the field
-        if not daily and CONF_THERMAL_MASS in user_input:
-            return True   # Track B just disabled — hide the field
+        load_shift = user_input.get(_CONF_LOAD_SHIFT, False)
+        # daily_learning_mode toggled on — load-shift toggle not yet visible
+        if daily and _CONF_LOAD_SHIFT not in user_input:
+            return True
+        # daily_learning_mode toggled off — load-shift toggle still in submitted form
+        if not daily and _CONF_LOAD_SHIFT in user_input:
+            return True
+        # overnight_load_shift_correction toggled on — sensor/thermal-mass fields not yet visible
+        if daily and load_shift and CONF_THERMAL_MASS not in user_input:
+            return True
+        # overnight_load_shift_correction toggled off — thermal-mass field still in submitted form
+        if daily and not load_shift and CONF_THERMAL_MASS in user_input:
+            return True
         return False
 
     def _build_final_data(self, step3_input: dict) -> dict:
@@ -138,6 +150,13 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # present (truthy) in self._flow_data from a previous save.
         if not step3_input.get(CONF_SECONDARY_WEATHER_ENTITY):
             data.pop(CONF_SECONDARY_WEATHER_ENTITY, None)
+        # Clear indoor_temp_sensor when load-shift correction is not active so a
+        # previously saved sensor does not leak in from _flow_data.
+        if not (step3_input.get(CONF_DAILY_LEARNING_MODE) and step3_input.get(_CONF_LOAD_SHIFT)
+                and step3_input.get(CONF_INDOOR_TEMP_SENSOR)):
+            data.pop(CONF_INDOOR_TEMP_SENSOR, None)
+        # _CONF_LOAD_SHIFT is UI-only — never stored.
+        data.pop(_CONF_LOAD_SHIFT, None)
         for key in [
             "outdoor_temp_sensor", "wind_speed_sensor", "wind_gust_sensor",
             CONF_INDOOR_TEMP_SENSOR,
@@ -203,7 +222,6 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         for field, device_class in [
             ("wind_speed_sensor", "wind_speed"),
             ("wind_gust_sensor", "wind_speed"),
-            (CONF_INDOOR_TEMP_SENSOR, "temperature"),
         ]:
             schema[vol.Optional(field, description={"suggested_value": g(field)})] = selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor", device_class=device_class)
@@ -232,15 +250,26 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         max_wind = {WIND_UNIT_KMH: 80.0, WIND_UNIT_KNOTS: 40.0}.get(current_unit, 20.0)
         max_extreme = {WIND_UNIT_KMH: 120.0, WIND_UNIT_KNOTS: 60.0}.get(current_unit, 30.0)
 
+        # Derive load-shift default from whether indoor_temp_sensor is already configured
+        load_shift = g(_CONF_LOAD_SHIFT, bool(g(CONF_INDOOR_TEMP_SENSOR)))
+
         schema: dict = {
             vol.Optional(CONF_DAILY_LEARNING_MODE, default=daily): selector.BooleanSelector(),
         }
         if daily:
-            schema[vol.Required(CONF_THERMAL_MASS, default=g(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS))] = (
-                selector.NumberSelector(
-                    selector.NumberSelectorConfig(min=0.0, max=50.0, step=0.1, unit_of_measurement="kWh/°C")
+            schema[vol.Optional(_CONF_LOAD_SHIFT, default=bool(load_shift))] = selector.BooleanSelector()
+            if load_shift:
+                schema[vol.Optional(
+                    CONF_INDOOR_TEMP_SENSOR,
+                    description={"suggested_value": g(CONF_INDOOR_TEMP_SENSOR)},
+                )] = selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
                 )
-            )
+                schema[vol.Required(CONF_THERMAL_MASS, default=g(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS))] = (
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(min=0.0, max=50.0, step=0.1, unit_of_measurement="kWh/°C")
+                    )
+                )
         schema.update({
             vol.Required("wind_gust_factor", default=g("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.05, mode="slider")
@@ -298,7 +327,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors = self._validate_physics(user_input)
             if not errors:
                 self._flow_data.update(user_input)
-                self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor", CONF_INDOOR_TEMP_SENSOR])
+                self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor"])
                 return await self.async_step_advanced()
         return self.async_show_form(
             step_id="physics",
@@ -360,7 +389,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors = self._validate_physics(user_input)
             if not errors:
                 self._flow_data.update(user_input)
-                self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor", CONF_INDOOR_TEMP_SENSOR])
+                self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor"])
                 return await self.async_step_reconfigure_advanced()
         return self.async_show_form(
             step_id="reconfigure_physics",

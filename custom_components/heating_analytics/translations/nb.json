@@ -51,6 +51,7 @@
                 "description": "Finjuster læringsmodellen og aktiver valgfrie funksjoner. Standardverdiene passer for de fleste installasjoner.",
                 "data": {
                     "daily_learning_mode": "Daglig læringsmodus (Track B)",
+                    "overnight_load_shift_correction": "Nattlig lastforskyvningskorreksjon",
                     "thermal_mass_kwh_per_degree": "Termisk masse-faktor (kWh/°C)",
                     "wind_gust_factor": "Vindkastfaktor",
                     "wind_threshold": "Grense for sterk vind",
@@ -66,6 +67,7 @@
                 },
                 "data_description": {
                     "daily_learning_mode": "Når aktivert lærer modellen én gang per dag ved midnatt (Track B) i stedet for hver time (Track A). Anbefales kun for boliger med svært høy termisk masse (betong/stein) eller varmepumper med høy minimumsmodulering. Senker læringshastigheten betydelig — full karakterisering av varmekurven kan ta en hel varmesesong.",
+                    "overnight_load_shift_correction": "ADVARSEL: Aktiver kun hvis du aktivt forvarmer eller kjøler på tvers av midnattsgrensen (f.eks. billigstrøm om natten). Korrigerer dagens energitotale for varme lagret i bygningsmassen før midnatt. Hvis du ikke driver med bevisst lastforskyvning over midnatt, la dette være AV — feil aktivering forvrenger den innlærte modellen.",
                     "thermal_mass_kwh_per_degree": "Kompenserer for varme lagret i bygningsmassen ved endring i innetemperatur. Tommelfingerregel: (Areal_m² × 35) / 1000 / gj.snitt_COP. Eksempel: 250 m² hus med COP 3,0 ≈ 2,9 kWh/°C. Sett til 0,0 for å deaktivere.",
                     "wind_gust_factor": "Styrer vindkastenes påvirkning på varmetapsberegningene. 0,0 ignorerer kastene helt; 1,0 bruker dem fullt ut. Eldre eller trekkfulle bygg tjener ofte på en høyere verdi.",
                     "wind_threshold": "Utendørs vindhastighet over grensen aktiverer sterk-vind-korreksjon.",
@@ -123,6 +125,7 @@
                 "description": "Juster modellparametere og valgfrie funksjoner.",
                 "data": {
                     "daily_learning_mode": "Daglig læringsmodus (Track B)",
+                    "overnight_load_shift_correction": "Nattlig lastforskyvningskorreksjon",
                     "thermal_mass_kwh_per_degree": "Termisk masse-faktor (kWh/°C)",
                     "wind_gust_factor": "Vindkastfaktor",
                     "wind_threshold": "Grense for sterk vind",
@@ -138,6 +141,7 @@
                 },
                 "data_description": {
                     "daily_learning_mode": "Når aktivert lærer modellen én gang per dag ved midnatt (Track B) i stedet for hver time (Track A). Anbefales kun for boliger med svært høy termisk masse (betong/stein) eller varmepumper med høy minimumsmodulering. Senker læringshastigheten betydelig — full karakterisering av varmekurven kan ta en hel varmesesong.",
+                    "overnight_load_shift_correction": "ADVARSEL: Aktiver kun hvis du aktivt forvarmer eller kjøler på tvers av midnattsgrensen (f.eks. billigstrøm om natten). Korrigerer dagens energitotale for varme lagret i bygningsmassen før midnatt. Hvis du ikke driver med bevisst lastforskyvning over midnatt, la dette være AV — feil aktivering forvrenger den innlærte modellen.",
                     "thermal_mass_kwh_per_degree": "Kompenserer for varme lagret i bygningsmassen ved endring i innetemperatur. Tommelfingerregel: (Areal_m² × 35) / 1000 / gj.snitt_COP. Eksempel: 250 m² hus med COP 3,0 ≈ 2,9 kWh/°C. Sett til 0,0 for å deaktivere.",
                     "wind_gust_factor": "Styrer vindkastenes påvirkning på varmetapsberegningene. 0,0 ignorerer kastene helt; 1,0 bruker dem fullt ut. Eldre eller trekkfulle bygg tjener ofte på en høyere verdi.",
                     "wind_threshold": "Utendørs vindhastighet over grensen aktiverer sterk-vind-korreksjon.",
