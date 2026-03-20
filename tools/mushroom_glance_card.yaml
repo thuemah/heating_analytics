@@ -1,0 +1,95 @@
+# ==============================================================================
+# THE GLANCE CHIP — COMPACT HEATING SUMMARY DASHBOARD CARD
+# ==============================================================================
+#
+# A highly condensed, logic-heavy dashboard card that summarizes your entire
+# heating situation in a single glance. 
+#
+# Displays:
+#   - 🎯 Forecast: Projected end-of-day total vs Midnight Budget
+#   - ✅ Actual: Energy consumed so far today
+#   - 📊 Deviation: Current kWh difference vs expected, and daily percentage
+#   - 🌡️ Environment: Current temperature and dynamic weather/aux icons
+#
+# Dynamic Features:
+#   - The icon changes color based on your deviation (Green = saving, Red = over)
+#   - Weather emojis appear automatically during high wind (💨), extreme wind (🌪️)
+#   - A fire emoji (🔥) appears when your auxiliary heat source is active.
+#
+# REQUIREMENTS:
+#   - Mushroom Cards installed via HACS (custom:mushroom-template-card)
+#   - Replace 'sensor.outdoor_temperature' with your actual weather/temp sensor 
+#     if you do not use the default name.
+#
+# PLACEMENT: Add this block as a manual card in your Lovelace dashboard.
+# ==============================================================================
+
+type: custom:mushroom-template-card
+primary: "Heating: 🎯 Forecast | ✅ Actual | 📊 Deviation"
+secondary: >
+  {# --- FETCH DATA --- #} 
+  {% set actual_today = states('sensor.heating_analytics_energy_consumption_today') | float(0) %} 
+  {% set expected_so_far = states('sensor.heating_analytics_expected_consumption_so_far_today') | float(0) %}
+
+  {# Daily Forecasts #} 
+  {% set forecast = states('sensor.heating_analytics_forecast_today') | float(0) %} 
+  {% set expected_total_end_of_day = states('sensor.heating_analytics_predicted_consumption') | float(0) %}
+
+  {# Weather Data - Replace sensor.outdoor_temperature if needed #} 
+  {% set temp = states('sensor.outdoor_temperature') | float(0) %} 
+  {% set current_wind = states('sensor.heating_analytics_effective_wind') | float(0) %}
+
+  {# --- CALCULATIONS --- #} 
+  {% set diff_now = actual_today - expected_so_far %} 
+  {% set deviation_pct = states('sensor.heating_analytics_deviation') | float(0) %}
+
+  {# Wind Thresholds #} 
+  {% set wind_threshold = states('number.heating_analytics_wind_threshold') | float(4.2) %} 
+  {% set extreme_threshold = states('number.heating_analytics_extreme_wind_threshold') | float(6.4) %}
+
+  {# Check if Auxiliary Heating (e.g., fireplace) is active #} 
+  {% set aux_active = is_state('switch.heating_analytics_auxiliary_untracked_heating_active', 'on') %}
+
+  {# --- DYNAMIC ICONS --- #} 
+  {% if aux_active %}
+    {% set category = '🔥' %}
+  {% elif current_wind > extreme_threshold %}
+    {% set category = '🌪️' %}
+  {% elif current_wind > wind_threshold %}
+    {% set category = '💨' %}
+  {% else %}
+    {% set category = '' %}
+  {% endif %}
+
+  {# --- DISPLAY LOGIC --- #} 
+  {% if expected_total_end_of_day > 0 %}
+    {# Status emoji for deviation #}
+    {% if deviation_pct > 15 %}⚠️{% elif deviation_pct > 8 %}📈{% elif deviation_pct < -8 %}📉{% else %}✅{% endif %} 
+    
+    {# Output String #}
+    🎯 ~{{ forecast | round(1) }}/{{ expected_total_end_of_day | round(1) }} kWh | ✅ {{ actual_today | round(1) }} kWh | 📊 {% if diff_now > 0 %}+{% endif %}{{ diff_now | round(1) }} kWh ({{ deviation_pct | round(0) }}%) | 🌡️ {{ temp | round(1) }}°C {{ category }}
+  {% else %}
+    🔄 Calculating...
+  {% endif %}
+icon: >
+  {% set deviation_pct = states('sensor.heating_analytics_deviation') | float(0) %} 
+  {% if deviation_pct > 15 %} mdi:fire-alert 
+  {% elif deviation_pct > 8 %} mdi:fire 
+  {% elif deviation_pct < -8 %} mdi:leaf 
+  {% else %} mdi:radiator 
+  {% endif %}
+color: >
+  {% set deviation_pct = states('sensor.heating_analytics_deviation') | float(0) %} 
+  {% if deviation_pct > 15 %} red 
+  {% elif deviation_pct > 8 %} orange 
+  {% elif deviation_pct < -8 %} green 
+  {% else %} blue 
+  {% endif %}
+badge_icon: >
+  {% set deviation_pct = states('sensor.heating_analytics_deviation') | float(0) %} 
+  {% if deviation_pct > 15 %} mdi:alert {% endif %}
+badge_color: red
+tap_action:
+  action: more-info
+vertical: true
+features_position: bottom
