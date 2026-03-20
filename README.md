@@ -101,9 +101,11 @@ If you have past energy/weather data, jump-start the learning process:
 - Track per-room efficiency and solar distribution
 
 **Dashboard & Visualizations:**
-- See [dashboard_heating.md](https://github.com/thuemah/heating_analytics/blob/main/tools/dashboard_heating.md) for ready-made Lovelace YAML
-- Includes Plotly charts, efficiency cards, and forecast breakdowns
-- [plotly_heat_demand_curve.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_heat_demand_curve.yaml) – standalone heat demand curve (temperature vs kWh/day)
+- Ready-to-paste Plotly cards are available in the [`tools/`](https://github.com/thuemah/heating_analytics/blob/main/tools/) folder
+- [plotly_heat_demand_curve.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_heat_demand_curve.yaml) – heat demand curve (temperature vs kWh/day, segmented by wind)
+- [plotly_today_breakdown_pie.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_today_breakdown_pie.yaml) – donut chart of today's per-unit energy split
+- [plotly_week_ahead_forecast.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_week_ahead_forecast.yaml) – 7-day energy and temperature forecast
+- [heating_forecast_sensor_and_dashboard.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/heating_forecast_sensor_and_dashboard.yaml) – 48-hour hourly forecast with solar contribution
 
 ---
 
@@ -270,25 +272,21 @@ The system stores **Hourly Data Vectors** (Temp, Wind, Actual Load) for every da
 
 ## Dashboard & Visualizations
 
-A complete dashboard configuration is available in [dashboard_heating.md](https://github.com/thuemah/heating_analytics/blob/main/tools/dashboard_heating.md).
+Rather than a single monolithic dashboard, the [`tools/`](https://github.com/thuemah/heating_analytics/blob/main/tools/) folder contains ready-to-paste Plotly cards that you combine as needed. Each card references standard integration sensors directly — no fragile pre-built dashboard to maintain.
 
-**Includes:**
+**Available cards:**
 
-- Plotly charts (Expected vs Actual)
-- Efficiency cards with trends
-- Deviation alerts
-- Weather & solar impact
-- Week-ahead forecast
-
+| File | Description |
+|------|-------------|
+| [plotly_heat_demand_curve.yaml](https://github.com/thuemah/healing_analytics/blob/main/tools/plotly_heat_demand_curve.yaml) | Heat demand curve — temperature vs kWh/day across wind conditions |
+| [plotly_today_breakdown_pie.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_today_breakdown_pie.yaml) | Donut chart of today's per-unit energy split |
+| [plotly_week_ahead_forecast.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_week_ahead_forecast.yaml) | 7-day bar chart with temperature and wind overlay |
+| [heating_forecast_sensor_and_dashboard.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/heating_forecast_sensor_and_dashboard.yaml) | 48-hour hourly forecast with solar contribution |
+| [mushroom_glance_card.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/mushroom_glance_card.yaml) | Mushroom glance card for key metrics at a glance |
 
 <img width="682" height="1326" alt="week_ahead" src="https://github.com/user-attachments/assets/0666e162-e64f-4b49-b7c9-a82a12223692" />
 
-
 <img width="677" height="941" alt="model_comparison" src="https://github.com/user-attachments/assets/ea956d36-d809-470d-bcf3-3a08aa6d29e3" />
-
-### Heat Demand Curve
-
-The learned heat demand curve (temperature vs kWh/day across wind conditions) is available as a standalone Plotly card in [plotly_heat_demand_curve.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_heat_demand_curve.yaml).
 
 <img width="611" height="605" alt="image" src="https://github.com/user-attachments/assets/4af1f748-3b0a-4d42-a0c1-3a84ab617c99" />
 
