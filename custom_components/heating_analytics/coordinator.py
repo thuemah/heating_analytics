@@ -126,6 +126,7 @@ from .const import (
     COOLDOWN_MIN_HOURS,
     COOLDOWN_MAX_HOURS,
     COOLDOWN_CONVERGENCE_THRESHOLD,
+    SOLAR_BATTERY_DECAY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -155,6 +156,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         # New Per-Unit Solar State
         self._solar_coefficients_per_unit = {} # { entity_id: { "temp": coeff } }
+
+        # Solar thermal battery: accumulates solar impact across hours with exponential decay.
+        # Carries residual solar heat (stored in building mass) into post-solar hours.
+        # Reset to 0 on restart — recovers within a few hours.
+        self._solar_battery_state: float = 0.0
 
         self._hourly_delta_per_unit = {} # { entity_id: accumulated_kwh_this_hour }
         self._hourly_expected_per_unit = {} # { entity_id: accumulated_expected_kwh_this_hour }
@@ -2534,12 +2540,20 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             # Update global attr for consistency
             self.data[ATTR_SOLAR_IMPACT] = round(solar_impact, 3)
 
+        # Solar Thermal Battery: accumulate impact with exponential decay.
+        # Carries residual solar heat stored in building mass into post-solar hours,
+        # preventing over-prediction of consumption in the hours after peak sun.
+        # Only charge/decay when solar is enabled; on solar-disabled installs stays at 0.
+        if self.solar_enabled:
+            self._solar_battery_state = self._solar_battery_state * SOLAR_BATTERY_DECAY + solar_impact
+        effective_solar_impact = self._solar_battery_state
+
         # Update Last Hour Data in Coordinator
         self.data[ATTR_LAST_HOUR_ACTUAL] = round(total_energy_kwh, 3)
         self.data[ATTR_LAST_HOUR_EXPECTED] = round(expected_kwh, 3)
         self.data[ATTR_LAST_HOUR_DEVIATION] = round(total_energy_kwh - expected_kwh, 3)
         self.data["last_hour_wind_bucket"] = wind_bucket
-        self.data["last_hour_solar_impact_kwh"] = round(solar_impact, 3)
+        self.data["last_hour_solar_impact_kwh"] = round(effective_solar_impact, 3)
         self.data["last_hour_guest_impact_kwh"] = round(guest_impact_kwh, 3)
 
         if expected_kwh > ENERGY_GUARD_THRESHOLD:
@@ -2576,7 +2590,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 avg_temp=avg_temp,
                 total_energy_kwh=learning_energy_kwh,
                 base_expected_kwh=base_expected_kwh,
-                solar_impact=solar_impact,
+                solar_impact=effective_solar_impact,
                 avg_solar_vector=avg_solar_vector,
                 is_aux_active=is_aux_dominant,
                 aux_impact=self._get_aux_impact_kw(temp_key, wind_bucket),
@@ -2654,9 +2668,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
             # Calculate Thermodynamic Gross (Actual + Aux + Solar Adjustment)
             # Make mode-aware: Add in Heating, Subtract in Cooling
-            solar_adjustment = solar_impact
+            # Use effective_solar_impact (battery-smoothed) so the gross reflects
+            # the full residual solar heat carried in building mass.
+            solar_adjustment = effective_solar_impact
             if avg_temp >= self.balance_point:
-                solar_adjustment = -solar_impact
+                solar_adjustment = -effective_solar_impact
 
             thermodynamic_gross_kwh = total_energy_kwh + aux_impact_kwh + solar_adjustment
 
@@ -2689,7 +2705,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "solar_factor": round(avg_solar_factor, 3),
                 "solar_vector_s": round(avg_solar_vector[0], 3),
                 "solar_vector_e": round(avg_solar_vector[1], 3),
-                "solar_impact_kwh": round(solar_impact, 3),
+                "solar_impact_kwh": round(effective_solar_impact, 3),
+                "solar_impact_raw_kwh": round(solar_impact, 3),
                 "primary_entity": self.weather_entity,
                 "secondary_entity": self.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY),
                 "crossover_day": self.entry.data.get(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY),

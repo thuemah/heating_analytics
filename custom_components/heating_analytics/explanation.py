@@ -254,7 +254,8 @@ class WeatherImpactAnalyzer:
         }
 
     def analyze_period(self, period_days: List[Dict], baseline_days: List[Dict], context: str = 'week_ahead',
-                      current_total_kwh: Optional[float] = None, last_year_total_kwh: Optional[float] = None) -> Dict:
+                      current_total_kwh: Optional[float] = None, last_year_total_kwh: Optional[float] = None,
+                      current_basis: str = "actual", reference_basis: str = "actual") -> Dict:
         """Analyze entire period with aggregated insights."""
 
         total_kwh = current_total_kwh if current_total_kwh is not None else sum(d.get('kwh', 0.0) for d in period_days)
@@ -439,7 +440,9 @@ class WeatherImpactAnalyzer:
             'drivers': drivers_list,
             'variability': variability,
             'characterization': characterization,
-            'daily_analysis': daily_analysis
+            'daily_analysis': daily_analysis,
+            'current_basis': current_basis,
+            'reference_basis': reference_basis,
         }
 
     def _increment_driver(self, counts, factor, impact):
@@ -516,18 +519,26 @@ class ExplanationFormatter:
         delta_kwh = analysis['delta_kwh']
         delta_pct = analysis['delta_pct']
         char = analysis['characterization']
+        reference_basis = analysis.get('reference_basis', 'actual')
 
-        # 1. Main Summary
-        # "Significantly Colder: +50 kWh (+20% vs last year)."
+        # Label reflects what the reference actually is
+        if reference_basis == "actual":
+            ref_label = "vs last year"
+            similar_label = "Consumption similar to last year"
+        elif reference_basis == "hybrid":
+            ref_label = "vs last year (partial)"
+            similar_label = "Consumption similar to last year (partial data)"
+        else:  # "modeled"
+            ref_label = "vs last year's model"
+            similar_label = "Consumption similar to last year's model"
+
         sign = "+" if delta_kwh > 0 else ""
 
         if abs(delta_kwh) <= 5.0:
-            return "Consumption similar to last year"
+            return similar_label
 
-        summary = f"{char}: {sign}{delta_kwh:.0f} kWh ({sign}{delta_pct:.0f}% vs last year)."
+        summary = f"{char}: {sign}{delta_kwh:.0f} kWh ({sign}{delta_pct:.0f}% {ref_label})."
 
-        # 2. Drivers
-        # "Driven by 2 cold days and 1 windy day."
         driver_text = self._build_driver_cause(analysis['drivers'], delta_kwh)
         if driver_text:
             summary += f" {driver_text}."
@@ -668,16 +679,17 @@ class ExplanationFormatter:
         cross_kwh = comparison.get("actual_vs_reference_model_kwh")
         cross_pct = comparison.get("actual_vs_reference_model_pct")
 
-        # Use cross-comparison if actuals are missing for reference period
-        p2_actual = p2.get("actual_kwh")
-        use_cross = (p2_actual is None or p2_actual == 0) and cross_kwh is not None
+        # Use cross-comparison (P1 actual vs P2 modeled) when reference has no measurements
+        p2_basis = comparison.get("period_2_basis", "actual")
+        use_cross = p2_basis != "actual" and cross_kwh is not None
 
         if use_cross:
             headline_kwh = cross_kwh
             headline_pct = cross_pct
-            label = "vs reference model"
+            label = "vs reference model" if p2_basis == "modeled" else "vs reference (partial)"
         elif delta_kwh is not None:
             headline_kwh = delta_kwh
+            p2_actual = p2.get("actual_kwh")
             p2_val = p2_actual if p2_actual and p2_actual > 0.1 else None
             headline_pct = round((delta_kwh / p2_val) * 100, 1) if p2_val else None
             label = "vs reference"

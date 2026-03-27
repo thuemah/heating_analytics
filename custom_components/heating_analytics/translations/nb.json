@@ -38,7 +38,7 @@
                 },
                 "data_description": {
                     "wind_unit": "Enheten som brukes for vindinnstillinger på neste side.",
-                    "has_ac_units": "Aktiver hvis systemet brukes til kjøling for å få tilgang til kjølemoduser.",
+                    "has_ac_units": "Aktiver for å låse opp Kjølemodus, Gjeste-modus og VVB-modus. Hver modus oppretter dedikerte input-entiteter per varmeenhet for direkte styring via blueprints.",
                     "balance_point": "Utetemperaturen der boligen slutter å trenge varme. Typisk 15–17°C for godt isolerte boliger, opp til 18°C for eldre bygg.",
                     "thermal_inertia": "Antall timer med utetemperaturhistorikk modellen tar hensyn til. Bruk lav verdi for lette trekonstruksjoner, høyere for tunge betong- eller steinbygg.",
                     "wind_speed_sensor": "Valgfri. Et lokalt anemometer forbedrer vindmodelleringen. Hvis tomt, brukes værtjenesten.",
@@ -112,7 +112,7 @@
                 },
                 "data_description": {
                     "wind_unit": "Enheten som brukes for vindinnstillinger på neste side.",
-                    "has_ac_units": "Aktiver hvis systemet brukes til kjøling for å få tilgang til kjølemoduser.",
+                    "has_ac_units": "Aktiver for å låse opp Kjølemodus, Gjeste-modus og VVB-modus. Hver modus oppretter dedikerte input-entiteter per varmeenhet for direkte styring via blueprints.",
                     "balance_point": "Utetemperaturen der boligen slutter å trenge varme. Typisk 15–17°C for godt isolerte boliger, opp til 18°C for eldre bygg.",
                     "thermal_inertia": "Antall timer med utetemperaturhistorikk modellen tar hensyn til. Bruk lav verdi for lette trekonstruksjoner, høyere for tunge betong- eller steinbygg.",
                     "wind_speed_sensor": "Valgfri. Et lokalt anemometer forbedrer vindmodelleringen. Hvis tomt, brukes værtjenesten.",

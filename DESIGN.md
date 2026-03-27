@@ -69,18 +69,15 @@ Unlike traditional systems that split Heating Degree Days (HDD) and Cooling Degr
 *   **Why:** A well-insulated house behaves symmetrically: deviation from the balance point requires energy, whether it's heating or cooling. This allows a single continuous model curve.
 
 ### B. Inertia & Effective Temperature
-Buildings do not react instantly to outside air temperature. The system calculates an **Effective Temperature** using a weighted history (Inertia). This value is exposed via the **Thermal State Sensor** for external automations.
+Buildings do not react instantly to outside air temperature. The system calculates an **Effective Temperature** using a causal exponential-decay kernel — physically equivalent to the steady-state response of a first-order RC thermal circuit. This value is exposed via the **Thermal State Sensor** for external automations.
 
-*   **Default Profile (Thermal Mass Balanced):**
-    *   Current Hour: 20%
-    *   T-1 Hour: 30%
-    *   T-2 Hours: 30%
-    *   T-3 Hours: 20%
-    *   **Logic:** Symmetric arc profile. The middle hours (H-1, H-2) carry the most weight, reflecting that a well-insulated house's heating demand correlates most with the 1-3 hour temperature trend.
+*   **Model:** Each hour's outdoor temperature is weighted by `e^(-t/τ)`, where `t` is how many hours ago it was and `τ` (tau) is the user-configured time constant. The most recent hour always carries the highest weight; influence decays monotonically going back in time, never peaking in the middle. The kernel window is `5×τ` hours, which captures ≥ 99 % of the total weight.
 
-*   **Configurable Profiles:**
-    *   **Fast (2h):** `(0.50, 0.50)` - High responsiveness. Good for poorly insulated structures.
-    *   **Slow (12h):** Bell curve over 12 hours. Good for high thermal mass (concrete, passive house).
+*   **Default τ = 4 hours:** Suitable for a typical well-insulated residential building. The effective temperature is a blend of roughly the last 20 hours, with the past 4 hours dominating.
+
+*   **Configurable Profiles (τ values):**
+    *   **Fast (τ = 2h):** High responsiveness. Good for poorly insulated structures or lightweight construction.
+    *   **Slow (τ = 12h):** Long thermal memory (~60 h window). Good for high thermal mass (concrete, passive house).
 
 *   **Design Rule:** `NEVER` use future data (forecasts) to calculate inertia for the past. This prevents data leakage in the learning model.
 
@@ -482,7 +479,7 @@ The model treats identical outdoor temperatures as thermodynamically equivalent,
 
 -   **Deep thermal mass lag.** Foundations and structural elements have a thermal time constant of days to weeks, not hours. After a deep cold spell they continue acting as a heat sink well after outdoor air has warmed, drawing energy from the heating system invisibly to the 4-hour inertia window.
 -   **Heat pump COP history.** During the cold spell the heat pump operated in its least efficient zone (low COP, frequent defrost cycles). This accumulated thermal debt is not captured in any current model variable.
--   **Symmetric inertia model.** The 4-hour thermal inertia horizon represents only the shallow, fast thermal mass (indoor air, wall surfaces). It is direction-agnostic: warming from cold and cooling from warm are treated as mirror images of the same physical process, which they are not.
+-   **Direction-agnostic inertia model.** The exponential decay kernel (τ = 4 h by default) represents only the shallow, fast thermal mass (indoor air, wall surfaces). The same kernel is used regardless of whether temperatures are rising or falling — warming from cold and cooling from warm are treated as mirror images of the same physical process, which they are not.
 
 **Observed symptom:** After a deep cold spell the model consistently *underestimates* actual heat demand during the recovery phase. Conversely, when temperatures drop from a mild baseline the model tends to *overestimate* demand at the same outdoor temperatures. The asymmetry is most pronounced near +1 °C to +3 °C.
 

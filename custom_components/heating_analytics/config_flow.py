@@ -130,6 +130,13 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # overnight_load_shift_correction toggled off — thermal-mass field still in submitted form
         if daily and not load_shift and CONF_THERMAL_MASS in user_input:
             return True
+        # csv_auto_logging toggled on — path fields not yet visible
+        csv_logging = user_input.get("csv_auto_logging", False)
+        if csv_logging and "csv_hourly_path" not in user_input:
+            return True
+        # csv_auto_logging toggled off — path fields still in submitted form
+        if not csv_logging and "csv_hourly_path" in user_input:
+            return True
         return False
 
     def _build_final_data(self, step3_input: dict) -> dict:
@@ -290,8 +297,14 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
             ),
             vol.Optional("csv_auto_logging", default=g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING)): selector.BooleanSelector(),
-            vol.Optional("csv_hourly_path", default=g("csv_hourly_path", DEFAULT_CSV_HOURLY_PATH)): selector.TextSelector(),
-            vol.Optional("csv_daily_path", default=g("csv_daily_path", DEFAULT_CSV_DAILY_PATH)): selector.TextSelector(),
+        })
+        csv_logging = g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING)
+        if csv_logging:
+            schema.update({
+                vol.Optional("csv_hourly_path", default=g("csv_hourly_path", DEFAULT_CSV_HOURLY_PATH)): selector.TextSelector(),
+                vol.Optional("csv_daily_path", default=g("csv_daily_path", DEFAULT_CSV_DAILY_PATH)): selector.TextSelector(),
+            })
+        schema.update({
             vol.Optional(CONF_ENABLE_LIFETIME_TRACKING, default=g(CONF_ENABLE_LIFETIME_TRACKING, False)): selector.BooleanSelector(),
             vol.Optional(
                 CONF_SECONDARY_WEATHER_ENTITY,

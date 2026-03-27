@@ -38,7 +38,7 @@
                 },
                 "data_description": {
                     "wind_unit": "The unit for wind speed settings on the next page.",
-                    "has_ac_units": "Enable if you use this system for cooling to access cooling modes.",
+                    "has_ac_units": "Enable to unlock Cooling Mode, Guest Mode, and DHW Mode. Each mode creates dedicated input entities per heating unit for direct control via blueprints.",
                     "balance_point": "The outdoor temperature at which your home stops needing heat. Typically 15-17°C for well-insulated homes, up to 18°C for older buildings.",
                     "thermal_inertia": "How many hours of outdoor temperature history the model considers. Use a low value for lightweight wood-frame structures, higher for heavy concrete or stone buildings.",
                     "wind_speed_sensor": "Optional. A local anemometer improves wind modelling accuracy. If left blank, the weather provider is used.",
@@ -112,7 +112,7 @@
                 },
                 "data_description": {
                     "wind_unit": "The unit for wind speed settings on the next page.",
-                    "has_ac_units": "Enable if you use this system for cooling to access cooling modes.",
+                    "has_ac_units": "Enable to unlock Cooling Mode, Guest Mode, and DHW Mode. Each mode creates dedicated input entities per heating unit for direct control via blueprints.",
                     "balance_point": "The outdoor temperature at which your home stops needing heat. Typically 15-17°C for well-insulated homes, up to 18°C for older buildings.",
                     "thermal_inertia": "How many hours of outdoor temperature history the model considers. Use a low value for lightweight wood-frame structures, higher for heavy concrete or stone buildings.",
                     "wind_speed_sensor": "Optional. A local anemometer improves wind modelling accuracy. If left blank, the weather provider is used.",

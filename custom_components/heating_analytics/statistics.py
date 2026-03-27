@@ -1788,6 +1788,22 @@ class StatisticsManager:
         period1_data = _get_period_data(p1_start, p1_end)
         period2_data = _get_period_data(p2_start, p2_end)
 
+        # === Determine data basis for each period ===
+        # "actual"  — all days past, has measured consumption
+        # "modeled" — all days past, no consumption measurements (system not tracking)
+        # "hybrid"  — period spans today or future (actuals + forecast mix)
+        def _determine_basis(pdata: dict, start: date, end: date) -> str:
+            today = dt_util.now().date()
+            has_actuals = (pdata.get("actual_kwh") or 0.0) > 0.1
+            if end < today:
+                return "actual" if has_actuals else "modeled"
+            return "hybrid"
+
+        p1_basis = _determine_basis(period1_data, p1_start, p1_end)
+        p2_basis = _determine_basis(period2_data, p2_start, p2_end)
+        period1_data["basis"] = p1_basis
+        period2_data["basis"] = p2_basis
+
         # === 2. Build Detailed Daily Data (New Logic) ===
         def _get_period_daily_data(start_date: date, end_date: date) -> list[dict]:
             """Build daily data list for period with Hybrid logic (Actual + Forecast)."""
@@ -1916,7 +1932,9 @@ class StatisticsManager:
             p2_days,
             'period_comparison',
             current_total_kwh=p1_hybrid_kwh,
-            last_year_total_kwh=p2_hybrid_kwh
+            last_year_total_kwh=p2_hybrid_kwh,
+            current_basis=p1_basis,
+            reference_basis=p2_basis,
         )
 
         formatter = ExplanationFormatter()
@@ -1932,7 +1950,11 @@ class StatisticsManager:
                 return round(v1 - v2, precision)
             return None
 
-        deltas["delta_actual_kwh"] = _calc_delta("actual_kwh", 2)
+        # delta_actual_kwh is only meaningful when both periods have real measurements
+        if p1_basis == "actual" and p2_basis == "actual":
+            deltas["delta_actual_kwh"] = _calc_delta("actual_kwh", 2)
+        else:
+            deltas["delta_actual_kwh"] = None
         deltas["delta_modeled_kwh"] = _calc_delta("modeled_kwh", 2)
         deltas["delta_solar_impact_kwh"] = _calc_delta("solar_impact_kwh", 2)
         deltas["delta_aux_impact_kwh"] = _calc_delta("aux_impact_kwh", 2)
@@ -1956,6 +1978,8 @@ class StatisticsManager:
         return {
             "period_1": period1_data,
             "period_2": period2_data,
+            "period_1_basis": p1_basis,
+            "period_2_basis": p2_basis,
             **deltas,
             # New Analytical Fields
             "summary": summary_text,

@@ -64,6 +64,13 @@ DEFAULT_AUX_LEARNING_RATE = 0.01
 DEFAULT_SOLAR_COEFF_HEATING = 0.35
 DEFAULT_SOLAR_COEFF_COOLING = 0.40
 
+# Solar thermal battery: exponential decay factor applied per hour.
+# Models how solar energy absorbed by building mass is released over time.
+# 0.60 → ~20 % of a solar impact still effective after 3 hours (half-life ~1.4 h).
+# Effect: evening/night hours after a sunny afternoon see a non-zero residual
+# solar correction, preventing over-prediction of heating consumption.
+SOLAR_BATTERY_DECAY = 0.60
+
 # Minimum solar transmittance when screens are fully closed.
 # Models two physical realities:
 #   1. Screen G-value (SHGC): fabric lets through ~10-15 % of solar irradiance.
@@ -94,7 +101,7 @@ MS_TO_KNOTS = 1.94384
 # Learning Constants
 PER_UNIT_LEARNING_RATE_CAP = 0.03   # 3% max EMA rate to prevent oscillation
 SOLAR_COEFF_CAP = 5.0               # Max solar coefficient (kW per full sun)
-COLD_START_SOLAR_DAMPING = 0.5      # Dampen cold-start solar estimates; base model noise inflates early samples
+COLD_START_SOLAR_DAMPING = 0.75     # Dampen cold-start solar estimates; base model noise inflates early samples
 LEARNING_BUFFER_THRESHOLD = 4
 TARGET_TDD_WINDOW = 0.5  # Minimum TDD accumulation for seamless rolling window efficiency
 MIN_EXTRAPOLATION_DELTA_T = 0.5  # Minimum Delta T (Degrees) required to trust extrapolation source
