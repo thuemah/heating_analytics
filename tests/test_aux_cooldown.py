@@ -41,6 +41,26 @@ def coordinator(hass):
         # Mock Forecast Manager
         coord.forecast.get_forecast_for_hour.return_value = None
 
+        # Mock Solar — get_approx_sun_pos must return (elev, azimuth) tuple
+        coord.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
+        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+        coord.solar.calculate_solar_factor.return_value = 0.0
+        coord.solar.calculate_unit_solar_impact.return_value = 0.0
+        coord.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
+
+        # Mock Statistics — calculate_total_power must return a proper dict
+        coord.statistics.calculate_total_power.return_value = {
+            "total_kwh": 5.0,
+            "global_base_kwh": 5.0,
+            "global_aux_reduction_kwh": 0.0,
+            "breakdown": {
+                "base_kwh": 5.0,
+                "aux_reduction_kwh": 0.0,
+                "solar_reduction_kwh": 0.0,
+            },
+            "unit_breakdown": {},
+        }
+
         # Mock Storage Manager (Async)
         coord.storage.async_save_data = AsyncMock()
         coord.storage.append_hourly_log_csv = AsyncMock()
@@ -53,8 +73,8 @@ def coordinator(hass):
         coord._hourly_expected_base_per_unit = {}
 
         # Ensure sample count > 0 so learning triggers
-        coord._hourly_sample_count = 60
-        coord._hourly_wind_values = [0.0] * 60
+        coord._collector.sample_count = 60
+        coord._collector.wind_values = [0.0] * 60
 
         return coord
 
@@ -93,9 +113,10 @@ async def test_aux_cooldown_lock_duration(coordinator):
     # Verify Cooldown STILL Active
     assert coordinator._aux_cooldown_active is True
 
-    # Verify Learning Called with is_cooldown_active=True
+    # Verify Learning Called with was_cooldown_active=True (via HourlyObservation)
     call_args = coordinator.learning.process_learning.call_args
-    assert call_args.kwargs["is_cooldown_active"] is True
+    obs_arg = call_args.kwargs.get("obs") or call_args.args[0]
+    assert obs_arg.was_cooldown_active is True
 
 @pytest.mark.asyncio
 async def test_aux_cooldown_convergence_failure(coordinator):
@@ -146,7 +167,8 @@ async def test_aux_cooldown_convergence_success(coordinator):
     # Verify Learning Called with is_cooldown_active=True
     # Because the convergent hour itself should still be protected (cooldown active during the hour)
     call_args = coordinator.learning.process_learning.call_args
-    assert call_args.kwargs["is_cooldown_active"] is True
+    obs_arg = call_args.kwargs.get("obs") or call_args.args[0]
+    assert obs_arg.was_cooldown_active is True
 
 @pytest.mark.asyncio
 async def test_aux_cooldown_max_timeout(coordinator):
@@ -218,6 +240,16 @@ async def test_cooldown_default_all_affected(hass):
             "model_base_after": 5.0
         }
         coord.forecast.get_forecast_for_hour.return_value = None
+        coord.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
+        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+        coord.solar.calculate_solar_factor.return_value = 0.0
+        coord.solar.calculate_unit_solar_impact.return_value = 0.0
+        coord.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
+        coord.statistics.calculate_total_power.return_value = {
+            "total_kwh": 5.0, "global_base_kwh": 5.0, "global_aux_reduction_kwh": 0.0,
+            "breakdown": {"base_kwh": 5.0, "aux_reduction_kwh": 0.0, "solar_reduction_kwh": 0.0},
+            "unit_breakdown": {},
+        }
         coord.storage.async_save_data = AsyncMock()
         coord.storage.append_hourly_log_csv = AsyncMock()
         coord.async_set_updated_data = MagicMock()
@@ -256,8 +288,8 @@ async def test_cooldown_default_all_affected(hass):
         }
 
         # Ensure sample count > 0 to run logic
-        coord._hourly_sample_count = 60
-        coord._hourly_wind_values = [0.0] * 60
+        coord._collector.sample_count = 60
+        coord._collector.wind_values = [0.0] * 60
 
         # Mock forecast item processing to return a valid tuple
         # val, solar, breakdown, gross, gross_breakdown, _, _
@@ -286,9 +318,11 @@ async def test_cooldown_non_affected_learning(coordinator):
     # Verify Learning Manager called correctly
     call_args = coordinator.learning.process_learning.call_args
     assert call_args is not None
-    assert call_args.kwargs["is_cooldown_active"] is True
-    # Verify aux_affected_entities is passed
-    assert call_args.kwargs["aux_affected_entities"] == ["sensor.heater"]
+    obs_arg = call_args.kwargs.get("obs") or call_args.args[0]
+    assert obs_arg.was_cooldown_active is True
+    # Verify aux_affected_entities is passed (via LearningConfig)
+    config_arg = call_args.kwargs.get("config") or call_args.args[2]
+    assert config_arg.aux_affected_entities == ["sensor.heater"]
 
 @pytest.mark.asyncio
 async def test_manual_exit_cooldown(coordinator):

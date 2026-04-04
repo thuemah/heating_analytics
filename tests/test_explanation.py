@@ -1,5 +1,6 @@
 """Tests for the explanation module."""
 from datetime import date
+from tests.helpers import CoordinatorModelMixin
 import pytest
 from custom_components.heating_analytics.explanation import (
     CategoryThresholds,
@@ -8,7 +9,7 @@ from custom_components.heating_analytics.explanation import (
 )
 
 # Dummy Coordinator for testing (mocking _get_wind_bucket)
-class MockCoordinator:
+class MockCoordinator(CoordinatorModelMixin):
     def __init__(self):
         self.solar_azimuth = 180
 

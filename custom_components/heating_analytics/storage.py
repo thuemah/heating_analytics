@@ -31,6 +31,20 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _sanitize_solar_coeff(value: dict) -> dict:
+    """Clamp solar coefficient components to >= 0.
+
+    Solar gain can only reduce heating demand — negative coefficients
+    are physically impossible and indicate confounding variables or
+    storage from a pre-clamp version.
+    """
+    return {
+        "s": round(max(0.0, value.get("s", 0.0)), 5),
+        "e": round(max(0.0, value.get("e", 0.0)), 5),
+    }
+
+
 class StorageManager:
     """Manages data persistence (JSON, CSV)."""
 
@@ -168,7 +182,7 @@ class StorageManager:
                 for entity_id, value in loaded_solar_coefficients_per_unit.items():
                     if isinstance(value, dict) and ("s" in value or "e" in value):
                         # New format: already a flat coefficient dict
-                        self.coordinator._solar_coefficients_per_unit[entity_id] = value
+                        self.coordinator._solar_coefficients_per_unit[entity_id] = _sanitize_solar_coeff(value)
                     elif isinstance(value, dict):
                         # Old format: nested by temp_key — flatten by picking the first valid entry
                         migrated = None
@@ -183,7 +197,7 @@ class StorageManager:
                                 }
                                 break
                         if migrated is not None:
-                            self.coordinator._solar_coefficients_per_unit[entity_id] = migrated
+                            self.coordinator._solar_coefficients_per_unit[entity_id] = _sanitize_solar_coeff(migrated)
                             _LOGGER.info(f"Migrated temp-stratified solar coefficient for unit {entity_id} to global: {migrated}")
 
                 self._cleanup_removed_sensors(self.coordinator._solar_coefficients_per_unit)
@@ -356,7 +370,7 @@ class StorageManager:
                 _LOGGER.warning("Loaded daily_history is not a dictionary.")
 
             self.coordinator._accumulated_energy_today = data.get("accumulated_energy_today", 0.0)
-            self.coordinator._accumulated_expected_energy_hour = data.get("accumulated_expected_energy_hour", 0.0)
+            self.coordinator._collector.expected_energy_hour = data.get("accumulated_expected_energy_hour", 0.0)
 
             # Load daily aux breakdown
             loaded_daily_aux_breakdown = data.get("daily_aux_breakdown", {})
@@ -413,14 +427,14 @@ class StorageManager:
                 # Only restore if still same hour
                 if acc_start_time and acc_start_time.replace(minute=0, second=0, microsecond=0) == current_hour:
                     self.coordinator._accumulation_start_time = acc_start_time
-                    self.coordinator._accumulated_energy_hour = data.get("accumulated_energy_hour", 0.0)
-                    self.coordinator._accumulated_expected_energy_hour = data.get("accumulated_expected_energy_hour", 0.0)
-                    self.coordinator._accumulated_aux_impact_hour = data.get("accumulated_aux_impact_hour", 0.0)
-                    self.coordinator._accumulated_orphaned_aux = data.get("accumulated_orphaned_aux", 0.0)
-                    self.coordinator._accumulated_aux_breakdown = data.get("accumulated_aux_breakdown", {})
-                    self.coordinator._hourly_delta_per_unit = data.get("hourly_delta_per_unit", {})
-                    self.coordinator._hourly_expected_per_unit = data.get("hourly_expected_per_unit", {})
-                    self.coordinator._last_minute_processed = data.get("last_minute_processed")
+                    self.coordinator._collector.energy_hour = data.get("accumulated_energy_hour", 0.0)
+                    self.coordinator._collector.expected_energy_hour = data.get("accumulated_expected_energy_hour", 0.0)
+                    self.coordinator._collector.aux_impact_hour = data.get("accumulated_aux_impact_hour", 0.0)
+                    self.coordinator._collector.orphaned_aux = data.get("accumulated_orphaned_aux", 0.0)
+                    self.coordinator._collector.aux_breakdown = data.get("accumulated_aux_breakdown", {})
+                    self.coordinator._collector.delta_per_unit.update(data.get("hourly_delta_per_unit", {}))
+                    self.coordinator._collector.expected_per_unit.update(data.get("hourly_expected_per_unit", {}))
+                    self.coordinator._collector.last_minute_processed = data.get("last_minute_processed")
                     # Restore gap filling state
                     self.coordinator.data["current_model_rate"] = data.get("current_model_rate", 0.0)
                     self.coordinator.data["current_unit_breakdown"] = data.get("current_unit_breakdown", {})
@@ -428,16 +442,10 @@ class StorageManager:
                     self.coordinator.data["current_calc_temp"] = data.get("current_calc_temp")
                     _LOGGER.info(f"Restored hourly energy data from {acc_start_time.strftime('%H:%M')}")
                 else:
-                    # Different hour - start fresh
+                    # Different hour - start fresh (collector already initialized empty)
                     self.coordinator._accumulation_start_time = None
-                    self.coordinator._accumulated_energy_hour = 0.0
-                    self.coordinator._accumulated_expected_energy_hour = 0.0
-                    self.coordinator._accumulated_aux_impact_hour = 0.0
-                    self.coordinator._accumulated_orphaned_aux = 0.0
-                    self.coordinator._accumulated_aux_breakdown = {}
-                    self.coordinator._hourly_delta_per_unit = {}
-                    self.coordinator._hourly_expected_per_unit = {}
-                    self.coordinator._last_minute_processed = None
+                    self.coordinator._collector.reset()
+                    self.coordinator._collector.last_minute_processed = None
                     # Mark baselines as stale so they are discarded after the
                     # unconditional last_energy_values load below.
                     stale_energy_baselines = True
@@ -453,23 +461,23 @@ class StorageManager:
                 saved_hour = dt_util.parse_datetime(aggregates["hour_start"])
                 if saved_hour and saved_hour.replace(minute=0, second=0, microsecond=0) == current_hour:
                     # Same hour - restore aggregates
-                    self.coordinator._hourly_start_time = saved_hour
-                    self.coordinator._hourly_wind_sum = aggregates.get("wind_sum", 0.0)
-                    self.coordinator._hourly_wind_values = aggregates.get("wind_values", [])
-                    self.coordinator._hourly_temp_sum = aggregates.get("temp_sum", 0.0)
-                    self.coordinator._hourly_solar_sum = aggregates.get("solar_sum", 0.0)
-                    self.coordinator._hourly_bucket_counts = aggregates.get("bucket_counts", {"normal": 0, "high_wind": 0, "extreme_wind": 0, "with_auxiliary_heating": 0})
-                    self.coordinator._hourly_aux_count = aggregates.get("aux_count", 0)
-                    self.coordinator._hourly_sample_count = aggregates.get("sample_count", 0)
-                    _LOGGER.info(f"Restored {self.coordinator._hourly_sample_count} hourly samples from {saved_hour.strftime('%H:%M')}")
+                    self.coordinator._collector.start_time = saved_hour
+                    self.coordinator._collector.wind_sum = aggregates.get("wind_sum", 0.0)
+                    self.coordinator._collector.wind_values = aggregates.get("wind_values", [])
+                    self.coordinator._collector.temp_sum = aggregates.get("temp_sum", 0.0)
+                    self.coordinator._collector.solar_sum = aggregates.get("solar_sum", 0.0)
+                    self.coordinator._collector.bucket_counts = aggregates.get("bucket_counts", {"normal": 0, "high_wind": 0, "extreme_wind": 0, "with_auxiliary_heating": 0})
+                    self.coordinator._collector.aux_count = aggregates.get("aux_count", 0)
+                    self.coordinator._collector.sample_count = aggregates.get("sample_count", 0)
+                    _LOGGER.info(f"Restored {self.coordinator._collector.sample_count} hourly samples from {saved_hour.strftime('%H:%M')}")
 
             # Restore current effective wind for sensors (prevent 0.0 drop on restart)
             current_wind = 0.0
             wind_restored = False
 
             # Priority 1: Last sample from current partial hour (if available)
-            if self.coordinator._hourly_wind_values:
-                current_wind = self.coordinator._hourly_wind_values[-1]
+            if self.coordinator._collector.wind_values:
+                current_wind = self.coordinator._collector.wind_values[-1]
                 wind_restored = True
 
             # Priority 2: Last completed hour (if no current samples)
@@ -681,6 +689,9 @@ class StorageManager:
             self.coordinator.statistics.calculate_temp_stats()
             self.coordinator.statistics.calculate_potential_savings()
 
+            # Invalidate cached ModelState so the model property picks up the loaded data.
+            self.coordinator._invalidate_model_cache()
+
             _LOGGER.info(f"Loaded correlation data: {len(self.coordinator._correlation_data)} temp points, {len(self.coordinator._daily_history)} days history")
 
         except Exception as e:
@@ -758,14 +769,14 @@ class StorageManager:
                     "daily_aux_breakdown": self.coordinator._daily_aux_breakdown,
                     "daily_individual": self.coordinator._daily_individual,
                     "lifetime_individual": self.coordinator._lifetime_individual,
-                    "accumulated_energy_hour": self.coordinator._accumulated_energy_hour,
-                    "accumulated_expected_energy_hour": self.coordinator._accumulated_expected_energy_hour,
-                    "accumulated_aux_impact_hour": self.coordinator._accumulated_aux_impact_hour,
-                    "accumulated_orphaned_aux": self.coordinator._accumulated_orphaned_aux,
-                    "accumulated_aux_breakdown": self.coordinator._accumulated_aux_breakdown,
+                    "accumulated_energy_hour": self.coordinator._collector.energy_hour,
+                    "accumulated_expected_energy_hour": self.coordinator._collector.expected_energy_hour,
+                    "accumulated_aux_impact_hour": self.coordinator._collector.aux_impact_hour,
+                    "accumulated_orphaned_aux": self.coordinator._collector.orphaned_aux,
+                    "accumulated_aux_breakdown": self.coordinator._collector.aux_breakdown,
                     "hourly_delta_per_unit": self.coordinator._hourly_delta_per_unit,
                     "hourly_expected_per_unit": self.coordinator._hourly_expected_per_unit,
-                    "last_minute_processed": self.coordinator._last_minute_processed,
+                    "last_minute_processed": self.coordinator._collector.last_minute_processed,
                     "last_hour_processed": self.coordinator._last_hour_processed,
                     # Persist critical state for robust gap filling (resolves race condition)
                     "current_model_rate": self.coordinator.data.get("current_model_rate", 0.0),
@@ -774,14 +785,14 @@ class StorageManager:
                     "current_calc_temp": self.coordinator.data.get("current_calc_temp"),
                     "accumulation_start_time": self.coordinator._accumulation_start_time.isoformat() if self.coordinator._accumulation_start_time else None,
                     "hourly_aggregates": {
-                        "hour_start": self.coordinator._hourly_start_time.isoformat() if self.coordinator._hourly_start_time else None,
-                        "wind_sum": self.coordinator._hourly_wind_sum,
-                        "wind_values": self.coordinator._hourly_wind_values,
-                        "temp_sum": self.coordinator._hourly_temp_sum,
-                        "solar_sum": self.coordinator._hourly_solar_sum,
-                        "bucket_counts": self.coordinator._hourly_bucket_counts,
-                        "aux_count": self.coordinator._hourly_aux_count,
-                        "sample_count": self.coordinator._hourly_sample_count,
+                        "hour_start": self.coordinator._collector.start_time.isoformat() if self.coordinator._collector.start_time else None,
+                        "wind_sum": self.coordinator._collector.wind_sum,
+                        "wind_values": self.coordinator._collector.wind_values,
+                        "temp_sum": self.coordinator._collector.temp_sum,
+                        "solar_sum": self.coordinator._collector.solar_sum,
+                        "bucket_counts": self.coordinator._collector.bucket_counts,
+                        "aux_count": self.coordinator._collector.aux_count,
+                        "sample_count": self.coordinator._collector.sample_count,
                     },
                     "last_energy_values": self.coordinator._last_energy_values,
                     "last_save_date": dt_util.now().date().isoformat(),
@@ -835,13 +846,18 @@ class StorageManager:
         self.coordinator._correlation_data.clear()
         self.coordinator._correlation_data_per_unit.clear()
         self.coordinator._learning_buffer_per_unit.clear()
+        self.coordinator._learning_buffer_global.clear()
         self.coordinator._observation_counts.clear()
-        # Also clear unit aux data
+        # Clear aux data (global + per-unit)
+        self.coordinator._aux_coefficients.clear()
         self.coordinator._aux_coefficients_per_unit.clear()
         self.coordinator._learning_buffer_aux_per_unit.clear()
         # Clear unit solar data
         self.coordinator._solar_coefficients_per_unit.clear()
         self.coordinator._learning_buffer_solar_per_unit.clear()
+        # Clear daily learning U-coefficient
+        self.coordinator._learned_u_coefficient = None
+        self.coordinator._invalidate_model_cache()
         await self.async_save_data(force=True)
         _LOGGER.info("Learning data reset successfully.")
 
@@ -860,11 +876,11 @@ class StorageManager:
             "daily_aux_breakdown": self.coordinator._daily_aux_breakdown,
             "daily_individual": self.coordinator._daily_individual,
             "lifetime_individual": self.coordinator._lifetime_individual,
-            "accumulated_energy_hour": self.coordinator._accumulated_energy_hour,
-            "accumulated_expected_energy_hour": self.coordinator._accumulated_expected_energy_hour,
-            "accumulated_aux_impact_hour": self.coordinator._accumulated_aux_impact_hour,
-            "accumulated_orphaned_aux": self.coordinator._accumulated_orphaned_aux,
-            "accumulated_aux_breakdown": self.coordinator._accumulated_aux_breakdown,
+            "accumulated_energy_hour": self.coordinator._collector.energy_hour,
+            "accumulated_expected_energy_hour": self.coordinator._collector.expected_energy_hour,
+            "accumulated_aux_impact_hour": self.coordinator._collector.aux_impact_hour,
+            "accumulated_orphaned_aux": self.coordinator._collector.orphaned_aux,
+            "accumulated_aux_breakdown": self.coordinator._collector.aux_breakdown,
             "hourly_delta_per_unit": self.coordinator._hourly_delta_per_unit,
             "accumulation_start_time": self.coordinator._accumulation_start_time.isoformat() if self.coordinator._accumulation_start_time else None,
             "last_energy_values": self.coordinator._last_energy_values,
@@ -944,14 +960,14 @@ class StorageManager:
             self.coordinator._daily_individual = data.get("daily_individual", {})
             self.coordinator._lifetime_individual = data.get("lifetime_individual", {})
 
-            self.coordinator._accumulated_energy_hour = data.get("accumulated_energy_hour", 0.0)
-            self.coordinator._accumulated_expected_energy_hour = data.get("accumulated_expected_energy_hour", 0.0)
-            self.coordinator._accumulated_aux_impact_hour = data.get("accumulated_aux_impact_hour", 0.0)
-            self.coordinator._accumulated_orphaned_aux = data.get("accumulated_orphaned_aux", 0.0)
-            self.coordinator._accumulated_aux_breakdown = data.get("accumulated_aux_breakdown", {})
-            self.coordinator._hourly_delta_per_unit = data.get("hourly_delta_per_unit", {})
-            self.coordinator._hourly_expected_per_unit = data.get("hourly_expected_per_unit", {})
-            self.coordinator._last_minute_processed = data.get("last_minute_processed")
+            self.coordinator._collector.energy_hour = data.get("accumulated_energy_hour", 0.0)
+            self.coordinator._collector.expected_energy_hour = data.get("accumulated_expected_energy_hour", 0.0)
+            self.coordinator._collector.aux_impact_hour = data.get("accumulated_aux_impact_hour", 0.0)
+            self.coordinator._collector.orphaned_aux = data.get("accumulated_orphaned_aux", 0.0)
+            self.coordinator._collector.aux_breakdown = data.get("accumulated_aux_breakdown", {})
+            self.coordinator._collector.delta_per_unit.update(data.get("hourly_delta_per_unit", {}))
+            self.coordinator._collector.expected_per_unit.update(data.get("hourly_expected_per_unit", {}))
+            self.coordinator._collector.last_minute_processed = data.get("last_minute_processed")
             saved_last_hour = data.get("last_hour_processed")
             if saved_last_hour is not None:
                 self.coordinator._last_hour_processed = int(saved_last_hour)
@@ -1000,12 +1016,19 @@ class StorageManager:
             if "solar_correction_percent" in data:
                 self.coordinator.solar_correction_percent = data["solar_correction_percent"]
 
-            # Restore Unit Aux Data
+            # Restore Aux Data (global + per-unit)
+            loaded_aux = data.get("aux_coefficients", {})
+            if isinstance(loaded_aux, dict):
+                self.coordinator._aux_coefficients = loaded_aux
             self.coordinator._aux_coefficients_per_unit = data.get("aux_coefficients_per_unit", {})
             self.coordinator._learning_buffer_aux_per_unit = data.get("learning_buffer_aux_per_unit", {})
 
-            # Restore Unit Solar Data
-            self.coordinator._solar_coefficients_per_unit = data.get("solar_coefficients_per_unit", {})
+            # Restore Unit Solar Data (clamp components >= 0)
+            raw_solar = data.get("solar_coefficients_per_unit", {})
+            self.coordinator._solar_coefficients_per_unit = {
+                eid: _sanitize_solar_coeff(v) if isinstance(v, dict) else v
+                for eid, v in raw_solar.items()
+            }
             self.coordinator._learning_buffer_solar_per_unit = data.get("learning_buffer_solar_per_unit", {})
 
             # Restore Unit Modes
@@ -1014,6 +1037,7 @@ class StorageManager:
             # Restore Solar Optimizer
             self.coordinator.solar_optimizer.set_data(data.get("solar_optimizer_data", {}))
 
+            self.coordinator._invalidate_model_cache()
             await self.async_save_data(force=True)
 
             self.coordinator.statistics.calculate_temp_stats()
@@ -1437,10 +1461,9 @@ class StorageManager:
                     _LOGGER.warning(f"Skipping row in CSV due to processing error: {e}. Row: {row}")
                     continue
 
-            # Track B: batch daily aggregation (daily_learning_mode only)
-            # Groups all imported full-mode entries by day and applies the same EMA
-            # logic as the live midnight calibration. Thermal mass correction is skipped
-            # because historical indoor temperatures are not available in the CSV.
+            # Daily learning: batch per day using strategy dispatch (#776).
+            # CSV imports don't have Track C distribution, so all sensors are
+            # effectively DirectMeter (actual kWh from the CSV).
             if update_model and self.coordinator.daily_learning_mode and new_log_entries:
                 daily_batches: dict[str, list] = {}
                 for entry in new_log_entries:
@@ -1449,20 +1472,14 @@ class StorageManager:
 
                 for date_str, day_entries in sorted(daily_batches.items()):
                     if len(day_entries) < 22:
-                        _LOGGER.debug(f"CSV Track B: Skipping {date_str} — only {len(day_entries)}/24 hours")
+                        _LOGGER.debug(f"CSV import: Skipping {date_str} — only {len(day_entries)}/24 hours")
                         continue
 
                     total_kwh = sum(e["actual_kwh"] for e in day_entries)
                     daily_tdd = sum(e["tdd"] for e in day_entries)
-                    avg_temp = sum(e["temp"] for e in day_entries) / len(day_entries)
-                    avg_wind = sum(e["effective_wind"] for e in day_entries) / len(day_entries)
 
                     if daily_tdd < 0.5 or total_kwh <= 0:
                         continue
-
-                    q_hourly_avg = total_kwh / 24.0
-                    temp_key = str(int(round(avg_temp)))
-                    wind_bucket = self.coordinator._get_wind_bucket(avg_wind)
 
                     observed_u = total_kwh / daily_tdd
                     if self.coordinator._learned_u_coefficient is None:
@@ -1472,17 +1489,13 @@ class StorageManager:
                             observed_u - self.coordinator._learned_u_coefficient
                         )
 
-                    if temp_key not in self.coordinator._correlation_data:
-                        self.coordinator._correlation_data[temp_key] = {}
-                    current_pred = self.coordinator._correlation_data[temp_key].get(wind_bucket, 0.0)
-                    if current_pred == 0.0:
-                        self.coordinator._correlation_data[temp_key][wind_bucket] = round(q_hourly_avg, 5)
-                    else:
-                        new_pred = current_pred + self.coordinator.learning_rate * (q_hourly_avg - current_pred)
-                        self.coordinator._correlation_data[temp_key][wind_bucket] = round(new_pred, 5)
+                    # Strategy-based per-hour learning (no Track C dist for CSV).
+                    self.coordinator._apply_strategies_to_global_model(
+                        day_entries, track_c_distribution=None,
+                    )
                     learning_count += 1
 
-                _LOGGER.info(f"CSV Track B: Learned from {learning_count} days (daily_learning_mode active).")
+                _LOGGER.info(f"CSV import: Learned from {learning_count} days (strategy dispatch).")
 
             return new_log_entries, learning_count
 

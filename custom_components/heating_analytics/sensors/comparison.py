@@ -278,8 +278,8 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
         """Extract day data from _daily_history and calculate Model value."""
         day_str = date_obj.isoformat()
 
-        if day_str in self.coordinator._daily_history:
-            entry = self.coordinator._daily_history[day_str]
+        if day_str in self.coordinator.model.daily_history:
+            entry = self.coordinator.model.daily_history[day_str]
             # Guard against None entries in legacy storage
             if entry is None:
                 # Treat as missing data

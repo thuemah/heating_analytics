@@ -24,7 +24,7 @@ def test_sensor_attributes():
         "weather_adjusted_deviation": {},
     }
     coordinator.auxiliary_heating_active = False
-    coordinator._hourly_sample_count = 0
+    coordinator._collector.sample_count = 0
 
     entry = MagicMock()
     entry.entry_id = "test"

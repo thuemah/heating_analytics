@@ -26,7 +26,7 @@ async def test_gap_state_persistence_and_restoration(hass):
     coordinator.data["current_aux_impact_rate"] = 1.0
     coordinator.data["current_unit_breakdown"] = test_unit_breakdown
     coordinator.data["current_calc_temp"] = 10.5
-    coordinator._last_minute_processed = 58
+    coordinator._collector.last_minute_processed = 58
     # CRITICAL: Set start time to now so restoration succeeds (same hour check)
     coordinator._accumulation_start_time = dt_util.now()
 

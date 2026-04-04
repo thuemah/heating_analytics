@@ -94,8 +94,12 @@ class SolarCalculator:
             # Zone 3: Backside
             az_factor = BACKSIDE_FLOOR
 
-        # 3. Cloud Factor
-        cloud_factor = 1.0 - (cloud_coverage / 100.0)
+        # 3. Cloud Factor (Kasten-derived power law)
+        # Linear 1-cloud/100 overstates reduction at partial coverage.
+        # The power-law better matches empirical data: thin/partial clouds
+        # transmit more than a linear model predicts.
+        cloud_frac = cloud_coverage / 100.0
+        cloud_factor = 1.0 - 0.75 * cloud_frac ** 1.5
 
         return elev_factor * az_factor * cloud_factor
 
@@ -114,8 +118,9 @@ class SolarCalculator:
         raw_elev_factor = max(0.0, math.cos(elev_rad))
         elev_factor = raw_elev_factor * intensity
 
-        # Cloud Factor
-        cloud_factor = 1.0 - (cloud_coverage / 100.0)
+        # Cloud Factor (Kasten-derived power law — matches calculate_solar_factor)
+        cloud_frac = cloud_coverage / 100.0
+        cloud_factor = 1.0 - 0.75 * cloud_frac ** 1.5
 
         base_intensity = elev_factor * cloud_factor
 
@@ -191,7 +196,7 @@ class SolarCalculator:
         2. Mode-appropriate global default (optimized for heat pumps).
         """
         # Check storage structure: {unit: {"s": float, "e": float}}
-        coeff = self.coordinator._solar_coefficients_per_unit.get(entity_id)
+        coeff = self.coordinator.model.solar_coefficients_per_unit.get(entity_id)
         if coeff is not None:
             return coeff
 

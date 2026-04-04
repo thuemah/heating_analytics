@@ -431,8 +431,8 @@ class ForecastManager:
         temps_for_calculation = {}
 
         # 1. Backfill with actuals from today's log (Composite Forecast)
-        if self.coordinator._hourly_log:
-             for entry in self.coordinator._hourly_log:
+        if self.coordinator.model.hourly_log:
+             for entry in self.coordinator.model.hourly_log:
                  if entry["timestamp"].startswith(today_iso):
                      hour = entry["hour"]
                      temps_for_calculation[hour] = entry["temp"]
@@ -510,9 +510,9 @@ class ForecastManager:
 
         history_needed = len(self.coordinator.inertia_weights) - 1
 
-        if self.coordinator._hourly_log:
+        if self.coordinator.model.hourly_log:
             recent_logs = []
-            for log in reversed(self.coordinator._hourly_log):
+            for log in reversed(self.coordinator.model.hourly_log):
                  if log["timestamp"] < target_iso:
                      recent_logs.append(log)
                  if len(recent_logs) >= history_needed:
@@ -590,10 +590,10 @@ class ForecastManager:
         inertia_history = []
         history_needed = len(self.coordinator.inertia_weights) - 1
 
-        if self.coordinator._hourly_log:
+        if self.coordinator.model.hourly_log:
             recent_logs = []
             if history_needed > 0:
-                recent_logs = self.coordinator._hourly_log[-history_needed:]
+                recent_logs = self.coordinator.model.hourly_log[-history_needed:]
             for log in recent_logs:
                 # Use RAW temp for inertia calculation to prevent double-averaging
                 inertia_history.append(log["temp"])
@@ -1516,7 +1516,7 @@ class ForecastManager:
         """Calculate impact of actual weather and user actions deviating from the initial plan."""
         now = dt_util.now()
         today_iso = now.date().isoformat()
-        today_logs = [log for log in self.coordinator._hourly_log if log["timestamp"].startswith(today_iso)]
+        today_logs = [log for log in self.coordinator.model.hourly_log if log["timestamp"].startswith(today_iso)]
 
         # Ensure reference map is available
         if self._cached_reference_map is None:
@@ -1646,9 +1646,9 @@ class ForecastManager:
         target_hours = { (current_hour - 1) % 24, (current_hour - 2) % 24 }
 
         found_hours = set()
-        if self.coordinator._hourly_log:
+        if self.coordinator.model.hourly_log:
             # Iterate backwards to find most recent matching hours
-            for log in reversed(self.coordinator._hourly_log):
+            for log in reversed(self.coordinator.model.hourly_log):
                 h = log.get("hour")
                 if h in target_hours and h not in found_hours:
                     # Use expected_kwh (Model) not actual (User behavior) for trend
@@ -1716,7 +1716,7 @@ class ForecastManager:
         """Generate synthetic forecast history from hourly logs."""
         _LOGGER.info("Backfilling forecast history from hourly logs (Option B)...")
         daily_groups = {}
-        for entry in self.coordinator._hourly_log:
+        for entry in self.coordinator.model.hourly_log:
             # Skip legacy entries without provenance tracking
             if "primary_entity" not in entry:
                 continue
@@ -1817,7 +1817,7 @@ class ForecastManager:
             night_error_sum = 0.0
             night_count = 0
 
-            for entry in self.coordinator._hourly_log:
+            for entry in self.coordinator.model.hourly_log:
                 if entry["timestamp"].startswith(date_key):
                     # Data Preparation
                     h_aux = entry.get("aux_impact_kwh", 0.0)

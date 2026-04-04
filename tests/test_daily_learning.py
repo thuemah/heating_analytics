@@ -19,7 +19,7 @@ def mock_coordinator():
     coord.learning_enabled = True
     coord.learning_rate = 0.01
     coord._correlation_data = {}
-    coord._hourly_wind_values = []
+    coord._collector.wind_values = []
     coord._hourly_log = []
     return coord
 
@@ -67,6 +67,7 @@ async def test_daily_learning_storage_save_load(mock_coordinator):
 async def test_daily_learning_thermal_mass_correction(hass):
     coord = _get_real_coordinator(hass)
     coord.learning_enabled = True
+    coord.daily_learning_mode = True
     coord._last_midnight_indoor_temp = 20.0
 
     def _mock_float_state(entity_id):
@@ -87,18 +88,23 @@ async def test_daily_learning_thermal_mass_correction(hass):
             "actual_kwh": 2.0,
             "expected_kwh": 2.0,
             "temp": 0.0,
+            "temp_key": "0",
             "tdd": 1.0,
             "effective_wind": 0.0,
             "wind_bucket": "normal",
+            "unit_breakdown": {"sensor.heater1": 2.0},
         })
 
     date_obj = base_time.date()
     await coord._process_daily_data(date_obj)
 
     assert coord._learned_u_coefficient is not None
+    # U-coefficient uses thermal-mass-corrected total: (48 - 2.9*2) / 24 = 1.7583
     assert round(coord._learned_u_coefficient, 4) == 1.7583
     assert coord._last_midnight_indoor_temp == 22.0
 
+    # Track B flattened daily learning writes q_adjusted/24 to one bucket.
+    # q_adjusted = 48 - 2.9*2 = 42.2, q_hourly_avg = 42.2/24 = 1.7583
     assert "0" in coord._correlation_data
     assert "normal" in coord._correlation_data["0"]
     assert round(coord._correlation_data["0"]["normal"], 4) == 1.7583
@@ -127,9 +133,11 @@ async def test_daily_learning_rejects_partial_day(hass):
             "actual_kwh": 2.0,
             "expected_kwh": 2.0,
             "temp": 0.0,
+            "temp_key": "0",
             "tdd": 1.0,
             "effective_wind": 0.0,
             "wind_bucket": "normal",
+            "unit_breakdown": {"sensor.heater1": 2.0},
         })
 
     date_obj = base_time.date()

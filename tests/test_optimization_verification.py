@@ -1,12 +1,13 @@
 
 import unittest
+from tests.helpers import CoordinatorModelMixin
 from datetime import date, timedelta
 from unittest.mock import MagicMock
 from custom_components.heating_analytics.statistics import StatisticsManager
 from custom_components.heating_analytics.const import MODE_HEATING, MODE_COOLING, ATTR_SOLAR_FACTOR
 
 # Mock Coordinator
-class MockCoordinator:
+class MockCoordinator(CoordinatorModelMixin):
     def __init__(self, sensors):
         self.solar_azimuth = 180
         self.energy_sensors = sensors

@@ -80,30 +80,30 @@ async def test_temp_key_rounding(hass, mock_time):
         current_time = FIXED_NOW
 
         # Case A: 5.4
-        coordinator._hourly_sample_count = 1
-        coordinator._hourly_wind_values = [0.0]
-        coordinator._hourly_bucket_counts = {"normal": 1}
-        coordinator._hourly_temp_sum = 5.4
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0]
+        coordinator._collector.bucket_counts = {"normal": 1}
+        coordinator._collector.temp_sum = 5.4
         coordinator._hourly_log = []
 
         await coordinator._process_hourly_data(current_time)
         assert coordinator._hourly_log[0]["temp_key"] == "5"
 
         # Case B: 5.6
-        coordinator._hourly_sample_count = 1
-        coordinator._hourly_wind_values = [0.0] # Reset needed!
-        coordinator._hourly_bucket_counts = {"normal": 1}
-        coordinator._hourly_temp_sum = 5.6
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0] # Reset needed!
+        coordinator._collector.bucket_counts = {"normal": 1}
+        coordinator._collector.temp_sum = 5.6
         coordinator._hourly_log = []
 
         await coordinator._process_hourly_data(current_time)
         assert coordinator._hourly_log[0]["temp_key"] == "6"
 
         # Case C: -1.5
-        coordinator._hourly_sample_count = 1
-        coordinator._hourly_wind_values = [0.0] # Reset needed!
-        coordinator._hourly_bucket_counts = {"normal": 1}
-        coordinator._hourly_temp_sum = -1.5
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0] # Reset needed!
+        coordinator._collector.bucket_counts = {"normal": 1}
+        coordinator._collector.temp_sum = -1.5
         coordinator._hourly_log = []
 
         await coordinator._process_hourly_data(current_time)
@@ -139,8 +139,8 @@ async def test_inertia_fallback(hass, mock_time):
         assert coordinator._calculate_inertia_temp() == 5.0
 
         # Scenario 2: Samples available (e.g. from earlier in hour), sensor dead now.
-        coordinator._hourly_sample_count = 10
-        coordinator._hourly_temp_sum = 100.0 # Avg 10.0
+        coordinator._collector.sample_count = 10
+        coordinator._collector.temp_sum = 100.0 # Avg 10.0
 
         # Using dynamic kernel
         inertia = coordinator._calculate_inertia_temp()

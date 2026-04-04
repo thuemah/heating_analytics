@@ -62,9 +62,9 @@ async def test_log_retention(hass: HomeAssistant):
         # Fill logs with 2160 entries (90 days)
         coordinator._hourly_log = [{"id": i, "temp": 0.0} for i in range(2160)]
 
-        coordinator._hourly_sample_count = 1
-        coordinator._hourly_wind_values = [0.0]
-        coordinator._hourly_temp_sum = 0.0
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0]
+        coordinator._collector.temp_sum = 0.0
 
         current_time = datetime(2023, 10, 27, 13, 0, 0)
         await coordinator._process_hourly_data(current_time)
@@ -87,8 +87,8 @@ async def test_csv_append_trigger(hass: HomeAssistant):
         coordinator._async_save_data = AsyncMock()
         coordinator.storage.append_hourly_log_csv = AsyncMock()
 
-        coordinator._hourly_sample_count = 1
-        coordinator._hourly_wind_values = [0.0]
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0]
         coordinator._hourly_log = [{"temp": 0.0}] # For inertia
 
         current_time = datetime(2023, 10, 27, 13, 0, 0)

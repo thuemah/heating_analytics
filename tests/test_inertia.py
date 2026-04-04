@@ -148,8 +148,8 @@ def test_inertia_temp_missing_current(coordinator, mock_time):
     coordinator._get_float_state = MagicMock(return_value=None)
 
     # Has hourly samples (New aggregate structure)
-    coordinator._hourly_sample_count = 1
-    coordinator._hourly_temp_sum = 8.0
+    coordinator._collector.sample_count = 1
+    coordinator._collector.temp_sum = 8.0
 
     inertia = coordinator._calculate_inertia_temp()
     assert inertia == 8.0
@@ -159,8 +159,8 @@ def test_inertia_temp_no_data(coordinator, mock_time):
     coordinator._hourly_log = []
     coordinator._get_float_state = MagicMock(return_value=None)
     # No samples
-    coordinator._hourly_sample_count = 0
-    coordinator._hourly_temp_sum = 0.0
+    coordinator._collector.sample_count = 0
+    coordinator._collector.temp_sum = 0.0
 
     inertia = coordinator._calculate_inertia_temp()
     assert inertia is None

@@ -1,5 +1,5 @@
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, NonCallableMagicMock
 import pytest
 from datetime import timezone, datetime
 
@@ -125,9 +125,46 @@ mock_dt.as_local.side_effect = lambda d: d
 sys.modules["homeassistant.util"].dt = mock_dt
 sys.modules["homeassistant.util.dt"] = mock_dt
 
+from tests.helpers import ModelProxy, CoordinatorModelMixin  # noqa: F401
+
+
 @pytest.fixture
 def hass():
     """Mock Home Assistant object."""
     h = MagicMock()
     h.config.units.is_metric = True
     return h
+
+
+# --- Monkey-patch MagicMock to auto-create _collector (#775) ---
+# Tests use MagicMock(spec=HeatingDataCoordinator) which blocks underscore
+# attribute auto-creation.  The _collector is the only underscore attr that
+# production code *creates in __init__* and then accesses via dotted reads
+# (self._collector.sample_count).  Rather than patching every fixture, we
+# monkey-patch MagicMock.__getattr__ to lazily create a real
+# ObservationCollector when _collector is first accessed on any mock.
+_original_mock_getattr = MagicMock.__getattr__
+
+def _patched_mock_getattr(self, name):
+    if name == "_collector":
+        from custom_components.heating_analytics.observation import ObservationCollector
+        collector = ObservationCollector()
+        object.__setattr__(self, "_collector", collector)
+        return collector
+    if name == "model":
+        # Build a ModelState-like namespace that delegates to the mock's
+        # own _fields.  This lets ``coordinator.model.hourly_log`` resolve
+        # to the same list that tests set via ``coordinator._hourly_log = [...]``.
+        from custom_components.heating_analytics.observation import ModelState
+        mock_self = self
+        class _LazyModel:
+            """Proxy: reads coordinator._field via model.field."""
+            def __getattr__(inner_self, attr):
+                return getattr(mock_self, f"_{attr}")
+        proxy = _LazyModel()
+        object.__setattr__(self, "model", proxy)
+        return proxy
+    return _original_mock_getattr(self, name)
+
+MagicMock.__getattr__ = _patched_mock_getattr
+NonCallableMagicMock.__getattr__ = _patched_mock_getattr

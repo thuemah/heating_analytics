@@ -63,7 +63,8 @@ async def test_setup_failure_handling(hass, mock_entry):
 def test_coordinator_data_flow_to_sensor(hass, mock_entry):
     """Test that coordinator data flows to sensor entity."""
     # We define a MockCoordinator that behaves enough like real one
-    class MockCoordinator:
+    from tests.helpers import CoordinatorModelMixin
+    class MockCoordinator(CoordinatorModelMixin):
         def __init__(self, hass, entry):
             self.solar_azimuth = 180
             self.hass = hass

@@ -26,7 +26,7 @@ async def test_thermodynamic_projection_calculation():
         mock_now.return_value = now
 
         # Setup Data State
-        coordinator._accumulated_expected_energy_hour = 2.0 # expected_hour_so_far
+        coordinator._collector.expected_energy_hour = 2.0 # expected_hour_so_far
         coordinator._accumulated_energy_today = 15.0 # Actual so far
 
         # Setup Logs (expected_today_sum)

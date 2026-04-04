@@ -17,20 +17,17 @@ def coordinator(hass):
         return HeatingDataCoordinator(hass, entry)
 
 def test_wind_bucket_normal(coordinator):
-    """Test normal wind bucket."""
-    # < 5.5
+    """Test normal wind bucket (< DEFAULT_WIND_THRESHOLD = 8 m/s)."""
     assert coordinator._get_wind_bucket(0.0) == "normal"
-    assert coordinator._get_wind_bucket(5.4) == "normal"
+    assert coordinator._get_wind_bucket(7.9) == "normal"
 
 def test_wind_bucket_high(coordinator):
-    """Test high wind bucket."""
-    # >= 5.5 and < 10.8
-    assert coordinator._get_wind_bucket(5.5) == "high_wind"
+    """Test high wind bucket (>= 8 and < 10.8 m/s)."""
+    assert coordinator._get_wind_bucket(8.0) == "high_wind"
     assert coordinator._get_wind_bucket(10.7) == "high_wind"
 
 def test_wind_bucket_extreme(coordinator):
-    """Test extreme wind bucket."""
-    # >= 10.8
+    """Test extreme wind bucket (>= 10.8 m/s)."""
     assert coordinator._get_wind_bucket(10.8) == "extreme_wind"
     assert coordinator._get_wind_bucket(20.0) == "extreme_wind"
 

@@ -47,12 +47,12 @@ async def test_potential_savings_breakdown_mismatch(hass):
     coordinator._daily_aux_breakdown = {
         "sensor.heater": {"allocated": 10.894, "overflow": 0.228}
     }
-    coordinator._accumulated_aux_breakdown = {
+    coordinator._collector.aux_breakdown = {
         "sensor.heater": {"allocated": 0.0, "overflow": 0.0}
     }
     # Initialize orphaned accumulators to avoid MagicMock recursion
     coordinator._daily_orphaned_aux = 0.0
-    coordinator._accumulated_orphaned_aux = 0.0
+    coordinator._collector.orphaned_aux = 0.0
     # Initialize _hourly_log to avoid MagicMock recursion in extra_state_attributes
     coordinator._hourly_log = []
 

@@ -134,6 +134,7 @@ This is optional but highly recommended for maximum accuracy.
 
 - **Automatic Learning:** No manual calibration needed—the system learns your home's thermal characteristics
 - **Daily Learning Mode (Track B):** For homes where hourly learning is unreliable — typically high thermal mass buildings (concrete, stone) or heat pumps with a high minimum modulation level. The model learns once per day at midnight instead of every hour. **Note:** Building a complete heating curve takes months rather than weeks. Only use this if your building dynamics genuinely make hourly observations unreliable — hourly learning (Track A) is the right choice for the large majority of installations.
+- **Thermodynamic Baseline Engine (Track C):** For systems with Model Predictive Control (MPC) load-shifting via `heatpump_mpc`. Track C ignores the electricity meter entirely and instead uses real thermal production data from the MPC to construct a synthetic electrical baseline — each hour's smeared thermal load is divided by that hour's actual COP (computed from the MPC's learned Carnot model, including a defrost penalty for cold+humid conditions). Unlike Track B, Track C retains full hourly resolution — making it a complete alternative to Track A with 2–4 week learning time — while being fully immune to the MPC feedback loop. In multi-unit installations, each unit's learning strategy is auto-assigned: MPC units use the synthetic baseline, non-MPC units contribute actual meter data per hour. See [DESIGN.md](DESIGN.md) for details.
 - **Regime-Aware Prediction:**
     - **Cold Regime:** Uses thermodynamic scaling for accurate extrapolation in deep winter.
     - **Mild Regime:** Prioritizes neighbor averaging and wind fallbacks for stability in variable transition seasons.
@@ -769,7 +770,7 @@ data:
 
 **Hourly Logging:**
 - Keeps detailed log of the last 90 days
-- Includes: temperature, wind, expected vs actual energy
+- Includes: temperature, wind, humidity, expected vs actual energy
 - Available attributes on `sensor.heating_analytics_last_hour_deviation`:
   - `model_updated_temp_category`: Temperature bucket used for learning
   - `model_value_before/after`: Model prediction before/after update

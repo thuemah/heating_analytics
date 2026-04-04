@@ -40,7 +40,7 @@ async def test_gap_fill_mean_imputation(mock_hass):
         }
 
         # Initialize accumulators
-        coordinator._accumulated_expected_energy_hour = 0.0
+        coordinator._collector.expected_energy_hour = 0.0
         coordinator._hourly_expected_per_unit = {}
 
         # EXECUTE:
@@ -65,5 +65,5 @@ async def test_gap_fill_mean_imputation(mock_hass):
         assert kwargs["override_solar_factor"] == 0.5 # avg_solar
 
         # 2. Accumulators updated using the rate (20.0 * 0.5 = 10.0)
-        assert coordinator._accumulated_expected_energy_hour == 10.0
+        assert coordinator._collector.expected_energy_hour == 10.0
         assert coordinator._hourly_expected_per_unit["sensor.heater_1"] == 10.0

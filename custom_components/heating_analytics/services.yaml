@@ -246,6 +246,16 @@ get_forecast:
           min: 1
           max: 7
           mode: box
+    isolate_sensor:
+      name: Isolate Sensor
+      description: >-
+        Energy sensor entity_id to isolate the forecast for. When set, each
+        hourly entry returns max(0, global − Σ other units) — the demand that
+        the target sensor must cover. Designed for MPC integrations that need
+        their unit's share only, not the building total.
+      selector:
+        entity:
+          domain: sensor
 
 calibrate_wind_thresholds:
   name: Calibrate Wind Thresholds

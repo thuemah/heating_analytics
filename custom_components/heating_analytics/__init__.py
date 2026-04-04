@@ -439,9 +439,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register Get Forecast Service
     async def handle_get_forecast(call: ServiceCall) -> dict:
-        """Handle the get forecast service call."""
+        """Handle the get forecast service call.
+
+        When ``isolate_sensor`` is provided, the returned forecast represents
+        only that sensor's share of the building total — computed as
+        ``max(0, global − Σ per_unit for all *other* sensors)``.  This is the
+        demand signal that an MPC solver needs: the portion of heat loss that
+        the target unit must cover after all other units have contributed their
+        predicted share.
+        """
         entity_id = call.data.get("entity_id")
         days = call.data.get("days", 1)
+        isolate_sensor = call.data.get("isolate_sensor")
 
         target_coordinator = _get_target_coordinator(hass, entity_id)
         _LOGGER.debug("Handling get_forecast for %d days (coordinator: %s)", days, target_coordinator.entry.entry_id)
@@ -451,6 +460,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         end_time = now + timedelta(days=days)
 
         result = target_coordinator.forecast.get_hourly_forecast(start_time, end_time)
+
+        if isolate_sensor and isolate_sensor in target_coordinator.energy_sensors:
+            # Subtraction-based forecast isolation: the global prediction
+            # includes all units.  Subtract predicted contributions from every
+            # unit *except* the target to isolate the target's demand.
+            for hour_entry in result:
+                breakdown = hour_entry.get("unit_breakdown", {})
+                other_sum = sum(
+                    stats.get("net_kwh", 0.0)
+                    for sid, stats in breakdown.items()
+                    if sid != isolate_sensor
+                )
+                isolated = max(0.0, hour_entry["kwh"] - other_sum)
+                hour_entry["kwh"] = round(isolated, 2)
+                hour_entry["isolated_for"] = isolate_sensor
+                hour_entry["subtracted_kwh"] = round(other_sum, 2)
+
         return {"forecast": result}
 
     hass.services.async_register(

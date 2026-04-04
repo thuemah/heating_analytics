@@ -45,9 +45,9 @@ def mock_coordinator():
     coordinator.data = {}
     # Initialize internal stats
     coordinator._hourly_log = []
-    coordinator._hourly_bucket_counts = {"with_auxiliary_heating": 0}
-    coordinator._hourly_sample_count = 0
-    coordinator._hourly_wind_sum = 0.0
+    coordinator._collector.bucket_counts = {"with_auxiliary_heating": 0}
+    coordinator._collector.sample_count = 0
+    coordinator._collector.wind_sum = 0.0
     coordinator.wind_unit = "m/s"
     coordinator.wind_threshold = 5.5
     coordinator.extreme_wind_threshold = 10.8
@@ -121,8 +121,8 @@ async def test_predicted_sensor(hass: HomeAssistant, mock_coordinator, mock_entr
 async def test_effective_wind_sensor(hass: HomeAssistant, mock_coordinator, mock_entry):
     """Test HeatingEffectiveWindSensor."""
     mock_coordinator.data = {"effective_wind": 5.0}
-    mock_coordinator._hourly_sample_count = 10
-    mock_coordinator._hourly_wind_sum = 48.0 # avg 4.8
+    mock_coordinator._collector.sample_count = 10
+    mock_coordinator._collector.wind_sum = 48.0 # avg 4.8
 
     sensor = HeatingEffectiveWindSensor(mock_coordinator, mock_entry)
 

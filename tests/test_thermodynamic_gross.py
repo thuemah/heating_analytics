@@ -38,14 +38,14 @@ async def test_hourly_thermodynamic_gross(hass: HomeAssistant):
         # Solar Impact: 0.5 kWh
         # Expected Gross: 5.0 + 2.0 + 0.5 = 7.5 kWh
 
-        coordinator._accumulated_energy_hour = 5.0
-        coordinator._accumulated_aux_impact_hour = 2.0
+        coordinator._collector.energy_hour = 5.0
+        coordinator._collector.aux_impact_hour = 2.0
 
         # Mock Solar Factors to ensure calculation runs
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_solar_sum = 60.0 # Avg 1.0
-        coordinator._hourly_temp_sum = 0.0
-        coordinator._hourly_wind_values = [0.0]
+        coordinator._collector.sample_count = 60
+        coordinator._collector.solar_sum = 60.0 # Avg 1.0
+        coordinator._collector.temp_sum = 0.0
+        coordinator._collector.wind_values = [0.0]
 
         # Ensure aux impact is passed through
         coordinator._hourly_delta_per_unit = {"sensor.heater": 5.0}
@@ -61,7 +61,7 @@ async def test_hourly_thermodynamic_gross(hass: HomeAssistant):
         }
 
         current_time = datetime(2023, 10, 27, 13, 0, 0)
-        coordinator._hourly_start_time = datetime(2023, 10, 27, 12, 0, 0)
+        coordinator._collector.start_time = datetime(2023, 10, 27, 12, 0, 0)
 
         # Run Processing
         await coordinator._process_hourly_data(current_time)

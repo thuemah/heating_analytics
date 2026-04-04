@@ -867,10 +867,10 @@ class HeatingDeviationSensor(HeatingAnalyticsBaseSensor):
         diagnostics = {}
 
         # Current hour stability (critical for wood heating detection)
-        sample_count = self.coordinator._hourly_sample_count
+        sample_count = self.coordinator._collector.sample_count
 
         if sample_count > 0:
-            aux_count = self.coordinator._hourly_aux_count
+            aux_count = self.coordinator._collector.aux_count
             purity = aux_count / sample_count
 
             # Classify stability
@@ -918,9 +918,9 @@ class HeatingEffectiveWindSensor(HeatingAnalyticsBaseSensor):
     def extra_state_attributes(self):
         """Return attributes."""
         # Calculate running average of effective wind for current hour using aggregates
-        sample_count = self.coordinator._hourly_sample_count
+        sample_count = self.coordinator._collector.sample_count
         if sample_count > 0:
-            avg_eff_wind = self.coordinator._hourly_wind_sum / sample_count
+            avg_eff_wind = self.coordinator._collector.wind_sum / sample_count
             projected_bucket = self.coordinator._get_wind_bucket(avg_eff_wind)
             data_quality = "complete" if sample_count > 30 else "partial"
         else:
@@ -1028,12 +1028,12 @@ class HeatingCorrelationDataSensor(HeatingAnalyticsBaseSensor):
         }
 
         # Add Aux Coefficients if available
-        if self.coordinator._aux_coefficients:
+        if self.coordinator.model.aux_coefficients:
             aux_x = []
             aux_y = []
-            sorted_temps = sorted([int(k) for k in self.coordinator._aux_coefficients.keys()])
+            sorted_temps = sorted([int(k) for k in self.coordinator.model.aux_coefficients.keys()])
             for temp in sorted_temps:
-                val = self.coordinator._aux_coefficients.get(str(temp))
+                val = self.coordinator.model.aux_coefficients.get(str(temp))
                 if val is not None:
                     aux_x.append(temp)
                     aux_y.append(val) # kW impact
@@ -1063,10 +1063,10 @@ class HeatingLastHourActualSensor(HeatingAnalyticsBaseSensor):
     @property
     def extra_state_attributes(self):
         """Return attributes from the last hourly log."""
-        if not self.coordinator._hourly_log:
+        if not self.coordinator.model.hourly_log:
             return {}
 
-        last_entry = self.coordinator._hourly_log[-1]
+        last_entry = self.coordinator.model.hourly_log[-1]
         attributes = {
             "timestamp": last_entry.get("timestamp"),
             "avg_temperature": last_entry.get("temp"),
@@ -1141,10 +1141,10 @@ class HeatingLastHourExpectedSensor(HeatingAnalyticsBaseSensor):
     @property
     def extra_state_attributes(self):
         """Return attributes exposing the model parameters used."""
-        if not self.coordinator._hourly_log:
+        if not self.coordinator.model.hourly_log:
             return {}
 
-        last_entry = self.coordinator._hourly_log[-1]
+        last_entry = self.coordinator.model.hourly_log[-1]
         expected = last_entry.get("expected_kwh", 0.0)
         solar_impact = last_entry.get("solar_impact_kwh", 0.0)
 
@@ -1186,8 +1186,8 @@ class HeatingLastHourDeviationSensor(HeatingAnalyticsBaseSensor):
         last_hour_guest_impact = 0.0
         last_hour_timestamp = None
 
-        if self.coordinator._hourly_log:
-            last_entry = self.coordinator._hourly_log[-1]
+        if self.coordinator.model.hourly_log:
+            last_entry = self.coordinator.model.hourly_log[-1]
             last_hour_wind_bucket = last_entry.get("wind_bucket")
             last_hour_solar_impact = last_entry.get("solar_impact_kwh", 0.0)
             last_hour_aux_impact = last_entry.get("aux_impact_kwh", 0.0)
@@ -1196,7 +1196,7 @@ class HeatingLastHourDeviationSensor(HeatingAnalyticsBaseSensor):
 
         attrs = {
             "percentage": self.coordinator.data.get(ATTR_LAST_HOUR_DEVIATION_PCT, 0.0),
-            "last_hour_thermodynamic_gross_kwh": self.coordinator._hourly_log[-1].get("thermodynamic_gross_kwh") if self.coordinator._hourly_log else None,
+            "last_hour_thermodynamic_gross_kwh": self.coordinator.model.hourly_log[-1].get("thermodynamic_gross_kwh") if self.coordinator.model.hourly_log else None,
             "last_hour_wind_bucket": last_hour_wind_bucket,
             "last_hour_solar_impact_kwh": round(last_hour_solar_impact, 3),
             "last_hour_aux_impact_kwh": round(last_hour_aux_impact, 3),
@@ -1206,8 +1206,8 @@ class HeatingLastHourDeviationSensor(HeatingAnalyticsBaseSensor):
             "last_hour_actual_kwh": self.coordinator.data.get(ATTR_LAST_HOUR_ACTUAL, 0.0),
         }
 
-        if self.coordinator._hourly_log:
-            last_entry = self.coordinator._hourly_log[-1]
+        if self.coordinator.model.hourly_log:
+            last_entry = self.coordinator.model.hourly_log[-1]
 
             # Get raw values
             model_before = last_entry.get("model_base_before")
@@ -1289,7 +1289,7 @@ class HeatingPotentialSavingsSensor(HeatingAnalyticsBaseSensor):
 
         # Retrieve Daily + Current Hour Accumulations
         daily_accum = self.coordinator._daily_aux_breakdown
-        current_accum = self.coordinator._accumulated_aux_breakdown
+        current_accum = self.coordinator._collector.aux_breakdown
 
         unit_breakdown_list = []
         global_allocated_sum = 0.0
@@ -1352,7 +1352,7 @@ class HeatingPotentialSavingsSensor(HeatingAnalyticsBaseSensor):
         # Add Orphaned Global Savings (Not attached to any unit)
         # Sum of Daily (Past Hours) + Current Hour (Live)
         orphaned_daily = getattr(self.coordinator, "_daily_orphaned_aux", 0.0)
-        orphaned_live = getattr(self.coordinator, "_accumulated_orphaned_aux", 0.0)
+        orphaned_live = getattr(self.coordinator._collector, "orphaned_aux", 0.0)
 
         global_unassigned_sum += (orphaned_daily + orphaned_live)
 
@@ -1365,8 +1365,8 @@ class HeatingPotentialSavingsSensor(HeatingAnalyticsBaseSensor):
 
         # Detailed Aux Learning (Moved from Deviation sensors)
         learning_diagnostics = {}
-        if self.coordinator._hourly_log:
-            last_entry = self.coordinator._hourly_log[-1]
+        if self.coordinator.model.hourly_log:
+            last_entry = self.coordinator.model.hourly_log[-1]
             learning_diagnostics["last_hour_learning_status"] = last_entry.get("learning_status", "unknown")
             learning_diagnostics["aux_model_updated"] = last_entry.get("aux_model_updated", False)
 
@@ -1505,16 +1505,16 @@ class HeatingDeviceDailySensor(HeatingAnalyticsBaseSensor):
         attrs["theoretical_daily_consumption"] = unit_forecast
 
         # Metadata
-        if self.coordinator._hourly_log:
-             attrs["last_learning_update"] = self.coordinator._hourly_log[-1]["timestamp"]
+        if self.coordinator.model.hourly_log:
+             attrs["last_learning_update"] = self.coordinator.model.hourly_log[-1]["timestamp"]
         else:
              attrs["last_learning_update"] = None
 
         # 2. Correlation Data (Moved to bottom)
-        unit_data = self.coordinator._correlation_data_per_unit.get(self.source_entity_id, {})
+        unit_data = self.coordinator.model.correlation_data_per_unit.get(self.source_entity_id, {})
 
         # Calculate Total Observations (Training Hours)
-        unit_counts = self.coordinator._observation_counts.get(self.source_entity_id, {})
+        unit_counts = self.coordinator.model.observation_counts.get(self.source_entity_id, {})
         total_observations = 0
         for temp_counts in unit_counts.values():
             for count in temp_counts.values():
@@ -1710,7 +1710,7 @@ class HeatingDailyLearningSensor(HeatingAnalyticsBaseSensor):
 
     @property
     def native_value(self):
-        u = self.coordinator._learned_u_coefficient
+        u = self.coordinator.model.learned_u_coefficient
         if u is None:
             return None
         return round(u, 4)

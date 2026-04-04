@@ -17,7 +17,7 @@ def _make_coordinator():
     coordinator.forecast = MagicMock()
     coordinator.statistics = MagicMock()
     coordinator.energy_sensors = []  # Empty → _cleanup_removed_sensors is a no-op
-    coordinator._hourly_wind_values = []  # Prevent MagicMock truthy → wind format crash
+    coordinator._collector.wind_values = []  # Prevent MagicMock truthy → wind format crash
     coordinator._hourly_log = []
     coordinator.data = {}
     return coordinator

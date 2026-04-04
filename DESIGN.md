@@ -11,11 +11,13 @@ graph TD
     Sensors[HA Sensors] --> Coordinator
     Weather[Weather Providers] --> Coordinator
 
-    Coordinator[HeatingDataCoordinator] --> Statistics[StatisticsManager]
-    Coordinator --> Forecast[ForecastManager]
-    Coordinator --> Learning[LearningManager]
+    Coordinator[HeatingDataCoordinator] --> Collector[ObservationCollector]
+    Collector -- "HourlyObservation" --> Learning[LearningManager]
+    Coordinator -- "ModelState" --> Statistics[StatisticsManager]
+    Coordinator -- "ModelState" --> Forecast[ForecastManager]
     Coordinator --> Solar[SolarCalculator]
     Coordinator --> Storage[StorageManager]
+    Coordinator --> Strategies[LearningStrategies]
 
     Statistics --> Output[Sensor State]
     Forecast --> Output
@@ -24,38 +26,54 @@ graph TD
     Statistics -- "Thermodynamics" --> Model[Global Energy Model]
     Learning -- "Updates" --> Model
     Solar -- "Corrections" --> Model
+    Strategies -- "Daily Learning" --> Model
     end
 ```
+
+### Data Contracts (`observation.py`)
+
+The observation → learning pipeline communicates through explicit typed contracts:
+
+*   **`HourlyObservation`** (frozen dataclass): Immutable snapshot of one completed hour — weather averages, energy totals, per-unit breakdowns, aux/solar state. Produced by `ObservationCollector` at each hour boundary.
+*   **`ModelState`** (dataclass): Reference-based view of the learned model — correlation tables, aux/solar coefficients, learning buffers. Consumers read via `coordinator.model`; only the learning layer mutates the underlying dicts.
+*   **`LearningConfig`** (frozen dataclass): Per-hour learning settings — rates, eligibility flags, service dependencies.
+*   **`LearningStrategy`** (protocol): Per-unit strategy for daily learning with two implementations: `DirectMeter` (actual per-hour kWh) and `WeightedSmear` (COP-corrected synthetic baseline from Track C).
 
 ### Components
 
 1.  **HeatingDataCoordinator (`coordinator.py`):**
     *   **Role:** The Central Nervous System.
-    *   **Duty:** Orchestrates the 1-minute update loop, dispatches data to managers, and holds the canonical state (`self.data`).
+    *   **Duty:** Orchestrates the 1-minute update loop, dispatches data to managers, and exposes learned model state via the `coordinator.model` property (backed by `ModelState` with live references).
     *   **Key Behavior:** Handles "Smart Merging" of data gaps (e.g., if HA restarts) using persisted snapshots.
 
-2.  **StatisticsManager (`statistics.py`):**
+2.  **ObservationCollector (`observation.py`):**
+    *   **Role:** The Scribe.
+    *   **Duty:** Owns all hour-scoped mutable accumulators (weather, energy, per-unit deltas). Provides `accumulate_weather()`, `accumulate_expected()`, and atomic `reset()`. Eliminates the class of restart bugs caused by forgetting to zero individual fields.
+
+3.  **StatisticsManager (`statistics.py`):**
     *   **Role:** The Physicist.
     *   **Duty:** Calculates thermodynamic power predictions, deviations, and efficiencies.
     *   **Key Innovation:** **Regime-Aware Prediction** (see below). It treats "Cold" days (physics-dominated) differently from "Mild" days (noise-dominated).
+    *   **Model Access:** Reads learned state via `self.coordinator.model.correlation_data`, not direct private fields.
 
-3.  **ForecastManager (`forecast.py`):**
+4.  **ForecastManager (`forecast.py`):**
     *   **Role:** The Oracle.
     *   **Duty:** Manages future predictions and "What If" scenarios.
     *   **Key Innovation:** **Shadow Forecasting**. It tracks the accuracy of multiple weather sources (Primary vs. Secondary) *simultaneously*, allowing users to validate a new weather provider without switching the active control logic.
 
-4.  **LearningManager (`learning.py`):**
+5.  **LearningManager (`learning.py`):**
     *   **Role:** The Student.
     *   **Duty:** Updates the energy model based on observed performance.
+    *   **Interface:** `process_learning(obs: HourlyObservation, model: ModelState, config: LearningConfig)` — three typed objects instead of ~30 loose parameters.
     *   **Key Behavior:** Uses **Exponential Moving Average (EMA)** to gently adapt the model over time, preventing single-day anomalies from corrupting long-term stats. It also enforces **Purity Guards** (ignoring data during Guest Mode or mixed heating/cooling usage).
 
-5.  **SolarCalculator (`solar.py`):**
+6.  **SolarCalculator (`solar.py`):**
     *   **Role:** The Astronomer.
     *   **Duty:** Calculates theoretical solar potential and learns the **Solar Coefficient** (how well the house captures that potential).
 
-6.  **StorageManager (`storage.py`):**
+7.  **StorageManager (`storage.py`):**
     *   **Role:** The Librarian.
-    *   **Duty:** Handles JSON persistence, schema migrations (e.g., HDD -> TDD), and backfilling missing metadata.
+    *   **Duty:** Handles JSON persistence, schema migrations (e.g., HDD -> TDD), and backfilling missing metadata. Canonical write-path for all model state.
     *   **Data Lifecycle:** Manages the promotion of high-resolution `hourly_log` data into aggregated `daily_history` summaries. This ensures that while granular data (logs) is rotated (90 days), the statistical backbone (history) persists indefinitely (2 years).
 
 ---
@@ -122,6 +140,19 @@ Standard solar integration is difficult because "1000W of sun" doesn't mean "100
     *   This dot-product formula means that a south-facing room learns a large `Coeff_S` and near-zero `Coeff_E`, while an east-facing room learns the opposite — without any user configuration.
     *   During cold-start (no learned coefficients yet), an initial scalar default is decomposed along a 180° (south) assumption until real data replaces it.
 
+5.  **Air Mass Transmittance:**
+    *   Solar attenuation at low sun angles is handled by a physics-based Air Mass Transmittance model (`intensity = 0.7 ** (1 / sin(elevation))`), replacing arbitrary elevation cutoff zones.
+
+6.  **Cloud Coverage Model (Kasten-derived power law):**
+    *   `cloud_factor = 1.0 − 0.75 × (cloud_coverage / 100)^1.5`
+    *   A linear model (`1 − cloud/100`) overstates reduction at partial coverage: 50% cloud does not mean 50% solar loss. Thin/partial clouds transmit significantly more energy than a linear interpolation predicts. The power law matches empirical Kasten data at the partial-cloud regime (30–70%) where the error is largest. The per-unit coefficient learning absorbs any remaining systematic bias from the crude HA weather entity input.
+
+7.  **Screen Transmittance Floor:**
+    *   When solar screens are closed, a minimum transmittance floor (e.g., 20%) is enforced. Physically, a closed screen still transmits some solar irradiance through its fabric. This ensures effective vectors remain non-zero for coefficient learning.
+
+8.  **Solar Thermal Battery:**
+    *   Instead of an instantaneous subtraction, solar gain is modeled as charging an exponential decay accumulator (`_solar_battery_state`). The absorbed heat releases gradually into the building mass over the following hours (e.g., decaying by 40% per hour), dampening instant compensation loops and matching real-world thermal inertia.
+
 ### E. Auxiliary Heating (Dynamic Coefficients)
 For hybrid systems (Heat Pump + Fireplace/Heater), the system does not use a separate "Fireplace Mode" curve. Instead, it learns an **Auxiliary Coefficient**.
 
@@ -147,7 +178,7 @@ To prevent this, the system implements a **Cooldown State Machine**:
     *   *Note:* Units NOT in this list continue learning normally (Dual-Track Learning).
 3.  **Exit Conditions:**
     *   **Time-out:** `COOLDOWN_MAX_HOURS` (6h) elapsed.
-    *   **Convergence:** `Actual_Consumption / Expected_Base > COOLDOWN_CONVERGENCE_THRESHOLD` (95%). This means the heating system has "woken up" and is behaving normally again.
+    *   **Convergence:** `Actual_Consumption / Expected_Base > COOLDOWN_CONVERGENCE_THRESHOLD` (92%). This means the heating system has "woken up" and is behaving normally again. Waiting for 95% was unnecessarily conservative for radiant heat sources that linger well beyond the active burn period.
 
 #### Auxiliary Conservation Strategy
 When a heating unit is removed from the 'Aux Affected Entities' list (or replaced), its learned auxiliary coefficient (kW reduction) is not lost. The **Conservation Strategy** (`async_migrate_aux_coefficients`) redistributes this coefficient proportionally to the remaining affected units. This preserves the global energy balance—the house doesn't stop saving energy just because you reconfigured a sensor.
@@ -223,9 +254,104 @@ In practice this means:
 - **Track A:** The heating curve is broadly characterised within 2–4 weeks of varied weather.
 - **Track B:** Full characterisation of the heating curve may require an entire heating season.
 
-Track B should therefore be strictly reserved for setups where the underlying building physics — significant load shifting or very high concrete/stone thermal mass — render hourly observations thermodynamically invalid as individual learning samples.
+Track B should therefore be strictly reserved for setups where the underlying building physics — very high concrete/stone thermal mass or high minimum modulation — render hourly observations thermodynamically invalid as individual learning samples. For systems with MPC-based load shifting, **Track C** (see Section I) is the recommended path: it retains Track A's hourly resolution while completely decoupling the model from the MPC's economic scheduling.
 
-### I. Thermodynamic Reconstruction
+### I. Thermodynamic Baseline Engine (Track C — "The Digital Twin")
+
+Track C is a fundamentally different learning paradigm. Where Track A observes the electricity meter and Track B aggregates the same meter into daily totals, Track C **ignores the electricity meter entirely** and instead consumes real thermal production data from an external Model Predictive Control (MPC) integration — specifically `heatpump_mpc`. This makes Track C a **full-fidelity alternative to Track A** that retains hourly resolution while being completely immune to MPC load-shifting.
+
+#### The Problem Track C Solves
+
+When a heat pump is controlled by an MPC to shift consumption to off-peak hours, the electrical meter no longer reflects the building's real-time heat loss. Without correction, a dangerous feedback loop emerges:
+
+1.  MPC shifts 100 % of the day's heating to 03:00 (cheapest electricity).
+2.  Track A sees a massive electricity spike at 03:00 and learns "the house loses enormous heat at 03:00".
+3.  The next day, the model demands even more heating at 03:00. The model collapses.
+
+Track B mitigates this by collapsing the day to a single data point, but at the cost of severe **Diurnal Collapse** (see Section H): one temperature bucket per day, full heating-season characterisation time. Track C solves the feedback loop without sacrificing hourly resolution.
+
+#### Data Contract with `heatpump_mpc`
+
+Track C depends on a rolling 24–48 hour buffer exposed by the `heatpump_mpc` integration via the `heatpump_mpc.get_sh_hourly` service. Each hourly record has the following structure:
+
+```json
+{
+  "datetime": "2026-03-29T13:00:00+01:00",
+  "kwh_th_sh": 1.87,
+  "kwh_el_sh": 0.55,
+  "mode": "sh"
+}
+```
+
+| Field | Description |
+|---|---|
+| `kwh_th_sh` | Actual thermal energy (kWh) delivered for space heating. Set to `0.0` during DHW hours. |
+| `kwh_el_sh` | Electrical energy (kWh) consumed during space-heating windows only. |
+| `mode` | `"sh"` (space heating), `"dhw"` (domestic hot water), or `"off"`. |
+
+**Why COP is not stored in the buffer:** The per-hour COP is computed at midnight from the MPC's learned Carnot model parameters (`η_Carnot`, leaving water temperature, defrost penalty) applied to each hour's actual outdoor conditions. This is more accurate than a time-weighted average COP from the buffer, which would be mathematically incorrect for hours with variable compressor load. A secondary `heatpump_mpc.get_cop_params` service provides the model parameters alongside `get_sh_hourly`.
+
+**DHW Mode:** When a given hour is dominated by DHW production, `mode = "dhw"` and `kwh_th_sh = 0.0`. This is the physical truth — zero space heat was delivered. The model does not learn from DHW hours (preventing false "super-insulation" artefacts), but the building's heat loss during those hours is still accounted for in the smearing step.
+
+#### The Midnight Sync
+
+Track C performs its core calculation once per day, after midnight:
+
+1.  **Collect Production:** Fetch the 24-hour thermal buffer from `heatpump_mpc.get_sh_hourly` and COP model parameters from `heatpump_mpc.get_cop_params`. Sum total `kwh_th_sh` and `kwh_el_sh` (SH-mode hours only).
+2.  **Calculate Fallback Daily COP:** `daily_avg_cop = sum(kwh_th_sh) / sum(kwh_el_sh)`. Used only when per-hour COP parameters are unavailable. Fallback to `1.0` if the pump was off all day.
+3.  **Calculate Theoretical Loss Weights:** For each of the 24 hours, compute a weather-based loss weight from Delta-T, wind bucket multiplier (1.0 / 1.3 / 1.6), and solar factor (including Solar Battery decay residual). These weights express *when* the building needed heat, based purely on physics.
+4.  **Smear Thermal Load:** Distribute the total delivered thermal energy proportionally to the loss weights: `smeared_kwh_th[h] = total_kwh_th × (weight[h] / sum_of_weights)`. DHW hours receive their proportional share — the envelope still lost heat to the environment even when the pump was making hot water.
+5.  **Convert to Synthetic Electrical Baseline via Per-Hour COP:** Each smeared thermal hour is divided by that hour's actual COP: `synthetic_kwh_el[h] = smeared_kwh_th[h] / COP(T_outdoor[h], RH[h])`. The COP is computed from the MPC's learned parameters: `COP = max(1.0, min(10.0, η_Carnot × T_hot_K / (T_hot_K − T_cold_K) × defrost_factor))`, where `defrost_factor < 1.0` during icing conditions (cold + humid). The COP cap at 10.0 prevents physically unrealistic values when outdoor temperature approaches the leaving water temperature. After per-hour COP division, the 24-hour synthetic total is **renormalized** to match actual metered electrical consumption: `synthetic_kwh_el[h] *= total_kwh_el / sum(synthetic_kwh_el)`. This preserves the per-hour *shape* (cold hours cost more, warm hours cost less) while anchoring the daily sum to metered reality. When MPC COP parameters are unavailable, falls back to daily average COP (where COP cancels mathematically, giving pure weather-weighted redistribution of actual electrical).
+
+#### Why Track C Is a Full Alternative to Track A
+
+The 24 synthetic hourly baselines produced in step 5 carry the same information density as Track A's raw meter observations:
+
+*   Each hour maps to a specific outdoor temperature and wind condition → populates a distinct `temp_key × wind_bucket` cell in the correlation table.
+*   A day ranging from 4 °C at night to 14 °C at noon populates up to 10 temperature buckets — identical to Track A.
+*   Full heating-curve characterisation requires **2–4 weeks** of varied weather, the same as Track A.
+
+Compare this to Track B, which collapses the same day into a single average temperature (e.g. 9 °C) and yields one data point — requiring an entire heating season for full characterisation.
+
+The critical difference from Track A is the **data source**: Track A reads the electricity meter directly (and is therefore vulnerable to the MPC feedback loop). Track C reads thermally verified production data from `heatpump_mpc` and reconstructs a physically correct electrical baseline that is completely independent of when the MPC chose to run the compressor.
+
+#### Graceful Degradation
+
+If the `heatpump_mpc` service is unavailable at midnight (e.g. integration restart, network issue), Track C falls back to Track B's thermal mass correction for that day. This ensures learning never stalls, at the cost of one day of reduced resolution.
+
+#### Multi-Unit Installations and Per-Unit Learning
+
+In installations with additional heating units (panel heaters, heated cables, secondary heat pumps), Track C combines two data sources to build the global model:
+
+*   **MPC-controlled unit:** Contributes its *synthetic* electrical baseline (weather-smeared via `ThermodynamicEngine`). Its meter data is corrupted by load-shifting and is never used for learning.
+*   **Non-MPC units:** Contribute their *actual* hourly electrical consumption from the meter. Their data is ground truth — no load-shifting to correct — regardless of unit type (resistive or variable-COP heat pump). The model learns the resulting `kWh_el` implicitly, including COP variation with temperature.
+
+The per-hour total written to the global model is simply `synthetic_el[h] + actual_el[h]` — both in pure `kWh_el`, both representing the same hour, from different sources appropriate to each unit's data quality.
+
+This is implemented via the **per-unit learning strategy pattern** (`LearningStrategy` protocol in `observation.py`):
+
+*   **`DirectMeter`:** Assigned to non-MPC units. Returns actual per-hour kWh from `hourly_log["unit_breakdown"]`.
+*   **`WeightedSmear`:** Assigned to the MPC-managed unit. Returns `track_c_distribution[hour]["synthetic_kwh_el"]` — the COP-corrected synthetic baseline.
+
+The midnight loop in `_apply_strategies_to_global_model()` iterates all unit strategies uniformly: each strategy contributes a kWh value per hour, the sum is written to the correlation table via the standard buffer → jump-start → EMA pipeline. `build_strategies()` auto-assigns strategies from config — no manual per-unit configuration needed.
+
+**Configuration:** When Track C is enabled, the user selects which energy sensor is MPC-managed (`mpc_managed_sensor`). This sensor is excluded from per-unit Track A learning (its meter data is time-shifted). The MPC sensor intentionally has no per-unit model — its forecast share is derived via subtraction (see Forecast Isolation below), not from a dedicated per-unit correlation table.
+
+*   **Per-unit models (Track A):** Continue to learn hourly via the standard buffer → jump-start → EMA pipeline for all *non-MPC* units. The MPC unit's per-unit model is bootstrapped from the global model but does not receive Track A updates (its meter data is corrupted by load-shifting).
+
+#### Forecast Isolation for MPC
+
+The `get_forecast` service accepts an optional `isolate_sensor` parameter. When set, each hourly prediction is transformed from building-total to unit-isolated demand:
+
+```
+forecast_for_mpc[h] = max(0, global[h] - Σ per_unit[h] for non-MPC units)
+```
+
+This subtraction-based approach minimises error propagation: the bulk of the prediction rests on the robust global model, while per-unit uncertainty is limited to the marginal contribution from secondary sources. The MPC solver receives `kWh_el` that it converts to thermal demand via its own COP — correct precisely because the panel heaters' electrical contribution has already been subtracted.
+
+**Edge case:** When `Σ per_unit_other > global` (transition season, low total demand), the result is clamped to zero — the MPC unit stands idle and secondary units cover all demand.
+
+### J. Thermodynamic Reconstruction
 When reconstructing historical data (e.g., for model comparison), the system prioritizes **Hourly Vectors** (see Section 5). If vectors are missing (legacy data), it performs **Thermodynamic Reconstruction**:
 
 *   It recovers the **Effective Temperature** from the stored TDD value.
@@ -314,19 +440,25 @@ This **Hybrid Approach** is also used for multi-day period comparisons (`compare
 
 ## 4. Learning & Data Flow
 
-### The Learning Loop (Hourly)
-At the top of every hour, the system:
-1.  **Validates:** Is data complete? Is the "Guest Switch" off?
+### The Learning Loop (Hourly — Track A)
+At the top of every hour, `ObservationCollector` freezes the accumulated sensor readings into an immutable `HourlyObservation`. The coordinator then:
+1.  **Validates:** Is data complete? Is the "Guest Switch" off? Is it mixed-mode (20–80% aux)?
 2.  **Normalizes:** Removes estimated Solar and Auxiliary impact from the actual consumption to find the "Pure Thermal Base".
-3.  **Updates:** Feeds this Pure Base into the model using **EMA (Exponential Moving Average)**.
+3.  **Updates:** Passes `HourlyObservation`, `ModelState`, and `LearningConfig` to `LearningManager.process_learning()`, which feeds the Pure Base into the model using **EMA (Exponential Moving Average)**.
     *   `New_Model_Value = (Old_Value * (1 - Rate)) + (New_Observation * Rate)`
     *   **Rate:** Typically 0.01 (1%). This makes the model "sticky" and resistant to outliers.
 
+### The Learning Loop (Daily — Track B / Track C)
+At midnight, `_process_daily_data()` assembles the full day's statistics and applies the appropriate learning path:
+*   **Track B:** Writes a single `q_adjusted / 24` value to one `(avg_temp, avg_wind)` bucket — flattened daily learning for high thermal mass buildings.
+*   **Track C:** Iterates per-unit `LearningStrategy` objects via `_apply_strategies_to_global_model()`. Each unit's strategy produces a kWh contribution per hour (24 buckets), and the sum is written to the correlation table. `retrain_from_history` uses the same dispatch.
+
 ### Jump-Start Mechanism
 To prevent slow convergence on new installations:
-1.  **Buffering:** The system buffers the first 4 samples for any new Temperature/Wind bucket.
+1.  **Buffering:** The system buffers the first 4 samples for any new Temperature/Wind bucket. (For Solar Coefficients, observations are pooled globally across all temperatures rather than partitioned by bucket to prevent stalling).
 2.  **Injection:** Once the buffer is full, it calculates the average and "Jump Starts" the model value directly to this average, bypassing the slow EMA warmup.
-3.  **Result:** Useable predictions appear within hours, not weeks.
+3.  **Damping:** Initial jump-start estimates for solar coefficients are mathematically dampened by 25% (`COLD_START_SOLAR_DAMPING = 0.75`) to guard against early-learning noise inflating outliers.
+4.  **Result:** Useable predictions appear within hours, not weeks.
 
 ### DHW Mode — Air-to-Water Heat Pump Hysteresis
 

@@ -44,7 +44,7 @@ def coordinator(mock_hass):
 
     # Init internal structures
     coord._hourly_delta_per_unit = {"sensor.heater_1": 0.0}
-    coord._accumulated_aux_breakdown = {}
+    coord._collector.aux_breakdown = {}
 
     # Init storage structures (required for calculate_total_power lookups)
     coord._correlation_data_per_unit = {"sensor.heater_1": {"_id": "unit_base"}}

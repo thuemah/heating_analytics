@@ -28,12 +28,12 @@ def mock_coordinator():
     coordinator.data = {}
     # Initialize internal stats to prevent comparison errors with MagicMock
     coordinator._hourly_log = []
-    coordinator._hourly_bucket_counts = {"with_auxiliary_heating": 0}
-    coordinator._hourly_sample_count = 0
-    coordinator._hourly_wind_sum = 0.0
+    coordinator._collector.bucket_counts = {"with_auxiliary_heating": 0}
+    coordinator._collector.sample_count = 0
+    coordinator._collector.wind_sum = 0.0
     # Initialize orphaned accumulators to avoid MagicMock recursion
     coordinator._daily_orphaned_aux = 0.0
-    coordinator._accumulated_orphaned_aux = 0.0
+    coordinator._collector.orphaned_aux = 0.0
     coordinator.wind_unit = "m/s"
     coordinator.wind_threshold = 5.5
     coordinator.extreme_wind_threshold = 10.8

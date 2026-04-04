@@ -50,7 +50,7 @@ def coordinator(mock_hass):
 
     # Init internal structures
     coord._hourly_delta_per_unit = {"sensor.heater_1": 0.0, "sensor.heater_2": 0.0}
-    coord._accumulated_aux_breakdown = {}
+    coord._collector.aux_breakdown = {}
 
     return coord
 
@@ -173,7 +173,7 @@ def test_aux_overflow_calculation(coordinator):
     coordinator.data["current_aux_impact_rate"] = 4.0 # Global
 
     # Simulate 30 minutes passing
-    coordinator._last_minute_processed = 0
+    coordinator._collector.last_minute_processed = 0
     current_time = datetime(2023, 1, 1, 12, 30) # 30 mins passed
 
     # Call accumulation logic directly (since we can't easily run the full loop)
@@ -185,23 +185,23 @@ def test_aux_overflow_calculation(coordinator):
 
     # Accumulate
     for entity_id, stats in bd.items():
-        if entity_id not in coordinator._accumulated_aux_breakdown:
-            coordinator._accumulated_aux_breakdown[entity_id] = {"allocated": 0.0, "overflow": 0.0}
+        if entity_id not in coordinator._collector.aux_breakdown:
+            coordinator._collector.aux_breakdown[entity_id] = {"allocated": 0.0, "overflow": 0.0}
 
         applied_aux = stats.get("aux_reduction_kwh", 0.0)
         overflow_aux = stats.get("overflow_kwh", 0.0)
 
-        coordinator._accumulated_aux_breakdown[entity_id]["allocated"] += (applied_aux * fraction)
-        coordinator._accumulated_aux_breakdown[entity_id]["overflow"] += (overflow_aux * fraction)
+        coordinator._collector.aux_breakdown[entity_id]["allocated"] += (applied_aux * fraction)
+        coordinator._collector.aux_breakdown[entity_id]["overflow"] += (overflow_aux * fraction)
 
     # Verify Accumulation
-    acc_h1 = coordinator._accumulated_aux_breakdown["sensor.heater_1"]
+    acc_h1 = coordinator._collector.aux_breakdown["sensor.heater_1"]
     # Applied 1.0 * 0.5 = 0.5
     assert acc_h1["allocated"] == 0.5
     # Overflow 1.0 * 0.5 = 0.5
     assert acc_h1["overflow"] == 0.5
 
-    acc_h2 = coordinator._accumulated_aux_breakdown["sensor.heater_2"]
+    acc_h2 = coordinator._collector.aux_breakdown["sensor.heater_2"]
     # Applied 2.0 * 0.5 = 1.0
     assert acc_h2["allocated"] == 1.0
     # Overflow 0.0

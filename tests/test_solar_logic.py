@@ -122,12 +122,12 @@ async def test_process_hourly_data_solar_logic(mock_coordinator):
     current_time = datetime(2023, 10, 10, 11, 0, 0)
 
     # Aggregates
-    coord._hourly_sample_count = 60
-    coord._hourly_temp_sum = 10.0 * 60 # Avg 10C
-    coord._hourly_wind_values = [0.0] * 60
-    coord._hourly_solar_sum = 0.5 * 60 # Avg Factor 0.5
-    coord._accumulated_energy_hour = 0.8 # Actual
-    coord._accumulated_expected_energy_hour = 0.8 # Expected (to match logic)
+    coord._collector.sample_count = 60
+    coord._collector.temp_sum = 10.0 * 60 # Avg 10C
+    coord._collector.wind_values = [0.0] * 60
+    coord._collector.solar_sum = 0.5 * 60 # Avg Factor 0.5
+    coord._collector.energy_hour = 0.8 # Actual
+    coord._collector.expected_energy_hour = 0.8 # Expected (to match logic)
 
     # NEW LOGIC: We no longer mock calculate_solar_impact_kw (Global) for the final result.
     # We must mock unit coefficient and calculation.

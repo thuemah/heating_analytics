@@ -16,8 +16,8 @@ def mock_coordinator():
     coordinator._hourly_expected_base_per_unit = {}
     coordinator.auxiliary_heating_active = False
     coordinator.get_unit_mode = MagicMock(return_value="heating")
-    coordinator._accumulated_aux_impact_hour = 0.0  # Added for new minute-by-minute tracking
-    coordinator._accumulated_energy_hour = 0.0
+    coordinator._collector.aux_impact_hour = 0.0  # Added for new minute-by-minute tracking
+    coordinator._collector.energy_hour = 0.0
     coordinator.balance_point = 17.0
     return coordinator
 
@@ -37,7 +37,7 @@ def test_accumulated_impacts_start_of_day(mock_coordinator):
     # Simulate accumulation (since we replaced the naive calculation)
     # The new logic uses _accumulated_aux_impact_hour directly
     # Previously: 0.5 * 0.25 = 0.125
-    mock_coordinator._accumulated_aux_impact_hour = 0.125
+    mock_coordinator._collector.aux_impact_hour = 0.125
 
     HeatingDataCoordinator._update_accumulated_impacts(mock_coordinator, current_time)
 
@@ -65,7 +65,7 @@ def test_accumulated_impacts_with_hourly_logs(mock_coordinator):
 
     # Simulate accumulation for the current hour
     # Previously: 0.6 * 0.5 = 0.3
-    mock_coordinator._accumulated_aux_impact_hour = 0.3
+    mock_coordinator._collector.aux_impact_hour = 0.3
 
     HeatingDataCoordinator._update_accumulated_impacts(mock_coordinator, current_time)
 

@@ -36,13 +36,13 @@ def mock_coordinator_with_orphaned():
     coord._daily_aux_breakdown = {
         "sensor.heater_1": {"allocated": 5.0, "overflow": 2.0}
     }
-    coord._accumulated_aux_breakdown = {
+    coord._collector.aux_breakdown = {
         "sensor.heater_1": {"allocated": 1.0, "overflow": 0.5}
     }
 
     # Mock Orphaned Accumulators (The Fix)
     coord._daily_orphaned_aux = 3.0
-    coord._accumulated_orphaned_aux = 0.5
+    coord._collector.orphaned_aux = 0.5
 
     # Mock hourly log to avoid error accessing learning status
     coord._hourly_log = []

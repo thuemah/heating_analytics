@@ -1,17 +1,19 @@
 """Test Deviation Threshold Logic."""
 import pytest
+from tests.helpers import CoordinatorModelMixin
 from custom_components.heating_analytics.statistics import StatisticsManager
 
-class MockCoordinator:
+class MockCoordinator(CoordinatorModelMixin):
     def __init__(self):
+        from custom_components.heating_analytics.observation import ObservationCollector
+        self._collector = ObservationCollector()
         self.solar_azimuth = 180
         self.data = {}
         self.hass = None
         self.energy_sensors = []
         self._daily_individual = {}
         self._hourly_log = []
-        self._hourly_delta_per_unit = {}
-        self._accumulated_energy_hour = 0.0
+        self._hourly_delta_per_unit = self._collector.delta_per_unit
         # Add required attributes for StatisticsManager
         self.wind_unit = "km/h"
         self.wind_threshold = 20.0

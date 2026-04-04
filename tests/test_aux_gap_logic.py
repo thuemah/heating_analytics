@@ -50,9 +50,9 @@ def coordinator(hass):
         coord.statistics = mock_stats_instance
 
         # Initialize trackers
-        coord._accumulated_aux_impact_hour = 0.0
-        coord._accumulated_expected_energy_hour = 0.0
-        coord._last_minute_processed = None
+        coord._collector.aux_impact_hour = 0.0
+        coord._collector.expected_energy_hour = 0.0
+        coord._collector.last_minute_processed = None
 
         return coord
 
@@ -81,7 +81,7 @@ async def test_gap_filling_uses_persisted_state(coordinator):
     # Verify State Persistence
     assert coordinator.data["current_aux_impact_rate"] == 1.0
     assert coordinator.data["current_model_rate"] == 4.0 # 5.0 - 1.0
-    assert coordinator._last_minute_processed == 58
+    assert coordinator._collector.last_minute_processed == 58
 
     # 2. Change State (Aux OFF) - Simulating change during gap/restart
     coordinator.auxiliary_heating_active = False
@@ -114,7 +114,7 @@ async def test_gap_filling_uses_persisted_state(coordinator):
     # Total minutes processed: 59 (0..58) + 1 (59) = 60 minutes = 1.0 hour
     # Total impact should be exactly 1.0 kWh (since aux was ON for 58 min, and gap fill assumes ON)
 
-    assert coordinator._accumulated_aux_impact_hour == pytest.approx(1.0)
+    assert coordinator._collector.aux_impact_hour == pytest.approx(1.0)
 
 @pytest.mark.asyncio
 async def test_gap_filling_fallback(coordinator):
@@ -126,7 +126,7 @@ async def test_gap_filling_fallback(coordinator):
     coordinator.data["current_model_rate"] = 4.0 # Assume some rate exists from legacy
 
     # Last processed: 58
-    coordinator._last_minute_processed = 58
+    coordinator._collector.last_minute_processed = 58
 
     # Current State: Aux ON
     coordinator.auxiliary_heating_active = True
@@ -138,4 +138,4 @@ async def test_gap_filling_fallback(coordinator):
     # Fallback recalculates using CURRENT state (Aux ON -> 1.0 kW)
     # Gap: 1 min.
     expected_gap = 1.0 * (1/60)
-    assert coordinator._accumulated_aux_impact_hour == pytest.approx(expected_gap)
+    assert coordinator._collector.aux_impact_hour == pytest.approx(expected_gap)

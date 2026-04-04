@@ -130,14 +130,14 @@ async def test_aux_coefficient_learning_additive(hass):
         # Delta = 4.0 - 2.0 = 2.0
         # New Impact = 2.0 + 0.1 * (2.0) = 2.2
 
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 0.0
-        coordinator._hourly_bucket_counts = {"normal": 60}
-        coordinator._hourly_wind_values = [0.0] * 60 # Fix: Populate wind values
-        coordinator._hourly_aux_count = 60 # Dominant
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 0.0
+        coordinator._collector.bucket_counts = {"normal": 60}
+        coordinator._collector.wind_values = [0.0] * 60 # Fix: Populate wind values
+        coordinator._collector.aux_count = 60 # Dominant
         coordinator.auxiliary_heating_active = True
 
-        coordinator._accumulated_energy_hour = 6.0 # Actual
+        coordinator._collector.energy_hour = 6.0 # Actual
         # Also populate per-unit delta, as learning uses this sum
         coordinator._hourly_delta_per_unit = {"sensor.dummy": 6.0}
 
@@ -210,10 +210,10 @@ async def test_per_unit_aux_learning(hass):
         }
 
         # Needed for learning process
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 0.0 # Avg Temp 0
-        coordinator._hourly_bucket_counts = {"normal": 60}
-        coordinator._hourly_aux_count = 60 # Dominant Aux
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 0.0 # Avg Temp 0
+        coordinator._collector.bucket_counts = {"normal": 60}
+        coordinator._collector.aux_count = 60 # Dominant Aux
         coordinator.auxiliary_heating_active = True
 
         # Mock unit modes
@@ -245,7 +245,7 @@ async def test_per_unit_aux_learning(hass):
                  "learning_rate": 0.1,
                  "balance_point": 15.0,
                  "energy_sensors": ["sensor.heater_1", "sensor.heater_2"],
-                 "hourly_bucket_counts": coordinator._hourly_bucket_counts,
+                 "hourly_bucket_counts": coordinator._collector.bucket_counts,
                  "hourly_sample_count": 60,
                  "correlation_data": coordinator._correlation_data,
                  "correlation_data_per_unit": coordinator._correlation_data_per_unit,

@@ -118,7 +118,7 @@ def test_close_hour_gap_per_unit(coordinator, mock_time):
 
     # Global accumulated expected should increase by 10.0 * 0.5 = 5.0
     # But we mock _accumulated_expected_energy_hour which is 0.0 init
-    assert coordinator._accumulated_expected_energy_hour == 5.0
+    assert coordinator._collector.expected_energy_hour == 5.0
 
     # Per unit expected should increase
     # Heater 1: 6.0 * 0.5 = 3.0. Total 100 + 3 = 103.

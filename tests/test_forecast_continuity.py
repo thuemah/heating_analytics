@@ -64,7 +64,7 @@ async def test_forecast_continuity_high_consumption(hass):
         current_hour_actual = 0.9
 
         coordinator._accumulated_energy_today = previous_hours_total + current_hour_actual
-        coordinator._accumulated_energy_hour = current_hour_actual
+        coordinator._collector.energy_hour = current_hour_actual
 
         # 4. Execute Update
         # current_prediction_rate doesn't matter for the forecast logic as it uses forecast_item_now

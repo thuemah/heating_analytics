@@ -122,8 +122,8 @@ class StatisticsManager:
         wind_bucket = self.coordinator._get_wind_bucket(effective_wind)
 
         # Retrieve per-unit data structures
-        correlation_per_unit = self.coordinator._correlation_data_per_unit
-        aux_coeffs_per_unit = self.coordinator._aux_coefficients_per_unit
+        correlation_per_unit = self.coordinator.model.correlation_data_per_unit
+        aux_coeffs_per_unit = self.coordinator.model.aux_coefficients_per_unit
 
         # Pre-calculate Solar Vector if needed for unit calculation
         if override_solar_vector is not None:
@@ -162,7 +162,7 @@ class StatisticsManager:
             # via unassigned_kwh / leak_status in the Potential Savings sensor — that is
             # the intended feedback loop for this configuration.
             global_aux_reduction = self._get_prediction_from_model(
-                self.coordinator._aux_coefficients, temp_key, wind_bucket, temp, self.coordinator.balance_point
+                self.coordinator.model.aux_coefficients, temp_key, wind_bucket, temp, self.coordinator.balance_point
             )
 
         # --- Track B: Unit Models (Bottom-Up) ---
@@ -611,10 +611,10 @@ class StatisticsManager:
     def get_max_historical_daily_kwh(self) -> float:
         """Get the maximum daily energy consumption observed in history."""
         max_kwh = 0.0
-        if not self.coordinator._daily_history:
+        if not self.coordinator.model.daily_history:
             return 0.0
 
-        for day_data in self.coordinator._daily_history.values():
+        for day_data in self.coordinator.model.daily_history.values():
             if day_data and "kwh" in day_data:
                 kwh = day_data["kwh"]
                 if kwh > max_kwh:
@@ -632,18 +632,18 @@ class StatisticsManager:
         Returns:
             (typical_kwh, sample_count, confidence_level)
         """
-        if not self.coordinator._daily_history:
+        if not self.coordinator.model.daily_history:
             return None, 0, "low"
 
         # Calculate global average wind
-        winds = [d["wind"] for d in self.coordinator._daily_history.values() if d and "wind" in d]
+        winds = [d["wind"] for d in self.coordinator.model.daily_history.values() if d and "wind" in d]
         if not winds:
             return None, 0, "low"
 
         avg_wind_global = sum(winds) / len(winds)
 
         samples = []
-        for day_data in self.coordinator._daily_history.values():
+        for day_data in self.coordinator.model.daily_history.values():
             if not day_data or "temp" not in day_data or "kwh" not in day_data:
                 continue
 
@@ -701,7 +701,7 @@ class StatisticsManager:
         # This avoids scanning the entire 90-day history when we only need the current month.
         # Reduces complexity from O(Total History) to O(Current Month).
         # Optimization: Use running sums to avoid O(N) list allocation and secondary iteration.
-        for entry in reversed(self.coordinator._hourly_log):
+        for entry in reversed(self.coordinator.model.hourly_log):
             ts = entry["timestamp"]
 
             if ts < start_of_month_iso:
@@ -738,7 +738,7 @@ class StatisticsManager:
             last_year_today = today.replace(year=today.year - 1, day=28)
 
         ly_day_key = last_year_today.isoformat()
-        entry_ly_day = self.coordinator._daily_history.get(ly_day_key)
+        entry_ly_day = self.coordinator.model.daily_history.get(ly_day_key)
 
         if entry_ly_day:
             self.coordinator.data[ATTR_TEMP_LAST_YEAR_DAY] = entry_ly_day.get("temp")
@@ -773,8 +773,8 @@ class StatisticsManager:
 
         yesterday = today - timedelta(days=1)
         yesterday_key = yesterday.isoformat()
-        if yesterday_key in self.coordinator._daily_history:
-             entry = self.coordinator._daily_history[yesterday_key]
+        if yesterday_key in self.coordinator.model.daily_history:
+             entry = self.coordinator.model.daily_history[yesterday_key]
              if entry is not None:
                  tdd_yest = entry.get("tdd", 0.0)
                  kwh_yest = entry.get("kwh", 0.0)
@@ -796,7 +796,7 @@ class StatisticsManager:
 
         for i in range(1, 31):
             d_key = (today - timedelta(days=i)).isoformat()
-            if d_key in self.coordinator._daily_history:
+            if d_key in self.coordinator.model.daily_history:
                 if i <= 7:
                     last_7_keys.append(d_key)
                 last_30_keys.append(d_key)
@@ -816,7 +816,7 @@ class StatisticsManager:
         count = 0
 
         # Optimization: Local variable for history and iteration
-        history = self.coordinator._daily_history
+        history = self.coordinator.model.daily_history
         current_date = start_date
         one_day = timedelta(days=1)
 
@@ -843,7 +843,7 @@ class StatisticsManager:
         sum_tdd = 0.0
         sum_kwh = 0.0
         count = 0
-        history = self.coordinator._daily_history
+        history = self.coordinator.model.daily_history
 
         # Optimization: Iterate once, avoid list allocation
         for k in keys:
@@ -880,7 +880,7 @@ class StatisticsManager:
         actual_savings_kwh = 0.0
         aux_hours_list = []
 
-        today_logs = [e for e in self.coordinator._hourly_log if e["timestamp"].startswith(today_iso)]
+        today_logs = [e for e in self.coordinator.model.hourly_log if e["timestamp"].startswith(today_iso)]
 
         for entry in today_logs:
             temp = entry["temp"]
@@ -961,7 +961,7 @@ class StatisticsManager:
              remainder_aux = t_aux * remaining_fraction
 
              # Check if Aux is active OR has produced impact (Mixed Mode)
-             live_aux_impact = self.coordinator._accumulated_aux_impact_hour
+             live_aux_impact = self.coordinator._collector.aux_impact_hour
              if self.coordinator.auxiliary_heating_active or live_aux_impact > 0.001:
                  aux_hours_count += fraction
                  aux_hours_list.append(dt_util.now().hour)
@@ -1073,8 +1073,8 @@ class StatisticsManager:
                         "multiplier": 1.0, # Hourly logs have 1h weight
                         "unit_modes": log.get("unit_modes") # Capture unit modes
                     })
-            elif date_iso in self.coordinator._daily_history:
-                entry = self.coordinator._daily_history[date_iso]
+            elif date_iso in self.coordinator.model.daily_history:
+                entry = self.coordinator.model.daily_history[date_iso]
                 # Guard against None entries in legacy storage
                 if entry is not None:
                     # Strategy: Use Vectors (Precision) -> Fallback to Daily (Average)
@@ -1263,13 +1263,13 @@ class StatisticsManager:
         """
         daily_log_map = {}
 
-        if not self.coordinator._hourly_log:
+        if not self.coordinator.model.hourly_log:
             return daily_log_map
 
         start_iso = start_date.isoformat()
         end_iso = end_date.isoformat()
 
-        for entry in reversed(self.coordinator._hourly_log):
+        for entry in reversed(self.coordinator.model.hourly_log):
             date_key = entry["timestamp"][:10]
 
             if date_key > end_iso:
@@ -1302,8 +1302,8 @@ class StatisticsManager:
         current = start_date
         while current <= end_date:
             day_str = current.isoformat()
-            if day_str in self.coordinator._daily_history:
-                entry = self.coordinator._daily_history[day_str]
+            if day_str in self.coordinator.model.daily_history:
+                entry = self.coordinator.model.daily_history[day_str]
                 if entry is not None:
                     total += entry.get("kwh", 0.0)
                     found_data = True
@@ -1363,7 +1363,7 @@ class StatisticsManager:
 
         # 1. Past Hours (from Log) - Reconstruct Model Value
         # This ensures we use the model even if actual consumption was different (or aux affected it)
-        for log in self.coordinator._hourly_log:
+        for log in self.coordinator.model.hourly_log:
             if log["timestamp"].startswith(today_iso):
                 model_kwh, solar_kwh = self._calculate_model_value_from_log(log)
                 total_kwh += model_kwh
@@ -1549,7 +1549,7 @@ class StatisticsManager:
         today_iso = now_dt.date().isoformat()
         today_logs = []
 
-        for entry in reversed(self.coordinator._hourly_log):
+        for entry in reversed(self.coordinator.model.hourly_log):
              if entry["timestamp"].startswith(today_iso):
                  today_logs.append(entry)
              else:
@@ -1679,7 +1679,7 @@ class StatisticsManager:
         effective_wind: float | None = None
     ) -> float:
         """Calculate fallback projection if intra-hour accumulation is missing."""
-        unit_data = self.coordinator._correlation_data_per_unit.get(entity_id, {})
+        unit_data = self.coordinator.model.correlation_data_per_unit.get(entity_id, {})
         unit_base_curr = self._get_prediction_from_model(unit_data, temp_key, wind_bucket, current_temp, self.coordinator.balance_point)
 
         if self.coordinator.solar_enabled:
@@ -1747,7 +1747,7 @@ class StatisticsManager:
             current = start_date
             while current <= end_date:
                 day_str = current.isoformat()
-                entry = self.coordinator._daily_history.get(day_str)
+                entry = self.coordinator.model.daily_history.get(day_str)
                 if entry:
                     aux_impact += entry.get("aux_impact_kwh", 0.0)
                 current += timedelta(days=1)
@@ -1818,7 +1818,7 @@ class StatisticsManager:
                 if current < today:
                     # Past: Use daily_history
                     day_str = current.isoformat()
-                    entry = self.coordinator._daily_history.get(day_str)
+                    entry = self.coordinator.model.daily_history.get(day_str)
 
                     if entry:
                         temp = entry.get('temp')
@@ -2017,7 +2017,7 @@ class StatisticsManager:
         }
 
         # Sort logs chronologically (oldest first)
-        sorted_logs = sorted(self.coordinator._hourly_log, key=lambda x: x["timestamp"])
+        sorted_logs = sorted(self.coordinator.model.hourly_log, key=lambda x: x["timestamp"])
 
         for log in sorted_logs:
             if log["timestamp"] < start_iso:
@@ -2086,7 +2086,7 @@ class StatisticsManager:
             }
 
         # 2. Shared kernel evaluation helper (TDD linear regression → R², RMSE)
-        correlation_data = self.coordinator._correlation_data
+        correlation_data = self.coordinator.model.correlation_data
         bp = self.coordinator.balance_point
 
         def _eval_kernel_on_logs(kernel: tuple, kernel_window: int, logs: list) -> tuple:
@@ -2396,7 +2396,7 @@ class StatisticsManager:
             "missing_wind_or_temp": 0,
         }
 
-        sorted_logs = sorted(self.coordinator._hourly_log, key=lambda x: x["timestamp"])
+        sorted_logs = sorted(self.coordinator.model.hourly_log, key=lambda x: x["timestamp"])
 
         for log in sorted_logs:
             if log["timestamp"] < start_iso:
@@ -2449,7 +2449,7 @@ class StatisticsManager:
         candidates = []
         current_high = self.coordinator.wind_threshold
         current_extreme = self.coordinator.extreme_wind_threshold
-        correlation_data = self.coordinator._correlation_data
+        correlation_data = self.coordinator.model.correlation_data
 
         # Build candidate grid
         h_cand = 3.0

@@ -30,20 +30,20 @@ async def test_hourly_learning_basic(hass: HomeAssistant):
         coordinator._correlation_data_per_unit = {"sensor.heater": {"0": {"normal": 1.0}}}
 
         # Simulate accumulated data for the hour
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 0.0 # Avg 0.0
-        coordinator._hourly_wind_values = [0.0] * 60
-        coordinator._hourly_bucket_counts = {"normal": 60, "high_wind": 0, "extreme_wind": 0}
-        coordinator._accumulated_energy_hour = 2.0 # Actual was 2.0 (High!)
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 0.0 # Avg 0.0
+        coordinator._collector.wind_values = [0.0] * 60
+        coordinator._collector.bucket_counts = {"normal": 60, "high_wind": 0, "extreme_wind": 0}
+        coordinator._collector.energy_hour = 2.0 # Actual was 2.0 (High!)
 
         # FIX: Set expected energy explicitly to match the scenario
         # In real operation, this accumulates minute-by-minute.
-        coordinator._accumulated_expected_energy_hour = 1.0
+        coordinator._collector.expected_energy_hour = 1.0
 
         coordinator._hourly_delta_per_unit = {"sensor.heater": 2.0}
 
         current_time = datetime(2023, 10, 27, 13, 0, 0) # End of hour (processing 12:00-13:00)
-        coordinator._hourly_start_time = datetime(2023, 10, 27, 12, 0, 0)
+        coordinator._collector.start_time = datetime(2023, 10, 27, 12, 0, 0)
 
         # Run
         await coordinator._process_hourly_data(current_time)
@@ -87,42 +87,28 @@ async def test_hourly_learning_with_solar(hass: HomeAssistant):
         # FIX: Set per-unit data
         coordinator._correlation_data_per_unit = {"sensor.heater": {"0": {"normal": 2.0}}}
 
-        # Setup Solar Mock
-        # Solar Factor 1.0 -> Impact 0.5 kWh
-        # We need to mock both Global (for deprecated check) and Unit methods
+        # Setup Solar Mock — ensure all solar methods return deterministic values.
+        # Solar impact = 0.5 kWh for the test scenario.
+        coordinator.solar.get_approx_sun_pos = MagicMock(return_value=(30.0, 180.0))
+        coordinator.solar.calculate_solar_factor = MagicMock(return_value=1.0)
+        coordinator.solar.calculate_potential_solar_impact = MagicMock(return_value=(0.5, (0.5, 0.0), 1.0))
         coordinator.solar.calculate_solar_impact_kw = MagicMock(return_value=0.5)
-
-        # New logic calculates unit impact during processing.
-        # It calls calculate_unit_coefficient and calculate_unit_solar_impact.
-        # We need to ensure calculate_unit_solar_impact returns something consistent
-        # with the test assumption (Impact 0.5).
-        # We can just mock normalize_for_learning to do the math we want.
-
-        # Apply correction: Base - Impact. 2.0 - 0.5 = 1.5 Expected.
         coordinator.solar.apply_correction = MagicMock(side_effect=lambda base, impact, temp: base - impact)
-
-        # Normalize: Actual + Impact.
-        # The test expects normalized to be 2.0 (Actual 1.5 + Impact 0.5).
-        # In process_learning, solar_impact is passed.
-        # In the new logic, unit_solar_impact is calculated.
-        # We need to mock normalize_for_learning to handle whatever impact is passed.
-
         coordinator.solar.normalize_for_learning = MagicMock(side_effect=lambda actual, impact, temp: actual + impact)
-
-        # Mock unit calls to ensure `unit_solar_impact` is also 0.5 if used
         coordinator.solar.calculate_unit_coefficient = MagicMock(return_value=1.0)
         coordinator.solar.calculate_unit_solar_impact = MagicMock(return_value=0.5)
+        coordinator.solar.calculate_saturation = MagicMock(side_effect=lambda net, solar, mode: (min(solar, net), max(0, solar - net), max(0, net - solar)))
 
         # Data
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 0.0
-        coordinator._hourly_wind_values = [0.0] * 60
-        coordinator._hourly_bucket_counts = {"normal": 60}
-        coordinator._hourly_solar_sum = 60.0 # Avg 1.0
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 0.0
+        coordinator._collector.wind_values = [0.0] * 60
+        coordinator._collector.bucket_counts = {"normal": 60}
+        coordinator._collector.solar_sum = 60.0 # Avg 1.0
 
         # Actual Consumption was 1.5 (Matched expected with solar)
-        coordinator._accumulated_energy_hour = 1.5
-        coordinator._accumulated_expected_energy_hour = 1.5 # FIX: Set expected
+        coordinator._collector.energy_hour = 1.5
+        coordinator._collector.expected_energy_hour = 1.5 # FIX: Set expected
         coordinator._hourly_delta_per_unit = {"sensor.heater": 1.5}
 
         current_time = datetime(2023, 10, 27, 13, 0, 0)
@@ -141,21 +127,23 @@ async def test_hourly_learning_with_solar(hass: HomeAssistant):
 
         assert coordinator._correlation_data["0"]["normal"] == 2.0
 
-        # Scenario 2: Actual was higher (1.8) -> Normalized 2.3
-        # New Base = 2.0 + 0.1 * (2.3 - 2.0) = 2.03
+        # Scenario 2: Actual was higher (1.8)
+        # Solar battery carries residual from scenario 1: 0.5 * DECAY(0.6) + 0.5 = 0.8
+        # Normalized = 1.8 + 0.8 = 2.6
+        # New Base = 2.0 + 0.1 * (2.6 - 2.0) = 2.06
 
         # Reset for next run (simulation of next hour data accumulation)
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 0.0
-        coordinator._hourly_wind_values = [0.0] * 60
-        coordinator._hourly_bucket_counts = {"normal": 60}
-        coordinator._hourly_solar_sum = 60.0 # Avg 1.0
-        coordinator._accumulated_energy_hour = 1.8
-        coordinator._accumulated_expected_energy_hour = 1.5 # Still expected 1.5
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 0.0
+        coordinator._collector.wind_values = [0.0] * 60
+        coordinator._collector.bucket_counts = {"normal": 60}
+        coordinator._collector.solar_sum = 60.0 # Avg 1.0
+        coordinator._collector.energy_hour = 1.8
+        coordinator._collector.expected_energy_hour = 1.5 # Still expected 1.5
         coordinator._hourly_delta_per_unit = {"sensor.heater": 1.8}
 
         await coordinator._process_hourly_data(current_time)
-        assert coordinator._correlation_data["0"]["normal"] == pytest.approx(2.03, abs=0.001)
+        assert coordinator._correlation_data["0"]["normal"] == pytest.approx(2.06, abs=0.001)
 
 @pytest.mark.asyncio
 async def test_hourly_bucket_auxiliary(hass: HomeAssistant):
@@ -177,15 +165,15 @@ async def test_hourly_bucket_auxiliary(hass: HomeAssistant):
         # FIX: Set per-unit aux
         coordinator._aux_coefficients_per_unit = {"sensor.heater": {"0": {"normal": 0.0}}}
 
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 0.0
-        coordinator._hourly_wind_values = [0.0] * 60
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 0.0
+        coordinator._collector.wind_values = [0.0] * 60
 
         # Dominant Aux active
         # Refactor: _hourly_bucket_counts only tracks physical buckets
-        coordinator._hourly_bucket_counts = {"normal": 60}
+        coordinator._collector.bucket_counts = {"normal": 60}
         coordinator.auxiliary_heating_active = True
-        coordinator._hourly_aux_count = 60 # Dominant
+        coordinator._collector.aux_count = 60 # Dominant
 
         # Scenario:
         # Base Model (Normal) = 1.0 kWh
@@ -193,8 +181,8 @@ async def test_hourly_bucket_auxiliary(hass: HomeAssistant):
         # Implied Aux Impact = 1.0 - 0.5 = 0.5 kWh
         # Learning Rate = 0.1 (simulated)
 
-        coordinator._accumulated_energy_hour = 0.5
-        coordinator._accumulated_expected_energy_hour = 1.0
+        coordinator._collector.energy_hour = 0.5
+        coordinator._collector.expected_energy_hour = 1.0
 
         # FIX: Populate unit deltas so per-unit breakdown is calculated
         coordinator._hourly_delta_per_unit = {"sensor.heater": 0.5}

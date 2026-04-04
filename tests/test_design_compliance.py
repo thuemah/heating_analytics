@@ -71,7 +71,7 @@ def test_hybrid_projection_funnel():
 
         # Setup State
         coordinator._accumulated_energy_today = 60.0 # Actual So Far (Includes current hour)
-        coordinator._accumulated_energy_hour = 2.0 # Actual This Hour (Included in above)
+        coordinator._collector.energy_hour = 2.0 # Actual This Hour (Included in above)
         coordinator.auxiliary_heating_active = False
 
         # Mocks

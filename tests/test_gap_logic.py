@@ -22,17 +22,17 @@ async def test_gap_fill_end_of_hour(hass: HomeAssistant):
         coordinator._async_save_data = AsyncMock()
 
         # Simulate last processed minute was 58
-        coordinator._last_minute_processed = 58
+        coordinator._collector.last_minute_processed = 58
         coordinator.data["current_model_rate"] = 6.0
         coordinator.data["current_calc_temp"] = 5.0
 
-        coordinator._accumulated_expected_energy_hour = 5.8
+        coordinator._collector.expected_energy_hour = 5.8
 
         # Ensure we have sample counts to trigger log append
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 300.0
-        coordinator._hourly_wind_values = [0.0] * 60
-        coordinator._hourly_start_time = datetime(2023, 10, 27, 12, 0, 0)
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 300.0
+        coordinator._collector.wind_values = [0.0] * 60
+        coordinator._collector.start_time = datetime(2023, 10, 27, 12, 0, 0)
 
         current_time = datetime(2023, 10, 27, 13, 0, 0)
 
@@ -64,16 +64,16 @@ async def test_gap_fill_large_gap(hass: HomeAssistant):
         coordinator._async_save_data = AsyncMock()
 
         # Last processed min 29. Missed 30 mins (30..59).
-        coordinator._last_minute_processed = 29
+        coordinator._collector.last_minute_processed = 29
         coordinator.data["current_model_rate"] = 2.0
 
-        coordinator._accumulated_expected_energy_hour = 1.0
+        coordinator._collector.expected_energy_hour = 1.0
 
         # Setup logging pre-reqs
-        coordinator._hourly_sample_count = 30
-        coordinator._hourly_temp_sum = 150.0
-        coordinator._hourly_wind_values = [0.0] * 30
-        coordinator._hourly_start_time = datetime(2023, 10, 27, 12, 0, 0)
+        coordinator._collector.sample_count = 30
+        coordinator._collector.temp_sum = 150.0
+        coordinator._collector.wind_values = [0.0] * 30
+        coordinator._collector.start_time = datetime(2023, 10, 27, 12, 0, 0)
 
         current_time = datetime(2023, 10, 27, 13, 0, 0)
 
@@ -100,11 +100,11 @@ async def test_gap_no_previous_state(hass: HomeAssistant):
         coordinator = HeatingDataCoordinator(hass, entry)
         coordinator._async_save_data = AsyncMock()
 
-        coordinator._last_minute_processed = None # No state
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 600.0
-        coordinator._hourly_wind_values = [0.0] * 60
-        coordinator._hourly_start_time = datetime(2023, 10, 27, 12, 0, 0)
+        coordinator._collector.last_minute_processed = None # No state
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 600.0
+        coordinator._collector.wind_values = [0.0] * 60
+        coordinator._collector.start_time = datetime(2023, 10, 27, 12, 0, 0)
 
         current_time = datetime(2023, 10, 27, 13, 0, 0)
 

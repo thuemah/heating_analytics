@@ -37,14 +37,14 @@ async def test_aux_exclusion_learning_bug(hass: HomeAssistant):
         coordinator._aux_coefficients = {"0": {"normal": 0.0}}
 
         # Setup Hour Data
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 0.0
-        coordinator._hourly_wind_values = [0.0] * 60
-        coordinator._hourly_bucket_counts = {"normal": 60, "high_wind": 0, "extreme_wind": 0}
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 0.0
+        coordinator._collector.wind_values = [0.0] * 60
+        coordinator._collector.bucket_counts = {"normal": 60, "high_wind": 0, "extreme_wind": 0}
 
         # Enable Aux
         coordinator.auxiliary_heating_active = True
-        coordinator._hourly_aux_count = 60 # Dominant Aux
+        coordinator._collector.aux_count = 60 # Dominant Aux
 
         # Scenario:
         # Main (Affected): Consumes 0.5 (Reduced from 1.0 by Aux)
@@ -52,8 +52,8 @@ async def test_aux_exclusion_learning_bug(hass: HomeAssistant):
         # We expect Main to learn Aux Coefficient.
         # We expect Annex to learn Base Model (Update 1.0 -> higher).
 
-        coordinator._accumulated_energy_hour = 2.0 # Total
-        coordinator._accumulated_expected_energy_hour = 2.0 # Base expectation
+        coordinator._collector.energy_hour = 2.0 # Total
+        coordinator._collector.expected_energy_hour = 2.0 # Base expectation
 
         # Breakdown
         coordinator._hourly_delta_per_unit = {

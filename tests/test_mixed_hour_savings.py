@@ -11,8 +11,8 @@ def mock_coordinator():
     coord.data = {}
     coord._hourly_log = []
     coord.auxiliary_heating_active = False # Currently OFF
-    coord._accumulated_aux_impact_hour = 2.5 # But was ON earlier (mixed hour)
-    coord._accumulated_energy_hour = 5.0
+    coord._collector.aux_impact_hour = 2.5 # But was ON earlier (mixed hour)
+    coord._collector.energy_hour = 5.0
 
     # Mock calculate_total_power dependencies
     coord.energy_sensors = ["sensor.heat_pump"]
@@ -83,7 +83,7 @@ def test_live_mixed_hour_savings_captured(mock_coordinator):
         "accumulated_aux_impact_kwh": 2.5
     }
     mock_coordinator.auxiliary_heating_active = False # Currently OFF
-    mock_coordinator._accumulated_aux_impact_hour = 2.5
+    mock_coordinator._collector.aux_impact_hour = 2.5
 
     stats._calculate_savings_component = MagicMock(return_value=(10.0, 5.0, False, {}))
     mock_coordinator.forecast.calculate_future_energy.return_value = (0.0, 0.0, {})

@@ -17,10 +17,10 @@ class TestForecastOptimization(unittest.TestCase):
         self.coordinator = HeatingDataCoordinator(self.hass, self.entry)
 
         # Mock internal state needed for _update_daily_budgets
-        self.coordinator._accumulated_expected_energy_hour = 0.0
+        self.coordinator._collector.expected_energy_hour = 0.0
         self.coordinator._hourly_log = []
         self.coordinator._accumulated_energy_today = 0.0
-        self.coordinator._accumulated_energy_hour = 0.0
+        self.coordinator._collector.energy_hour = 0.0
         self.coordinator.data = {ATTR_SOLAR_FACTOR: 0.0, ATTR_SOLAR_IMPACT: 0.0}
 
         # Mock ForecastManager

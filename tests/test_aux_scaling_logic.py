@@ -1,10 +1,11 @@
 """Test removal of scaling logic in StatisticsManager."""
 from unittest.mock import MagicMock
+from tests.helpers import CoordinatorModelMixin
 import pytest
 from custom_components.heating_analytics.statistics import StatisticsManager
 from custom_components.heating_analytics.const import DOMAIN
 
-class MockCoordinator:
+class MockCoordinator(CoordinatorModelMixin):
     def __init__(self):
         self.solar_azimuth = 180
         self.hass = MagicMock()

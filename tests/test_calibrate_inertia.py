@@ -1,10 +1,11 @@
 import math
+from tests.helpers import CoordinatorModelMixin
 import pytest
 from datetime import datetime, timedelta
 from homeassistant.util import dt as dt_util
 from custom_components.heating_analytics.statistics import StatisticsManager
 
-class MockCoordinator:
+class MockCoordinator(CoordinatorModelMixin):
     def __init__(self):
         self.solar_azimuth = 180
         self.balance_point = 17.0

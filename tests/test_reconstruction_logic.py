@@ -1,12 +1,13 @@
 """Test reconstruction logic in StatisticsManager."""
 from datetime import date
+from tests.helpers import CoordinatorModelMixin
 from unittest.mock import MagicMock
 import pytest
 from custom_components.heating_analytics.statistics import StatisticsManager
 
 from custom_components.heating_analytics.const import ATTR_SOLAR_FACTOR
 
-class MockCoordinator:
+class MockCoordinator(CoordinatorModelMixin):
     def __init__(self):
         self.solar_azimuth = 180
         self.balance_point = 20.0

@@ -37,6 +37,11 @@ async def test_weather_source_selection(hass, mock_entry):
 
     coordinator = HeatingDataCoordinator(hass, mock_entry)
     coordinator.solar = MagicMock()
+    coordinator.solar.calculate_solar_factor.return_value = 0.0
+    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+    coordinator.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
+    coordinator.solar.calculate_unit_solar_impact.return_value = 0.0
+    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
     coordinator.statistics = MagicMock()
     # Fix return value for calculate_total_power
     coordinator.statistics.calculate_total_power.return_value = {
@@ -100,10 +105,10 @@ async def test_weather_source_selection(hass, mock_entry):
         await coordinator._async_update_data()
 
         # Verify Temp comes from Weather (15.0)
-        assert coordinator._hourly_temp_sum == 15.0
+        assert coordinator._collector.temp_sum == 15.0
 
         # Verify Wind comes from Sensor (20.0)
-        assert coordinator._hourly_wind_sum == 20.0
+        assert coordinator._collector.wind_sum == 20.0
 
 @pytest.mark.asyncio
 async def test_mixed_source_selection(hass, mock_entry):
@@ -113,6 +118,11 @@ async def test_mixed_source_selection(hass, mock_entry):
 
     coordinator = HeatingDataCoordinator(hass, mock_entry)
     coordinator.solar = MagicMock()
+    coordinator.solar.calculate_solar_factor.return_value = 0.0
+    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+    coordinator.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
+    coordinator.solar.calculate_unit_solar_impact.return_value = 0.0
+    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
     coordinator.statistics = MagicMock()
     # Fix return value for calculate_total_power
     coordinator.statistics.calculate_total_power.return_value = {
@@ -135,8 +145,6 @@ async def test_mixed_source_selection(hass, mock_entry):
     coordinator.forecast.calculate_future_energy.return_value = (0.0, 0.0, {})
     coordinator.forecast.calculate_weather_deviation.return_value = {}
     coordinator.forecast.calculate_plan_revision_impact.return_value = {}
-    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
-    coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
     coordinator.forecast._process_forecast_item.return_value = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0)
     coordinator.forecast.get_forecast_for_hour.return_value = None
     # FIX: Mock get_plan_for_hour to return a 2-tuple
@@ -166,10 +174,10 @@ async def test_mixed_source_selection(hass, mock_entry):
         await coordinator._async_update_data()
 
         # Verify Temp comes from Sensor (10.0)
-        assert coordinator._hourly_temp_sum == 10.0
+        assert coordinator._collector.temp_sum == 10.0
 
         # Verify Wind comes from Weather (5.0)
-        assert coordinator._hourly_wind_sum == 5.0
+        assert coordinator._collector.wind_sum == 5.0
 
 @pytest.mark.asyncio
 async def test_strict_mode_no_fallback(hass, mock_entry):
@@ -223,8 +231,8 @@ async def test_strict_mode_no_fallback(hass, mock_entry):
 
         # Should be 0.0 (initialized) because update failed to get temp
         # And strict mode means no fallback.
-        assert coordinator._hourly_temp_sum == 0.0
-        assert coordinator._hourly_sample_count == 0 # Or 1 with 0?
+        assert coordinator._collector.temp_sum == 0.0
+        assert coordinator._collector.sample_count == 0 # Or 1 with 0?
         # If temp is None, it skips the "Calculate Effective Wind & Conditions" block
         # So sample count remains 0.
 
@@ -249,6 +257,11 @@ async def test_optional_gust_sensor(hass, mock_entry):
 
     coordinator = HeatingDataCoordinator(hass, mock_entry)
     coordinator.solar = MagicMock()
+    coordinator.solar.calculate_solar_factor.return_value = 0.0
+    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+    coordinator.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
+    coordinator.solar.calculate_unit_solar_impact.return_value = 0.0
+    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
     coordinator.statistics = MagicMock()
     # Fix return value for calculate_total_power
     coordinator.statistics.calculate_total_power.return_value = {

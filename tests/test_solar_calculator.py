@@ -1,5 +1,6 @@
 """Unit tests for SolarCalculator with updated physics."""
 import pytest
+from tests.helpers import CoordinatorModelMixin
 import math
 from unittest.mock import MagicMock
 from custom_components.heating_analytics.solar import SolarCalculator
@@ -8,7 +9,7 @@ from custom_components.heating_analytics.const import (
     DEFAULT_SOLAR_COEFF_COOLING,
 )
 
-class MockCoordinator:
+class MockCoordinator(CoordinatorModelMixin):
     def __init__(self):
         self.solar_azimuth = 180
         self.balance_point = 15.0

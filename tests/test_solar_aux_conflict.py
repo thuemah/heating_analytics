@@ -45,29 +45,29 @@ async def test_solar_aux_dual_interference(hass: HomeAssistant):
         coordinator.solar.normalize_for_learning = MagicMock(side_effect=lambda actual, impact, temp: actual + impact)
 
         # 4. Simulate Hourly Data
-        coordinator._hourly_sample_count = 60
-        coordinator._hourly_temp_sum = 0.0 # Temp 0
-        coordinator._hourly_wind_values = [0.0] * 60
-        coordinator._hourly_bucket_counts = {"normal": 60, "high_wind": 0, "extreme_wind": 0}
-        coordinator._hourly_solar_sum = 1.0 # Avg Solar Factor
+        coordinator._collector.sample_count = 60
+        coordinator._collector.temp_sum = 0.0 # Temp 0
+        coordinator._collector.wind_values = [0.0] * 60
+        coordinator._collector.bucket_counts = {"normal": 60, "high_wind": 0, "extreme_wind": 0}
+        coordinator._collector.solar_sum = 1.0 # Avg Solar Factor
 
         # Aux Dominant
-        coordinator._hourly_aux_count = 60
+        coordinator._collector.aux_count = 60
         coordinator.auxiliary_heating_active = True
 
         # 5. Set Impacts
         # Solar Impact will be calculated as 0.5 inside (mocked above)
         # Aux Impact (Accumulated) - Significant!
-        coordinator._accumulated_aux_impact_hour = 1.0
+        coordinator._collector.aux_impact_hour = 1.0
 
         # 6. Set Actuals
         # Expected Net = Base(2.0) - Solar(0.5) - Aux(1.0) = 0.5
         # Let's say Actual is 0.8 (Deviation of +0.3)
-        coordinator._accumulated_energy_hour = 0.8
+        coordinator._collector.energy_hour = 0.8
         coordinator._hourly_delta_per_unit = {"sensor.heater": 0.8}
 
         current_time = datetime(2023, 10, 27, 13, 0, 0)
-        coordinator._hourly_start_time = datetime(2023, 10, 27, 12, 0, 0)
+        coordinator._collector.start_time = datetime(2023, 10, 27, 12, 0, 0)
 
         # 7. Run
         await coordinator._process_hourly_data(current_time)

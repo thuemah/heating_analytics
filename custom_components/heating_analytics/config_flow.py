@@ -47,6 +47,9 @@ from .const import (
     CONF_THERMAL_MASS,
     DEFAULT_THERMAL_MASS,
     CONF_DAILY_LEARNING_MODE,
+    CONF_TRACK_C,
+    CONF_MPC_ENTRY_ID,
+    CONF_MPC_MANAGED_SENSOR,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -114,34 +117,17 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not user_input.get(key):
                 self._flow_data.pop(key, None)
 
-    def _needs_reload_advanced(self, user_input: dict) -> bool:
-        """Return True when step 3 must re-render to show/hide dynamic fields."""
-        daily = user_input.get(CONF_DAILY_LEARNING_MODE, False)
-        load_shift = user_input.get(_CONF_LOAD_SHIFT, False)
-        # daily_learning_mode toggled on — load-shift toggle not yet visible
-        if daily and _CONF_LOAD_SHIFT not in user_input:
-            return True
-        # daily_learning_mode toggled off — load-shift toggle still in submitted form
-        if not daily and _CONF_LOAD_SHIFT in user_input:
-            return True
-        # overnight_load_shift_correction toggled on — sensor/thermal-mass fields not yet visible
-        if daily and load_shift and CONF_THERMAL_MASS not in user_input:
-            return True
-        # overnight_load_shift_correction toggled off — thermal-mass field still in submitted form
-        if daily and not load_shift and CONF_THERMAL_MASS in user_input:
-            return True
-        # csv_auto_logging toggled on — path fields not yet visible
-        csv_logging = user_input.get("csv_auto_logging", False)
-        if csv_logging and "csv_hourly_path" not in user_input:
-            return True
-        # csv_auto_logging toggled off — path fields still in submitted form
-        if not csv_logging and "csv_hourly_path" in user_input:
-            return True
-        return False
+    def _needs_feature_config_step(self) -> bool:
+        """Return True when the feature_config page has at least one field to show."""
+        daily = self._flow_data.get(CONF_DAILY_LEARNING_MODE, False)
+        load_shift = self._flow_data.get(_CONF_LOAD_SHIFT, False)
+        track_c = self._flow_data.get(CONF_TRACK_C, False)
+        csv = self._flow_data.get("csv_auto_logging", False)
+        return (daily and (load_shift or track_c)) or csv
 
-    def _build_final_data(self, step3_input: dict) -> dict:
+    def _build_final_data(self, last_step_input: dict) -> dict:
         """Merge all steps and normalise values for storage."""
-        data = {**self._flow_data, **step3_input}
+        data = {**self._flow_data, **last_step_input}
 
         # Derive source constants from sensor presence (no more source dropdowns)
         data[CONF_OUTDOOR_TEMP_SOURCE] = SOURCE_SENSOR if data.get("outdoor_temp_sensor") else SOURCE_WEATHER
@@ -152,18 +138,25 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data[CONF_SOLAR_ENABLED] = True
 
         # Strip absent/falsy optional entity keys so EntitySelector never shows "None".
-        # Step-3 keys must also be checked against step3_input directly: if the user
-        # cleared the field, the key is absent from step3_input but may still be
-        # present (truthy) in self._flow_data from a previous save.
-        if not step3_input.get(CONF_SECONDARY_WEATHER_ENTITY):
+        if not data.get(CONF_SECONDARY_WEATHER_ENTITY):
             data.pop(CONF_SECONDARY_WEATHER_ENTITY, None)
         # Clear indoor_temp_sensor when load-shift correction is not active so a
         # previously saved sensor does not leak in from _flow_data.
-        if not (step3_input.get(CONF_DAILY_LEARNING_MODE) and step3_input.get(_CONF_LOAD_SHIFT)
-                and step3_input.get(CONF_INDOOR_TEMP_SENSOR)):
+        if not (data.get(CONF_DAILY_LEARNING_MODE) and data.get(_CONF_LOAD_SHIFT)):
             data.pop(CONF_INDOOR_TEMP_SENSOR, None)
         # _CONF_LOAD_SHIFT is UI-only — never stored.
         data.pop(_CONF_LOAD_SHIFT, None)
+        # Clear Track C state when daily_learning_mode is off (Track C requires it),
+        # or when track_c_enabled is explicitly off. Prevents stale flags surviving
+        # a reconfigure where the daily_learning_mode toggle was hidden and absent
+        # from the input.
+        if not data.get(CONF_DAILY_LEARNING_MODE):
+            data.pop(CONF_TRACK_C, None)
+            data.pop(CONF_MPC_ENTRY_ID, None)
+            data.pop(CONF_MPC_MANAGED_SENSOR, None)
+        elif not data.get(CONF_TRACK_C):
+            data.pop(CONF_MPC_ENTRY_ID, None)
+            data.pop(CONF_MPC_MANAGED_SENSOR, None)
         for key in [
             "outdoor_temp_sensor", "wind_speed_sensor", "wind_gust_sensor",
             CONF_INDOOR_TEMP_SENSOR,
@@ -236,9 +229,14 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return vol.Schema(schema)
 
     def _schema_advanced(self, user_input, defaults) -> vol.Schema:
+        """Schema for toggles, wind tuning, and miscellaneous options.
+
+        All boolean feature toggles live here. Their corresponding sub-fields
+        (sensors, paths, entry selectors) are on the *next* page
+        (feature_config) so no dynamic re-render is ever needed.
+        """
         g = lambda k, d=None: self._v(user_input, defaults, k, d)
         current_unit = self._flow_data.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
-        daily = g(CONF_DAILY_LEARNING_MODE, False)
 
         # Wind thresholds: stored in m/s, displayed in the unit chosen in step 2
         if user_input is not None and "wind_threshold" in user_input:
@@ -261,23 +259,9 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         load_shift = g(_CONF_LOAD_SHIFT, bool(g(CONF_INDOOR_TEMP_SENSOR)))
 
         schema: dict = {
-            vol.Optional(CONF_DAILY_LEARNING_MODE, default=daily): selector.BooleanSelector(),
-        }
-        if daily:
-            schema[vol.Optional(_CONF_LOAD_SHIFT, default=bool(load_shift))] = selector.BooleanSelector()
-            if load_shift:
-                schema[vol.Optional(
-                    CONF_INDOOR_TEMP_SENSOR,
-                    description={"suggested_value": g(CONF_INDOOR_TEMP_SENSOR)},
-                )] = selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
-                )
-                schema[vol.Required(CONF_THERMAL_MASS, default=g(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS))] = (
-                    selector.NumberSelector(
-                        selector.NumberSelectorConfig(min=0.0, max=50.0, step=0.1, unit_of_measurement="kWh/°C")
-                    )
-                )
-        schema.update({
+            vol.Optional(CONF_DAILY_LEARNING_MODE, default=g(CONF_DAILY_LEARNING_MODE, False)): selector.BooleanSelector(),
+            vol.Optional(_CONF_LOAD_SHIFT, default=bool(load_shift)): selector.BooleanSelector(),
+            vol.Optional(CONF_TRACK_C, default=g(CONF_TRACK_C, False)): selector.BooleanSelector(),
             vol.Required("wind_gust_factor", default=g("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.05, mode="slider")
             ),
@@ -297,27 +281,79 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
             ),
             vol.Optional("csv_auto_logging", default=g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING)): selector.BooleanSelector(),
-        })
-        csv_logging = g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING)
-        if csv_logging:
-            schema.update({
-                vol.Optional("csv_hourly_path", default=g("csv_hourly_path", DEFAULT_CSV_HOURLY_PATH)): selector.TextSelector(),
-                vol.Optional("csv_daily_path", default=g("csv_daily_path", DEFAULT_CSV_DAILY_PATH)): selector.TextSelector(),
-            })
-        schema.update({
             vol.Optional(CONF_ENABLE_LIFETIME_TRACKING, default=g(CONF_ENABLE_LIFETIME_TRACKING, False)): selector.BooleanSelector(),
-            vol.Optional(
-                CONF_SECONDARY_WEATHER_ENTITY,
-                description={"suggested_value": g(CONF_SECONDARY_WEATHER_ENTITY)},
-            ): selector.EntitySelector(selector.EntitySelectorConfig(domain="weather")),
-            vol.Optional(CONF_FORECAST_CROSSOVER_DAY, default=g(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY)): selector.NumberSelector(
+        }
+        schema[vol.Optional(
+            CONF_SECONDARY_WEATHER_ENTITY,
+            description={"suggested_value": g(CONF_SECONDARY_WEATHER_ENTITY)},
+        )] = selector.EntitySelector(selector.EntitySelectorConfig(domain="weather"))
+        schema[vol.Optional(CONF_FORECAST_CROSSOVER_DAY, default=g(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY))] = (
+            selector.NumberSelector(
                 selector.NumberSelectorConfig(min=1, max=7, step=1, mode="slider")
-            ),
-        })
+            )
+        )
+        return vol.Schema(schema)
+
+    def _schema_feature_config(self, user_input, defaults) -> vol.Schema:
+        """Schema for sub-fields gated by the toggles set on the advanced page.
+
+        Only shown when at least one toggle requires additional input.
+        The schema is fully determined by _flow_data — no re-render needed.
+        """
+        g = lambda k, d=None: self._v(user_input, defaults, k, d)
+        daily = self._flow_data.get(CONF_DAILY_LEARNING_MODE, False)
+        load_shift = self._flow_data.get(_CONF_LOAD_SHIFT, False)
+        track_c = self._flow_data.get(CONF_TRACK_C, False)
+        csv_logging = self._flow_data.get("csv_auto_logging", False)
+
+        schema: dict = {}
+
+        if daily and load_shift:
+            schema[vol.Optional(
+                CONF_INDOOR_TEMP_SENSOR,
+                description={"suggested_value": g(CONF_INDOOR_TEMP_SENSOR)},
+            )] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
+            )
+            schema[vol.Required(CONF_THERMAL_MASS, default=g(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS))] = (
+                selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.0, max=50.0, step=0.1, unit_of_measurement="kWh/°C")
+                )
+            )
+
+        if daily and track_c:
+            schema[vol.Required(CONF_MPC_ENTRY_ID, default=g(CONF_MPC_ENTRY_ID, ""))] = (
+                selector.ConfigEntrySelector(
+                    selector.ConfigEntrySelectorConfig(integration="heatpump_mpc")
+                )
+            )
+            # Which energy sensor is managed by the MPC?  Its meter data is
+            # time-shifted by load-scheduling and must not be used for per-unit
+            # Track A learning.  Track C replaces it with a synthetic baseline.
+            configured_sensors = self._flow_data.get("energy_sensors", [])
+            if configured_sensors:
+                schema[vol.Required(CONF_MPC_MANAGED_SENSOR, default=g(CONF_MPC_MANAGED_SENSOR, configured_sensors[0]))] = (
+                    selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=configured_sensors,
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        )
+                    )
+                )
+
+        if csv_logging:
+            schema[vol.Optional("csv_hourly_path", default=g("csv_hourly_path", DEFAULT_CSV_HOURLY_PATH))] = (
+                selector.TextSelector()
+            )
+            schema[vol.Optional("csv_daily_path", default=g("csv_daily_path", DEFAULT_CSV_DAILY_PATH))] = (
+                selector.TextSelector()
+            )
+
         return vol.Schema(schema)
 
     # ------------------------------------------------------------------ #
-    # Setup flow: user → physics → advanced → create_entry               #
+    # Setup flow: user → physics → advanced → [feature_config] →          #
+    #             create_entry                                             #
     # ------------------------------------------------------------------ #
 
     async def async_step_user(self, user_input=None) -> FlowResult:
@@ -341,6 +377,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not errors:
                 self._flow_data.update(user_input)
                 self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor"])
+                self._flow_data[CONF_HAS_AC_UNITS] = bool(user_input.get(CONF_HAS_AC_UNITS, False))
                 return await self.async_step_advanced()
         return self.async_show_form(
             step_id="physics",
@@ -350,23 +387,46 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_advanced(self, user_input=None) -> FlowResult:
         if user_input is not None:
-            if self._needs_reload_advanced(user_input):
-                return self.async_show_form(
-                    step_id="advanced",
-                    data_schema=self._schema_advanced(user_input, self._flow_data),
-                )
+            self._flow_data.update(user_input)
+            self._clear_absent_entity_keys(user_input, [CONF_SECONDARY_WEATHER_ENTITY])
+            # Explicitly write all boolean keys so that a False value is always
+            # present in _flow_data even if HA omits it from user_input.
+            for _k in (CONF_DAILY_LEARNING_MODE, _CONF_LOAD_SHIFT, CONF_TRACK_C,
+                       "csv_auto_logging", CONF_ENABLE_LIFETIME_TRACKING):
+                self._flow_data[_k] = bool(user_input.get(_k, False))
+            if self._needs_feature_config_step():
+                return await self.async_step_feature_config()
             return self.async_create_entry(
                 title=self._flow_data[CONF_NAME],
-                data=self._build_final_data(user_input),
+                data=self._build_final_data({}),
             )
         return self.async_show_form(
             step_id="advanced",
             data_schema=self._schema_advanced(None, self._flow_data),
         )
 
+    async def async_step_feature_config(self, user_input=None) -> FlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            # Clear optional entity fields that were visible but left empty.
+            # vol.Optional with suggested_value omits the key from user_input
+            # when blank; without this the stale value in _flow_data leaks in.
+            self._clear_absent_entity_keys(user_input, [CONF_INDOOR_TEMP_SENSOR])
+            if not errors:
+                return self.async_create_entry(
+                    title=self._flow_data[CONF_NAME],
+                    data=self._build_final_data(user_input),
+                )
+        return self.async_show_form(
+            step_id="feature_config",
+            data_schema=self._schema_feature_config(user_input, self._flow_data),
+            errors=errors,
+        )
+
     # ------------------------------------------------------------------ #
     # Reconfigure flow: reconfigure → reconfigure_physics →              #
-    #                   reconfigure_advanced → update_reload_and_abort    #
+    #                   reconfigure_advanced → [reconfigure_feature_config]#
+    #                   → update_reload_and_abort                         #
     # ------------------------------------------------------------------ #
 
     async def async_step_reconfigure(self, user_input=None) -> FlowResult:
@@ -403,6 +463,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not errors:
                 self._flow_data.update(user_input)
                 self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor"])
+                self._flow_data[CONF_HAS_AC_UNITS] = bool(user_input.get(CONF_HAS_AC_UNITS, False))
                 return await self.async_step_reconfigure_advanced()
         return self.async_show_form(
             step_id="reconfigure_physics",
@@ -412,20 +473,42 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_reconfigure_advanced(self, user_input=None) -> FlowResult:
         if user_input is not None:
-            if self._needs_reload_advanced(user_input):
-                return self.async_show_form(
-                    step_id="reconfigure_advanced",
-                    data_schema=self._schema_advanced(user_input, self._flow_data),
-                )
+            self._flow_data.update(user_input)
+            self._clear_absent_entity_keys(user_input, [CONF_SECONDARY_WEATHER_ENTITY])
+            # Explicitly write all boolean keys so that a False value is always
+            # present in _flow_data even if HA omits it from user_input.
+            for _k in (CONF_DAILY_LEARNING_MODE, _CONF_LOAD_SHIFT, CONF_TRACK_C,
+                       "csv_auto_logging", CONF_ENABLE_LIFETIME_TRACKING):
+                self._flow_data[_k] = bool(user_input.get(_k, False))
+            # Run aux migration here — CONF_AUX_AFFECTED_ENTITIES is on this page
+            # and _flow_data now has the new value regardless of whether the
+            # feature_config page is shown next or skipped entirely.
             new_aux = user_input.get(CONF_AUX_AFFECTED_ENTITIES)
             if new_aux is not None:
                 coord = self.hass.data.get(DOMAIN, {}).get(self.context["entry_id"])
                 if coord:
                     await coord.async_migrate_aux_coefficients(new_aux)
+            if self._needs_feature_config_step():
+                return await self.async_step_reconfigure_feature_config()
             return self.async_update_reload_and_abort(
-                self._entry, data=self._build_final_data(user_input)
+                self._entry, data=self._build_final_data({})
             )
         return self.async_show_form(
             step_id="reconfigure_advanced",
             data_schema=self._schema_advanced(None, self._flow_data),
+        )
+
+    async def async_step_reconfigure_feature_config(self, user_input=None) -> FlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            # Clear optional entity fields that were visible but left empty.
+            self._clear_absent_entity_keys(user_input, [CONF_INDOOR_TEMP_SENSOR])
+            if not errors:
+                return self.async_update_reload_and_abort(
+                    self._entry, data=self._build_final_data(user_input)
+                )
+        return self.async_show_form(
+            step_id="reconfigure_feature_config",
+            data_schema=self._schema_feature_config(user_input, self._flow_data),
+            errors=errors,
         )

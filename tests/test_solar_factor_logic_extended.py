@@ -1,10 +1,11 @@
 """Test solar factor logic with extended types."""
 import pytest
+from tests.helpers import CoordinatorModelMixin
 from unittest.mock import MagicMock
 from custom_components.heating_analytics.solar import SolarCalculator
 from custom_components.heating_analytics.const import MODE_HEATING, MODE_COOLING
 
-class MockCoordinator:
+class MockCoordinator(CoordinatorModelMixin):
     def __init__(self):
         self.solar_azimuth = 180
         self.balance_point = 15.0

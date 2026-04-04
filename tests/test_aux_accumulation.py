@@ -25,6 +25,10 @@ def coordinator(hass):
 
         coord = HeatingDataCoordinator(hass, entry)
 
+        # Mock Solar — get_approx_sun_pos must return (elev, azimuth) tuple
+        coord.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
+        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+
         # Configure the MockStats to behave predictably
         mock_stats_instance = MockStats.return_value
         # Mock calculate_total_power to return 1.0 kW aux reduction when active
@@ -51,8 +55,8 @@ def coordinator(hass):
         coord.statistics = mock_stats_instance
 
         # Manually initialize trackers
-        coord._accumulated_aux_impact_hour = 0.0
-        coord._last_minute_processed = None
+        coord._collector.aux_impact_hour = 0.0
+        coord._collector.last_minute_processed = None
 
         return coord
 
@@ -77,8 +81,8 @@ async def test_aux_impact_accumulation_logic(coordinator):
 
     # Expected: 1.0 kW * (1/60) h = 0.0166... kWh
     expected_impact = 1.0 * (1/60)
-    assert abs(coordinator._accumulated_aux_impact_hour - expected_impact) < 0.0001
-    assert coordinator._last_minute_processed == 0
+    assert abs(coordinator._collector.aux_impact_hour - expected_impact) < 0.0001
+    assert coordinator._collector.last_minute_processed == 0
 
     # 2. Advance time 29 minutes (Minute 29) - Aux still ON
     current_time = datetime(2023, 1, 1, 12, 29, 0)
@@ -90,8 +94,8 @@ async def test_aux_impact_accumulation_logic(coordinator):
     )
 
     expected_impact = 1.0 * (30/60) # 0.5 kWh
-    assert abs(coordinator._accumulated_aux_impact_hour - expected_impact) < 0.0001
-    assert coordinator._last_minute_processed == 29
+    assert abs(coordinator._collector.aux_impact_hour - expected_impact) < 0.0001
+    assert coordinator._collector.last_minute_processed == 29
 
     # 3. Turn Aux OFF (Minute 30)
     coordinator.auxiliary_heating_active = False
@@ -105,8 +109,8 @@ async def test_aux_impact_accumulation_logic(coordinator):
 
     # Accumulator should NOT change (or increase by 0)
     # Still 0.5 kWh
-    assert abs(coordinator._accumulated_aux_impact_hour - 0.5) < 0.0001
-    assert coordinator._last_minute_processed == 30
+    assert abs(coordinator._collector.aux_impact_hour - 0.5) < 0.0001
+    assert coordinator._collector.last_minute_processed == 30
 
     # 4. Verify _update_accumulated_impacts uses the accumulator
     coordinator._update_accumulated_impacts(current_time)
@@ -121,11 +125,11 @@ async def test_aux_impact_log_persistence(coordinator):
     # Pre-load accumulator with a small value
     # E.g., active for only 3 minutes (5% of hour) -> Should strictly be logged
     # 1.0 kW * 3/60 = 0.05 kWh
-    coordinator._accumulated_aux_impact_hour = 0.05
-    coordinator._hourly_aux_count = 3
-    coordinator._hourly_sample_count = 60 # 5% fraction
+    coordinator._collector.aux_impact_hour = 0.05
+    coordinator._collector.aux_count = 3
+    coordinator._collector.sample_count = 60 # 5% fraction
     # Initialize list for percentile calculation to avoid IndexError
-    coordinator._hourly_wind_values = [0.0] * 60
+    coordinator._collector.wind_values = [0.0] * 60
 
     # Mock dependencies for _process_hourly_data
     current_time = datetime(2023, 1, 1, 13, 0, 0)
@@ -137,7 +141,7 @@ async def test_aux_impact_log_persistence(coordinator):
     }
 
     # Set start time for the hour
-    coordinator._hourly_start_time = datetime(2023, 1, 1, 12, 0, 0)
+    coordinator._collector.start_time = datetime(2023, 1, 1, 12, 0, 0)
 
     # Mock forecast stuff called in _process_hourly_data
     coordinator.forecast.get_forecast_for_hour.return_value = None
@@ -164,4 +168,4 @@ async def test_aux_impact_log_persistence(coordinator):
     assert coordinator.data["last_hour_aux_impact_kwh"] == 0.05
 
     # Check accumulator reset
-    assert coordinator._accumulated_aux_impact_hour == 0.0
+    assert coordinator._collector.aux_impact_hour == 0.0

@@ -17,6 +17,7 @@ from .const import (
     PER_UNIT_LEARNING_RATE_CAP,
     SOLAR_COEFF_CAP,
 )
+from .observation import HourlyObservation, ModelState, LearningConfig
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,52 +26,15 @@ class LearningManager:
 
     def process_learning(
         self,
-        # Inputs
-        temp_key: str,
-        wind_bucket: str,
-        avg_temp: float,
-        total_energy_kwh: float,
-        base_expected_kwh: float,
-        solar_impact: float,
-        avg_solar_vector: tuple[float, float],
-        is_aux_active: bool,
-        aux_impact: float,
-        # Configuration
-        learning_enabled: bool,
-        solar_enabled: bool,
-        learning_rate: float,
-        balance_point: float,
-        energy_sensors: list[str],
-        # State (Mutable)
-        hourly_bucket_counts: dict,
-        hourly_sample_count: int,
-        correlation_data: dict,
-        correlation_data_per_unit: dict,
-        aux_coefficients: dict,
-        learning_buffer_global: dict,
-        learning_buffer_per_unit: dict,
-        observation_counts: dict,
-        hourly_delta_per_unit: dict,
-        hourly_expected_per_unit: dict,
-        hourly_expected_base_per_unit: dict,
-        aux_coefficients_per_unit: dict,
-        learning_buffer_aux_per_unit: dict,
-        # NEW State Arguments for Unit Solar Learning
-        solar_coefficients_per_unit: dict,
-        learning_buffer_solar_per_unit: dict,
-        # Services / Callbacks
-        solar_calculator,  # Passing the instance
-        get_predicted_unit_base_fn: Callable[[str, str, str], float],
-        # Mode Control
-        unit_modes: dict = {},
-        # Aux Control
-        aux_affected_entities: list[str] | None = None,
-        # Guest Mode Flag
-        has_guest_activity: bool = False,
-        # Cooldown State
-        is_cooldown_active: bool = False,
+        obs: HourlyObservation | None = None,
+        model: ModelState | None = None,
+        config: LearningConfig | None = None,
+        **kwargs,
     ) -> dict:
         """Process learning for the completed hour.
+
+        Accepts either the new contract-based interface (obs, model, config)
+        or legacy keyword arguments for backward compatibility with tests.
 
         Returns a dictionary with learning results for logging:
         {
@@ -83,7 +47,58 @@ class LearningManager:
             "learning_status": str
         }
         """
-        # Aux mode determined by is_aux_active from coordinator
+        if kwargs:
+            # Legacy call path — build contracts from kwargs
+            return self._process_learning_legacy(**kwargs)
+
+        # --- Destructure data contracts into local variables ---
+        # This preserves all existing code below without changes.
+        # Once internal methods are migrated to use obs/model/config
+        # directly, these locals can be removed.
+
+        # From HourlyObservation
+        temp_key = obs.temp_key
+        wind_bucket = obs.wind_bucket
+        avg_temp = obs.avg_temp
+        total_energy_kwh = obs.learning_energy_kwh
+        base_expected_kwh = obs.base_expected_kwh
+        solar_impact = obs.effective_solar_impact
+        avg_solar_vector = obs.solar_vector
+        is_aux_active = obs.is_aux_dominant
+        hourly_bucket_counts = obs.bucket_counts
+        hourly_sample_count = obs.sample_count
+        hourly_delta_per_unit = obs.unit_breakdown
+        hourly_expected_per_unit = obs.unit_expected
+        hourly_expected_base_per_unit = obs.unit_expected_base
+        unit_modes = obs.unit_modes
+        is_cooldown_active = obs.was_cooldown_active
+
+        # From ModelState
+        correlation_data = model.correlation_data
+        correlation_data_per_unit = model.correlation_data_per_unit
+        aux_coefficients = model.aux_coefficients
+        learning_buffer_global = model.learning_buffer_global
+        learning_buffer_per_unit = model.learning_buffer_per_unit
+        observation_counts = model.observation_counts
+        aux_coefficients_per_unit = model.aux_coefficients_per_unit
+        learning_buffer_aux_per_unit = model.learning_buffer_aux_per_unit
+        solar_coefficients_per_unit = model.solar_coefficients_per_unit
+        learning_buffer_solar_per_unit = model.learning_buffer_solar_per_unit
+
+        # From LearningConfig
+        learning_enabled = config.learning_enabled
+        solar_enabled = config.solar_enabled
+        learning_rate = config.learning_rate
+        balance_point = config.balance_point
+        energy_sensors = config.energy_sensors
+        aux_impact = config.aux_impact
+        solar_calculator = config.solar_calculator
+        get_predicted_unit_base_fn = config.get_predicted_unit_base_fn
+        aux_affected_entities = config.aux_affected_entities
+        has_guest_activity = config.has_guest_activity
+        per_unit_learning_enabled = config.per_unit_learning_enabled
+
+        # --- Original logic (unchanged) ---
 
         if hourly_sample_count == 0:
             return {
@@ -107,8 +122,19 @@ class LearningManager:
         learning_status = "unknown"
         should_run_per_unit = False
 
+        # Resolve per-unit override: when Track B/C owns the global model,
+        # the coordinator passes learning_enabled=False but may allow per-unit
+        # learning to continue for non-MPC units via per_unit_learning_enabled.
+        _per_unit_enabled = per_unit_learning_enabled if per_unit_learning_enabled is not None else learning_enabled
+
         if not learning_enabled:
-            learning_status = "disabled"
+            if _per_unit_enabled:
+                # Global blocked (Track B/C), per-unit allowed.
+                model_updated = False
+                should_run_per_unit = True
+                learning_status = "disabled_global_only"
+            else:
+                learning_status = "disabled"
         elif is_cooldown_active:
             # COOLDOWN LOCK: Global Base Model is frozen.
             # Only non-affected units will learn (in per-unit step).
@@ -273,6 +299,76 @@ class LearningManager:
             "aux_model_after": aux_model_after,
             "learning_status": learning_status,
         }
+
+    def _process_learning_legacy(self, **kwargs) -> dict:
+        """Backward-compatible entry point using flat keyword arguments.
+
+        Builds HourlyObservation, ModelState, and LearningConfig from the
+        legacy parameter dict, then delegates to the contract-based path.
+        This exists solely to support existing tests; new code should use
+        the (obs, model, config) interface.
+        """
+        from datetime import datetime
+
+        obs = HourlyObservation(
+            timestamp=datetime.now(),
+            hour=0,
+            avg_temp=kwargs["avg_temp"],
+            inertia_temp=kwargs["avg_temp"],
+            temp_key=kwargs["temp_key"],
+            effective_wind=0.0,
+            wind_bucket=kwargs["wind_bucket"],
+            bucket_counts=kwargs.get("hourly_bucket_counts", {}),
+            avg_humidity=None,
+            solar_factor=0.0,
+            solar_vector=kwargs.get("avg_solar_vector", (0.0, 0.0)),
+            solar_impact_raw=kwargs.get("solar_impact", 0.0),
+            effective_solar_impact=kwargs.get("solar_impact", 0.0),
+            total_energy_kwh=kwargs.get("total_energy_kwh", 0.0),
+            learning_energy_kwh=kwargs.get("total_energy_kwh", 0.0),
+            guest_impact_kwh=0.0,
+            expected_kwh=kwargs.get("base_expected_kwh", 0.0),
+            base_expected_kwh=kwargs.get("base_expected_kwh", 0.0),
+            unit_breakdown=kwargs.get("hourly_delta_per_unit", {}),
+            unit_expected=kwargs.get("hourly_expected_per_unit", {}),
+            unit_expected_base=kwargs.get("hourly_expected_base_per_unit", {}),
+            aux_impact_kwh=kwargs.get("aux_impact", 0.0),
+            aux_fraction=1.0 if kwargs.get("is_aux_active", False) else 0.0,
+            is_aux_dominant=kwargs.get("is_aux_active", False),
+            sample_count=kwargs.get("hourly_sample_count", 0),
+            unit_modes=kwargs.get("unit_modes", {}),
+            was_cooldown_active=kwargs.get("is_cooldown_active", False),
+        )
+
+        model = ModelState(
+            correlation_data=kwargs.get("correlation_data", {}),
+            correlation_data_per_unit=kwargs.get("correlation_data_per_unit", {}),
+            observation_counts=kwargs.get("observation_counts", {}),
+            aux_coefficients=kwargs.get("aux_coefficients", {}),
+            aux_coefficients_per_unit=kwargs.get("aux_coefficients_per_unit", {}),
+            solar_coefficients_per_unit=kwargs.get("solar_coefficients_per_unit", {}),
+            learned_u_coefficient=None,
+            learning_buffer_global=kwargs.get("learning_buffer_global", {}),
+            learning_buffer_per_unit=kwargs.get("learning_buffer_per_unit", {}),
+            learning_buffer_aux_per_unit=kwargs.get("learning_buffer_aux_per_unit", {}),
+            learning_buffer_solar_per_unit=kwargs.get("learning_buffer_solar_per_unit", {}),
+        )
+
+        config = LearningConfig(
+            learning_enabled=kwargs.get("learning_enabled", True),
+            solar_enabled=kwargs.get("solar_enabled", False),
+            learning_rate=kwargs.get("learning_rate", 0.01),
+            balance_point=kwargs.get("balance_point", 17.0),
+            energy_sensors=kwargs.get("energy_sensors", []),
+            aux_impact=kwargs.get("aux_impact", 0.0),
+            solar_calculator=kwargs.get("solar_calculator"),
+            get_predicted_unit_base_fn=kwargs.get("get_predicted_unit_base_fn"),
+            aux_affected_entities=kwargs.get("aux_affected_entities"),
+            has_guest_activity=kwargs.get("has_guest_activity", False),
+            per_unit_learning_enabled=kwargs.get("per_unit_learning_enabled"),
+        )
+
+        return self.process_learning(obs=obs, model=model, config=config)
 
     def _process_per_unit_learning(
         self,
@@ -702,10 +798,16 @@ class LearningManager:
         aux_coefficients_per_unit[entity_id][temp_key][wind_bucket] = round(value, 3)
 
     def _update_unit_solar_coefficient(self, entity_id, value: dict[str, float], solar_coefficients_per_unit):
-        """Update the solar coefficient data structure (global per unit, not temp-stratified)."""
+        """Update the solar coefficient data structure (global per unit, not temp-stratified).
+
+        Coefficients are clamped to >= 0: solar gain can only reduce heating
+        demand, never increase it.  A negative value indicates a confounding
+        variable (e.g. a scheduled pre-heating routine that coincides with
+        morning sun) and must not propagate into the model.
+        """
         solar_coefficients_per_unit[entity_id] = {
-            "s": round(value.get("s", 0.0), 5),
-            "e": round(value.get("e", 0.0), 5)
+            "s": round(max(0.0, value.get("s", 0.0)), 5),
+            "e": round(max(0.0, value.get("e", 0.0)), 5)
         }
 
     def _increment_observation_count(self, entity_id, temp_key, wind_bucket, observation_counts):
@@ -758,3 +860,197 @@ class LearningManager:
             new_pred = current_pred + learning_rate * (normalized_actual - current_pred) if current_pred != 0.0 else normalized_actual
             correlation_data[temp_key][wind_bucket] = round(new_pred, 5)
             return "updated_base_model"
+
+    def apply_strategies_to_global_model(
+        self,
+        day_logs: list[dict],
+        track_c_distribution: list[dict] | None,
+        strategies: dict,
+        model: "ModelState",
+        learning_rate: float,
+        balance_point: float,
+        wind_threshold: float,
+        extreme_wind_threshold: float,
+        parse_datetime_fn,
+    ) -> int:
+        """Apply per-unit strategies to write hourly sums to the global model.
+
+        Each sensor's strategy produces a kWh contribution per hour.
+        The global model receives the sum of all contributions for each
+        (temp_key, wind_bucket) pair via the standard buffer → jump-start
+        → EMA pipeline.
+
+        Moved from coordinator.py (#784) — pure model-writing logic with
+        no Home Assistant dependencies.
+
+        Returns the number of bucket updates written.
+        """
+        from .observation import WeightedSmear
+
+        log_by_hour: dict[int, dict] = {e.get("hour", -1): e for e in day_logs}
+
+        # Clear stale distribution from previous day on all synthetic
+        # WeightedSmear strategies.
+        for strategy in strategies.values():
+            if isinstance(strategy, WeightedSmear) and strategy.use_synthetic:
+                strategy.set_distribution(None)
+
+        # Prepare WeightedSmear strategies with their data for this day.
+        if track_c_distribution:
+            dist_by_hour: dict[int, dict] = {}
+            for entry in track_c_distribution:
+                try:
+                    entry_dt = parse_datetime_fn(entry["datetime"])
+                    if entry_dt is not None:
+                        dist_by_hour[entry_dt.hour] = entry
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+            for strategy in strategies.values():
+                if isinstance(strategy, WeightedSmear) and strategy.use_synthetic:
+                    strategy.set_distribution(dist_by_hour)
+
+        # Compute normalised loss weights from hourly log weather data.
+        raw_weights: list[float] = []
+        for h in range(24):
+            log_h = log_by_hour.get(h, {})
+            inertia_t = log_h.get("inertia_temp")
+            raw_t = log_h.get("temp")
+            outdoor = inertia_t if inertia_t is not None else (raw_t if raw_t is not None else balance_point)
+            delta_t = max(0.0, balance_point - outdoor)
+            eff_wind = log_h.get("effective_wind")
+            effective_wind = eff_wind if eff_wind is not None else 0.0
+            if effective_wind >= extreme_wind_threshold:
+                wind_factor = 1.6
+            elif effective_wind >= wind_threshold:
+                wind_factor = 1.3
+            else:
+                wind_factor = 1.0
+            solar_f = log_h.get("solar_factor")
+            solar_f = solar_f if solar_f is not None else 0.0
+            solar_mult = max(0.0, 1.0 - solar_f)
+            raw_weights.append(delta_t * wind_factor * solar_mult)
+        total_weight = sum(raw_weights)
+        norm_weights = [w / total_weight if total_weight > 0 else 1.0 / 24 for w in raw_weights]
+
+        # Set daily totals for non-MPC WeightedSmear strategies.
+        for strategy in strategies.values():
+            if isinstance(strategy, WeightedSmear) and not strategy.use_synthetic:
+                daily_total = sum(
+                    log_by_hour.get(h, {}).get("unit_breakdown", {}).get(strategy.sensor_id, 0.0)
+                    for h in range(24)
+                )
+                strategy.set_daily_total(daily_total)
+
+        # Iterate hours and sum all strategy contributions per bucket.
+        correlation_data = model.correlation_data
+        learning_buffer = model.learning_buffer_global
+        bucket_updates = 0
+
+        for h in range(24):
+            log_entry = log_by_hour.get(h, {})
+            h_temp_key = log_entry.get("temp_key")
+            h_wind_bucket = log_entry.get("wind_bucket")
+            if h_temp_key is None or h_wind_bucket is None:
+                continue
+
+            weight = norm_weights[h]
+
+            total_kwh = 0.0
+            for strategy in strategies.values():
+                contrib = strategy.get_hourly_contribution(h, weight, log_entry)
+                if contrib is not None:
+                    total_kwh += contrib
+
+            if total_kwh <= 0.0:
+                continue
+
+            # Buffer → jump-start → EMA.
+            if h_temp_key not in correlation_data:
+                correlation_data[h_temp_key] = {}
+            current_pred = correlation_data[h_temp_key].get(h_wind_bucket, 0.0)
+
+            if current_pred == 0.0:
+                if h_temp_key not in learning_buffer:
+                    learning_buffer[h_temp_key] = {}
+                if h_wind_bucket not in learning_buffer[h_temp_key]:
+                    learning_buffer[h_temp_key][h_wind_bucket] = []
+                buffer_list = learning_buffer[h_temp_key][h_wind_bucket]
+                buffer_list.append(total_kwh)
+                if len(buffer_list) >= LEARNING_BUFFER_THRESHOLD:
+                    avg_val = sum(buffer_list) / len(buffer_list)
+                    correlation_data[h_temp_key][h_wind_bucket] = round(avg_val, 5)
+                    buffer_list.clear()
+                    bucket_updates += 1
+                    _LOGGER.info(f"Strategy Learning [Jump Start]: T={h_temp_key} W={h_wind_bucket} -> {avg_val:.3f} kWh")
+                else:
+                    _LOGGER.debug(f"Strategy Learning [Buffering]: T={h_temp_key} W={h_wind_bucket} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD}")
+            else:
+                new_pred = current_pred + learning_rate * (total_kwh - current_pred)
+                correlation_data[h_temp_key][h_wind_bucket] = round(new_pred, 5)
+                bucket_updates += 1
+                _LOGGER.debug(f"Strategy Learning [EMA]: T={h_temp_key} W={h_wind_bucket} -> {new_pred:.5f} kWh (was {current_pred:.5f})")
+
+        return bucket_updates
+
+    def replay_per_unit_models(
+        self,
+        day_entries: list[dict],
+        strategies: dict,
+        model: "ModelState",
+        learning_rate: float,
+    ) -> None:
+        """Replay per-unit correlation models from hourly log entries.
+
+        Each DirectMeter sensor's actual kWh is written to its per-unit
+        correlation table via buffer → jump-start → EMA.  Needed so that
+        ``isolate_sensor`` subtraction works after ``retrain_from_history(reset_first=True)``.
+        WeightedSmear sensors are skipped.
+
+        Moved from coordinator.py (#784) — pure model-writing logic.
+        """
+        from .observation import DirectMeter
+
+        direct_sensors = [
+            s for s in strategies.values()
+            if isinstance(s, DirectMeter)
+        ]
+        if not direct_sensors:
+            return
+
+        correlation_per_unit = model.correlation_data_per_unit
+        buffer_per_unit = model.learning_buffer_per_unit
+
+        for log_entry in day_entries:
+            h_temp_key = log_entry.get("temp_key")
+            h_wind_bucket = log_entry.get("wind_bucket")
+            if h_temp_key is None or h_wind_bucket is None:
+                continue
+            breakdown = log_entry.get("unit_breakdown", {})
+            for strategy in direct_sensors:
+                sid = strategy.sensor_id
+                unit_kwh = breakdown.get(sid, 0.0)
+                if unit_kwh <= 0.0:
+                    continue
+                if sid not in correlation_per_unit:
+                    correlation_per_unit[sid] = {}
+                if h_temp_key not in correlation_per_unit[sid]:
+                    correlation_per_unit[sid][h_temp_key] = {}
+                cur = correlation_per_unit[sid][h_temp_key].get(h_wind_bucket, 0.0)
+                if cur == 0.0:
+                    if sid not in buffer_per_unit:
+                        buffer_per_unit[sid] = {}
+                    if h_temp_key not in buffer_per_unit[sid]:
+                        buffer_per_unit[sid][h_temp_key] = {}
+                    if h_wind_bucket not in buffer_per_unit[sid][h_temp_key]:
+                        buffer_per_unit[sid][h_temp_key][h_wind_bucket] = []
+                    buf = buffer_per_unit[sid][h_temp_key][h_wind_bucket]
+                    buf.append(unit_kwh)
+                    if len(buf) >= LEARNING_BUFFER_THRESHOLD:
+                        correlation_per_unit[sid][h_temp_key][h_wind_bucket] = round(
+                            sum(buf) / len(buf), 5
+                        )
+                        buf.clear()
+                else:
+                    new_val = cur + learning_rate * (unit_kwh - cur)
+                    correlation_per_unit[sid][h_temp_key][h_wind_bucket] = round(new_val, 5)
