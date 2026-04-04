@@ -367,3 +367,73 @@ class TestBuildStrategies:
     def test_empty_sensors(self):
         strategies = build_strategies([], track_c_enabled=False, mpc_managed_sensor=None)
         assert strategies == {}
+
+
+# --- Mode filtering (#789) ---
+
+
+class TestDirectMeterModeFiltering:
+    """DirectMeter must skip units in excluded modes (#789)."""
+
+    def _log(self, mode=None):
+        log = {"unit_breakdown": {"sensor.h1": 2.0}}
+        if mode is not None:
+            log["unit_modes"] = {"sensor.h1": mode}
+        return log
+
+    def test_heating_included(self):
+        dm = DirectMeter("sensor.h1")
+        assert dm.get_hourly_contribution(0, 0.05, self._log("heating")) == 2.0
+
+    def test_default_mode_is_heating(self):
+        """No unit_modes key → default to heating → included."""
+        dm = DirectMeter("sensor.h1")
+        assert dm.get_hourly_contribution(0, 0.05, self._log()) == 2.0
+
+    def test_off_excluded(self):
+        dm = DirectMeter("sensor.h1")
+        assert dm.get_hourly_contribution(0, 0.05, self._log("off")) is None
+
+    def test_dhw_excluded(self):
+        dm = DirectMeter("sensor.h1")
+        assert dm.get_hourly_contribution(0, 0.05, self._log("dhw")) is None
+
+    def test_guest_heating_excluded(self):
+        dm = DirectMeter("sensor.h1")
+        assert dm.get_hourly_contribution(0, 0.05, self._log("guest_heating")) is None
+
+    def test_guest_cooling_excluded(self):
+        dm = DirectMeter("sensor.h1")
+        assert dm.get_hourly_contribution(0, 0.05, self._log("guest_cooling")) is None
+
+    def test_cooling_excluded(self):
+        dm = DirectMeter("sensor.h1")
+        assert dm.get_hourly_contribution(0, 0.05, self._log("cooling")) is None
+
+
+class TestWeightedSmearModeFiltering:
+    """WeightedSmear defensive mode guard (#789)."""
+
+    def test_synthetic_excluded_when_off(self):
+        ws = WeightedSmear("sensor.mpc", use_synthetic=True)
+        ws.set_distribution({5: {"synthetic_kwh_el": 1.0}})
+        log = {"unit_modes": {"sensor.mpc": "off"}}
+        assert ws.get_hourly_contribution(5, 0.05, log) is None
+
+    def test_synthetic_included_when_heating(self):
+        ws = WeightedSmear("sensor.mpc", use_synthetic=True)
+        ws.set_distribution({5: {"synthetic_kwh_el": 1.0}})
+        log = {"unit_modes": {"sensor.mpc": "heating"}}
+        assert ws.get_hourly_contribution(5, 0.05, log) == 1.0
+
+    def test_weighted_excluded_when_dhw(self):
+        ws = WeightedSmear("sensor.floor", use_synthetic=False)
+        ws.set_daily_total(24.0)
+        log = {"unit_modes": {"sensor.floor": "dhw"}}
+        assert ws.get_hourly_contribution(5, 0.1, log) is None
+
+    def test_weighted_included_no_mode_entry(self):
+        """No unit_modes → default heating → included."""
+        ws = WeightedSmear("sensor.floor", use_synthetic=False)
+        ws.set_daily_total(24.0)
+        assert ws.get_hourly_contribution(5, 0.1, {}) == pytest.approx(2.4)

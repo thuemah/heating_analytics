@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Protocol, runtime_checkable
 
+from .const import MODE_HEATING, MODES_EXCLUDED_FROM_GLOBAL_LEARNING
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -199,6 +201,9 @@ class DirectMeter:
     For units with reliable per-hour electrical data (panel heaters,
     A2A heat pumps, any non-MPC unit).  The meter is ground truth —
     no smearing or COP correction needed.
+
+    Mode filtering (#789): units in OFF/DHW/Guest/Cooling modes are
+    excluded from the global model to match Track A semantics.
     """
 
     def __init__(self, sensor_id: str) -> None:
@@ -210,6 +215,12 @@ class DirectMeter:
         weight: float,
         log_entry: dict,
     ) -> float | None:
+        # Mode filtering (#789): skip units in excluded modes.
+        unit_modes = log_entry.get("unit_modes", {})
+        mode = unit_modes.get(self.sensor_id, MODE_HEATING)
+        if mode in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
+            return None
+
         breakdown = log_entry.get("unit_breakdown", {})
         kwh = breakdown.get(self.sensor_id, 0.0)
         return kwh if kwh > 0.0 else None
@@ -265,6 +276,13 @@ class WeightedSmear:
         weight: float,
         log_entry: dict,
     ) -> float | None:
+        # Defensive mode guard (#789): MPC data is already mode-filtered
+        # by ThermodynamicEngine, but guard for consistency / edge cases.
+        unit_modes = log_entry.get("unit_modes", {})
+        mode = unit_modes.get(self.sensor_id, MODE_HEATING)
+        if mode in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
+            return None
+
         if self.use_synthetic:
             # MPC path: read pre-computed synthetic kWh from distribution.
             if not self._distribution or hour not in self._distribution:

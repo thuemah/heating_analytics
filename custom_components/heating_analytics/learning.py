@@ -14,6 +14,7 @@ from .const import (
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
     MODE_DHW,
+    MODES_EXCLUDED_FROM_GLOBAL_LEARNING,
     PER_UNIT_LEARNING_RATE_CAP,
     SOLAR_COEFF_CAP,
 )
@@ -934,12 +935,17 @@ class LearningManager:
         norm_weights = [w / total_weight if total_weight > 0 else 1.0 / 24 for w in raw_weights]
 
         # Set daily totals for non-MPC WeightedSmear strategies.
+        # Mode filtering (#789): only sum hours where the unit is in a
+        # learning-eligible mode so excluded energy is not smeared.
         for strategy in strategies.values():
             if isinstance(strategy, WeightedSmear) and not strategy.use_synthetic:
-                daily_total = sum(
-                    log_by_hour.get(h, {}).get("unit_breakdown", {}).get(strategy.sensor_id, 0.0)
-                    for h in range(24)
-                )
+                daily_total = 0.0
+                for h in range(24):
+                    entry = log_by_hour.get(h, {})
+                    unit_modes = entry.get("unit_modes", {})
+                    mode = unit_modes.get(strategy.sensor_id, MODE_HEATING)
+                    if mode not in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
+                        daily_total += entry.get("unit_breakdown", {}).get(strategy.sensor_id, 0.0)
                 strategy.set_daily_total(daily_total)
 
         # Iterate hours and sum all strategy contributions per bucket.

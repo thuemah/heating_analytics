@@ -120,6 +120,7 @@ from .const import (
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
     MODE_DHW,
+    MODES_EXCLUDED_FROM_GLOBAL_LEARNING,
     DEFAULT_CSV_AUTO_LOGGING,
     DEFAULT_CSV_HOURLY_PATH,
     DEFAULT_CSV_DAILY_PATH,
@@ -785,6 +786,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 daily_tdd = sum(e.get("tdd", 0.0) for e in day_entries)
 
                 if daily_tdd < 0.5 or total_kwh <= 0:
+                    continue
+
+                # Mode filtering (#789): exclude OFF/DHW/Guest/Cooling from retrain.
+                excluded_kwh = self._compute_excluded_mode_energy(day_entries)
+                total_kwh -= excluded_kwh
+
+                if total_kwh <= 0:
                     continue
 
                 # Determine q_adjusted for U-coefficient.
@@ -3330,6 +3338,24 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             learning_rate=self.learning_rate,
         )
 
+    @staticmethod
+    def _compute_excluded_mode_energy(day_logs: list[dict]) -> float:
+        """Sum energy from units in modes excluded from global learning.
+
+        Iterates hourly logs and totals kWh for any unit whose mode
+        (per that hour's snapshot) is in MODES_EXCLUDED_FROM_GLOBAL_LEARNING.
+        Units without a recorded mode default to MODE_HEATING (included).
+        """
+        excluded = 0.0
+        for entry in day_logs:
+            unit_modes = entry.get("unit_modes", {})
+            breakdown = entry.get("unit_breakdown", {})
+            for sid, kwh in breakdown.items():
+                mode = unit_modes.get(sid, MODE_HEATING)
+                if mode in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
+                    excluded += kwh
+        return excluded
+
     async def _process_daily_data(self, date_obj):
         """Process end of day."""
         key = date_obj.isoformat()
@@ -3388,8 +3414,18 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if self.indoor_temp_sensor:
             current_indoor_temp = self._get_float_state(self.indoor_temp_sensor)
 
-        q_adjusted = daily_stats["kwh"]
+        # Mode filtering (#789): exclude OFF/DHW/Guest/Cooling energy from
+        # daily learning so Track B/C match Track A's filtering semantics.
+        excluded_mode_kwh = self._compute_excluded_mode_energy(day_logs) if day_logs else 0.0
+        q_adjusted = daily_stats["kwh"] - excluded_mode_kwh
         track_c_distribution = None
+
+        if excluded_mode_kwh > 0.0:
+            _LOGGER.debug(
+                "Daily mode filter (#789): excluded %.3f kWh "
+                "(OFF/DHW/Guest/Cooling) from %.2f kWh total.",
+                excluded_mode_kwh, daily_stats["kwh"],
+            )
 
         if self.track_c_enabled and self.daily_learning_mode and day_logs:
             # Track C: replace electrical baseline with thermodynamic synthetic baseline.
@@ -3398,13 +3434,17 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 track_c_kwh, track_c_distribution = track_c_result
 
                 # Compute q_adjusted from strategy contributions for U-coefficient.
+                # Only include non-MPC sensors that are in a learning-eligible mode (#789).
                 non_mpc_daily_kwh = 0.0
                 if self.mpc_managed_sensor:
                     for log_entry in day_logs:
                         breakdown = log_entry.get("unit_breakdown", {})
+                        unit_modes = log_entry.get("unit_modes", {})
                         for sid in self.energy_sensors:
                             if sid != self.mpc_managed_sensor:
-                                non_mpc_daily_kwh += breakdown.get(sid, 0.0)
+                                mode = unit_modes.get(sid, MODE_HEATING)
+                                if mode not in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
+                                    non_mpc_daily_kwh += breakdown.get(sid, 0.0)
 
                 q_adjusted = track_c_kwh + non_mpc_daily_kwh
                 self._daily_history[key]["track_c_kwh"] = round(q_adjusted, 3)
@@ -3415,12 +3455,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 _LOGGER.warning("Track C unavailable for %s — applying Track B correction.", key)
                 if self.thermal_mass_kwh_per_degree > 0.0 and current_indoor_temp is not None and self._last_midnight_indoor_temp is not None:
                     delta_t_indoor = current_indoor_temp - self._last_midnight_indoor_temp
-                    q_adjusted = daily_stats["kwh"] - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
-                    _LOGGER.debug(f"Track B fallback: Adjusted kWh from {daily_stats['kwh']:.2f} to {q_adjusted:.2f} (ΔT={delta_t_indoor:.2f}°C)")
+                    base_kwh = daily_stats["kwh"] - excluded_mode_kwh
+                    q_adjusted = base_kwh - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
+                    _LOGGER.debug(f"Track B fallback: Adjusted kWh from {base_kwh:.2f} to {q_adjusted:.2f} (ΔT={delta_t_indoor:.2f}°C)")
         elif self.thermal_mass_kwh_per_degree > 0.0 and current_indoor_temp is not None and self._last_midnight_indoor_temp is not None:
             delta_t_indoor = current_indoor_temp - self._last_midnight_indoor_temp
-            q_adjusted = daily_stats["kwh"] - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
-            _LOGGER.debug(f"Daily Learning: Adjusted kWh from {daily_stats['kwh']:.2f} to {q_adjusted:.2f} based on indoor delta T {delta_t_indoor:.2f}°C")
+            base_kwh = daily_stats["kwh"] - excluded_mode_kwh
+            q_adjusted = base_kwh - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
+            _LOGGER.debug(f"Daily Learning: Adjusted kWh from {base_kwh:.2f} to {q_adjusted:.2f} based on indoor delta T {delta_t_indoor:.2f}°C")
 
         if self.daily_learning_mode and self.learning_enabled and daily_stats["tdd"] >= 0.5 and q_adjusted > 0:
             if len(day_logs) >= 22:

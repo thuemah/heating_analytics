@@ -328,4 +328,16 @@ MODE_OFF = "off"
 MODE_GUEST_HEATING = "guest_heating"
 MODE_GUEST_COOLING = "guest_cooling"
 MODE_DHW = "dhw"
+
+# Modes excluded from global model learning (Track B/C).
+# Cooling is excluded because its solar relationship is inverted relative to
+# heating — mixing the two in one model corrupts solar normalisation.
+MODES_EXCLUDED_FROM_GLOBAL_LEARNING = frozenset({
+    MODE_OFF,
+    MODE_DHW,
+    MODE_GUEST_HEATING,
+    MODE_GUEST_COOLING,
+    MODE_COOLING,
+})
+
 CONF_HAS_AC_UNITS = "has_ac_units"
