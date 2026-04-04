@@ -341,3 +341,10 @@ MODES_EXCLUDED_FROM_GLOBAL_LEARNING = frozenset({
 })
 
 CONF_HAS_AC_UNITS = "has_ac_units"
+
+# --- Internal feature flags (not exposed in config flow) ---
+# #793: Use COP-weighted smearing for Track B instead of flat q/24.
+# When True and COP params are available (from MPC or future manual config),
+# Track B distributes daily energy across 24 hours using per-hour COP weights
+# instead of flat daily average. Provides Track A/C resolution without thermal sensors.
+ENABLE_TRACK_B_COP_SMEARING = False

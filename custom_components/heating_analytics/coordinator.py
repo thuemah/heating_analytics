@@ -718,7 +718,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Import historical data from CSV."""
         await self.storage.import_csv_data(file_path, mapping, update_model)
 
-    async def retrain_from_history(self, days_back: int | None = None, reset_first: bool = False) -> dict:
+    async def retrain_from_history(self, days_back: int | None = None, reset_first: bool = False, experimental_cop_smear: bool = False) -> dict:
         """Retrain the learning model from existing hourly log data.
 
         Track A (daily_learning_mode=False): replays each logged hour through
@@ -838,22 +838,39 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 if track_c_dist:
                     self._apply_strategies_to_global_model(day_entries, track_c_dist)
                 else:
-                    # Track B flattened daily bucket learning.
-                    q_hourly_avg = q_adjusted / 24.0
-                    avg_temp_retrain = sum(e.get("temp", 0.0) for e in day_entries) / len(day_entries)
-                    daily_wind_retrain = sum(e.get("effective_wind", 0.0) for e in day_entries) / len(day_entries)
-                    flat_temp_key = str(int(round(avg_temp_retrain)))
-                    flat_wind_bucket = self._get_wind_bucket(daily_wind_retrain)
-
-                    if flat_temp_key not in self._correlation_data:
-                        self._correlation_data[flat_temp_key] = {}
-                    current_pred = self._correlation_data[flat_temp_key].get(flat_wind_bucket, 0.0)
-
-                    if current_pred == 0.0:
-                        self._correlation_data[flat_temp_key][flat_wind_bucket] = round(q_hourly_avg, 5)
+                    # Check for stored COP-smeared distribution, or generate
+                    # on-the-fly if experimental_cop_smear is active (#793).
+                    track_b_cop_dist = self._daily_history.get(date_str, {}).get("track_b_cop_distribution")
+                    if not track_b_cop_dist and experimental_cop_smear:
+                        cop_smeared = await self._try_track_b_cop_smearing(
+                            day_entries, q_adjusted, date_str,
+                        )
+                        if cop_smeared is not None:
+                            _LOGGER.info(f"retrain COP-smear (#793): {date_str} -> {cop_smeared} bucket updates")
+                            # Per-unit replay + continue — bucket writing already done
+                            self._replay_per_unit_models(day_entries)
+                            learning_count += 1
+                            days_processed += 1
+                            continue
+                    if track_b_cop_dist:
+                        self._apply_strategies_to_global_model(day_entries, track_b_cop_dist)
                     else:
-                        new_pred = current_pred + self.learning_rate * (q_hourly_avg - current_pred)
-                        self._correlation_data[flat_temp_key][flat_wind_bucket] = round(new_pred, 5)
+                        # Track B flattened daily bucket learning.
+                        q_hourly_avg = q_adjusted / 24.0
+                        avg_temp_retrain = sum(e.get("temp", 0.0) for e in day_entries) / len(day_entries)
+                        daily_wind_retrain = sum(e.get("effective_wind", 0.0) for e in day_entries) / len(day_entries)
+                        flat_temp_key = str(int(round(avg_temp_retrain)))
+                        flat_wind_bucket = self._get_wind_bucket(daily_wind_retrain)
+
+                        if flat_temp_key not in self._correlation_data:
+                            self._correlation_data[flat_temp_key] = {}
+                        current_pred = self._correlation_data[flat_temp_key].get(flat_wind_bucket, 0.0)
+
+                        if current_pred == 0.0:
+                            self._correlation_data[flat_temp_key][flat_wind_bucket] = round(q_hourly_avg, 5)
+                        else:
+                            new_pred = current_pred + self.learning_rate * (q_hourly_avg - current_pred)
+                            self._correlation_data[flat_temp_key][flat_wind_bucket] = round(new_pred, 5)
 
                 # Per-unit model replay for DirectMeter sensors (needed for isolate_sensor).
                 self._replay_per_unit_models(day_entries)
@@ -3187,6 +3204,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             )
             if isinstance(cop_response, dict) and "eta_carnot" in cop_response:
                 cop_params = cop_response
+                self._last_cop_params = cop_params  # Cache for Track B COP smearing (#793)
                 _LOGGER.debug(
                     "Track C: COP params received — η=%.3f, f_defrost=%.2f, LWT=%.1f",
                     cop_params["eta_carnot"], cop_params.get("f_defrost", 0.85), cop_params.get("lwt", 35.0),
@@ -3338,6 +3356,121 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             learning_rate=self.learning_rate,
         )
 
+    async def _try_track_b_cop_smearing(
+        self,
+        day_logs: list[dict],
+        q_adjusted: float,
+        date_key: str,
+    ) -> int | None:
+        """Attempt COP-weighted smearing for Track B (#793).
+
+        When ENABLE_TRACK_B_COP_SMEARING is True and MPC COP params are
+        available, distributes q_adjusted across 24 hours using per-hour
+        COP weights instead of flat q/24.  Returns bucket update count,
+        or None if smearing was not possible (flag off, no COP params).
+        """
+        from .const import ENABLE_TRACK_B_COP_SMEARING
+        if not ENABLE_TRACK_B_COP_SMEARING:
+            return None
+
+        # Try cached COP params (set by Track C midnight sync if it ran).
+        cop_params = getattr(self, '_last_cop_params', None)
+
+        # If not cached, fetch directly from MPC.
+        if cop_params is None and self.mpc_entry_id:
+            try:
+                service_data = {"entry_id": self.mpc_entry_id}
+                cop_response = await self.hass.services.async_call(
+                    "heatpump_mpc", "get_cop_params",
+                    service_data, blocking=True, return_response=True,
+                )
+                if isinstance(cop_response, dict) and "eta_carnot" in cop_response:
+                    cop_params = cop_response
+                    self._last_cop_params = cop_params
+            except Exception as err:
+                _LOGGER.debug(f"Track B COP smearing: could not fetch COP params ({err})")
+
+        if cop_params is None:
+            return None
+
+        from homeassistant.util import dt as _dt
+        from .thermodynamics import ThermodynamicEngine
+
+        # Build weather data from hourly log (same logic as Track C).
+        log_by_hour = {e.get("hour", -1): e for e in day_logs}
+        solar_battery = 0.0
+        solar_residual_by_hour: dict[int, float] = {}
+        for h in range(24):
+            log_h = log_by_hour.get(h, {})
+            raw_solar_h = log_h.get("solar_factor") or 0.0
+            solar_battery = solar_battery * SOLAR_BATTERY_DECAY + raw_solar_h
+            solar_residual_by_hour[h] = min(1.0, solar_battery)
+
+        weather_data = []
+        synthetic_mpc_data = []
+        for h in range(24):
+            log_h = log_by_hour.get(h, {})
+            inertia_t = log_h.get("inertia_temp")
+            raw_t = log_h.get("temp")
+            outdoor = inertia_t if inertia_t is not None else (raw_t if raw_t is not None else self.balance_point)
+            eff_wind = log_h.get("effective_wind") or 0.0
+
+            if eff_wind >= self.extreme_wind_threshold:
+                wind_factor = 1.6
+            elif eff_wind >= self.wind_threshold:
+                wind_factor = 1.3
+            else:
+                wind_factor = 1.0
+
+            solar_with_decay = solar_residual_by_hour.get(h, 0.0)
+            solar_factor = max(0.0, 1.0 - solar_with_decay)
+
+            raw_outdoor = raw_t if raw_t is not None else self.balance_point
+            rh = log_h.get("humidity")
+            rh = rh if rh is not None else 50.0
+
+            ts = log_h.get("timestamp", f"{date_key}T{h:02d}:00:00")
+            weather_data.append({
+                "datetime": ts,
+                "delta_t": max(0.0, self.balance_point - outdoor),
+                "wind_factor": wind_factor,
+                "solar_factor": solar_factor,
+                "outdoor_temp": raw_outdoor,
+                "humidity": rh,
+            })
+            # Synthetic MPC record — we don't have thermal data, so use
+            # placeholders.  With per-hour COP + renormalization, only
+            # total_kwh_el matters (the thermal values cancel out).
+            synthetic_mpc_data.append({
+                "datetime": ts,
+                "kwh_th_sh": q_adjusted / 24.0,  # Placeholder — ratio matters, not absolute
+                "kwh_el_sh": q_adjusted / 24.0,   # COP=1 placeholder, overridden by per-hour COP
+                "mode": "sh",
+            })
+
+        engine = ThermodynamicEngine(balance_point=self.balance_point)
+        try:
+            distribution = engine.calculate_synthetic_baseline(
+                synthetic_mpc_data, weather_data, cop_params=cop_params,
+            )
+        except Exception as err:
+            _LOGGER.warning(f"Track B COP smearing failed ({err}), falling back to flat.")
+            return None
+
+        # Store distribution for strategy dispatch (same as Track C).
+        bucket_updates = self._apply_strategies_to_global_model(
+            day_logs, distribution,
+        )
+
+        # Persist distribution for retrain replay.
+        self._daily_history[date_key]["track_b_cop_distribution"] = distribution
+
+        _LOGGER.info(
+            f"Track B COP-smeared (#793): q_adjusted={q_adjusted:.2f} kWh "
+            f"distributed across 24 hours using per-hour COP."
+        )
+        return bucket_updates
+
     @staticmethod
     def _compute_excluded_mode_energy(day_logs: list[dict]) -> float:
         """Sum energy from units in modes excluded from global learning.
@@ -3481,27 +3614,31 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     )
                     _LOGGER.info(f"Track C Strategy Learning: {bucket_updates} bucket updates from 24 hours.")
                 else:
-                    # --- Track B: flattened daily bucket learning ---
-                    # Track B exists for buildings where per-hour data is unreliable
-                    # (high thermal mass, modulation floor).  A single q_adjusted/24
-                    # value is written to one (avg_temp, avg_wind) bucket per day.
-                    q_hourly_avg = q_adjusted / 24.0
-                    avg_temp = daily_stats["temp"]
-                    daily_wind = daily_stats["wind"]
-                    flat_temp_key = str(int(round(avg_temp)))
-                    flat_wind_bucket = self._get_wind_bucket(daily_wind)
-
-                    if flat_temp_key not in self._correlation_data:
-                        self._correlation_data[flat_temp_key] = {}
-                    current_pred = self._correlation_data[flat_temp_key].get(flat_wind_bucket, 0.0)
-
-                    if current_pred == 0.0:
-                        self._correlation_data[flat_temp_key][flat_wind_bucket] = round(q_hourly_avg, 5)
-                        _LOGGER.info(f"Track B Learning (Cold Start): T={flat_temp_key} W={flat_wind_bucket} -> {q_hourly_avg:.3f} kWh")
+                    # --- Track B bucket learning ---
+                    cop_smeared = await self._try_track_b_cop_smearing(
+                        day_logs, q_adjusted, key,
+                    )
+                    if cop_smeared:
+                        _LOGGER.info(f"Track B COP-smeared: {cop_smeared} bucket updates from 24 hours.")
                     else:
-                        new_pred = current_pred + self.learning_rate * (q_hourly_avg - current_pred)
-                        self._correlation_data[flat_temp_key][flat_wind_bucket] = round(new_pred, 5)
-                        _LOGGER.info(f"Track B Learning (EMA): T={flat_temp_key} W={flat_wind_bucket} -> {new_pred:.3f} kWh (was {current_pred:.3f}, actual avg {q_hourly_avg:.3f})")
+                        # Flat fallback: single q_adjusted/24 to one bucket.
+                        q_hourly_avg = q_adjusted / 24.0
+                        avg_temp = daily_stats["temp"]
+                        daily_wind = daily_stats["wind"]
+                        flat_temp_key = str(int(round(avg_temp)))
+                        flat_wind_bucket = self._get_wind_bucket(daily_wind)
+
+                        if flat_temp_key not in self._correlation_data:
+                            self._correlation_data[flat_temp_key] = {}
+                        current_pred = self._correlation_data[flat_temp_key].get(flat_wind_bucket, 0.0)
+
+                        if current_pred == 0.0:
+                            self._correlation_data[flat_temp_key][flat_wind_bucket] = round(q_hourly_avg, 5)
+                            _LOGGER.info(f"Track B Learning (Cold Start): T={flat_temp_key} W={flat_wind_bucket} -> {q_hourly_avg:.3f} kWh")
+                        else:
+                            new_pred = current_pred + self.learning_rate * (q_hourly_avg - current_pred)
+                            self._correlation_data[flat_temp_key][flat_wind_bucket] = round(new_pred, 5)
+                            _LOGGER.info(f"Track B Learning (EMA): T={flat_temp_key} W={flat_wind_bucket} -> {new_pred:.3f} kWh (was {current_pred:.3f}, actual avg {q_hourly_avg:.3f})")
             else:
                 _LOGGER.info(f"Daily Learning skipped: Incomplete day ({len(day_logs)}/24 hours)")
 

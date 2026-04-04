@@ -110,6 +110,7 @@ SERVICE_SCHEMA_RETRAIN = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days_back"): vol.All(vol.Coerce(int), vol.Range(min=1, max=730)),
     vol.Optional("reset_first", default=False): cv.boolean,
+    vol.Optional("experimental_cop_smear", default=False): cv.boolean,  # #793 hidden flag
 })
 
 SERVICE_SCHEMA_COMPARE_PERIODS = vol.Schema({
@@ -282,13 +283,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entity_id = call.data.get("entity_id")
         days_back = call.data.get("days_back")
         reset_first = call.data.get("reset_first", False)
+        experimental_cop_smear = call.data.get("experimental_cop_smear", False)
 
         coord = _get_target_coordinator(hass, entity_id)
         _LOGGER.info(
             f"Service called: retrain_from_history (days_back={days_back}, reset_first={reset_first}, "
-            f"coordinator={coord.entry.entry_id})"
+            f"experimental_cop_smear={experimental_cop_smear}, coordinator={coord.entry.entry_id})"
         )
-        return await coord.retrain_from_history(days_back=days_back, reset_first=reset_first)
+        return await coord.retrain_from_history(
+            days_back=days_back, reset_first=reset_first,
+            experimental_cop_smear=experimental_cop_smear,
+        )
 
     hass.services.async_register(
         DOMAIN,
