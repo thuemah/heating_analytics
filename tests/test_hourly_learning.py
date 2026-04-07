@@ -128,9 +128,11 @@ async def test_hourly_learning_with_solar(hass: HomeAssistant):
         assert coordinator._correlation_data["0"]["normal"] == 2.0
 
         # Scenario 2: Actual was higher (1.8)
-        # Solar battery carries residual from scenario 1: 0.5 * DECAY(0.6) + 0.5 = 0.8
-        # Normalized = 1.8 + 0.8 = 2.6
-        # New Base = 2.0 + 0.1 * (2.6 - 2.0) = 2.06
+        # With saturation-aware solar delta (#801): calculate_total_power
+        # computes per-unit solar with saturation. Unit base=2.0, solar=0.5,
+        # saturation(2.0, 0.5) → applied=0.5. Delta = 0.5 - 0.0 = 0.5.
+        # Normalized = 1.8 + 0.5 = 2.3
+        # New Base = 2.0 + 0.1 * (2.3 - 2.0) = 2.03
 
         # Reset for next run (simulation of next hour data accumulation)
         coordinator._collector.sample_count = 60
@@ -143,7 +145,7 @@ async def test_hourly_learning_with_solar(hass: HomeAssistant):
         coordinator._hourly_delta_per_unit = {"sensor.heater": 1.8}
 
         await coordinator._process_hourly_data(current_time)
-        assert coordinator._correlation_data["0"]["normal"] == pytest.approx(2.06, abs=0.001)
+        assert coordinator._correlation_data["0"]["normal"] == pytest.approx(2.03, abs=0.001)
 
 @pytest.mark.asyncio
 async def test_hourly_bucket_auxiliary(hass: HomeAssistant):

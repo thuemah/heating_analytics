@@ -111,6 +111,12 @@ class HourlyObservation:
     correction_percent: float = 0.0
     potential_solar_factor: float = 0.0
 
+    # --- Solar normalization for global model (#801) ---
+    # Saturation-aware delta: heating_solar_applied - cooling_solar_applied.
+    # Learning uses: dark_actual = actual + solar_normalization_delta.
+    # This correctly handles mixed heating+cooling without global_mode inference.
+    solar_normalization_delta: float = 0.0
+
     # --- Cooldown state at observation time ---
     was_cooldown_active: bool = False
 

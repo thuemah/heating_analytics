@@ -72,7 +72,7 @@ This integration uses high-resolution machine learning to build its thermodynami
 Once you have basic data flowing, enhance accuracy:
 
 **Wind Configuration:**
-- Enable "Wind Compensation" if you have a weather station with wind data
+- Wind data is used automatically from your weather entity (or dedicated sensor if configured)
 - The system accounts for wind chill and gusts affecting heat loss
 - **Supported Units:** `m/s`, `km/h`, `mph`, `kn` (knots)
 
@@ -111,20 +111,49 @@ If you have past energy/weather data, jump-start the learning process:
 
 ## Weather Integration Recommendations
 
-**Works with any weather provider** (Met.no, AccuWeather, etc.)
+**Works with any weather provider** (Met.no, AccuWeather, etc.), but the accuracy of predictions depends on the data your weather entity provides.
 
-**Unlock Enhanced Features with Open-Meteo:**
+### Required attributes
 
-Pair with the [Open-Meteo integration](https://github.com/thuemah/open_meteo) for:
+| Attribute | Used for | Required? | Fallback if missing |
+|-----------|----------|-----------|---------------------|
+| `temperature` | Outdoor temperature | Only if no dedicated `outdoor_temp_sensor` is configured | None — produces a warning |
+| `wind_speed` | Wind chill penalty | Only if no dedicated wind sensor is configured (advanced option, off by default) | 0.0 (no wind penalty) |
 
-- Precise **Wind Gust** compensation (not all providers include this)
-- **Vertical Solar** calculations for windows (vs. roof-mounted panels)
-- **7-day hourly forecast** (most providers only give daily forecasts)
-- Hourly cloud coverage data for accurate solar correction
+### Optional attributes (strongly recommended)
 
-*Open-Meteo is free, requires no API key, and provides detailed hourly forecast data.*
+| Attribute | Used for | Fallback if missing |
+|-----------|----------|---------------------|
+| `cloud_coverage` | Solar model — determines how much solar energy reaches windows | Maps from weather condition text (e.g. "sunny" → 10%, "cloudy" → 80%), then falls back to 50% if condition is unknown. This coarse estimate significantly reduces solar model accuracy. |
+| `wind_gust_speed` | Wind gust compensation (higher accuracy wind penalty) | Ignored — only sustained wind speed is used |
+| `humidity` | Per-hour COP defrost penalty (Track C) | 50% default — defrost may under/over-trigger |
+| `forecast` | 7-day hourly energy forecast | No forecast sensors available |
 
-This is optional but highly recommended for maximum accuracy.
+> **How to check what your weather entity provides:**
+> Go to Developer Tools → States, find your weather entity (e.g. `weather.home`), and expand the attributes. Look for `cloud_coverage` (numeric 0–100), `wind_gust_speed`, and `humidity`. If `cloud_coverage` is missing, the solar model falls back to condition-text mapping, which can cause the solar coefficient to be poorly calibrated.
+
+### Recommended: Open-Meteo with cloud coverage
+
+The built-in **Met.no** integration works well out of the box — it provides `cloud_coverage`, `humidity`, `wind_gust_speed`, and all required attributes. However, Met.no's forecast is limited to 6-hour blocks (not hourly), which reduces forecast sensor accuracy.
+
+The **standard Open-Meteo** integration in HA does **not** provide `cloud_coverage` or `humidity` as weather entity attributes. This significantly degrades the solar model. If you prefer Open-Meteo, use this custom version that includes the missing attributes:
+
+https://github.com/thuemah/open_meteo
+
+It adds:
+- Numeric **cloud coverage** (0–100%) for accurate solar correction
+- **Humidity** for Track C COP defrost penalty
+- Precise **wind gust** compensation
+- **7-day hourly forecast** (higher resolution than Met.no)
+
+*Open-Meteo is free and requires no API key.*
+
+**Summary:**
+| Provider | cloud_coverage | humidity | wind_gust | hourly forecast | Works out of box? |
+|----------|---------------|----------|-----------|----------------|-------------------|
+| Met.no | Yes | Yes | Yes | No (6h blocks) | Yes |
+| Open-Meteo (standard) | **No** | **No** | No | Yes | **Solar model degraded** |
+| Open-Meteo (custom) | Yes | Yes | Yes | Yes | Yes |
 
 ---
 
@@ -132,7 +161,7 @@ This is optional but highly recommended for maximum accuracy.
 
 ### Machine Learning That Just Works
 
-- **Automatic Learning:** No manual calibration needed—the system learns your home's thermal characteristics
+- **Automatic Learning (Track A):** No manual calibration needed—the system learns your home's thermal characteristics every hour. This is the default and recommended mode for the large majority of installations.
 - **Daily Learning Mode (Track B):** For homes where hourly learning is unreliable — typically high thermal mass buildings (concrete, stone) or heat pumps with a high minimum modulation level. The model learns once per day at midnight instead of every hour. **Note:** Building a complete heating curve takes months rather than weeks. Only use this if your building dynamics genuinely make hourly observations unreliable — hourly learning (Track A) is the right choice for the large majority of installations.
 - **Thermodynamic Baseline Engine (Track C):** For systems with Model Predictive Control (MPC) load-shifting via `heatpump_mpc`. Track C ignores the electricity meter entirely and instead uses real thermal production data from the MPC to construct a synthetic electrical baseline — each hour's smeared thermal load is divided by that hour's actual COP (computed from the MPC's learned Carnot model, including a defrost penalty for cold+humid conditions). Unlike Track B, Track C retains full hourly resolution — making it a complete alternative to Track A with 2–4 week learning time — while being fully immune to the MPC feedback loop. In multi-unit installations, each unit's learning strategy is auto-assigned: MPC units use the synthetic baseline, non-MPC units contribute actual meter data per hour. See [DESIGN.md](DESIGN.md) for details.
 - **Regime-Aware Prediction:**
@@ -271,6 +300,50 @@ The system stores **Hourly Data Vectors** (Temp, Wind, Actual Load) for every da
 
 ---
 
+## Entities Created
+
+### Sensors (always created)
+
+| Entity | Unit | Description |
+|--------|------|-------------|
+| Energy Today | kWh | Total heating energy consumed today |
+| Energy Baseline Today | kWh | Model expectation given actual weather. Rich attributes: thermal stress, drivers, solar/wind detail |
+| Efficiency | kWh/TDD | Rolling efficiency with historical averages |
+| Weather Plan Today | kWh | Full-day weather-based energy plan (frozen at midnight) |
+| Energy Estimate Today | kWh | Best estimate: actuals so far + forecast remainder. Includes confidence level |
+| Forecast Details | — | Diagnostic: which forecast source is performing better |
+| Deviation Today | % | Actual vs expected deviation with contributor breakdown |
+| Effective Wind | m/s | Current effective wind with gust factor applied |
+| Correlation Data | — | Diagnostic: temperature-vs-energy curves for graphing |
+| Last Hour Actual | kWh | Diagnostic: last completed hour's actual consumption |
+| Last Hour Expected | kWh | Diagnostic: last completed hour's model prediction |
+| Last Hour Deviation | kWh | Diagnostic: last hour deviation with model update details |
+| AUX Savings Today | kWh | Estimated energy saved by auxiliary heat (e.g. wood stove) |
+| Model Comparison Day/Week/Month | kWh | Current vs same period last year (3 sensors) |
+| Week Ahead Forecast | kWh | 7-day energy forecast with daily breakdown |
+| Period Comparison | — | Diagnostic: result of compare_periods service call |
+| Thermal State | °C | Inertia-weighted effective outdoor temperature |
+| {Unit} Daily | kWh | Per-unit daily consumption (one per energy sensor) |
+
+### Sensors (conditional)
+
+| Entity | Condition | Description |
+|--------|-----------|-------------|
+| Daily Learning | `daily_learning_mode` enabled | Learned U-coefficient (kWh/TDD) |
+| {Unit} Lifetime | `enable_lifetime_tracking` enabled | Cumulative lifetime energy per unit |
+
+### Controls
+
+| Entity | Type | Default | Description |
+|--------|------|---------|-------------|
+| Learning Rate | Number | 1.0% | EMA rate for model updates (0.1–10%) |
+| Solar Correction | Number | 100% | How much solar reaches the building (0–100%) |
+| Learning Enabled | Switch | On | Master on/off for model learning |
+| Auxiliary Heating Active | Switch | Off | Signals unmetered heat source is active |
+| {Unit} Mode | Select | Heating | Per-unit mode (heating/cooling/off/dhw/guest). Only when `has_ac_units` is enabled |
+
+---
+
 ## Dashboard & Visualizations
 
 Rather than a single monolithic dashboard, the [`tools/`](https://github.com/thuemah/heating_analytics/blob/main/tools/) folder contains ready-to-paste Plotly cards that you combine as needed. Each card references standard integration sensors directly — no fragile pre-built dashboard to maintain.
@@ -279,7 +352,7 @@ Rather than a single monolithic dashboard, the [`tools/`](https://github.com/thu
 
 | File | Description |
 |------|-------------|
-| [plotly_heat_demand_curve.yaml](https://github.com/thuemah/healing_analytics/blob/main/tools/plotly_heat_demand_curve.yaml) | Heat demand curve — temperature vs kWh/day across wind conditions |
+| [plotly_heat_demand_curve.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_heat_demand_curve.yaml) | Heat demand curve — temperature vs kWh/day across wind conditions |
 | [plotly_today_breakdown_pie.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_today_breakdown_pie.yaml) | Donut chart of today's per-unit energy split |
 | [plotly_week_ahead_forecast.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/plotly_week_ahead_forecast.yaml) | 7-day bar chart with temperature and wind overlay |
 | [heating_forecast_sensor_and_dashboard.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/heating_forecast_sensor_and_dashboard.yaml) | 48-hour hourly forecast with solar contribution |
@@ -309,9 +382,9 @@ Rather than a single monolithic dashboard, the [`tools/`](https://github.com/thu
 | **Balance Point** | 17°C | Temperature where heating starts |
 | **Learning Rate** | 0.01 | How fast the model adapts (1% per hour) |
 | **Wind Gust Factor** | 0.6 | Weight given to wind gusts (60%) |
-| **Wind Threshold** | 5.5 m/s | Threshold for 'High Wind' conditions. |
+| **Wind Threshold** | 8.0 m/s | Threshold for 'High Wind' conditions. Too low pushes many hours into the high_wind bucket with insufficient samples. |
 | **Extreme Wind Threshold** | 10.8 m/s | Threshold for 'Extreme Wind' conditions. |
-| **Thermal Inertia** | Normal | Building thermal mass profile (Fast, Normal, Slow) |
+| **Thermal Inertia** | 4 hours | Hours of outdoor temperature history the model considers (1–24h slider). Low for lightweight structures, high for heavy concrete/stone. |
 
 ### Thermal Mass Correction
 
@@ -365,11 +438,9 @@ If you have a hidden consumer (like a bathroom floor heater) that isn't tracked,
 
 ### Solar Settings
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| **Solar Enabled** | `false` | Enable solar correction |
-| **Initial Heating Coefficient** | 0.35 | Starting solar coefficient for heating. The model will auto-tune this. |
-| **Initial Cooling Coefficient** | 0.40 | Starting solar coefficient for cooling. The model will auto-tune this. |
+Solar correction is always active. The system exposes a **Solar Correction** number entity (0–100%, default 100%) that represents how much solar gain currently reaches the building (100% = screens fully open, 0% = fully closed). A minimum transmittance of 20% is always applied internally.
+
+Solar coefficients are learned automatically per unit — starting from 0.35 (heating) / 0.40 (cooling) and converging via 2D vector learning (south + east components).
 
 ### Auxiliary Settings
 
@@ -384,7 +455,7 @@ If you have a hidden consumer (like a bathroom floor heater) that isn't tracked,
 
 ### Tips
 
-- **Drafty house?** → Increase Wind Gust Factor to 0.5
+- **Drafty house?** → Increase Wind Gust Factor above the default 0.6 (e.g. 0.8)
 - **Model too slow to adapt?** → Increase Learning Rate to 0.02 (2%)
 - **Made changes to insulation/heating?** → Temporarily increase Learning Rate to 0.03-0.04 (3-4%) for a few days at stable temperatures to speed up re-learning
 - **Big south-facing windows?** → Enable solar with accurate area for best results
@@ -538,7 +609,7 @@ Create a complete backup of your learning model, history, and configuration to a
 **What's Included:**
 - Complete learning model (all correlation data)
 - Per-unit learning models
-- Learning buffers (cold-start data)
+- Learning buffers (warm-start data)
 - Daily history and hourly logs
 - Configuration settings
 - Observation counts
@@ -627,6 +698,37 @@ Unlike `reset_learning_data`, this service preserves the learning buffer. The bu
 
 ---
 
+### Retrain from History
+
+**Service:** `heating_analytics.retrain_from_history`
+
+Retrains the model using the existing hourly log — no CSV needed. Replays logged hours through the same learning path used during live operation.
+
+```yaml
+service: heating_analytics.retrain_from_history
+data:
+  days_back: 30
+  reset_first: true
+```
+
+**Parameters:**
+- `entity_id` (optional): Target instance
+- `days_back` (optional, 1–730): Limit to most recent N days. Empty = all available
+- `reset_first` (default false): Clear all learned data before retraining
+
+---
+
+### Other Reset Services
+
+| Service | Description |
+|---------|-------------|
+| `reset_forecast_accuracy` | Clears forecast accuracy tracking history. Preserves energy logs. |
+| `reset_solar_learning` | Resets solar coefficients for one unit (`unit_entity_id`) or all units in an instance. |
+| `exit_cooldown` | Force-exits the auxiliary cooldown period, resuming normal learning immediately. |
+| `compare_periods` | Compares two historical periods. Returns delta analysis as a response. |
+
+---
+
 ### Get Hourly Forecast Plan
 
 **Service:** `heating_analytics.get_forecast`
@@ -656,6 +758,66 @@ response_variable: heating_plan
 **Use Case:**
 - Automations that need to know *exactly* how much energy the house will use in the next few hours.
 - Custom dashboards that need raw prediction data.
+
+---
+
+### Calibrate Wind Thresholds
+
+**Service:** `heating_analytics.calibrate_wind_thresholds`
+
+> [!NOTE]
+> This service analyzes **Track A hourly data only**. It requires sufficient pure (non-aux, non-solar) hourly observations across different wind conditions. Not applicable for Track B or Track C installations that have not accumulated Track A history.
+
+Tests historical data to find the optimal high wind and extreme wind thresholds for your location by reclassifying hours and comparing model error (MAE) across different threshold pairs.
+
+```yaml
+action: heating_analytics.calibrate_wind_thresholds
+data:
+  days: 60
+```
+
+**Returns:** Recommended thresholds, per-bucket MAE, hour distribution, data quality assessment, and improvement percentage over current thresholds.
+
+**When to use:** After 30–60 days of Track A data, or if you suspect wind thresholds are causing noisy predictions. A too-low high wind threshold pushes many hours into the `high_wind` bucket with insufficient samples, adding noise to the correlation curve.
+
+---
+
+### Calibrate Thermal Inertia
+
+**Service:** `heating_analytics.calibrate_inertia`
+
+> [!NOTE]
+> This service analyzes **Track A hourly data only**. It requires at least 30 days of hourly observations to produce reliable results.
+
+Tests historical data to find the ideal thermal inertia time constant (tau, 1–24 hours) for your building. The primary result uses a causal exponential decay kernel matching the coordinator's RC-circuit model.
+
+```yaml
+action: heating_analytics.calibrate_inertia
+```
+
+**Returns:** Recommended tau, MAE comparison across tau values, and a Gaussian sweep for reference.
+
+---
+
+### Diagnose Model
+
+**Service:** `heating_analytics.diagnose_model`
+
+Analyzes the learned correlation model and hourly history for data quality issues. Useful for diagnosing model drift, inverted correlation curves, or validating data after configuration changes.
+
+```yaml
+action: heating_analytics.diagnose_model
+data:
+  days: 30
+```
+
+**Returns a diagnostic report with:**
+
+- **Monotonicity check:** Per wind bucket, is the correlation curve falling as temperature drops (physically correct)? Reports any inversions and their magnitude.
+- **Bucket population:** Observation count per `temp_key × wind_bucket`. Flags under-sampled buckets (< 4 observations) and wind bucket imbalance.
+- **Mode contamination:** Per-day breakdown of hours in OFF, DHW, Guest, and Cooling modes. Useful for validating that mode filtering is working correctly.
+- **Solar correlation:** Checks whether solar factor correlates with prediction error — positive correlation suggests solar is not fully captured by the model.
+- **Track B diagnostics:** For Track B days — `q_adjusted` vs raw kWh, thermal mass correction applied, daily average temperature, and which bucket was populated.
 
 ---
 

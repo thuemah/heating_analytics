@@ -56,6 +56,8 @@ _LOGGER = logging.getLogger(__name__)
 
 # UI-only key — not stored in entry.data. Derived from indoor_temp_sensor presence on load.
 _CONF_LOAD_SHIFT = "overnight_load_shift_correction"
+# UI-only key — not stored. Derived from wind_speed_sensor presence on load.
+_CONF_DEDICATED_WIND = "use_dedicated_wind_sensor"
 
 
 class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -118,12 +120,8 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._flow_data.pop(key, None)
 
     def _needs_feature_config_step(self) -> bool:
-        """Return True when the feature_config page has at least one field to show."""
-        daily = self._flow_data.get(CONF_DAILY_LEARNING_MODE, False)
-        load_shift = self._flow_data.get(_CONF_LOAD_SHIFT, False)
-        track_c = self._flow_data.get(CONF_TRACK_C, False)
-        csv = self._flow_data.get("csv_auto_logging", False)
-        return (daily and (load_shift or track_c)) or csv
+        """Always True — wind tuning fields are always shown on this page."""
+        return True
 
     def _build_final_data(self, last_step_input: dict) -> dict:
         """Merge all steps and normalise values for storage."""
@@ -144,8 +142,19 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # previously saved sensor does not leak in from _flow_data.
         if not (data.get(CONF_DAILY_LEARNING_MODE) and data.get(_CONF_LOAD_SHIFT)):
             data.pop(CONF_INDOOR_TEMP_SENSOR, None)
-        # _CONF_LOAD_SHIFT is UI-only — never stored.
+        # _CONF_LOAD_SHIFT and _CONF_DEDICATED_WIND are UI-only — never stored.
         data.pop(_CONF_LOAD_SHIFT, None)
+        # Clear wind sensor fields when dedicated wind toggle is off (#798).
+        has_dedicated_wind = bool(data.get(_CONF_DEDICATED_WIND))
+        if not has_dedicated_wind:
+            data.pop("wind_speed_sensor", None)
+            data.pop("wind_gust_sensor", None)
+        data.pop(_CONF_DEDICATED_WIND, None)
+        # Auto-enable Daily Learning when Track C is turned on — Track C is a
+        # variant of daily learning that replaces flat q/24 with COP-weighted
+        # smearing.  It makes no sense without daily mode.
+        if data.get(CONF_TRACK_C) and not data.get(CONF_DAILY_LEARNING_MODE):
+            data[CONF_DAILY_LEARNING_MODE] = True
         # Clear Track C state when daily_learning_mode is off (Track C requires it),
         # or when track_c_enabled is explicitly off. Prevents stale flags surviving
         # a reconfigure where the daily_learning_mode toggle was hidden and absent
@@ -164,9 +173,19 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not data.get(key):
                 data.pop(key, None)
 
-        # Convert wind thresholds from display unit to m/s for storage
+        # Ensure wind tuning fields have defaults.  Defaults are in m/s and
+        # must NOT be converted — only user-submitted values (in display units)
+        # need conversion.
+        wind_from_user = "wind_threshold" in last_step_input
+        data.setdefault("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)
+        data.setdefault("wind_threshold", DEFAULT_WIND_THRESHOLD)
+        data.setdefault("extreme_wind_threshold", DEFAULT_EXTREME_WIND_THRESHOLD)
+
+        # Convert wind thresholds from display unit to m/s for storage.
+        # Only convert when values came from user input (display units).
+        # setdefault values are already in m/s.
         unit = data.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
-        if unit != WIND_UNIT_MS:
+        if unit != WIND_UNIT_MS and wind_from_user:
             data["wind_threshold"] = convert_to_ms(data["wind_threshold"], unit)
             data["extreme_wind_threshold"] = convert_to_ms(data["extreme_wind_threshold"], unit)
 
@@ -219,41 +238,16 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 selector.NumberSelectorConfig(min=1, max=24, step=1, unit_of_measurement="h", mode="slider")
             ),
         }
-        for field, device_class in [
-            ("wind_speed_sensor", "wind_speed"),
-            ("wind_gust_sensor", "wind_speed"),
-        ]:
-            schema[vol.Optional(field, description={"suggested_value": g(field)})] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor", device_class=device_class)
-            )
         return vol.Schema(schema)
 
     def _schema_advanced(self, user_input, defaults) -> vol.Schema:
-        """Schema for toggles, wind tuning, and miscellaneous options.
+        """Schema for toggles and miscellaneous options.
 
         All boolean feature toggles live here. Their corresponding sub-fields
-        (sensors, paths, entry selectors) are on the *next* page
+        (sensors, paths, entry selectors, wind tuning) are on the *next* page
         (feature_config) so no dynamic re-render is ever needed.
         """
         g = lambda k, d=None: self._v(user_input, defaults, k, d)
-        current_unit = self._flow_data.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
-
-        # Wind thresholds: stored in m/s, displayed in the unit chosen in step 2
-        if user_input is not None and "wind_threshold" in user_input:
-            display_threshold = user_input["wind_threshold"]
-            display_extreme = user_input["extreme_wind_threshold"]
-        else:
-            stored_t = self._flow_data.get("wind_threshold", DEFAULT_WIND_THRESHOLD)
-            stored_e = self._flow_data.get("extreme_wind_threshold", DEFAULT_EXTREME_WIND_THRESHOLD)
-            if current_unit != WIND_UNIT_MS:
-                display_threshold = convert_from_ms(stored_t, current_unit)
-                display_extreme = convert_from_ms(stored_e, current_unit)
-            else:
-                display_threshold = stored_t
-                display_extreme = stored_e
-
-        max_wind = {WIND_UNIT_KMH: 80.0, WIND_UNIT_KNOTS: 40.0}.get(current_unit, 20.0)
-        max_extreme = {WIND_UNIT_KMH: 120.0, WIND_UNIT_KNOTS: 60.0}.get(current_unit, 30.0)
 
         # Derive load-shift default from whether indoor_temp_sensor is already configured
         load_shift = g(_CONF_LOAD_SHIFT, bool(g(CONF_INDOOR_TEMP_SENSOR)))
@@ -262,26 +256,15 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Optional(CONF_DAILY_LEARNING_MODE, default=g(CONF_DAILY_LEARNING_MODE, False)): selector.BooleanSelector(),
             vol.Optional(_CONF_LOAD_SHIFT, default=bool(load_shift)): selector.BooleanSelector(),
             vol.Optional(CONF_TRACK_C, default=g(CONF_TRACK_C, False)): selector.BooleanSelector(),
-            vol.Required("wind_gust_factor", default=g("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.05, mode="slider")
-            ),
-            vol.Required("wind_threshold", default=round(display_threshold, 1)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=0.0, max=max_wind, step=0.1, unit_of_measurement=current_unit)
-            ),
-            vol.Required("extreme_wind_threshold", default=round(display_extreme, 1)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=0.0, max=max_extreme, step=0.1, unit_of_measurement=current_unit)
-            ),
-            vol.Optional("max_energy_delta", default=g("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=0.5, max=15.0, step=0.5, unit_of_measurement="kWh")
-            ),
             vol.Optional(
                 CONF_AUX_AFFECTED_ENTITIES,
                 default=g(CONF_AUX_AFFECTED_ENTITIES, self._flow_data.get("energy_sensors", [])),
             ): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
             ),
-            vol.Optional("csv_auto_logging", default=g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING)): selector.BooleanSelector(),
             vol.Optional(CONF_ENABLE_LIFETIME_TRACKING, default=g(CONF_ENABLE_LIFETIME_TRACKING, False)): selector.BooleanSelector(),
+            # Derive dedicated-wind default from whether a wind sensor is already configured
+            vol.Optional(_CONF_DEDICATED_WIND, default=bool(g("wind_speed_sensor"))): selector.BooleanSelector(),
         }
         schema[vol.Optional(
             CONF_SECONDARY_WEATHER_ENTITY,
@@ -290,6 +273,13 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema[vol.Optional(CONF_FORECAST_CROSSOVER_DAY, default=g(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY))] = (
             selector.NumberSelector(
                 selector.NumberSelectorConfig(min=1, max=7, step=1, mode="slider")
+            )
+        )
+        # --- Lower-priority fields at the bottom ---
+        schema[vol.Optional("csv_auto_logging", default=g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING))] = selector.BooleanSelector()
+        schema[vol.Optional("max_energy_delta", default=g("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA))] = (
+            selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0.5, max=15.0, step=0.5, unit_of_measurement="kWh")
             )
         )
         return vol.Schema(schema)
@@ -340,6 +330,53 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         )
                     )
                 )
+
+        # Dedicated wind sensors — hidden behind toggle (#798).
+        dedicated_wind = self._flow_data.get(_CONF_DEDICATED_WIND, False)
+        if dedicated_wind:
+            for field, device_class in [
+                ("wind_speed_sensor", "wind_speed"),
+                ("wind_gust_sensor", "wind_speed"),
+            ]:
+                schema[vol.Optional(field, description={"suggested_value": g(field)})] = (
+                    selector.EntitySelector(
+                        selector.EntitySelectorConfig(domain="sensor", device_class=device_class)
+                    )
+                )
+
+        # Wind tuning — always visible (relevant regardless of wind source).
+        current_unit = self._flow_data.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
+        if user_input is not None and "wind_threshold" in user_input:
+            display_threshold = user_input["wind_threshold"]
+            display_extreme = user_input["extreme_wind_threshold"]
+        else:
+            stored_t = self._flow_data.get("wind_threshold", DEFAULT_WIND_THRESHOLD)
+            stored_e = self._flow_data.get("extreme_wind_threshold", DEFAULT_EXTREME_WIND_THRESHOLD)
+            if current_unit != WIND_UNIT_MS:
+                display_threshold = convert_from_ms(stored_t, current_unit)
+                display_extreme = convert_from_ms(stored_e, current_unit)
+            else:
+                display_threshold = stored_t
+                display_extreme = stored_e
+
+        max_wind = {WIND_UNIT_KMH: 80.0, WIND_UNIT_KNOTS: 40.0}.get(current_unit, 20.0)
+        max_extreme = {WIND_UNIT_KMH: 120.0, WIND_UNIT_KNOTS: 60.0}.get(current_unit, 30.0)
+
+        schema[vol.Required("wind_gust_factor", default=g("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR))] = (
+            selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.05, mode="slider")
+            )
+        )
+        schema[vol.Required("wind_threshold", default=round(display_threshold, 1))] = (
+            selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0.0, max=max_wind, step=0.1, unit_of_measurement=current_unit)
+            )
+        )
+        schema[vol.Required("extreme_wind_threshold", default=round(display_extreme, 1))] = (
+            selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0.0, max=max_extreme, step=0.1, unit_of_measurement=current_unit)
+            )
+        )
 
         if csv_logging:
             schema[vol.Optional("csv_hourly_path", default=g("csv_hourly_path", DEFAULT_CSV_HOURLY_PATH))] = (
@@ -392,7 +429,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # Explicitly write all boolean keys so that a False value is always
             # present in _flow_data even if HA omits it from user_input.
             for _k in (CONF_DAILY_LEARNING_MODE, _CONF_LOAD_SHIFT, CONF_TRACK_C,
-                       "csv_auto_logging", CONF_ENABLE_LIFETIME_TRACKING):
+                       "csv_auto_logging", CONF_ENABLE_LIFETIME_TRACKING, _CONF_DEDICATED_WIND):
                 self._flow_data[_k] = bool(user_input.get(_k, False))
             if self._needs_feature_config_step():
                 return await self.async_step_feature_config()
@@ -478,7 +515,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # Explicitly write all boolean keys so that a False value is always
             # present in _flow_data even if HA omits it from user_input.
             for _k in (CONF_DAILY_LEARNING_MODE, _CONF_LOAD_SHIFT, CONF_TRACK_C,
-                       "csv_auto_logging", CONF_ENABLE_LIFETIME_TRACKING):
+                       "csv_auto_logging", CONF_ENABLE_LIFETIME_TRACKING, _CONF_DEDICATED_WIND):
                 self._flow_data[_k] = bool(user_input.get(_k, False))
             # Run aux migration here — CONF_AUX_AFFECTED_ENTITIES is on this page
             # and _flow_data now has the new value regardless of whether the

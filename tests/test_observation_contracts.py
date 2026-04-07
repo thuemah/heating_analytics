@@ -406,9 +406,10 @@ class TestDirectMeterModeFiltering:
         dm = DirectMeter("sensor.h1")
         assert dm.get_hourly_contribution(0, 0.05, self._log("guest_cooling")) is None
 
-    def test_cooling_excluded(self):
+    def test_cooling_included(self):
+        """Cooling participates in global model since #801."""
         dm = DirectMeter("sensor.h1")
-        assert dm.get_hourly_contribution(0, 0.05, self._log("cooling")) is None
+        assert dm.get_hourly_contribution(0, 0.05, self._log("cooling")) == 2.0
 
 
 class TestWeightedSmearModeFiltering:

@@ -73,6 +73,7 @@ class LearningManager:
         hourly_expected_base_per_unit = obs.unit_expected_base
         unit_modes = obs.unit_modes
         is_cooldown_active = obs.was_cooldown_active
+        solar_normalization_delta = obs.solar_normalization_delta
 
         # From ModelState
         correlation_data = model.correlation_data
@@ -151,12 +152,14 @@ class LearningManager:
         if model_updated:
             # --- Step 1: Learn Models ---
 
-            # Determine Global Mode for aggregate normalization
-            # Fallback to temp-based inference for global stats
-            global_mode = MODE_HEATING if avg_temp < balance_point else MODE_COOLING
-
+            # Saturation-aware solar normalization (#801).
+            # The solar_normalization_delta is pre-computed from per-unit
+            # saturation-aware solar impacts with correct mode signs:
+            #   delta = heating_solar_applied - cooling_solar_applied
+            # This eliminates the need for global_mode inference and correctly
+            # handles simultaneous heating+cooling units.
             if solar_enabled:
-                normalized_actual = solar_calculator.normalize_for_learning(total_energy_kwh, solar_impact, global_mode)
+                normalized_actual = max(0.0, total_energy_kwh + solar_normalization_delta)
             else:
                 normalized_actual = total_energy_kwh
 
@@ -912,13 +915,16 @@ class LearningManager:
                     strategy.set_distribution(dist_by_hour)
 
         # Compute normalised loss weights from hourly log weather data.
+        # Uses abs(delta_t) so cooling hours (outdoor > balance_point) also
+        # receive proportional weight (#792).  Solar multiplier is inverted
+        # for cooling: sun increases cooling load instead of reducing it.
         raw_weights: list[float] = []
         for h in range(24):
             log_h = log_by_hour.get(h, {})
             inertia_t = log_h.get("inertia_temp")
             raw_t = log_h.get("temp")
             outdoor = inertia_t if inertia_t is not None else (raw_t if raw_t is not None else balance_point)
-            delta_t = max(0.0, balance_point - outdoor)
+            delta_t = abs(balance_point - outdoor)
             eff_wind = log_h.get("effective_wind")
             effective_wind = eff_wind if eff_wind is not None else 0.0
             if effective_wind >= extreme_wind_threshold:
@@ -929,7 +935,13 @@ class LearningManager:
                 wind_factor = 1.0
             solar_f = log_h.get("solar_factor")
             solar_f = solar_f if solar_f is not None else 0.0
-            solar_mult = max(0.0, 1.0 - solar_f)
+            is_cooling_hour = outdoor > balance_point
+            if is_cooling_hour:
+                # Sun adds to cooling load — more sun = more weight
+                solar_mult = max(0.1, 1.0 + solar_f * 0.5)
+            else:
+                # Sun reduces heating load — more sun = less weight
+                solar_mult = max(0.0, 1.0 - solar_f)
             raw_weights.append(delta_t * wind_factor * solar_mult)
         total_weight = sum(raw_weights)
         norm_weights = [w / total_weight if total_weight > 0 else 1.0 / 24 for w in raw_weights]
@@ -967,6 +979,13 @@ class LearningManager:
                 contrib = strategy.get_hourly_contribution(h, weight, log_entry)
                 if contrib is not None:
                     total_kwh += contrib
+
+            # Apply saturation-aware solar normalization (#792).
+            # The delta was pre-computed during Track A and stored in the log.
+            # dark_actual = actual + (heating_solar_applied - cooling_solar_applied)
+            solar_delta = log_entry.get("solar_normalization_delta", 0.0)
+            if solar_delta:
+                total_kwh = max(0.0, total_kwh + solar_delta)
 
             if total_kwh <= 0.0:
                 continue

@@ -141,10 +141,10 @@ class ForecastManager:
                         if self.coordinator.solar_enabled:
                             condition = f.get("condition")
                             cloud_cov = DEFAULT_CLOUD_COVERAGE
-                            if condition and condition in CLOUD_COVERAGE_MAP:
-                                 cloud_cov = float(CLOUD_COVERAGE_MAP[condition])
-                            elif f.get("cloud_coverage") is not None:
+                            if f.get("cloud_coverage") is not None:
                                  cloud_cov = float(f.get("cloud_coverage"))
+                            elif condition and condition in CLOUD_COVERAGE_MAP:
+                                 cloud_cov = float(CLOUD_COVERAGE_MAP[condition])
 
                             elev, azim = self.coordinator.solar.get_approx_sun_pos(f_dt)
                             solar_factor = self.coordinator.solar.calculate_solar_factor(elev, azim, cloud_cov)
@@ -1069,10 +1069,10 @@ class ForecastManager:
         # Cloud
         condition = item.get("condition")
         forecast_cloud = default_cloud
-        if condition and condition in CLOUD_COVERAGE_MAP:
-            forecast_cloud = float(CLOUD_COVERAGE_MAP[condition])
-        elif item.get("cloud_coverage") is not None:
+        if item.get("cloud_coverage") is not None:
             forecast_cloud = float(item.get("cloud_coverage"))
+        elif condition and condition in CLOUD_COVERAGE_MAP:
+            forecast_cloud = float(CLOUD_COVERAGE_MAP[condition])
 
         # Use Inertia Value for Prediction Key
         temp_key = str(int(round(inertia_val)))
@@ -1173,7 +1173,9 @@ class ForecastManager:
         if self.coordinator.solar_enabled:
              condition = daily_item.get("condition")
              cloud_cov = DEFAULT_CLOUD_COVERAGE
-             if condition and condition in CLOUD_COVERAGE_MAP:
+             if daily_item.get("cloud_coverage") is not None:
+                 cloud_cov = float(daily_item.get("cloud_coverage"))
+             elif condition and condition in CLOUD_COVERAGE_MAP:
                  cloud_cov = float(CLOUD_COVERAGE_MAP[condition])
              s_factor = self.coordinator.solar.estimate_daily_avg_solar_factor(target_date, cloud_cov)
 

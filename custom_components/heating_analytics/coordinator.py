@@ -856,7 +856,12 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                         self._apply_strategies_to_global_model(day_entries, track_b_cop_dist)
                     else:
                         # Track B flattened daily bucket learning.
-                        q_hourly_avg = q_adjusted / 24.0
+                        # Apply accumulated solar normalization delta (#792).
+                        retrain_solar_delta = sum(
+                            e.get("solar_normalization_delta", 0.0) for e in day_entries
+                        )
+                        q_retrain_normalized = max(0.0, q_adjusted + retrain_solar_delta)
+                        q_hourly_avg = q_retrain_normalized / 24.0
                         avg_temp_retrain = sum(e.get("temp", 0.0) for e in day_entries) / len(day_entries)
                         daily_wind_retrain = sum(e.get("effective_wind", 0.0) for e in day_entries) / len(day_entries)
                         flat_temp_key = str(int(round(avg_temp_retrain)))
@@ -955,6 +960,227 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "skipped": skipped,
             }
 
+    def diagnose_model(self, days_back: int = 30) -> dict:
+        """Analyze the learned model and history for data quality issues.
+
+        Returns a diagnostic dict with monotonicity check, bucket
+        population, mode contamination, solar correlation, and
+        Track B specifics.  Designed as a service response.
+        """
+        from .const import MODES_EXCLUDED_FROM_GLOBAL_LEARNING
+
+        result: dict = {}
+
+        # --- 1. Monotonicity check per wind bucket ---
+        monotonicity: dict[str, dict] = {}
+        for wind_bucket in ("normal", "high_wind", "extreme_wind"):
+            # Collect (temp_key_int, kwh) pairs for this bucket.
+            points: list[tuple[int, float]] = []
+            for temp_key_str, buckets in self._correlation_data.items():
+                if wind_bucket in buckets:
+                    try:
+                        points.append((int(temp_key_str), buckets[wind_bucket]))
+                    except (ValueError, TypeError):
+                        continue
+            if len(points) < 2:
+                monotonicity[wind_bucket] = {
+                    "status": "insufficient_data",
+                    "points": len(points),
+                }
+                continue
+
+            points.sort(key=lambda p: p[0], reverse=True)  # warmest first
+            inversions = []
+            for i in range(len(points) - 1):
+                t_warm, kwh_warm = points[i]
+                t_cold, kwh_cold = points[i + 1]
+                if kwh_cold < kwh_warm:
+                    inversions.append({
+                        "from_temp": t_warm,
+                        "to_temp": t_cold,
+                        "kwh_warm": round(kwh_warm, 4),
+                        "kwh_cold": round(kwh_cold, 4),
+                        "delta": round(kwh_warm - kwh_cold, 4),
+                    })
+            monotonicity[wind_bucket] = {
+                "status": "monotonic" if not inversions else "inversions_found",
+                "points": len(points),
+                "temp_range": [points[-1][0], points[0][0]],
+                "inversions": inversions,
+            }
+        result["monotonicity"] = monotonicity
+
+        # --- 2. Bucket population ---
+        bucket_pop: dict[str, dict] = {}
+        total_observations = 0
+        for temp_key_str, buckets in self._correlation_data.items():
+            for wind_bucket, kwh in buckets.items():
+                if wind_bucket not in bucket_pop:
+                    bucket_pop[wind_bucket] = {"count": 0, "temp_keys": []}
+                bucket_pop[wind_bucket]["count"] += 1
+                bucket_pop[wind_bucket]["temp_keys"].append(temp_key_str)
+                total_observations += 1
+
+        # Check for under-sampled buckets via learning buffers.
+        buffered_buckets = 0
+        for temp_key_str, buckets in self._learning_buffer_global.items():
+            for wind_bucket, samples in buckets.items():
+                if samples:
+                    buffered_buckets += 1
+
+        bucket_summary = {
+            "total_buckets_learned": total_observations,
+            "buffered_pending": buffered_buckets,
+            "per_wind_bucket": {
+                wb: {"bucket_count": info["count"], "temp_range": [
+                    min(info["temp_keys"], key=int) if info["temp_keys"] else None,
+                    max(info["temp_keys"], key=int) if info["temp_keys"] else None,
+                ]}
+                for wb, info in bucket_pop.items()
+            },
+        }
+        result["bucket_population"] = bucket_summary
+
+        # --- 3. Mode contamination (from hourly log) ---
+        from homeassistant.util import dt as dt_util
+        cutoff = None
+        if days_back:
+            now = dt_util.now()
+            cutoff_str = (now - timedelta(days=days_back)).date().isoformat()
+
+        mode_stats: dict[str, dict[str, int]] = {}
+        total_hours = 0
+        excluded_kwh_total = 0.0
+
+        for entry in self._hourly_log:
+            ts = entry.get("timestamp", "")
+            if cutoff_str and ts[:10] < cutoff_str:
+                continue
+            total_hours += 1
+            day = ts[:10]
+            if day not in mode_stats:
+                mode_stats[day] = {"total_hours": 0, "excluded_hours": 0, "excluded_kwh": 0.0, "modes": {}}
+            mode_stats[day]["total_hours"] += 1
+
+            unit_modes = entry.get("unit_modes", {})
+            breakdown = entry.get("unit_breakdown", {})
+            for sid, kwh in breakdown.items():
+                mode = unit_modes.get(sid, "heating")
+                if mode != "heating":
+                    mode_stats[day]["modes"][mode] = mode_stats[day]["modes"].get(mode, 0) + 1
+                if mode in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
+                    mode_stats[day]["excluded_hours"] += 1
+                    mode_stats[day]["excluded_kwh"] += kwh
+                    excluded_kwh_total += kwh
+
+        # Summarize — only report days with excluded energy.
+        contaminated_days = {
+            day: stats for day, stats in mode_stats.items()
+            if stats["excluded_hours"] > 0
+        }
+        result["mode_contamination"] = {
+            "days_analyzed": len(mode_stats),
+            "total_hours_analyzed": total_hours,
+            "contaminated_days": len(contaminated_days),
+            "total_excluded_kwh": round(excluded_kwh_total, 2),
+            "details": dict(sorted(contaminated_days.items())[-10:]),  # Last 10 affected days
+        }
+
+        # --- 4. Solar correlation ---
+        # Use a low threshold (> 0.01) to capture any hour with measurable solar.
+        # The 0.05 threshold used in learning is too strict for diagnostics —
+        # we want to see if there's ANY solar signal in the data.
+        solar_errors: list[tuple[float, float]] = []
+        for entry in self._hourly_log:
+            ts = entry.get("timestamp", "")
+            if cutoff_str and ts[:10] < cutoff_str:
+                continue
+            solar_f = entry.get("solar_factor")
+            actual = entry.get("actual_kwh")
+            expected = entry.get("expected_kwh")
+            if solar_f is not None and actual is not None and expected is not None and solar_f > 0.01:
+                solar_errors.append((solar_f, actual - expected))
+
+        solar_diag: dict = {"qualifying_hours": len(solar_errors)}
+
+        # Report max solar_factor seen in the period regardless of qualification.
+        all_solar_factors = [
+            entry.get("solar_factor", 0.0) for entry in self._hourly_log
+            if (not cutoff_str or entry.get("timestamp", "")[:10] >= cutoff_str)
+            and entry.get("solar_factor") is not None
+        ]
+        if all_solar_factors:
+            solar_diag["max_solar_factor_in_period"] = round(max(all_solar_factors), 3)
+            solar_diag["hours_with_any_solar"] = sum(1 for f in all_solar_factors if f > 0.0)
+
+        if len(solar_errors) >= 10:
+            avg_solar = sum(s for s, _ in solar_errors) / len(solar_errors)
+            avg_error = sum(e for _, e in solar_errors) / len(solar_errors)
+            # Simple correlation: positive = solar hours have positive error (under-predicted solar reduction)
+            n = len(solar_errors)
+            mean_s = avg_solar
+            mean_e = avg_error
+            cov = sum((s - mean_s) * (e - mean_e) for s, e in solar_errors) / n
+            var_s = sum((s - mean_s) ** 2 for s, _ in solar_errors) / n
+            var_e = sum((e - mean_e) ** 2 for _, e in solar_errors) / n
+            denom = (var_s * var_e) ** 0.5
+            correlation = round(cov / denom, 3) if denom > 0 else 0.0
+            solar_diag["correlation_solar_vs_error"] = correlation
+            solar_diag["avg_solar_factor"] = round(avg_solar, 3)
+            solar_diag["avg_error_kwh"] = round(avg_error, 3)
+            solar_diag["interpretation"] = (
+                "Positive correlation: solar hours have higher-than-expected consumption — solar model may be over-subtracting."
+                if correlation > 0.15 else
+                "Negative correlation: solar hours have lower-than-expected consumption — solar model may be under-subtracting."
+                if correlation < -0.15 else
+                "No significant correlation — solar model appears well-calibrated."
+            )
+        result["solar_correlation"] = solar_diag
+
+        # --- 5. Track B diagnostics ---
+        track_b_days: list[dict] = []
+        for day_key, day_data in sorted(self._daily_history.items()):
+            if cutoff_str and day_key < cutoff_str:
+                continue
+            if "kwh" not in day_data:
+                continue
+            track_b_entry: dict = {
+                "date": day_key,
+                "raw_kwh": round(day_data["kwh"], 2),
+                "temp_avg": round(day_data.get("temp", 0.0), 1),
+                "tdd": round(day_data.get("tdd", 0.0), 2),
+                "wind_avg": round(day_data.get("wind", 0.0), 1),
+            }
+            if "track_c_kwh" in day_data:
+                track_b_entry["track_c_kwh"] = round(day_data["track_c_kwh"], 2)
+                track_b_entry["track"] = "C"
+            elif "track_b_cop_distribution" in day_data:
+                track_b_entry["track"] = "B_cop_smeared"
+            else:
+                track_b_entry["track"] = "B_flat" if self.daily_learning_mode else "A"
+            if "midnight_indoor_temp" in day_data:
+                track_b_entry["midnight_indoor_temp"] = day_data["midnight_indoor_temp"]
+            track_b_days.append(track_b_entry)
+
+        result["daily_history"] = {
+            "days": len(track_b_days),
+            "entries": track_b_days[-30:],  # Last 30 days
+        }
+
+        result["config_summary"] = {
+            "daily_learning_mode": self.daily_learning_mode,
+            "track_c_enabled": self.track_c_enabled,
+            "balance_point": self.balance_point,
+            "learning_rate": self.learning_rate,
+            "wind_threshold": self.wind_threshold,
+            "extreme_wind_threshold": self.extreme_wind_threshold,
+            "solar_enabled": self.solar_enabled,
+            "learned_u_coefficient": round(self._learned_u_coefficient, 4) if self._learned_u_coefficient else None,
+            "energy_sensors": self.energy_sensors,
+        }
+
+        return result
+
     def _get_float_state(self, entity_id: str) -> float | None:
         """Helper to get float state from an entity."""
         if not entity_id:
@@ -985,7 +1211,22 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             except ValueError:
                 pass
 
-        # Fallback: Map condition state
+        # Fallback: Map condition state — warn once per hour.
+        # Condition-text mapping (e.g. "sunny" → 10%) is too coarse for
+        # reliable solar coefficient learning.  Numeric cloud_coverage from
+        # the weather entity is strongly recommended.
+        now = dt_util.now()
+        last_warn = getattr(self, '_cloud_coverage_warn_time', None)
+        if last_warn is None or (now - last_warn).total_seconds() >= 3600:
+            _LOGGER.warning(
+                "Weather entity '%s' does not provide numeric cloud_coverage attribute. "
+                "Falling back to condition-text mapping which significantly reduces solar "
+                "model accuracy. Consider switching to a weather integration that provides "
+                "cloud_coverage (e.g. Met.no or the custom Open-Meteo fork).",
+                self.weather_entity,
+            )
+            self._cloud_coverage_warn_time = now
+
         condition = state.state
         if condition in CLOUD_COVERAGE_MAP:
             return float(CLOUD_COVERAGE_MAP[condition])
@@ -1225,6 +1466,16 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Get current sun elevation and azimuth from HA."""
         sun_state = self.hass.states.get("sun.sun")
         if not sun_state:
+            if self.solar_enabled:
+                now = dt_util.now()
+                last_warn = getattr(self, '_sun_entity_warn_time', None)
+                if last_warn is None or (now - last_warn).total_seconds() >= 3600:
+                    _LOGGER.warning(
+                        "sun.sun entity is unavailable — solar model is disabled. "
+                        "All solar factors will be zero until the entity recovers. "
+                        "Check that the Sun integration is enabled in HA."
+                    )
+                    self._sun_entity_warn_time = now
             return 0.0, 0.0
 
         try:
@@ -1892,6 +2143,17 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         # Fetch Humidity (for Track C per-hour COP / defrost penalty)
         humidity = self._get_weather_attribute("humidity")
+        if humidity is None and self.track_c_enabled:
+            now = dt_util.now()
+            last_warn = getattr(self, '_humidity_warn_time', None)
+            if last_warn is None or (now - last_warn).total_seconds() >= 3600:
+                _LOGGER.warning(
+                    "Weather entity '%s' does not provide humidity data. "
+                    "Track C per-hour COP defrost penalty will use 50%% default, "
+                    "which may over- or under-trigger defrost compensation.",
+                    self.weather_entity,
+                )
+                self._humidity_warn_time = now
 
         # Fetch Solar Data
         potential_solar_factor = 0.0
@@ -1916,6 +2178,15 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         if wind_speed is None:
             wind_speed = 0.0
+            now = dt_util.now()
+            last_warn = getattr(self, '_wind_speed_warn_time', None)
+            if last_warn is None or (now - last_warn).total_seconds() >= 3600:
+                _LOGGER.warning(
+                    "Wind speed data unavailable from configured source. "
+                    "Defaulting to 0.0 m/s — all hours will land in the 'normal' "
+                    "wind bucket, disabling wind differentiation in the model."
+                )
+                self._wind_speed_warn_time = now
 
         # Calculate Inertia & Temp Keys EARLY (Moved from Step 4)
         # We need these for Solar Impact calculation and other model lookups
@@ -2355,6 +2626,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         recommendation_state: str = "none",
         correction_percent: float = 0.0,
         potential_solar_factor: float = 0.0,
+        solar_normalization_delta: float = 0.0,
     ) -> "HourlyObservation":
         """Build an immutable HourlyObservation from current coordinator state.
 
@@ -2421,6 +2693,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             correction_percent=correction_percent,
             potential_solar_factor=potential_solar_factor,
             was_cooldown_active=was_cooldown_active,
+            solar_normalization_delta=solar_normalization_delta,
         )
 
     @property
@@ -2714,8 +2987,16 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Use the authoritative calculation from statistics which correctly applies saturation
         # (Solar cannot reduce consumption below zero or below base - aux)
         solar_impact = 0.0
+        solar_normalization_delta = 0.0
         if self.solar_enabled:
             solar_impact = res_analysis["breakdown"]["solar_reduction_kwh"]
+            # Saturation-aware solar delta for global model normalization (#801).
+            # Heating solar was subtracted from demand; cooling solar was added.
+            # To normalize to dark-sky: add heating solar back, subtract cooling solar.
+            solar_normalization_delta = (
+                res_analysis["breakdown"].get("solar_heating_applied_kwh", 0.0)
+                - res_analysis["breakdown"].get("solar_cooling_applied_kwh", 0.0)
+            )
             # Update global attr for consistency
             self.data[ATTR_SOLAR_IMPACT] = round(solar_impact, 3)
 
@@ -2797,6 +3078,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 recommendation_state=rec_state_avg,
                 correction_percent=round(actual_correction, 1),
                 potential_solar_factor=round(potential_factor_avg, 3),
+                solar_normalization_delta=solar_normalization_delta,
             )
 
             # Delegate Learning to LearningManager (#775 Phase 3)
@@ -2920,6 +3202,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "recommendation_state": rec_state_avg,
                 "correction_percent": round(actual_correction, 1),
                 "potential_solar_factor": round(potential_factor_avg, 3),
+                "solar_normalization_delta": round(solar_normalization_delta, 5),
                 # Only filter out MODE_HEATING (the true default) to reduce log clutter
                 # Cooling, off, and guest modes MUST be logged for correct historical reconstruction
                 "unit_modes": {
@@ -2972,6 +3255,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         solar_impact = sum(e.get("solar_impact_kwh", 0.0) for e in day_logs)
         aux_impact = sum(e.get("aux_impact_kwh", 0.0) for e in day_logs)
         guest_impact = sum(e.get("guest_impact_kwh", 0.0) for e in day_logs)
+        solar_norm_delta_total = sum(e.get("solar_normalization_delta", 0.0) for e in day_logs)
 
         # Sum thermodynamic gross values
         thermodynamic_gross_from_logs = sum(e.get("thermodynamic_gross_kwh", 0.0) for e in day_logs)
@@ -3031,6 +3315,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         }
         if self.solar_enabled:
             hourly_vectors["solar_rad"] = [None] * 24
+            hourly_vectors["solar_norm_delta"] = [None] * 24
 
         # Hour Collision Fix: Aggregate instead of overwrite
         # Iterate over hour slots (0-23) and aggregate all entries for that hour.
@@ -3060,6 +3345,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             hourly_vectors["actual_kwh"][hour] = sum_load
             if self.solar_enabled:
                 hourly_vectors["solar_rad"][hour] = hourly_avg_solar
+                # Sum (not average) — delta is an energy correction, not a rate
+                hourly_vectors["solar_norm_delta"][hour] = sum(
+                    e.get("solar_normalization_delta", 0.0) for e in hour_entries
+                )
 
         # Provenance (Last one wins)
         last_entry = day_logs[-1]
@@ -3074,6 +3363,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             "aux_impact_kwh": round(aux_impact, 2),
             "solar_impact_kwh": round(solar_impact, 2),
             "guest_impact_kwh": round(guest_impact, 2),
+            "solar_normalization_delta": round(solar_norm_delta_total, 5),
             "thermodynamic_gross_kwh": round(thermodynamic_gross_kwh, 2),
             "tdd": round(total_tdd, 1),
             "temp": round(avg_temp, 1),
@@ -3307,7 +3597,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
             weather_data.append({
                 "datetime": record["datetime"],
-                "delta_t": max(0.0, self.balance_point - outdoor_temp),
+                "delta_t": abs(self.balance_point - outdoor_temp),
+                "is_cooling": outdoor_temp > self.balance_point,
                 "wind_factor": wind_factor,
                 "solar_factor": solar_factor,
                 "outdoor_temp": raw_outdoor,
@@ -3432,7 +3723,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             ts = log_h.get("timestamp", f"{date_key}T{h:02d}:00:00")
             weather_data.append({
                 "datetime": ts,
-                "delta_t": max(0.0, self.balance_point - outdoor),
+                "delta_t": abs(self.balance_point - outdoor),
+                "is_cooling": outdoor > self.balance_point,
                 "wind_factor": wind_factor,
                 "solar_factor": solar_factor,
                 "outdoor_temp": raw_outdoor,
@@ -3547,16 +3839,24 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if self.indoor_temp_sensor:
             current_indoor_temp = self._get_float_state(self.indoor_temp_sensor)
 
-        # Mode filtering (#789): exclude OFF/DHW/Guest/Cooling energy from
+        # Mode filtering (#789): exclude OFF/DHW/Guest energy from
         # daily learning so Track B/C match Track A's filtering semantics.
+        # Cooling is included since #801 (saturation-aware solar normalization).
         excluded_mode_kwh = self._compute_excluded_mode_energy(day_logs) if day_logs else 0.0
         q_adjusted = daily_stats["kwh"] - excluded_mode_kwh
         track_c_distribution = None
 
+        # Accumulate solar normalization delta over all hours (#792).
+        # Used by Track B flat daily to normalize q_adjusted to dark-sky.
+        daily_solar_delta = 0.0
+        if day_logs:
+            for entry in day_logs:
+                daily_solar_delta += entry.get("solar_normalization_delta", 0.0)
+
         if excluded_mode_kwh > 0.0:
             _LOGGER.debug(
                 "Daily mode filter (#789): excluded %.3f kWh "
-                "(OFF/DHW/Guest/Cooling) from %.2f kWh total.",
+                "(OFF/DHW/Guest) from %.2f kWh total.",
                 excluded_mode_kwh, daily_stats["kwh"],
             )
 
@@ -3622,7 +3922,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                         _LOGGER.info(f"Track B COP-smeared: {cop_smeared} bucket updates from 24 hours.")
                     else:
                         # Flat fallback: single q_adjusted/24 to one bucket.
-                        q_hourly_avg = q_adjusted / 24.0
+                        # Apply accumulated solar normalization delta (#792).
+                        q_solar_normalized = max(0.0, q_adjusted + daily_solar_delta)
+                        q_hourly_avg = q_solar_normalized / 24.0
                         avg_temp = daily_stats["temp"]
                         daily_wind = daily_stats["wind"]
                         flat_temp_key = str(int(round(avg_temp)))

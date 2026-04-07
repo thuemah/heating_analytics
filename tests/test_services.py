@@ -72,8 +72,9 @@ async def test_exit_cooldown_service_call(hass, mock_entry):
 
             assert handler is not None, "Service handler was not captured"
 
-            # Simulate Service Call
+            # Simulate Service Call (no entity_id → first-available fallback)
             call = MagicMock()
+            call.data = {}
             await handler(call)
 
             # Verify coordinator method called

@@ -17,14 +17,14 @@ graph TD
     Coordinator -- "ModelState" --> Forecast[ForecastManager]
     Coordinator --> Solar[SolarCalculator]
     Coordinator --> Storage[StorageManager]
-    Coordinator --> Strategies[LearningStrategies]
 
     Statistics --> Output[Sensor State]
     Forecast --> Output
 
     subgraph "Core Logic"
     Statistics -- "Thermodynamics" --> Model[Global Energy Model]
-    Learning -- "Updates" --> Model
+    Learning -- "Hourly EMA" --> Model
+    Learning -- "Daily Strategies" --> Model
     Solar -- "Corrections" --> Model
     Strategies -- "Daily Learning" --> Model
     end
@@ -37,7 +37,8 @@ The observation → learning pipeline communicates through explicit typed contra
 *   **`HourlyObservation`** (frozen dataclass): Immutable snapshot of one completed hour — weather averages, energy totals, per-unit breakdowns, aux/solar state. Produced by `ObservationCollector` at each hour boundary.
 *   **`ModelState`** (dataclass): Reference-based view of the learned model — correlation tables, aux/solar coefficients, learning buffers. Consumers read via `coordinator.model`; only the learning layer mutates the underlying dicts.
 *   **`LearningConfig`** (frozen dataclass): Per-hour learning settings — rates, eligibility flags, service dependencies.
-*   **`LearningStrategy`** (protocol): Per-unit strategy for daily learning with two implementations: `DirectMeter` (actual per-hour kWh) and `WeightedSmear` (COP-corrected synthetic baseline from Track C).
+*   **`LearningStrategy`** (protocol): Per-unit strategy for daily learning with two implementations: `DirectMeter` (actual per-hour kWh) and `WeightedSmear` (COP-corrected synthetic baseline from Track C). Both implementations perform mode filtering (#789): units in `MODES_EXCLUDED_FROM_GLOBAL_LEARNING` (OFF, DHW, Guest) return `None` for that hour. Cooling participates in the global model with correct solar normalization (#801).
+*   **`CopParams`** (TypedDict in `thermodynamics.py`): MPC COP model parameters — `eta_carnot` and `lwt` (required), `f_defrost`, `defrost_temp_threshold`, `defrost_rh_threshold` (optional with defaults).
 
 ### Components
 
@@ -104,12 +105,12 @@ The system changes its prediction strategy based on the severity of the weather 
 
 1.  **Cold Regime (TDD > 4.0):**
     *   **Physics Dominates:** Heat loss is linear and predictable.
-    *   **Strategy:** If a specific wind/temp bucket is empty, the model uses **Ratio Extrapolation** (`New_Energy = Neighbor_Energy * (New_TDD / Neighbor_TDD)`).
-    *   **Constraint:** Strict thermodynamic checks prevent extrapolation from noisy data.
+    *   **Strategy:** Skips neighbor averaging entirely and forces **Ratio Extrapolation** (`New_Energy = Neighbor_Energy * (New_TDD / Neighbor_TDD)`). This is unconditional in Cold regime — the model always scales thermodynamically.
+    *   **Constraint:** Strict guard: source delta-T must exceed 1.0 to prevent extrapolation from noisy near-balance data.
 
 2.  **Mild Regime (TDD <= 4.0):**
     *   **Noise Dominates:** Solar, wind, and internal gains (cooking, people) have a huge relative impact.
-    *   **Strategy:** **Nearest Neighbor Averaging**. It prioritizes finding a similar temperature day (+/- 1°C) over trying to scale the energy mathematically. TDD scaling is forbidden here as `0.1 TDD` vs `0.2 TDD` is a 100% math difference but physically irrelevant.
+    *   **Strategy:** Three-step fallback chain: (1) **Nearest Neighbor Averaging** (+/- 1°C, same wind bucket), (2) **Wind Fallback** (same temp, relaxed wind bucket: extreme → high → normal), (3) **Thermodynamic Scaling** as final fallback (guard: source delta-T > 0.5). Neighbor averaging is prioritized because small TDD differences are physically irrelevant but mathematically noisy.
 
 #### Typical Day Normalization
 When calculating "Typical Daily Consumption" (Median) for a given temperature, the system applies **Normalization Logic** to ensure all days are comparable.
@@ -366,7 +367,7 @@ When reconstructing historical data (e.g., for model comparison), the system pri
 To maximize both short-term precision and long-term stability, the system implements a **Blended Forecast Strategy** that combines two weather providers.
 
 1.  **Primary Provider:** (e.g., Local Sensor or Met.no) Used for the immediate future (Days 1 to X). Provides high-resolution, local accuracy.
-2.  **Secondary Provider:** (e.g., Open-Meteo) Used for the long-term (Days X+1 to 7). Provides stable, consistent trends where local sensors might drift or fail.
+2.  **Secondary Provider:** (e.g., Open-Meteo) Used for the long-term (Days X+1 to 14). Provides stable, consistent trends where local sensors might drift or fail.
 3.  **Crossover Point:** Configurable via `Forecast Crossover Day`.
 
 ### B. Provenance Tracking (Accuracy Attribution)

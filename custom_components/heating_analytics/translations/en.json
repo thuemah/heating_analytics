@@ -54,29 +54,25 @@
           "daily_learning_mode": "Daily Learning Mode (Track B)",
           "overnight_load_shift_correction": "Overnight Load Shift Correction",
           "track_c_enabled": "Thermodynamic Baseline (Track C)",
-          "wind_gust_factor": "Wind Gust Factor",
-          "wind_threshold": "High Wind Threshold",
-          "extreme_wind_threshold": "Extreme Wind Threshold",
-          "max_energy_delta": "Spike Protection Threshold",
           "aux_affected_entities": "Auxiliary Affected Units",
-          "csv_auto_logging": "Enable CSV Logging",
           "enable_lifetime_tracking": "Track Lifetime Statistics",
+          "use_dedicated_wind_sensor": "Use Dedicated Wind Sensor",
           "secondary_weather_entity": "Secondary Weather Provider",
-          "forecast_crossover_day": "Forecast Crossover Day"
+          "forecast_crossover_day": "Forecast Crossover Day",
+          "csv_auto_logging": "Enable CSV Logging",
+          "max_energy_delta": "Spike Protection Threshold"
         },
         "data_description": {
           "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Only recommended for homes with very high thermal mass (concrete/stone) or heat pumps with a high minimum modulation level. Significantly slows down the learning curve — full model characterisation may take an entire heating season.",
           "overnight_load_shift_correction": "WARNING: Only enable if you actively pre-heat or pre-cool across the midnight boundary (e.g. cheap-rate overnight charging). This corrects the daily energy total for heat stored in the building structure before midnight. If you do not do deliberate overnight load shifting, leave this OFF — enabling it incorrectly will skew the learned model. Requires Daily Learning Mode.",
           "track_c_enabled": "Enables the Track C Midnight Sync engine. Instead of using raw electrical consumption as the learning baseline, Heating Analytics fetches actual delivered thermal energy from the MPC and redistributes (smears) it across 24 hours proportionally to weather-driven heat loss. This eliminates the feedback loop caused by overnight load shifting. Requires Daily Learning Mode to be active and a connected heatpump_mpc integration.",
-          "wind_gust_factor": "Controls the impact of wind gusts on heat loss calculations. 0.0 ignores gusts entirely; 1.0 applies them fully. Older or draughty buildings often benefit from a higher value.",
-          "wind_threshold": "Outdoor wind speed above which the high-wind correction model is applied.",
-          "extreme_wind_threshold": "Outdoor wind speed above which the extreme-wind correction model is applied.",
-          "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
           "aux_affected_entities": "Which heating units are supplemented by auxiliary heat sources (e.g. a wood stove). Defaults to all units if left empty.",
-          "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
           "enable_lifetime_tracking": "Maintain a cumulative history of total energy usage. Increases storage usage over time.",
+          "use_dedicated_wind_sensor": "Override weather entity wind data with a dedicated sensor. Not recommended — local sensors near buildings are affected by turbulence and shielding, producing systematically low readings. Weather entity wind data is preferred.",
           "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting). Useful for validating a new weather source before switching.",
-          "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions."
+          "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions.",
+          "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
+          "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model."
         }
       },
       "feature_config": {
@@ -86,6 +82,12 @@
           "indoor_temp_sensor": "Indoor Temperature Sensor",
           "thermal_mass_kwh_per_degree": "Thermal Mass Factor (kWh/°C)",
           "mpc_entry_id": "Heat Pump MPC Instance",
+          "mpc_managed_sensor": "MPC Managed Sensor",
+          "wind_speed_sensor": "Wind Speed Sensor",
+          "wind_gust_sensor": "Wind Gust Sensor",
+          "wind_gust_factor": "Wind Gust Factor",
+          "wind_threshold": "High Wind Threshold",
+          "extreme_wind_threshold": "Extreme Wind Threshold",
           "csv_hourly_path": "Hourly Log Path",
           "csv_daily_path": "Daily Log Path"
         },
@@ -93,6 +95,12 @@
           "indoor_temp_sensor": "Optional. Measures indoor temperature changes to calculate how much energy is stored in the building structure overnight.",
           "thermal_mass_kwh_per_degree": "Compensates for heat stored in the building structure during indoor temperature changes. Rule of thumb: (Floor_m² × 35) / 1000 / avg_COP. Example: 250 m² house with COP 3.0 ≈ 2.9 kWh/°C. Leave at 0.0 to disable.",
           "mpc_entry_id": "Select the Heat Pump MPC integration instance to read thermal data from. Required when multiple MPC instances are installed.",
+          "mpc_managed_sensor": "Which energy sensor is managed by the MPC. Its meter data is time-shifted by load scheduling and will use synthetic baseline instead of direct readings.",
+          "wind_speed_sensor": "Dedicated wind speed sensor. Not recommended for most installations.",
+          "wind_gust_sensor": "Dedicated wind gust sensor.",
+          "wind_gust_factor": "Controls the impact of wind gusts on heat loss calculations. 0.0 ignores gusts entirely; 1.0 applies them fully. Older or draughty buildings often benefit from a higher value.",
+          "wind_threshold": "Outdoor wind speed above which the high-wind correction model is applied.",
+          "extreme_wind_threshold": "Outdoor wind speed above which the extreme-wind correction model is applied.",
           "csv_hourly_path": "File path for the hourly CSV log.",
           "csv_daily_path": "File path for the daily CSV log."
         }
@@ -142,29 +150,25 @@
           "daily_learning_mode": "Daily Learning Mode (Track B)",
           "overnight_load_shift_correction": "Overnight Load Shift Correction",
           "track_c_enabled": "Thermodynamic Baseline (Track C)",
-          "wind_gust_factor": "Wind Gust Factor",
-          "wind_threshold": "High Wind Threshold",
-          "extreme_wind_threshold": "Extreme Wind Threshold",
-          "max_energy_delta": "Spike Protection Threshold",
           "aux_affected_entities": "Auxiliary Affected Units",
-          "csv_auto_logging": "Enable CSV Logging",
           "enable_lifetime_tracking": "Track Lifetime Statistics",
+          "use_dedicated_wind_sensor": "Use Dedicated Wind Sensor",
           "secondary_weather_entity": "Secondary Weather Provider",
-          "forecast_crossover_day": "Forecast Crossover Day"
+          "forecast_crossover_day": "Forecast Crossover Day",
+          "csv_auto_logging": "Enable CSV Logging",
+          "max_energy_delta": "Spike Protection Threshold"
         },
         "data_description": {
           "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Only recommended for homes with very high thermal mass (concrete/stone) or heat pumps with a high minimum modulation level. Significantly slows down the learning curve — full model characterisation may take an entire heating season.",
           "overnight_load_shift_correction": "WARNING: Only enable if you actively pre-heat or pre-cool across the midnight boundary (e.g. cheap-rate overnight charging). This corrects the daily energy total for heat stored in the building structure before midnight. If you do not do deliberate overnight load shifting, leave this OFF — enabling it incorrectly will skew the learned model. Requires Daily Learning Mode.",
           "track_c_enabled": "Enables the Track C Midnight Sync engine. Instead of using raw electrical consumption as the learning baseline, Heating Analytics fetches actual delivered thermal energy from the MPC and redistributes (smears) it across 24 hours proportionally to weather-driven heat loss. This eliminates the feedback loop caused by overnight load shifting. Requires Daily Learning Mode to be active and a connected heatpump_mpc integration.",
-          "wind_gust_factor": "Controls the impact of wind gusts on heat loss calculations. 0.0 ignores gusts entirely; 1.0 applies them fully. Older or draughty buildings often benefit from a higher value.",
-          "wind_threshold": "Outdoor wind speed above which the high-wind correction model is applied.",
-          "extreme_wind_threshold": "Outdoor wind speed above which the extreme-wind correction model is applied.",
-          "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
           "aux_affected_entities": "Which heating units are supplemented by auxiliary heat sources (e.g. a wood stove). Defaults to all units if left empty.",
-          "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
           "enable_lifetime_tracking": "Maintain a cumulative history of total energy usage. Increases storage usage over time.",
+          "use_dedicated_wind_sensor": "Override weather entity wind data with a dedicated sensor. Not recommended — local sensors near buildings are affected by turbulence and shielding, producing systematically low readings. Weather entity wind data is preferred.",
           "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting). Useful for validating a new weather source before switching.",
-          "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions."
+          "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions.",
+          "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
+          "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model."
         }
       },
       "reconfigure_feature_config": {
@@ -174,6 +178,12 @@
           "indoor_temp_sensor": "Indoor Temperature Sensor",
           "thermal_mass_kwh_per_degree": "Thermal Mass Factor (kWh/°C)",
           "mpc_entry_id": "Heat Pump MPC Instance",
+          "mpc_managed_sensor": "MPC Managed Sensor",
+          "wind_speed_sensor": "Wind Speed Sensor",
+          "wind_gust_sensor": "Wind Gust Sensor",
+          "wind_gust_factor": "Wind Gust Factor",
+          "wind_threshold": "High Wind Threshold",
+          "extreme_wind_threshold": "Extreme Wind Threshold",
           "csv_hourly_path": "Hourly Log Path",
           "csv_daily_path": "Daily Log Path"
         },
@@ -181,6 +191,12 @@
           "indoor_temp_sensor": "Optional. Measures indoor temperature changes to calculate how much energy is stored in the building structure overnight.",
           "thermal_mass_kwh_per_degree": "Compensates for heat stored in the building structure during indoor temperature changes. Rule of thumb: (Floor_m² × 35) / 1000 / avg_COP. Example: 250 m² house with COP 3.0 ≈ 2.9 kWh/°C. Leave at 0.0 to disable.",
           "mpc_entry_id": "Select the Heat Pump MPC integration instance to read thermal data from. Required when multiple MPC instances are installed.",
+          "mpc_managed_sensor": "Which energy sensor is managed by the MPC. Its meter data is time-shifted by load scheduling and will use synthetic baseline instead of direct readings.",
+          "wind_speed_sensor": "Dedicated wind speed sensor. Not recommended for most installations.",
+          "wind_gust_sensor": "Dedicated wind gust sensor.",
+          "wind_gust_factor": "Controls the impact of wind gusts on heat loss calculations. 0.0 ignores gusts entirely; 1.0 applies them fully. Older or draughty buildings often benefit from a higher value.",
+          "wind_threshold": "Outdoor wind speed above which the high-wind correction model is applied.",
+          "extreme_wind_threshold": "Outdoor wind speed above which the extreme-wind correction model is applied.",
           "csv_hourly_path": "File path for the hourly CSV log.",
           "csv_daily_path": "File path for the daily CSV log."
         }

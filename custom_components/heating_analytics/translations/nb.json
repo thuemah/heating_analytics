@@ -54,29 +54,25 @@
           "daily_learning_mode": "Daglig læringsmodus (Track B)",
           "overnight_load_shift_correction": "Nattlig lastforskyvningskorreksjon",
           "track_c_enabled": "Termodynamisk grunnlinje (Track C)",
-          "wind_gust_factor": "Vindkastfaktor",
-          "wind_threshold": "Grense for sterk vind",
-          "extreme_wind_threshold": "Grense for ekstrem vind",
-          "max_energy_delta": "Terskel for pigg-beskyttelse",
           "aux_affected_entities": "Enheter påvirket av hjelpevarmekilde",
-          "csv_auto_logging": "Aktiver CSV-logging",
           "enable_lifetime_tracking": "Spor livsløpsstatistikk",
+          "use_dedicated_wind_sensor": "Bruk dedikert vindsensor",
           "secondary_weather_entity": "Sekundær værtjeneste",
-          "forecast_crossover_day": "Dag for prognosebytte"
+          "forecast_crossover_day": "Dag for prognosebytte",
+          "csv_auto_logging": "Aktiver CSV-logging",
+          "max_energy_delta": "Terskel for pigg-beskyttelse"
         },
         "data_description": {
           "daily_learning_mode": "Når aktivert lærer modellen én gang per dag ved midnatt (Track B) i stedet for hver time (Track A). Anbefales kun for boliger med svært høy termisk masse (betong/stein) eller varmepumper med høy minimumsmodulering. Senker læringshastigheten betydelig — full karakterisering av varmekurven kan ta en hel varmesesong.",
           "overnight_load_shift_correction": "ADVARSEL: Aktiver kun hvis du aktivt forvarmer eller kjøler på tvers av midnattsgrensen (f.eks. billigstrøm om natten). Korrigerer dagens energitotale for varme lagret i bygningsmassen før midnatt. Hvis du ikke driver med bevisst lastforskyvning over midnatt, la dette være AV — feil aktivering forvrenger den innlærte modellen. Krever Daglig læringsmodus.",
           "track_c_enabled": "Aktiverer Track C Midnattssynkronisering. I stedet for å bruke råt elektrisk forbruk som læringsgrunnlag henter Heating Analytics faktisk levert termisk energi fra MPC-en og fordeler (smører) den over 24 timer proporsjonalt med værdrevet varmetap. Dette eliminerer tilbakekoblingseffekten som oppstår ved nattlig lastforskyvning. Krever at Daglig læringsmodus er aktivert og at en heatpump_mpc-integrasjon er installert.",
-          "wind_gust_factor": "Styrer vindkastenes påvirkning på varmetapsberegningene. 0,0 ignorerer kastene helt; 1,0 bruker dem fullt ut. Eldre eller trekkfulle bygg tjener ofte på en høyere verdi.",
-          "wind_threshold": "Utendørs vindhastighet over grensen aktiverer sterk-vind-korreksjon.",
-          "extreme_wind_threshold": "Utendørs vindhastighet over grensen aktiverer ekstrem-vind-korreksjon.",
-          "max_energy_delta": "Timesverdier over denne grensen (kWh) ignoreres for å hindre sensorfeil i å ødelegge modellen.",
           "aux_affected_entities": "Hvilke varmeenheter som suppleres av hjelpevarmekilde (f.eks. vedovn). Settes til alle enheter hvis feltet er tomt.",
-          "csv_auto_logging": "Skriv detaljerte time- og dagslgger til CSV-filer for ekstern analyse.",
           "enable_lifetime_tracking": "Oppretthold en kumulativ historikk over totalt energiforbruk. Øker lagringsbruken over tid.",
+          "use_dedicated_wind_sensor": "Overstyr værentitetens vinddata med en dedikert sensor. Anbefales ikke — lokale sensorer nær bygninger påvirkes av turbulens og skjerming, og gir systematisk lave avlesninger. Vinddata fra værentiteten foretrekkes.",
           "secondary_weather_entity": "Valgfri sekundærtjeneste for langtidsprognoser (skyggeprognoser). Nyttig for å validere en ny værkilde før bytte.",
-          "forecast_crossover_day": "Antall dager den primære værtjenesten brukes før det byttes til sekundær for langsiktige prognoser."
+          "forecast_crossover_day": "Antall dager den primære værtjenesten brukes før det byttes til sekundær for langsiktige prognoser.",
+          "csv_auto_logging": "Skriv detaljerte time- og dagslgger til CSV-filer for ekstern analyse.",
+          "max_energy_delta": "Timesverdier over denne grensen (kWh) ignoreres for å hindre sensorfeil i å ødelegge modellen."
         }
       },
       "feature_config": {
@@ -86,6 +82,12 @@
           "indoor_temp_sensor": "Innetemperatursensor",
           "thermal_mass_kwh_per_degree": "Termisk masse-faktor (kWh/°C)",
           "mpc_entry_id": "Varmepumpe MPC-instans",
+          "mpc_managed_sensor": "MPC-styrt sensor",
+          "wind_speed_sensor": "Vindhastighets-sensor",
+          "wind_gust_sensor": "Vindkast-sensor",
+          "wind_gust_factor": "Vindkastfaktor",
+          "wind_threshold": "Grense for sterk vind",
+          "extreme_wind_threshold": "Grense for ekstrem vind",
           "csv_hourly_path": "Filsti for timelogg",
           "csv_daily_path": "Filsti for dagslogg"
         },
@@ -93,6 +95,12 @@
           "indoor_temp_sensor": "Valgfri. Måler innetemperaturendringer for å beregne hvor mye energi som lagres i bygningskroppen over natten.",
           "thermal_mass_kwh_per_degree": "Kompenserer for varme lagret i bygningsmassen ved endring i innetemperatur. Tommelfingerregel: (Areal_m² × 35) / 1000 / gj.snitt_COP. Eksempel: 250 m² hus med COP 3,0 ≈ 2,9 kWh/°C. Sett til 0,0 for å deaktivere.",
           "mpc_entry_id": "Velg Varmepumpe MPC-integrasjonsinstansen som termiske data skal hentes fra. Påkrevd når flere MPC-instanser er installert.",
+          "mpc_managed_sensor": "Hvilken energisensor som styres av MPC-en. Dens målerdata er tidsforskjøvet av lastplanlegging og vil bruke syntetisk grunnlinje i stedet for direkte avlesninger.",
+          "wind_speed_sensor": "Dedikert vindhastighets-sensor. Anbefales ikke for de fleste installasjoner.",
+          "wind_gust_sensor": "Dedikert vindkast-sensor.",
+          "wind_gust_factor": "Styrer vindkastenes påvirkning på varmetapsberegningene. 0,0 ignorerer kastene helt; 1,0 bruker dem fullt ut. Eldre eller trekkfulle bygg tjener ofte på en høyere verdi.",
+          "wind_threshold": "Utendørs vindhastighet over grensen aktiverer sterk-vind-korreksjon.",
+          "extreme_wind_threshold": "Utendørs vindhastighet over grensen aktiverer ekstrem-vind-korreksjon.",
           "csv_hourly_path": "Filsti for timelogg i CSV-format.",
           "csv_daily_path": "Filsti for dagslogg i CSV-format."
         }
@@ -142,29 +150,25 @@
           "daily_learning_mode": "Daglig læringsmodus (Track B)",
           "overnight_load_shift_correction": "Nattlig lastforskyvningskorreksjon",
           "track_c_enabled": "Termodynamisk grunnlinje (Track C)",
-          "wind_gust_factor": "Vindkastfaktor",
-          "wind_threshold": "Grense for sterk vind",
-          "extreme_wind_threshold": "Grense for ekstrem vind",
-          "max_energy_delta": "Terskel for pigg-beskyttelse",
           "aux_affected_entities": "Enheter påvirket av hjelpevarmekilde",
-          "csv_auto_logging": "Aktiver CSV-logging",
           "enable_lifetime_tracking": "Spor livsløpsstatistikk",
+          "use_dedicated_wind_sensor": "Bruk dedikert vindsensor",
           "secondary_weather_entity": "Sekundær værtjeneste",
-          "forecast_crossover_day": "Dag for prognosebytte"
+          "forecast_crossover_day": "Dag for prognosebytte",
+          "csv_auto_logging": "Aktiver CSV-logging",
+          "max_energy_delta": "Terskel for pigg-beskyttelse"
         },
         "data_description": {
           "daily_learning_mode": "Når aktivert lærer modellen én gang per dag ved midnatt (Track B) i stedet for hver time (Track A). Anbefales kun for boliger med svært høy termisk masse (betong/stein) eller varmepumper med høy minimumsmodulering. Senker læringshastigheten betydelig — full karakterisering av varmekurven kan ta en hel varmesesong.",
           "overnight_load_shift_correction": "ADVARSEL: Aktiver kun hvis du aktivt forvarmer eller kjøler på tvers av midnattsgrensen (f.eks. billigstrøm om natten). Korrigerer dagens energitotale for varme lagret i bygningsmassen før midnatt. Hvis du ikke driver med bevisst lastforskyvning over midnatt, la dette være AV — feil aktivering forvrenger den innlærte modellen. Krever Daglig læringsmodus.",
           "track_c_enabled": "Aktiverer Track C Midnattssynkronisering. I stedet for å bruke råt elektrisk forbruk som læringsgrunnlag henter Heating Analytics faktisk levert termisk energi fra MPC-en og fordeler (smører) den over 24 timer proporsjonalt med værdrevet varmetap. Dette eliminerer tilbakekoblingseffekten som oppstår ved nattlig lastforskyvning. Krever at Daglig læringsmodus er aktivert og at en heatpump_mpc-integrasjon er installert.",
-          "wind_gust_factor": "Styrer vindkastenes påvirkning på varmetapsberegningene. 0,0 ignorerer kastene helt; 1,0 bruker dem fullt ut. Eldre eller trekkfulle bygg tjener ofte på en høyere verdi.",
-          "wind_threshold": "Utendørs vindhastighet over grensen aktiverer sterk-vind-korreksjon.",
-          "extreme_wind_threshold": "Utendørs vindhastighet over grensen aktiverer ekstrem-vind-korreksjon.",
-          "max_energy_delta": "Timesverdier over denne grensen (kWh) ignoreres for å hindre sensorfeil i å ødelegge modellen.",
           "aux_affected_entities": "Hvilke varmeenheter som suppleres av hjelpevarmekilde (f.eks. vedovn). Settes til alle enheter hvis feltet er tomt.",
-          "csv_auto_logging": "Skriv detaljerte time- og dagslgger til CSV-filer for ekstern analyse.",
           "enable_lifetime_tracking": "Oppretthold en kumulativ historikk over totalt energiforbruk. Øker lagringsbruken over tid.",
+          "use_dedicated_wind_sensor": "Overstyr værentitetens vinddata med en dedikert sensor. Anbefales ikke — lokale sensorer nær bygninger påvirkes av turbulens og skjerming, og gir systematisk lave avlesninger. Vinddata fra værentiteten foretrekkes.",
           "secondary_weather_entity": "Valgfri sekundærtjeneste for langtidsprognoser (skyggeprognoser). Nyttig for å validere en ny værkilde før bytte.",
-          "forecast_crossover_day": "Antall dager den primære værtjenesten brukes før det byttes til sekundær for langsiktige prognoser."
+          "forecast_crossover_day": "Antall dager den primære værtjenesten brukes før det byttes til sekundær for langsiktige prognoser.",
+          "csv_auto_logging": "Skriv detaljerte time- og dagslgger til CSV-filer for ekstern analyse.",
+          "max_energy_delta": "Timesverdier over denne grensen (kWh) ignoreres for å hindre sensorfeil i å ødelegge modellen."
         }
       },
       "reconfigure_feature_config": {
@@ -174,6 +178,12 @@
           "indoor_temp_sensor": "Innetemperatursensor",
           "thermal_mass_kwh_per_degree": "Termisk masse-faktor (kWh/°C)",
           "mpc_entry_id": "Varmepumpe MPC-instans",
+          "mpc_managed_sensor": "MPC-styrt sensor",
+          "wind_speed_sensor": "Vindhastighets-sensor",
+          "wind_gust_sensor": "Vindkast-sensor",
+          "wind_gust_factor": "Vindkastfaktor",
+          "wind_threshold": "Grense for sterk vind",
+          "extreme_wind_threshold": "Grense for ekstrem vind",
           "csv_hourly_path": "Filsti for timelogg",
           "csv_daily_path": "Filsti for dagslogg"
         },
@@ -181,6 +191,12 @@
           "indoor_temp_sensor": "Valgfri. Måler innetemperaturendringer for å beregne hvor mye energi som lagres i bygningskroppen over natten.",
           "thermal_mass_kwh_per_degree": "Kompenserer for varme lagret i bygningsmassen ved endring i innetemperatur. Tommelfingerregel: (Areal_m² × 35) / 1000 / gj.snitt_COP. Eksempel: 250 m² hus med COP 3,0 ≈ 2,9 kWh/°C. Sett til 0,0 for å deaktivere.",
           "mpc_entry_id": "Velg Varmepumpe MPC-integrasjonsinstansen som termiske data skal hentes fra. Påkrevd når flere MPC-instanser er installert.",
+          "mpc_managed_sensor": "Hvilken energisensor som styres av MPC-en. Dens målerdata er tidsforskjøvet av lastplanlegging og vil bruke syntetisk grunnlinje i stedet for direkte avlesninger.",
+          "wind_speed_sensor": "Dedikert vindhastighets-sensor. Anbefales ikke for de fleste installasjoner.",
+          "wind_gust_sensor": "Dedikert vindkast-sensor.",
+          "wind_gust_factor": "Styrer vindkastenes påvirkning på varmetapsberegningene. 0,0 ignorerer kastene helt; 1,0 bruker dem fullt ut. Eldre eller trekkfulle bygg tjener ofte på en høyere verdi.",
+          "wind_threshold": "Utendørs vindhastighet over grensen aktiverer sterk-vind-korreksjon.",
+          "extreme_wind_threshold": "Utendørs vindhastighet over grensen aktiverer ekstrem-vind-korreksjon.",
           "csv_hourly_path": "Filsti for timelogg i CSV-format.",
           "csv_daily_path": "Filsti for dagslogg i CSV-format."
         }

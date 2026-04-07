@@ -108,11 +108,15 @@ class StatisticsManager:
                 "total_kwh": float (Global Model),
                 "global_base_kwh": float (For Learning Track A),
                 "global_aux_reduction_kwh": float (Global Authority for Aux Impact),
+                "heating_total_kwh": float (Sum of heating-mode unit net predictions),
+                "cooling_total_kwh": float (Sum of cooling-mode unit net predictions),
                 "breakdown": {
                     "base_kwh": float (Unit Sum Base),
                     "aux_reduction_kwh": float (Unit Sum Aux - Scaled),
                     "unassigned_aux_savings": float (Aux overflow due to clamping),
                     "solar_reduction_kwh": float (Unit Sum Solar),
+                    "solar_heating_applied_kwh": float (Saturated solar reducing heating),
+                    "solar_cooling_applied_kwh": float (Saturated solar adding to cooling),
                     "unspecified_kwh": float (Global - Unit Sum)
                 },
                 "unit_breakdown": { ... }
@@ -241,6 +245,8 @@ class StatisticsManager:
         # Re-calculate global solar effect using the APPLIED (saturated) values to ensure consistency
         sum_applied_heating = 0.0
         sum_applied_cooling = 0.0
+        heating_unit_sum_net = 0.0
+        cooling_unit_sum_net = 0.0
 
         for entity_id, data in raw_unit_data.items():
             # Use raw learned aux reduction (No Scaling)
@@ -282,8 +288,10 @@ class StatisticsManager:
             # This also fixes a bug where detailed=False resulted in 0 solar effect
             if data["mode"] in (MODE_COOLING, MODE_GUEST_COOLING):
                 sum_applied_cooling += solar_applied
+                cooling_unit_sum_net += net_final
             else:
                 sum_applied_heating += solar_applied
+                heating_unit_sum_net += net_final
 
             unit_sum_net += net_final
             unit_sum_aux_final += applied_aux
@@ -313,11 +321,15 @@ class StatisticsManager:
             "total_kwh": round(global_net, 3),
             "global_base_kwh": round(global_base, 3),
             "global_aux_reduction_kwh": round(global_aux_reduction, 3),
+            "heating_total_kwh": round(heating_unit_sum_net, 3),
+            "cooling_total_kwh": round(cooling_unit_sum_net, 3),
             "breakdown": {
                 "base_kwh": round(unit_sum_base, 3),
                 "aux_reduction_kwh": round(unit_sum_aux_final, 3),
                 "solar_reduction_kwh": round(unit_sum_solar_final, 3),
                 "solar_wasted_kwh": round(unit_sum_solar_wasted, 3),
+                "solar_heating_applied_kwh": round(sum_applied_heating, 3),
+                "solar_cooling_applied_kwh": round(sum_applied_cooling, 3),
                 "unassigned_aux_savings": round(unassigned_aux_savings, 3),
                 "orphaned_aux_savings": round(orphaned_aux_savings, 3),
                 "unspecified_kwh": round(unspecified_kwh, 3)

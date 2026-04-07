@@ -38,6 +38,7 @@ SERVICE_EXIT_COOLDOWN = "exit_cooldown"
 SERVICE_GET_FORECAST = "get_forecast"
 SERVICE_CALIBRATE_INERTIA = "calibrate_inertia"
 SERVICE_CALIBRATE_WIND_THRESHOLDS = "calibrate_wind_thresholds"
+SERVICE_DIAGNOSE_MODEL = "diagnose_model"
 SERVICE_RESET_SOLAR_LEARNING = "reset_solar_learning"
 SERVICE_RETRAIN_FROM_HISTORY = "retrain_from_history"
 SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
@@ -88,7 +89,8 @@ SERVICE_SCHEMA_RESET_ACCURACY = vol.Schema({
 })
 
 SERVICE_SCHEMA_RESET_SOLAR = vol.Schema({
-    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("entity_id"): cv.entity_id,  # Instance targeting
+    vol.Optional("unit_entity_id"): cv.entity_id,  # Unit filter (which sensor to reset)
 })
 
 SERVICE_SCHEMA_BACKUP = vol.Schema({
@@ -102,6 +104,7 @@ SERVICE_SCHEMA_RESTORE = vol.Schema({
 })
 
 SERVICE_SCHEMA_REPLACE_SENSOR = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
     vol.Required("old_entity_id"): cv.entity_id,
     vol.Required("new_entity_id"): cv.entity_id,
 })
@@ -121,6 +124,17 @@ SERVICE_SCHEMA_COMPARE_PERIODS = vol.Schema({
     vol.Required("period_2_end"): cv.date,
 })
 
+SERVICE_SCHEMA_GET_FORECAST = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("days", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=14)),
+    vol.Optional("isolate_sensor"): cv.entity_id,
+})
+
+SERVICE_SCHEMA_DIAGNOSE = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=365)),
+})
+
 def _get_coordinators(hass: HomeAssistant) -> list[HeatingDataCoordinator]:
     """Helper to get all active HeatingDataCoordinators."""
     return [
@@ -134,7 +148,9 @@ def _get_target_coordinator(
 ) -> HeatingDataCoordinator:
     """Return the coordinator for entity_id, or the first available one.
 
-    Raises ValueError when no coordinator is found.
+    When entity_id is explicitly provided but lookup fails, raises
+    ValueError instead of silently falling back to an arbitrary instance.
+    When entity_id is None, returns the first available coordinator.
     """
     if entity_id:
         registry = er.async_get(hass)
@@ -143,6 +159,7 @@ def _get_target_coordinator(
             coord = hass.data[DOMAIN].get(entry.config_entry_id)
             if coord:
                 return coord
+        raise ValueError(f"Could not find Heating Analytics instance for entity '{entity_id}'.")
     coordinators = _get_coordinators(hass)
     if coordinators:
         return coordinators[0]
@@ -262,13 +279,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def handle_reset_solar_learning(call: ServiceCall):
         """Handle the reset solar learning service call."""
         entity_id = call.data.get("entity_id")
-        if entity_id:
-            _LOGGER.info(f"Service called to reset solar learning for {entity_id}")
-        else:
-            _LOGGER.info("Service called to reset solar learning for all units")
+        unit_entity_id = call.data.get("unit_entity_id")
 
-        for coord in _get_coordinators(hass):
-            await coord.async_reset_solar_learning_data(entity_id)
+        coord = _get_target_coordinator(hass, entity_id)
+        if unit_entity_id:
+            _LOGGER.info(f"Service called to reset solar learning for unit {unit_entity_id} (coordinator={coord.entry.entry_id})")
+        else:
+            _LOGGER.info(f"Service called to reset solar learning for all units (coordinator={coord.entry.entry_id})")
+        await coord.async_reset_solar_learning_data(unit_entity_id)
 
     hass.services.async_register(
         DOMAIN,
@@ -340,21 +358,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register Replace Sensor Service
     async def handle_replace_sensor(call: ServiceCall):
         """Handle the replace sensor source service call."""
+        entity_id = call.data.get("entity_id")
         old_id = call.data.get("old_entity_id")
         new_id = call.data.get("new_entity_id")
-        _LOGGER.info(f"Service called to replace sensor: {old_id} -> {new_id}")
 
-        entries_to_reload = []
-
-        for coord in _get_coordinators(hass):
+        if entity_id:
+            # Target a specific instance.
+            coord = _get_target_coordinator(hass, entity_id)
+            _LOGGER.info(f"Service called to replace sensor: {old_id} -> {new_id} (coordinator={coord.entry.entry_id})")
             if await coord.async_replace_sensor_source(old_id, new_id):
-                # Only reload if the replacement was actually performed
-                entries_to_reload.append(coord.entry.entry_id)
-
-        # Reload affected entries to update entity registry and baseline
-        for entry_id in entries_to_reload:
-            _LOGGER.info(f"Reloading entry {entry_id} to apply sensor replacement.")
-            await hass.config_entries.async_reload(entry_id)
+                _LOGGER.info(f"Reloading entry {coord.entry.entry_id} to apply sensor replacement.")
+                await hass.config_entries.async_reload(coord.entry.entry_id)
+        else:
+            # Legacy: try all instances.
+            entries_to_reload = []
+            _LOGGER.info(f"Service called to replace sensor: {old_id} -> {new_id} (all instances)")
+            for coord in _get_coordinators(hass):
+                if await coord.async_replace_sensor_source(old_id, new_id):
+                    entries_to_reload.append(coord.entry.entry_id)
+            for entry_id in entries_to_reload:
+                _LOGGER.info(f"Reloading entry {entry_id} to apply sensor replacement.")
+                await hass.config_entries.async_reload(entry_id)
 
     hass.services.async_register(
         DOMAIN,
@@ -488,6 +512,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DOMAIN,
         SERVICE_GET_FORECAST,
         handle_get_forecast,
+        schema=SERVICE_SCHEMA_GET_FORECAST,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    # Register Diagnose Model Service
+    async def handle_diagnose_model(call: ServiceCall) -> dict:
+        """Handle the diagnose model service call."""
+        entity_id = call.data.get("entity_id")
+        days = call.data.get("days", 30)
+        coord = _get_target_coordinator(hass, entity_id)
+        _LOGGER.info(f"Service called: diagnose_model (days={days}, coordinator={coord.entry.entry_id})")
+        return coord.diagnose_model(days_back=days)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DIAGNOSE_MODEL,
+        handle_diagnose_model,
+        schema=SERVICE_SCHEMA_DIAGNOSE,
         supports_response=SupportsResponse.ONLY,
     )
 

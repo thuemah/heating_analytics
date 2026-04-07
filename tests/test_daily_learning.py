@@ -164,8 +164,8 @@ def test_compute_excluded_mode_energy():
     ]
     excluded = HeatingDataCoordinator._compute_excluded_mode_energy(day_logs)
     # h2: 1.0 (off) + 0.5 (dhw) = 1.5
-    # ac: 0.5 (cooling) + 0.8 (cooling) = 1.3
-    assert round(excluded, 2) == 2.8
+    # ac: cooling is no longer excluded (#801 — saturation-aware solar delta)
+    assert round(excluded, 2) == 1.5
 
 
 def test_compute_excluded_mode_energy_no_modes():

@@ -118,29 +118,33 @@ class ThermodynamicEngine:
 
     def _calculate_theoretical_loss_weight(self, weather: WeatherData) -> float:
         """
-        Calculate a relative 'weight' representing the physical heat loss of the building
+        Calculate a relative 'weight' representing the physical HVAC demand
         for a given hour, based purely on weather data.
 
-        This is a simplified representation of the heat loss.
-        A real implementation would use the actual building U-coefficient,
-        but for proportional smearing, relative weights are sufficient.
+        Supports both heating and cooling regimes (#792):
+        - delta_t is abs(balance_point - outdoor), always >= 0
+        - For heating (outdoor < balance_point): solar reduces demand
+        - For cooling (outdoor > balance_point): solar increases demand
         """
-        # Base loss is proportional to Delta-T (Indoor - Outdoor).
-        # We assume heating is only needed if Delta-T > 0 (or Outdoor < Balance Point).
-        # For simplicity, we assume delta_t here is (balance_point - outdoor_temp) or similar.
-        loss = max(0.0, weather["delta_t"])
+        # HVAC demand is proportional to |delta_T| regardless of direction.
+        demand = max(0.0, weather["delta_t"])
 
-        # Wind increases heat loss
+        # Wind increases heat transfer in both directions
         wind_multiplier = max(1.0, weather.get("wind_factor", 1.0))
-        loss *= wind_multiplier
+        demand *= wind_multiplier
 
-        # Solar gain reduces heat loss.
-        # solar_factor is assumed to be a reduction multiplier (e.g., 0.8 means 20% reduction)
-        # or an absolute deduction. We'll treat it as a multiplier for now: 1.0 = no sun, 0.0 = full sun canceling heat need.
-        solar_multiplier = max(0.0, min(1.0, weather.get("solar_factor", 1.0)))
-        loss *= solar_multiplier
+        # Solar effect depends on regime:
+        # is_cooling is set by the caller when outdoor > balance_point.
+        solar_f = weather.get("solar_factor", 1.0)
+        if weather.get("is_cooling", False):
+            # Sun adds to cooling load — more sun = more demand
+            solar_multiplier = max(0.1, 1.0 + (1.0 - solar_f) * 0.5)
+        else:
+            # Sun reduces heating load — more sun = less demand
+            solar_multiplier = max(0.0, min(1.0, solar_f))
+        demand *= solar_multiplier
 
-        return loss
+        return demand
 
     def calculate_synthetic_baseline(
         self,

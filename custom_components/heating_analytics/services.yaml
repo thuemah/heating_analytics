@@ -93,6 +93,17 @@ retrain_from_history:
       default: false
       selector:
         boolean:
+    experimental_cop_smear:
+      name: COP-Weighted Smearing (experimental)
+      description: >-
+        For Track B installations with MPC COP parameters available: distributes
+        daily energy across 24 hours using per-hour COP weights instead of flat
+        q/24. Produces up to 24 temperature buckets per day instead of one.
+        Requires heatpump_mpc integration with get_cop_params service.
+        No effect on Track A or Track C.
+      default: false
+      selector:
+        boolean:
 
 reset_learning_data:
   name: Reset Learning Data
@@ -166,6 +177,12 @@ replace_sensor_source:
   name: Replace Sensor Source
   description: Replace a heating unit's energy sensor with a new one, migrating all historical data and learning models to the new entity ID.
   fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to update. Leave empty to apply to all instances that contain the old sensor.
+      selector:
+        entity:
+          integration: heating_analytics
     old_entity_id:
       name: Old Entity
       description: The entity ID of the old energy sensor to be replaced (e.g., sensor.old_heater).
@@ -216,6 +233,23 @@ compare_periods:
       selector:
         date:
 
+reset_solar_learning:
+  name: Reset Solar Learning
+  description: Reset the learned solar coefficients for a specific unit or all units within an instance.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to reset. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor (optional)
+      description: The energy sensor to reset solar learning for. Leave empty to reset all units in the instance.
+      selector:
+        entity:
+          domain: sensor
+
 exit_cooldown:
   name: Exit Auxiliary Cooldown
   description: Manually force the system to exit the auxiliary cooldown/decay state. Use this if you want to resume normal model learning immediately after an auxiliary event, bypassing the thermal settling period.
@@ -239,12 +273,12 @@ get_forecast:
           integration: heating_analytics
     days:
       name: Days
-      description: Number of days to forecast (1-7).
+      description: Number of days to forecast (1-14).
       default: 1
       selector:
         number:
           min: 1
-          max: 7
+          max: 14
           mode: box
     isolate_sensor:
       name: Isolate Sensor
@@ -309,7 +343,7 @@ calibrate_inertia:
       selector:
         boolean:
     test_delta_t_scaling:
-      name: Test ΔT-dependent Inertia Scaling
+      name: "Test ΔT-dependent Inertia Scaling"
       description: "Tests whether optimal thermal inertia grows with the temperature differential (balance_point − outdoor_temp). Bins pure hours into 5°C ΔT buckets and finds the best exponential τ per bin (window=min(5τ, 168)). Results carry best_tau instead of best_hours. A monotonic trend (low ΔT → short τ, high ΔT → long τ) supports using a ΔT-scaled inertia model."
       default: false
       selector:
@@ -320,3 +354,27 @@ calibrate_inertia:
       default: false
       selector:
         boolean:
+
+diagnose_model:
+  name: Diagnose Model
+  description: >-
+    Analyzes the learned correlation model and hourly history for data quality
+    issues. Reports monotonicity violations, bucket population, mode
+    contamination, solar correlation, and per-day Track B/C diagnostics.
+    Returns a diagnostic dict — inspect in Developer Tools → Services.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance to diagnose. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    days:
+      name: Days Back to Analyze
+      description: Number of days of hourly log history to include in the analysis (1-365).
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 365
+          mode: box
