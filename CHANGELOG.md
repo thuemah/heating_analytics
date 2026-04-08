@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.3.1] - 2026-04-17
+## [1.3.1] - 2026-04-08
 
 ### Added
 - **`diagnose_solar` service.** New diagnostic service for per-unit solar coefficient validation and global solar model health. Reports implied coefficients (back-calculated via normal equations), coefficient stability across 3 time windows, saturation frequency, temporal bias (morning vs afternoon), battery decay health (post-sunset residual analysis), screen correction impact (stratified error comparison), and hour-of-day residual curve. Includes battery decay calibration: sweeps decay rates 0.50–0.95 and recommends the optimal value. Set `apply_battery_decay: true` to persist the recommendation. Single-pass over hourly log, same pattern as `diagnose_model`.
