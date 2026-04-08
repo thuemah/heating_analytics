@@ -367,6 +367,7 @@ class ObservationCollector:
         "delta_per_unit",
         "expected_per_unit",
         "expected_base_per_unit",
+        "correction_sum",
         "last_minute_processed",
     )
 
@@ -397,6 +398,7 @@ class ObservationCollector:
         self.delta_per_unit: dict[str, float] = {}
         self.expected_per_unit: dict[str, float] = {}
         self.expected_base_per_unit: dict[str, float] = {}
+        self.correction_sum: float = 0.0
         self.last_minute_processed: int | None = None
 
     def reset(self) -> None:
@@ -426,6 +428,7 @@ class ObservationCollector:
         self.delta_per_unit.clear()
         self.expected_per_unit.clear()
         self.expected_base_per_unit.clear()
+        self.correction_sum = 0.0
         self.last_minute_processed = None
 
     def accumulate_weather(
@@ -438,6 +441,7 @@ class ObservationCollector:
         is_aux_active: bool,
         current_time: datetime,
         humidity: float | None = None,
+        correction_percent: float = 100.0,
     ) -> None:
         """Record one minute's weather readings."""
         self.wind_sum += effective_wind
@@ -449,6 +453,7 @@ class ObservationCollector:
         self.solar_sum += solar_factor
         self.solar_vector_s_sum += solar_vector[0]
         self.solar_vector_e_sum += solar_vector[1]
+        self.correction_sum += correction_percent
         self.bucket_counts[wind_bucket] += 1
         if is_aux_active:
             self.aux_count += 1

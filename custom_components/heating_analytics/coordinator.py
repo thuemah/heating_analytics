@@ -284,6 +284,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             mpc_managed_sensor=self.mpc_managed_sensor,
         )
 
+        self.solar_battery_decay = entry.data.get("solar_battery_decay", SOLAR_BATTERY_DECAY)
         self.wind_gust_factor = entry.data.get("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)
         self.balance_point = entry.data.get("balance_point", 17.0)
         self.learning_rate = entry.data.get("learning_rate", 0.01)
@@ -1181,6 +1182,401 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         return result
 
+    def diagnose_solar(self, days_back: int = 30, apply_battery_decay: bool = False) -> dict:
+        """Analyze per-unit solar coefficient health and global solar model quality.
+
+        Single-pass over hourly_log. Returns a diagnostic dict with per-unit
+        coefficient validation, global battery/screen health, and temporal bias.
+        Includes battery decay calibration: sweeps decay rates 0.50-0.95 to find
+        the optimal value for this building. Designed as a service response (#810).
+        """
+        from datetime import timedelta, date as _date
+        from homeassistant.util import dt as dt_util
+        from .const import (
+            MODE_HEATING, MODE_COOLING, MODE_OFF, MODE_DHW,
+            MODE_GUEST_HEATING, MODE_GUEST_COOLING,
+        )
+        from .solar import SolarCalculator as _SC
+
+        now = dt_util.now()
+        cutoff = (now - timedelta(days=days_back)).date().isoformat()
+
+        # --- Accumulators ---
+        # Per-unit: normal equations for implied coefficient (3 windows + 30d total)
+        window_boundaries = [days_back, int(days_back * 2 / 3), int(days_back / 3), 0]
+        unit_accum: dict[str, dict] = {}  # entity_id -> accumulators
+
+        def _get_unit_accum(eid: str) -> dict:
+            if eid not in unit_accum:
+                unit_accum[eid] = {
+                    # Normal equations for 30d implied coefficient
+                    "ss": 0.0, "ee": 0.0, "se": 0.0, "sI": 0.0, "eI": 0.0, "n": 0,
+                    # 3-window stability (each has own normal eqs)
+                    "windows": [
+                        {"ss": 0.0, "ee": 0.0, "se": 0.0, "sI": 0.0, "eI": 0.0, "n": 0}
+                        for _ in range(3)
+                    ],
+                    # Delta accumulator
+                    "sum_delta": 0.0, "delta_n": 0,
+                    # Temporal bias
+                    "morning_delta": 0.0, "morning_n": 0,
+                    "afternoon_delta": 0.0, "afternoon_n": 0,
+                    # Saturation counter
+                    "saturated": 0, "qualifying": 0,
+                }
+            return unit_accum[eid]
+
+        # Global accumulators
+        excluded = {"aux": 0, "guest": 0, "saturated": 0, "low_vector": 0, "no_base": 0, "legacy": 0}
+        total_qualifying = 0
+
+        # Battery calibration: collect per-day hourly sequences for decay sweep.
+        # Key = date string, value = list of (hour, solar_impact_raw, actual, expected)
+        day_sequences: dict[str, list[tuple]] = {}
+        # Battery health: post-sunset hours (using current decay)
+        battery_residuals: list[float] = []
+
+        # Screen stratification
+        screen_closed_errors: list[float] = []  # correction < 50, solar_factor > 0.3
+        screen_open_errors: list[float] = []    # correction > 80, solar_factor > 0.3
+
+        # Hour-of-day residual curve (hours 6-18)
+        hourly_residuals: dict[int, list[float]] = {h: [] for h in range(6, 19)}
+
+        # --- Single pass ---
+        for entry in self._hourly_log:
+            ts = entry.get("timestamp", "")
+            if ts[:10] < cutoff:
+                continue
+
+            hour = entry.get("hour", -1)
+            solar_factor = entry.get("solar_factor") or 0.0
+            solar_s = entry.get("solar_vector_s", 0.0)
+            solar_e = entry.get("solar_vector_e", 0.0)
+            vector_mag = (solar_s ** 2 + solar_e ** 2) ** 0.5
+            correction = entry.get("correction_percent", 100.0)
+            solar_impact_raw = entry.get("solar_impact_raw_kwh", 0.0)
+            solar_impact_eff = entry.get("solar_impact_kwh", 0.0)
+            aux_active = entry.get("auxiliary_active", False)
+            guest_kwh = entry.get("guest_impact_kwh", 0.0)
+            unit_modes = entry.get("unit_modes", {})
+            unit_breakdown = entry.get("unit_breakdown", {})
+            unit_expected_base = entry.get("unit_expected_breakdown", {})
+
+            # Battery health: post-sunset hours with residual battery charge
+            if solar_factor < 0.01 and solar_impact_eff > 0.05:
+                actual_total = entry.get("actual_kwh", 0.0)
+                expected_total = entry.get("expected_kwh", 0.0)
+                if expected_total > 0.05:
+                    battery_residuals.append(actual_total - expected_total)
+
+            # Collect day sequences for battery decay calibration sweep
+            day_key = ts[:10]
+            actual_total = entry.get("actual_kwh", 0.0)
+            expected_total = entry.get("expected_kwh", 0.0)
+            if day_key not in day_sequences:
+                day_sequences[day_key] = []
+            day_sequences[day_key].append((hour, solar_impact_raw, actual_total, expected_total))
+
+            # Days-ago for window assignment
+            try:
+                days_ago = (now.date() - _date.fromisoformat(ts[:10])).days
+            except (ValueError, TypeError):
+                days_ago = 0
+
+            # Per-unit analysis
+            for entity_id in self.energy_sensors:
+                mode = unit_modes.get(entity_id, MODE_HEATING)
+                if mode in (MODE_OFF, MODE_DHW, MODE_GUEST_HEATING, MODE_GUEST_COOLING):
+                    if mode in (MODE_GUEST_HEATING, MODE_GUEST_COOLING):
+                        excluded["guest"] += 1
+                    continue
+
+                if aux_active:
+                    excluded["aux"] += 1
+                    continue
+
+                if vector_mag < 0.01:
+                    excluded["low_vector"] += 1
+                    continue
+
+                actual_unit = unit_breakdown.get(entity_id, 0.0)
+                base_unit = unit_expected_base.get(entity_id)
+                if base_unit is None:
+                    excluded["no_base"] += 1
+                    continue
+
+                # Implied solar reduction
+                if mode == MODE_HEATING:
+                    implied_solar = base_unit - actual_unit
+                elif mode == MODE_COOLING:
+                    implied_solar = actual_unit - base_unit
+                else:
+                    continue
+
+                # Check saturation
+                acc = _get_unit_accum(entity_id)
+                acc["qualifying"] += 1
+                if mode == MODE_HEATING and actual_unit < 0.05 * base_unit and base_unit > 0.05:
+                    acc["saturated"] += 1
+                    excluded["saturated"] += 1
+                    continue
+
+                implied_solar = max(0.0, implied_solar)
+
+                # Modeled solar for this unit.
+                # Reconstruct potential vector from effective + screen transmittance.
+                # Coeff already absorbs transmittance via NLMS, so no extra factor.
+                diag_transmittance = _SC._screen_transmittance(correction) if correction is not None else 1.0
+                if diag_transmittance > 0.01:
+                    diag_potential = (solar_s / diag_transmittance, solar_e / diag_transmittance)
+                else:
+                    diag_potential = (solar_s, solar_e)
+                unit_coeff = self.solar.calculate_unit_coefficient(entity_id, entry.get("temp_key", "10"))
+                modeled_solar = self.solar.calculate_unit_solar_impact(diag_potential, unit_coeff)
+                delta = modeled_solar - implied_solar
+
+                total_qualifying += 1
+
+                # Normal equations (30d total)
+                acc["ss"] += solar_s * solar_s
+                acc["ee"] += solar_e * solar_e
+                acc["se"] += solar_s * solar_e
+                acc["sI"] += solar_s * implied_solar
+                acc["eI"] += solar_e * implied_solar
+                acc["n"] += 1
+
+                # Window assignment
+                for w_idx in range(3):
+                    w_start = window_boundaries[w_idx]
+                    w_end = window_boundaries[w_idx + 1]
+                    if w_end <= days_ago < w_start:
+                        w = acc["windows"][w_idx]
+                        w["ss"] += solar_s * solar_s
+                        w["ee"] += solar_e * solar_e
+                        w["se"] += solar_s * solar_e
+                        w["sI"] += solar_s * implied_solar
+                        w["eI"] += solar_e * implied_solar
+                        w["n"] += 1
+                        break
+
+                # Delta
+                acc["sum_delta"] += delta
+                acc["delta_n"] += 1
+
+                # Temporal bias
+                if 6 <= hour <= 11:
+                    acc["morning_delta"] += delta
+                    acc["morning_n"] += 1
+                elif 12 <= hour <= 17:
+                    acc["afternoon_delta"] += delta
+                    acc["afternoon_n"] += 1
+
+                # Screen stratification (global)
+                if solar_factor > 0.3:
+                    if correction < 50:
+                        screen_closed_errors.append(delta)
+                    elif correction > 80:
+                        screen_open_errors.append(delta)
+
+                # Hour-of-day residual
+                if 6 <= hour <= 18:
+                    hourly_residuals[hour].append(delta)
+
+        # --- Build results ---
+        def _solve_normal(ss, ee, se, sI, eI, n, min_samples=10):
+            """Solve 2x2 normal equations for implied coefficient."""
+            if n < min_samples:
+                return None
+            det = ss * ee - se * se
+            if abs(det) < 1e-6:
+                return None
+            return {
+                "s": round((ee * sI - se * eI) / det, 4),
+                "e": round((ss * eI - se * sI) / det, 4),
+            }
+
+        per_unit = {}
+        for entity_id, acc in unit_accum.items():
+            current = self.solar.calculate_unit_coefficient(entity_id, "10")
+
+            implied_30d = _solve_normal(
+                acc["ss"], acc["ee"], acc["se"], acc["sI"], acc["eI"], acc["n"]
+            )
+
+            # Physical-space implied (undo screen transmittance)
+            implied_physical = None
+            if implied_30d is not None:
+                # We can't perfectly recover avg transmittance from the log,
+                # but screen_closed + screen_open counts give us a proxy.
+                # Use the formula: physical = effective / transmittance.
+                # For simplicity, use current correction_percent from coordinator.
+                current_correction = self.solar_correction_percent
+                transmittance = _SC._screen_transmittance(current_correction)
+                if transmittance > 0.1:
+                    implied_physical = {
+                        "s": round(implied_30d["s"] / transmittance, 4),
+                        "e": round(implied_30d["e"] / transmittance, 4),
+                    }
+
+            # Stability windows
+            stability = []
+            for w in acc["windows"]:
+                coeff = _solve_normal(w["ss"], w["ee"], w["se"], w["sI"], w["eI"], w["n"], min_samples=5)
+                stability.append({"coefficient": coeff, "qualifying_hours": w["n"]})
+
+            # Flags
+            flags = []
+            if acc["qualifying"] > 0 and acc["saturated"] / acc["qualifying"] > 0.3:
+                flags.append("high_saturation")
+            # Coefficient stability: check if S component varies >2x between windows
+            s_values = [w["coefficient"]["s"] for w in stability if w["coefficient"] is not None and abs(w["coefficient"]["s"]) > 0.01]
+            if len(s_values) >= 2 and max(abs(v) for v in s_values) > 2 * min(abs(v) for v in s_values):
+                flags.append("coefficient_unstable")
+            # Under-prediction
+            mean_delta = acc["sum_delta"] / acc["delta_n"] if acc["delta_n"] > 0 else 0.0
+            if mean_delta < -0.1:
+                flags.append("under_predicting_solar")
+            elif mean_delta > 0.1:
+                flags.append("over_predicting_solar")
+
+            # Dominant component
+            cs = abs(current.get("s", 0.0))
+            ce = abs(current.get("e", 0.0))
+            total_c = cs + ce
+            dominant = "balanced"
+            if total_c > 0.01:
+                if cs / total_c > 0.9:
+                    dominant = "south"
+                elif ce / total_c > 0.9:
+                    dominant = "east"
+
+            per_unit[entity_id] = {
+                "current_coefficient": {k: round(v, 4) for k, v in current.items()},
+                "implied_coefficient_30d": implied_30d,
+                "implied_coefficient_physical": implied_physical,
+                "stability_windows": stability,
+                "mean_delta_kwh": round(mean_delta, 4),
+                "saturation_pct": round(100 * acc["saturated"] / acc["qualifying"], 1) if acc["qualifying"] > 0 else 0.0,
+                "dominant_component": dominant,
+                "qualifying_hours": acc["n"],
+                "temporal_bias": {
+                    "morning_mean_delta": round(acc["morning_delta"] / acc["morning_n"], 4) if acc["morning_n"] > 0 else None,
+                    "afternoon_mean_delta": round(acc["afternoon_delta"] / acc["afternoon_n"], 4) if acc["afternoon_n"] > 0 else None,
+                },
+                "flags": flags,
+            }
+
+        # Global metrics
+        global_flags = []
+
+        # Battery health
+        battery_health = {}
+        if battery_residuals:
+            mean_residual = sum(battery_residuals) / len(battery_residuals)
+            battery_health = {
+                "mean_residual_kwh": round(mean_residual, 4),
+                "qualifying_post_sunset_hours": len(battery_residuals),
+                "decay_rate": self.solar_battery_decay,
+                # Negative residual = actual < expected = battery under-credits
+                # post-sunset = decays too fast. Positive = opposite.
+                "assessment": "too_slow" if mean_residual > 0.05 else ("too_fast" if mean_residual < -0.05 else "ok"),
+            }
+            if battery_health["assessment"] != "ok":
+                global_flags.append(f"battery_decay_{battery_health['assessment']}")
+
+        # Battery decay calibration: sweep decay rates to find optimal
+        calibration = {}
+        candidates = [round(0.50 + i * 0.05, 2) for i in range(10)]  # 0.50 to 0.95
+        if day_sequences:
+            best_decay = self.solar_battery_decay
+            best_abs_residual = float("inf")
+            sweep_results = {}
+            for candidate in candidates:
+                total_residual = 0.0
+                n_post_sunset = 0
+                for _day_key, hours in day_sequences.items():
+                    hours_sorted = sorted(hours, key=lambda x: x[0])
+                    sim_battery = 0.0
+                    for h, raw_solar, actual, expected in hours_sorted:
+                        sim_battery = sim_battery * candidate + raw_solar
+                        # Post-sunset: solar_factor ~ 0 but battery > 0
+                        if raw_solar < 0.01 and sim_battery > 0.05 and expected > 0.05:
+                            # expected already includes current battery effect.
+                            # Residual from this candidate = what the candidate battery
+                            # would credit minus what the current battery credited.
+                            # Simpler: just track if actual-expected improves.
+                            total_residual += actual - expected
+                            n_post_sunset += 1
+                if n_post_sunset >= 5:
+                    mean_res = total_residual / n_post_sunset
+                    sweep_results[str(candidate)] = round(mean_res, 4)
+                    if abs(mean_res) < best_abs_residual:
+                        best_abs_residual = abs(mean_res)
+                        best_decay = candidate
+            calibration = {
+                "current_decay": self.solar_battery_decay,
+                "recommended_decay": best_decay,
+                "sweep_results": sweep_results,
+                "post_sunset_hours_evaluated": max(
+                    (sum(1 for h, raw, a, e in hrs if raw < 0.01)
+                     for hrs in day_sequences.values()), default=0
+                ),
+            }
+            if apply_battery_decay and best_decay != self.solar_battery_decay:
+                old_decay = self.solar_battery_decay
+                self.solar_battery_decay = best_decay
+                # Persist to entry.data
+                new_data = {**self.entry.data, "solar_battery_decay": best_decay}
+                self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+                calibration["applied"] = True
+                _LOGGER.info(
+                    "Solar battery decay calibrated: %.2f → %.2f (applied)",
+                    old_decay, best_decay,
+                )
+
+        # Screen impact
+        screen_impact = {}
+        if screen_closed_errors and screen_open_errors:
+            mean_closed = sum(screen_closed_errors) / len(screen_closed_errors)
+            mean_open = sum(screen_open_errors) / len(screen_open_errors)
+            screen_impact = {
+                "mean_error_screens_closed": round(mean_closed, 4),
+                "mean_error_screens_open": round(mean_open, 4),
+                "qualifying_hours_closed": len(screen_closed_errors),
+                "qualifying_hours_open": len(screen_open_errors),
+            }
+            if abs(mean_closed - mean_open) > 0.1:
+                global_flags.append("screen_drift_detected")
+
+        # Temporal bias (global)
+        all_morning = [acc["morning_delta"] / acc["morning_n"] for acc in unit_accum.values() if acc["morning_n"] > 5]
+        all_afternoon = [acc["afternoon_delta"] / acc["afternoon_n"] for acc in unit_accum.values() if acc["afternoon_n"] > 5]
+
+        # Hour-of-day curve
+        hour_curve = {}
+        for h in range(6, 19):
+            vals = hourly_residuals[h]
+            if vals:
+                hour_curve[str(h)] = round(sum(vals) / len(vals), 4)
+
+        return {
+            "global": {
+                "qualifying_hours": total_qualifying,
+                "excluded": excluded,
+                "battery_decay_health": battery_health,
+                "battery_calibration": calibration,
+                "screen_impact": screen_impact,
+                "temporal_bias": {
+                    "morning_mean_delta": round(sum(all_morning) / len(all_morning), 4) if all_morning else None,
+                    "afternoon_mean_delta": round(sum(all_afternoon) / len(all_afternoon), 4) if all_afternoon else None,
+                },
+                "hour_of_day_residual": hour_curve,
+                "flags": global_flags,
+            },
+            "per_unit": per_unit,
+        }
+
     def _get_float_state(self, entity_id: str) -> float | None:
         """Helper to get float state from an entity."""
         if not entity_id:
@@ -1215,17 +1611,18 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Condition-text mapping (e.g. "sunny" → 10%) is too coarse for
         # reliable solar coefficient learning.  Numeric cloud_coverage from
         # the weather entity is strongly recommended.
-        now = dt_util.now()
-        last_warn = getattr(self, '_cloud_coverage_warn_time', None)
-        if last_warn is None or (now - last_warn).total_seconds() >= 3600:
-            _LOGGER.warning(
-                "Weather entity '%s' does not provide numeric cloud_coverage attribute. "
-                "Falling back to condition-text mapping which significantly reduces solar "
-                "model accuracy. Consider switching to a weather integration that provides "
-                "cloud_coverage (e.g. Met.no or the custom Open-Meteo fork).",
-                self.weather_entity,
-            )
-            self._cloud_coverage_warn_time = now
+        if self.hass.is_running:
+            now = dt_util.now()
+            last_warn = getattr(self, '_cloud_coverage_warn_time', None)
+            if last_warn is None or (now - last_warn).total_seconds() >= 3600:
+                _LOGGER.warning(
+                    "Weather entity '%s' does not provide numeric cloud_coverage attribute. "
+                    "Falling back to condition-text mapping which significantly reduces solar "
+                    "model accuracy. Consider switching to a weather integration that provides "
+                    "cloud_coverage (e.g. Met.no or the custom Open-Meteo fork).",
+                    self.weather_entity,
+                )
+                self._cloud_coverage_warn_time = now
 
         condition = state.state
         if condition in CLOUD_COVERAGE_MAP:
@@ -1466,7 +1863,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Get current sun elevation and azimuth from HA."""
         sun_state = self.hass.states.get("sun.sun")
         if not sun_state:
-            if self.solar_enabled:
+            if self.solar_enabled and self.hass.is_running:
                 now = dt_util.now()
                 last_warn = getattr(self, '_sun_entity_warn_time', None)
                 if last_warn is None or (now - last_warn).total_seconds() >= 3600:
@@ -2143,7 +2540,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         # Fetch Humidity (for Track C per-hour COP / defrost penalty)
         humidity = self._get_weather_attribute("humidity")
-        if humidity is None and self.track_c_enabled:
+        if humidity is None and self.track_c_enabled and self.hass.is_running:
             now = dt_util.now()
             last_warn = getattr(self, '_humidity_warn_time', None)
             if last_warn is None or (now - last_warn).total_seconds() >= 3600:
@@ -2178,15 +2575,16 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         if wind_speed is None:
             wind_speed = 0.0
-            now = dt_util.now()
-            last_warn = getattr(self, '_wind_speed_warn_time', None)
-            if last_warn is None or (now - last_warn).total_seconds() >= 3600:
-                _LOGGER.warning(
-                    "Wind speed data unavailable from configured source. "
-                    "Defaulting to 0.0 m/s — all hours will land in the 'normal' "
-                    "wind bucket, disabling wind differentiation in the model."
-                )
-                self._wind_speed_warn_time = now
+            if self.hass.is_running:
+                now = dt_util.now()
+                last_warn = getattr(self, '_wind_speed_warn_time', None)
+                if last_warn is None or (now - last_warn).total_seconds() >= 3600:
+                    _LOGGER.warning(
+                        "Wind speed data unavailable from configured source. "
+                        "Defaulting to 0.0 m/s — all hours will land in the 'normal' "
+                        "wind bucket, disabling wind differentiation in the model."
+                    )
+                    self._wind_speed_warn_time = now
 
         # Calculate Inertia & Temp Keys EARLY (Moved from Step 4)
         # We need these for Solar Impact calculation and other model lookups
@@ -2236,6 +2634,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 is_aux_active=self.auxiliary_heating_active,
                 current_time=current_time,
                 humidity=humidity,
+                correction_percent=self.solar_correction_percent,
             )
         else:
             effective_wind = 0.0
@@ -2257,12 +2656,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     delta = val - prev_val
 
                     if delta < 0:
-                        _LOGGER.warning(f"Energy meter reset detected for {entity_id}: {prev_val} -> {val}. Skipping this reading.")
+                        if self.hass.is_running:
+                            _LOGGER.warning(f"Energy meter reset detected for {entity_id}: {prev_val} -> {val}. Skipping this reading.")
                         self._last_energy_values[entity_id] = val
                         continue
 
                     if delta > self.max_energy_delta:
-                        _LOGGER.warning(f"Energy spike detected for {entity_id}: {delta:.2f} kWh > {self.max_energy_delta} kWh. Skipping this reading and updating baseline.")
+                        if self.hass.is_running:
+                            _LOGGER.warning(f"Energy spike detected for {entity_id}: {delta:.2f} kWh > {self.max_energy_delta} kWh. Skipping this reading and updating baseline.")
                         self._last_energy_values[entity_id] = val
                         continue
 
@@ -2848,7 +3249,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         # Solar Optimization Learning
         rec_state_avg = "none"
-        actual_correction = self.solar_correction_percent
+        # Use hour-averaged correction instead of end-of-hour snapshot.
+        # Screen automation may change correction mid-hour; the average
+        # is consistent with the accumulated solar_factor and solar_vector.
+        if self._collector.sample_count > 0:
+            actual_correction = self._collector.correction_sum / self._collector.sample_count
+        else:
+            actual_correction = self.solar_correction_percent
         potential_factor_avg = 0.0
 
         if self.solar_enabled and self._collector.sample_count > 0:
@@ -3005,7 +3412,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # preventing over-prediction of consumption in the hours after peak sun.
         # Only charge/decay when solar is enabled; on solar-disabled installs stays at 0.
         if self.solar_enabled:
-            self._solar_battery_state = self._solar_battery_state * SOLAR_BATTERY_DECAY + solar_impact
+            self._solar_battery_state = self._solar_battery_state * self.solar_battery_decay + solar_impact
         effective_solar_impact = self._solar_battery_state
 
         # Update Last Hour Data in Coordinator
@@ -3534,7 +3941,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # wind_factor = 3-bucket multiplier matching Track A wind buckets (1.0/1.3/1.6)
         # solar_factor = 1.0 - solar (inverted; 0=no sun → full loss weight)
         #                — with solar thermal battery decay applied so afternoon solar
-        #                  gain residual carries into evening hours (mirrors SOLAR_BATTERY_DECAY)
+        #                  gain residual carries into evening hours (mirrors solar_battery_decay)
         weather_data = []
         log_by_hour = {e.get("hour", -1): e for e in day_logs}
 
@@ -3548,7 +3955,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             log_h = log_by_hour.get(h, {})
             raw_solar_h = log_h.get("solar_factor")
             raw_solar_h = raw_solar_h if raw_solar_h is not None else 0.0
-            solar_battery = solar_battery * SOLAR_BATTERY_DECAY + raw_solar_h
+            solar_battery = solar_battery * self.solar_battery_decay + raw_solar_h
             solar_residual_by_hour[h] = min(1.0, solar_battery)
 
         for record in mpc_records:
@@ -3694,7 +4101,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         for h in range(24):
             log_h = log_by_hour.get(h, {})
             raw_solar_h = log_h.get("solar_factor") or 0.0
-            solar_battery = solar_battery * SOLAR_BATTERY_DECAY + raw_solar_h
+            solar_battery = solar_battery * self.solar_battery_decay + raw_solar_h
             solar_residual_by_hour[h] = min(1.0, solar_battery)
 
         weather_data = []

@@ -9,6 +9,7 @@ from homeassistant.util import dt as dt_util
 
 from .helpers import get_last_year_iso_date, generate_gaussian_kernel, generate_exponential_kernel, calculate_asymmetric_inertia
 from .explanation import WeatherImpactAnalyzer, ExplanationFormatter
+from .solar import SolarCalculator
 from .const import (
     ATTR_TEMP_ACTUAL_TODAY,
     ATTR_TEMP_ACTUAL_WEEK,
@@ -129,21 +130,40 @@ class StatisticsManager:
         correlation_per_unit = self.coordinator.model.correlation_data_per_unit
         aux_coeffs_per_unit = self.coordinator.model.aux_coefficients_per_unit
 
-        # Pre-calculate Solar Vector if needed for unit calculation
+        # Pre-calculate Solar Vector if needed for unit calculation.
+        # Since #809, coefficients absorb screen transmittance implicitly
+        # (coeff ≈ phys_coeff × avg_transmittance) because the NLMS learning
+        # target (base − actual) includes the screen effect.  Therefore
+        # prediction uses coeff × potential with no extra transmittance factor.
+        # We reconstruct the potential vector from the effective + current screen.
+        try:
+            screen_pct = float(self.coordinator.solar_correction_percent)
+        except (TypeError, ValueError):
+            screen_pct = 100.0
+        screen_transmittance = SolarCalculator._screen_transmittance(screen_pct)
+
         if override_solar_vector is not None:
-            curr_solar_vector = override_solar_vector
+            effective_solar_vector = override_solar_vector
         else:
-            # Fallback to reconstructing from scalar if vector isn't provided (e.g. historical data)
             if override_solar_factor is not None:
                 curr_solar_factor = override_solar_factor
             else:
                 curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
 
             az_rad = math.radians(self.coordinator.solar_azimuth)
-            curr_solar_vector = (
+            effective_solar_vector = (
                 curr_solar_factor * (-math.cos(az_rad)),
                 curr_solar_factor * math.sin(az_rad)
             )
+
+        # Reconstruct potential (pre-screen) vector for coefficient dot product
+        if screen_transmittance > 0.01:
+            potential_solar_vector = (
+                effective_solar_vector[0] / screen_transmittance,
+                effective_solar_vector[1] / screen_transmittance,
+            )
+        else:
+            potential_solar_vector = effective_solar_vector
 
         # --- Track A: Global Model (Top-Down / Master) ---
         # 1. Global Base Prediction
@@ -210,7 +230,9 @@ class StatisticsManager:
             unit_solar_reduction = 0.0
             if self.coordinator.solar_enabled:
                  unit_coeff = self.coordinator.solar.calculate_unit_coefficient(entity_id, temp_key)
-                 unit_solar_reduction = self.coordinator.solar.calculate_unit_solar_impact(curr_solar_vector, unit_coeff)
+                 unit_solar_reduction = self.coordinator.solar.calculate_unit_solar_impact(
+                     potential_solar_vector, unit_coeff
+                 )
 
             # Determine Mode
             mode = MODE_HEATING
@@ -1697,11 +1719,18 @@ class StatisticsManager:
         if self.coordinator.solar_enabled:
              curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
              unit_coeff = self.coordinator.solar.calculate_unit_coefficient(entity_id, temp_key)
-             curr_solar_vector = (
+             eff_solar_vector = (
                  self.coordinator.data.get("solar_vector_s", 0.0),
                  self.coordinator.data.get("solar_vector_e", 0.0)
              )
-             unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(curr_solar_vector, unit_coeff)
+             # Reconstruct potential vector; coeff already absorbs transmittance
+             scr_pct = self.coordinator.solar_correction_percent
+             scr_t = SolarCalculator._screen_transmittance(scr_pct)
+             if scr_t > 0.01:
+                 pot_vec = (eff_solar_vector[0] / scr_t, eff_solar_vector[1] / scr_t)
+             else:
+                 pot_vec = eff_solar_vector
+             unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(pot_vec, unit_coeff)
 
              mode = MODE_HEATING if current_temp < self.coordinator.balance_point else MODE_COOLING
              unit_rate_curr = self.coordinator.solar.apply_correction(unit_base_curr, unit_solar_curr_kw, mode)

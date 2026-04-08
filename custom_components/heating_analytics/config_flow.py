@@ -24,7 +24,6 @@ from .const import (
     CONF_WIND_UNIT,
     CONF_ENABLE_LIFETIME_TRACKING,
     CONF_SOLAR_ENABLED,
-    CONF_HAS_AC_UNITS,
     DEFAULT_WIND_UNIT,
     WIND_UNIT_MS,
     WIND_UNIT_KMH,
@@ -99,13 +98,16 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return errors
 
     def _validate_physics(self, user_input: dict) -> dict[str, str]:
-        """Validate step 2: weather entity has wind_speed if no sensor."""
-        if not user_input.get("wind_speed_sensor"):
-            weather_id = self._flow_data.get("weather_entity")
-            if weather_id:
-                state = self.hass.states.get(weather_id)
-                if state and "wind_speed" not in state.attributes:
-                    return {"base": "weather_missing_wind_speed"}
+        """Validate step 2: weather entity has wind_speed attribute.
+
+        Wind sensor override is configured on the feature_config page, not here.
+        Always validate that the weather entity can supply wind data as a baseline.
+        """
+        weather_id = self._flow_data.get("weather_entity")
+        if weather_id:
+            state = self.hass.states.get(weather_id)
+            if state and "wind_speed" not in state.attributes:
+                return {"base": "weather_missing_wind_speed"}
         return {}
 
     def _clear_absent_entity_keys(self, user_input: dict, keys: list) -> None:
@@ -230,7 +232,6 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
-            vol.Optional(CONF_HAS_AC_UNITS, default=g(CONF_HAS_AC_UNITS, False)): selector.BooleanSelector(),
             vol.Required("balance_point", default=g("balance_point", DEFAULT_BALANCE_POINT)): selector.NumberSelector(
                 selector.NumberSelectorConfig(min=10, max=25, step=0.5, unit_of_measurement="°C")
             ),
@@ -414,7 +415,6 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not errors:
                 self._flow_data.update(user_input)
                 self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor"])
-                self._flow_data[CONF_HAS_AC_UNITS] = bool(user_input.get(CONF_HAS_AC_UNITS, False))
                 return await self.async_step_advanced()
         return self.async_show_form(
             step_id="physics",
@@ -500,7 +500,6 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not errors:
                 self._flow_data.update(user_input)
                 self._clear_absent_entity_keys(user_input, ["wind_speed_sensor", "wind_gust_sensor"])
-                self._flow_data[CONF_HAS_AC_UNITS] = bool(user_input.get(CONF_HAS_AC_UNITS, False))
                 return await self.async_step_reconfigure_advanced()
         return self.async_show_form(
             step_id="reconfigure_physics",

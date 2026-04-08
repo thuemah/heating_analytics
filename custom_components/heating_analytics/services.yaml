@@ -378,3 +378,39 @@ diagnose_model:
           min: 1
           max: 365
           mode: box
+
+diagnose_solar:
+  name: Diagnose Solar Model
+  description: >-
+    Analyzes per-unit solar coefficient health and global solar model quality.
+    Reports implied coefficients, convergence stability, battery decay health,
+    screen correction impact, temporal bias, and saturation frequency.
+    Includes battery decay calibration sweep — set apply_battery_decay to
+    automatically apply the recommended decay rate.
+    Returns a diagnostic dict — inspect in Developer Tools → Services.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance to diagnose. Leave empty to target the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    days:
+      name: Days Back to Analyze
+      description: Number of days of hourly log history to include in the analysis (1-365).
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 365
+          mode: box
+    apply_battery_decay:
+      name: Apply Recommended Battery Decay
+      description: >-
+        When enabled, automatically applies the recommended battery decay rate
+        from the calibration sweep. The value is persisted and takes effect
+        immediately. Use diagnose_solar without this flag first to review the
+        recommendation.
+      default: false
+      selector:
+        boolean:

@@ -26,25 +26,17 @@
         }
       },
       "physics": {
-        "title": "Sensor Overrides & Building Physics",
-        "description": "Optionally connect local wind sensors and configure the physical characteristics of your home. The defaults work well for most standard houses.",
+        "title": "Building Physics",
+        "description": "Configure the physical characteristics of your home. The defaults work well for most standard houses.",
         "data": {
           "wind_unit": "Wind Speed Unit",
-          "has_ac_units": "Show Cooling Modes",
           "balance_point": "Balance Point Temperature",
-          "thermal_inertia": "Thermal Inertia Profile",
-          "wind_speed_sensor": "Wind Speed Sensor",
-          "wind_gust_sensor": "Wind Gust Sensor",
-          "indoor_temp_sensor": "Indoor Temperature Sensor"
+          "thermal_inertia": "Thermal Inertia Profile"
         },
         "data_description": {
           "wind_unit": "The unit for wind speed settings on the next page.",
-          "has_ac_units": "Enable to unlock Cooling Mode, Guest Mode, and DHW Mode. Each mode creates dedicated input entities per heating unit for direct control via blueprints.",
           "balance_point": "The outdoor temperature at which your home stops needing heat. Typically 15-17°C for well-insulated homes, up to 18°C for older buildings.",
-          "thermal_inertia": "How many hours of outdoor temperature history the model considers. Use a low value for lightweight wood-frame structures, higher for heavy concrete or stone buildings.",
-          "wind_speed_sensor": "Optional. A local anemometer improves wind modelling accuracy. If left blank, the weather provider is used.",
-          "wind_gust_sensor": "Optional. Leave blank to use the weather provider's gust data.",
-          "indoor_temp_sensor": "Optional. Required for thermal mass correction in Daily Learning Mode (Track B). Leave blank if not using Track B."
+          "thermal_inertia": "How many hours of outdoor temperature history the model considers. Use a low value for lightweight wood-frame structures, higher for heavy concrete or stone buildings."
         }
       },
       "advanced": {
@@ -122,25 +114,17 @@
         }
       },
       "reconfigure_physics": {
-        "title": "Edit: Sensor Overrides & Building Physics",
-        "description": "Update local wind sensors and physical home characteristics.",
+        "title": "Edit: Building Physics",
+        "description": "Update physical home characteristics.",
         "data": {
           "wind_unit": "Wind Speed Unit",
-          "has_ac_units": "Show Cooling Modes",
           "balance_point": "Balance Point Temperature",
-          "thermal_inertia": "Thermal Inertia Profile",
-          "wind_speed_sensor": "Wind Speed Sensor",
-          "wind_gust_sensor": "Wind Gust Sensor",
-          "indoor_temp_sensor": "Indoor Temperature Sensor"
+          "thermal_inertia": "Thermal Inertia Profile"
         },
         "data_description": {
           "wind_unit": "The unit for wind speed settings on the next page.",
-          "has_ac_units": "Enable to unlock Cooling Mode, Guest Mode, and DHW Mode. Each mode creates dedicated input entities per heating unit for direct control via blueprints.",
           "balance_point": "The outdoor temperature at which your home stops needing heat. Typically 15-17°C for well-insulated homes, up to 18°C for older buildings.",
-          "thermal_inertia": "How many hours of outdoor temperature history the model considers. Use a low value for lightweight wood-frame structures, higher for heavy concrete or stone buildings.",
-          "wind_speed_sensor": "Optional. A local anemometer improves wind modelling accuracy. If left blank, the weather provider is used.",
-          "wind_gust_sensor": "Optional. Leave blank to use the weather provider's gust data.",
-          "indoor_temp_sensor": "Optional. Required for thermal mass correction in Daily Learning Mode (Track B). Leave blank if not using Track B."
+          "thermal_inertia": "How many hours of outdoor temperature history the model considers. Use a low value for lightweight wood-frame structures, higher for heavy concrete or stone buildings."
         }
       },
       "reconfigure_advanced": {

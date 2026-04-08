@@ -128,6 +128,7 @@ async def test_aux_impact_log_persistence(coordinator):
     coordinator._collector.aux_impact_hour = 0.05
     coordinator._collector.aux_count = 3
     coordinator._collector.sample_count = 60 # 5% fraction
+    coordinator._collector.correction_sum = 100.0 * 60  # screens fully open
     # Initialize list for percentile calculation to avoid IndexError
     coordinator._collector.wind_values = [0.0] * 60
 

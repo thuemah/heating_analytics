@@ -340,7 +340,7 @@ The system stores **Hourly Data Vectors** (Temp, Wind, Actual Load) for every da
 | Solar Correction | Number | 100% | How much solar reaches the building (0–100%) |
 | Learning Enabled | Switch | On | Master on/off for model learning |
 | Auxiliary Heating Active | Switch | Off | Signals unmetered heat source is active |
-| {Unit} Mode | Select | Heating | Per-unit mode (heating/cooling/off/dhw/guest). Only when `has_ac_units` is enabled |
+| {Unit} Mode | Select | Heating | Per-unit mode (heating/cooling/off/dhw/guest). Created for each energy sensor. |
 
 ---
 
@@ -438,9 +438,11 @@ If you have a hidden consumer (like a bathroom floor heater) that isn't tracked,
 
 ### Solar Settings
 
-Solar correction is always active. The system exposes a **Solar Correction** number entity (0–100%, default 100%) that represents how much solar gain currently reaches the building (100% = screens fully open, 0% = fully closed). A minimum transmittance of 20% is always applied internally.
+Solar correction is always active. The system exposes a **Solar Correction** number entity (0–100%, default 100%) that represents how much solar gain currently reaches the building (100% = screens fully open, 0% = fully closed). A minimum transmittance of 20% is always applied internally — this accounts for diffuse radiation, unscreened windows, and conductive heat gain through walls and roof surfaces.
 
-Solar coefficients are learned automatically per unit — starting from 0.35 (heating) / 0.40 (cooling) and converging via 2D vector learning (south + east components).
+Solar coefficients are learned automatically per unit using a 2D vector model (south + east components). Each unit learns how much energy it saves (heating) or consumes additionally (cooling) per unit of raw solar irradiance. The coefficients encode window physics (area, orientation, thermal coupling) and are independent of screen state — screen transmittance is applied separately at prediction time. Learning uses Normalized LMS (NLMS), which adapts the step size to the solar signal strength: high-solar units and low-solar units converge at the same rate, preventing oscillation in sun-exposed rooms.
+
+A **Solar Thermal Battery** smooths solar impact across hours using exponential decay (default 0.80, half-life ~3.8 hours). This models heat stored in building mass (concrete, floor slabs) that releases gradually after peak sun. The decay rate can be calibrated per installation via the `diagnose_solar` service.
 
 ### Auxiliary Settings
 
@@ -818,6 +820,37 @@ data:
 - **Mode contamination:** Per-day breakdown of hours in OFF, DHW, Guest, and Cooling modes. Useful for validating that mode filtering is working correctly.
 - **Solar correlation:** Checks whether solar factor correlates with prediction error — positive correlation suggests solar is not fully captured by the model.
 - **Track B diagnostics:** For Track B days — `q_adjusted` vs raw kWh, thermal mass correction applied, daily average temperature, and which bucket was populated.
+
+---
+
+### Diagnose Solar Model
+
+**Service:** `heating_analytics.diagnose_solar`
+
+Analyzes per-unit solar coefficient health and global solar model quality. Useful for identifying mis-calibrated units, validating coefficient convergence, and tuning the solar thermal battery decay rate.
+
+```yaml
+action: heating_analytics.diagnose_solar
+data:
+  days: 30
+```
+
+**Returns a diagnostic report with:**
+
+- **Per-unit coefficient analysis:** Current vs implied coefficients (back-calculated from hourly data via normal equations), stability across 3 time windows, saturation frequency, and dominant component (south vs east).
+- **Battery decay health:** Post-sunset residual analysis — detects if the thermal battery decays too fast or too slow. Includes a calibration sweep (0.50–0.95) with the recommended decay rate.
+- **Screen correction impact:** Compares prediction error at different screen positions (closed vs open) to detect screen-induced coefficient drift.
+- **Temporal bias:** Morning vs afternoon mean prediction delta — reveals timing errors in the cloud model or battery decay.
+- **Hour-of-day residual curve:** Per-hour mean error from 6:00 to 18:00.
+
+**Battery calibration:** To automatically apply the recommended decay rate:
+
+```yaml
+action: heating_analytics.diagnose_solar
+data:
+  days: 30
+  apply_battery_decay: true
+```
 
 ---
 

@@ -26,25 +26,17 @@
         }
       },
       "physics": {
-        "title": "Sensoroverbygg og bygningsfysikk",
-        "description": "Koble til lokale vindsensorer og konfigurer de fysiske egenskapene til boligen din. Standardverdiene fungerer bra for de fleste vanlige hus.",
+        "title": "Bygningsfysikk",
+        "description": "Konfigurer de fysiske egenskapene til boligen din. Standardverdiene fungerer bra for de fleste vanlige hus.",
         "data": {
           "wind_unit": "Enhet for vindhastighet",
-          "has_ac_units": "Vis kjølemodus",
           "balance_point": "Balansepunkttemperatur",
-          "thermal_inertia": "Termisk treghets-profil",
-          "wind_speed_sensor": "Vindhastighetssensor",
-          "wind_gust_sensor": "Vindkastsensor",
-          "indoor_temp_sensor": "Innetemperatursensor"
+          "thermal_inertia": "Termisk treghets-profil"
         },
         "data_description": {
           "wind_unit": "Enheten som brukes for vindinnstillinger på neste side.",
-          "has_ac_units": "Aktiver for å låse opp Kjølemodus, Gjeste-modus og VVB-modus. Hver modus oppretter dedikerte input-entiteter per varmeenhet for direkte styring via blueprints.",
           "balance_point": "Utetemperaturen der boligen slutter å trenge varme. Typisk 15–17°C for godt isolerte boliger, opp til 18°C for eldre bygg.",
-          "thermal_inertia": "Antall timer med utetemperaturhistorikk modellen tar hensyn til. Bruk lav verdi for lette trekonstruksjoner, høyere for tunge betong- eller steinbygg.",
-          "wind_speed_sensor": "Valgfri. Et lokalt anemometer forbedrer vindmodelleringen. Hvis tomt, brukes værtjenesten.",
-          "wind_gust_sensor": "Valgfri. La stå tomt for å bruke værtjenestens vindkastdata.",
-          "indoor_temp_sensor": "Valgfri. Nødvendig for termisk massekorreksjon i daglig læringsmodus (Track B). La stå tomt hvis Track B ikke brukes."
+          "thermal_inertia": "Antall timer med utetemperaturhistorikk modellen tar hensyn til. Bruk lav verdi for lette trekonstruksjoner, høyere for tunge betong- eller steinbygg."
         }
       },
       "advanced": {
@@ -122,25 +114,17 @@
         }
       },
       "reconfigure_physics": {
-        "title": "Rediger: Sensoroverbygg og bygningsfysikk",
-        "description": "Oppdater lokale vindsensorer og bygningsfysiske egenskaper.",
+        "title": "Rediger: Bygningsfysikk",
+        "description": "Oppdater bygningsfysiske egenskaper.",
         "data": {
           "wind_unit": "Enhet for vindhastighet",
-          "has_ac_units": "Vis kjølemodus",
           "balance_point": "Balansepunkttemperatur",
-          "thermal_inertia": "Termisk treghets-profil",
-          "wind_speed_sensor": "Vindhastighetssensor",
-          "wind_gust_sensor": "Vindkastsensor",
-          "indoor_temp_sensor": "Innetemperatursensor"
+          "thermal_inertia": "Termisk treghets-profil"
         },
         "data_description": {
           "wind_unit": "Enheten som brukes for vindinnstillinger på neste side.",
-          "has_ac_units": "Aktiver for å låse opp Kjølemodus, Gjeste-modus og VVB-modus. Hver modus oppretter dedikerte input-entiteter per varmeenhet for direkte styring via blueprints.",
           "balance_point": "Utetemperaturen der boligen slutter å trenge varme. Typisk 15–17°C for godt isolerte boliger, opp til 18°C for eldre bygg.",
-          "thermal_inertia": "Antall timer med utetemperaturhistorikk modellen tar hensyn til. Bruk lav verdi for lette trekonstruksjoner, høyere for tunge betong- eller steinbygg.",
-          "wind_speed_sensor": "Valgfri. Et lokalt anemometer forbedrer vindmodelleringen. Hvis tomt, brukes værtjenesten.",
-          "wind_gust_sensor": "Valgfri. La stå tomt for å bruke værtjenestens vindkastdata.",
-          "indoor_temp_sensor": "Valgfri. Nødvendig for termisk massekorreksjon i daglig læringsmodus (Track B). La stå tomt hvis Track B ikke brukes."
+          "thermal_inertia": "Antall timer med utetemperaturhistorikk modellen tar hensyn til. Bruk lav verdi for lette trekonstruksjoner, høyere for tunge betong- eller steinbygg."
         }
       },
       "reconfigure_advanced": {

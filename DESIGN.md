@@ -136,23 +136,26 @@ Standard solar integration is difficult because "1000W of sun" doesn't mean "100
 
 4.  **2D Solar Vector Model:**
     *   The sun's position is decomposed into a **South** (`S`) and **East** (`E`) component using pure geometry — no manual azimuth input required.
-    *   Each unit learns a matching 2D coefficient vector `(Coeff_S, Coeff_E)` that captures its effective window orientation and transmittance empirically.
-    *   `Unit_Solar_Gain = Coeff_S × Solar_S + Coeff_E × Solar_E`
-    *   This dot-product formula means that a south-facing room learns a large `Coeff_S` and near-zero `Coeff_E`, while an east-facing room learns the opposite — without any user configuration.
+    *   Each unit learns a matching 2D coefficient vector `(Coeff_S, Coeff_E)` that captures its effective window orientation empirically.
+    *   `Unit_Solar_Impact = Coeff_S × Potential_S + Coeff_E × Potential_E`  (screen transmittance is implicit in the learned coefficient)
+    *   Coefficients are learned against the **potential** (pre-screen) solar vector. Because the learning target (`base − actual`) inherently includes the screen effect, the coefficient converges to `physical_window_coeff × average_screen_transmittance`. This is a deliberate trade-off: using the potential vector keeps the learning signal strong even when screens are closed (avoiding vector-magnitude stalls), while the implicit transmittance coupling is slowly tracked by NLMS. Windowless rooms correctly converge to near-zero coefficients regardless of screen state.
+    *   Learning uses **Normalized LMS (NLMS)** instead of standard LMS gradient descent. NLMS divides the step by the input power (`solar_s² + solar_e² + ε`), making convergence rate independent of the solar vector magnitude. This prevents gain-dependent instability where high-solar units oscillate while low-solar units converge. The regularization constant `ε = 0.05` naturally shrinks the east coefficient when the east signal is weak (typical at high latitudes where the sun tracks a narrow arc).
     *   During cold-start (no learned coefficients yet), an initial scalar default is decomposed along a 180° (south) assumption until real data replaces it.
 
 5.  **Air Mass Transmittance:**
     *   Solar attenuation at low sun angles is handled by a physics-based Air Mass Transmittance model (`intensity = 0.7 ** (1 / sin(elevation))`), replacing arbitrary elevation cutoff zones.
 
-6.  **Cloud Coverage Model (Kasten-derived power law):**
-    *   `cloud_factor = 1.0 − 0.75 × (cloud_coverage / 100)^1.5`
-    *   A linear model (`1 − cloud/100`) overstates reduction at partial coverage: 50% cloud does not mean 50% solar loss. Thin/partial clouds transmit significantly more energy than a linear interpolation predicts. The power law matches empirical Kasten data at the partial-cloud regime (30–70%) where the error is largest. The per-unit coefficient learning absorbs any remaining systematic bias from the crude HA weather entity input.
+6.  **Cloud Coverage Model (Kasten & Czeplak 1980):**
+    *   `cloud_factor = 1.0 − 0.75 × (cloud_coverage / 100)^3.4`
+    *   The original Kasten & Czeplak formula `G/G_clear = 1 − 0.75 × (N/8)^3.4` was calibrated against ground-observed oktas, not satellite-derived percentages. HA weather APIs report model/satellite cloud area fractions (0–100%) which are a related but different quantity. The exponent 3.4 produces a nearly constant bias multiplier (~1.01×) across all cloud levels when applied to API percentages, which is the critical property: a constant bias is cleanly absorbed by the per-unit coefficient, leaving the coefficient to represent window physics rather than cloud-model compensation. A lower exponent (e.g. 1.5) creates a cloud-level-dependent bias (2–39%) that forces the coefficient to track weather patterns instead of building properties.
 
 7.  **Screen Transmittance Floor:**
-    *   When solar screens are closed, a minimum transmittance floor (e.g., 20%) is enforced. Physically, a closed screen still transmits some solar irradiance through its fabric. This ensures effective vectors remain non-zero for coefficient learning.
+    *   When solar screens are closed, a minimum transmittance floor (20%) is enforced. This captures real physics beyond window transmittance: solar radiation heats exterior walls, roof surfaces, and the ground around the building, transferring heat inward through conduction regardless of screen position. The floor keeps the prediction path responsive to solar conditions even at 0% correction.
 
 8.  **Solar Thermal Battery:**
-    *   Instead of an instantaneous subtraction, solar gain is modeled as charging an exponential decay accumulator (`_solar_battery_state`). The absorbed heat releases gradually into the building mass over the following hours (e.g., decaying by 40% per hour), dampening instant compensation loops and matching real-world thermal inertia.
+    *   Instead of an instantaneous subtraction, solar gain is modeled as charging an exponential decay accumulator (`_solar_battery_state`). The absorbed heat releases gradually into the building mass over the following hours, dampening instant compensation loops and matching real-world thermal inertia.
+    *   Default decay rate is 0.75 (25% loss per hour, half-life ~2.4 hours), a middle ground between lightweight (furniture, interior surfaces) and heavier (concrete, floor heating) construction. Light-frame buildings may benefit from a faster decay (~0.60), while heavy masonry may need a slower one (~0.88). Per-installation calibration via `diagnose_solar` is recommended once 2+ weeks of data is available.
+    *   The `diagnose_solar` service includes a calibration sweep that tests decay rates from 0.50 to 0.95 against post-sunset residuals and recommends the optimal value. The `apply_battery_decay` parameter persists the recommendation to `entry.data` without requiring config flow changes.
 
 ### E. Auxiliary Heating (Dynamic Coefficients)
 For hybrid systems (Heat Pump + Fireplace/Heater), the system does not use a separate "Fireplace Mode" curve. Instead, it learns an **Auxiliary Coefficient**.
@@ -457,9 +460,10 @@ At midnight, `_process_daily_data()` assembles the full day's statistics and app
 ### Jump-Start Mechanism
 To prevent slow convergence on new installations:
 1.  **Buffering:** The system buffers the first 4 samples for any new Temperature/Wind bucket. (For Solar Coefficients, observations are pooled globally across all temperatures rather than partitioned by bucket to prevent stalling).
-2.  **Injection:** Once the buffer is full, it calculates the average and "Jump Starts" the model value directly to this average, bypassing the slow EMA warmup.
+2.  **Injection:** Once the buffer is full, it calculates the average and "Jump Starts" the model value directly to this average, bypassing the slow EMA warmup. For solar coefficients, a 2×2 least-squares fit is used to initialise both south and east components from the buffered observations.
 3.  **Damping:** Initial jump-start estimates for solar coefficients are mathematically dampened by 25% (`COLD_START_SOLAR_DAMPING = 0.75`) to guard against early-learning noise inflating outliers.
-4.  **Result:** Useable predictions appear within hours, not weeks.
+4.  **Post-jump-start:** Solar coefficients transition to NLMS adaptive learning. Base model and auxiliary coefficients continue with standard EMA.
+5.  **Result:** Useable predictions appear within hours, not weeks.
 
 ### DHW Mode — Air-to-Water Heat Pump Hysteresis
 

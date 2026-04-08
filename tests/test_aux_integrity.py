@@ -9,7 +9,7 @@ class MockSolarCalculator:
         return value
     def calculate_unit_coefficient(self, entity_id, temp_key):
         return 0.1
-    def calculate_unit_solar_impact(self, factor, coeff):
+    def calculate_unit_solar_impact(self, factor, coeff, screen_transmittance=1.0):
         return 0.0
 
     def calculate_saturation(self, net_demand, solar_potential, val):

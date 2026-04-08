@@ -22,6 +22,9 @@ class CoordinatorModelMixin:
     the real coordinator's lazy ModelState proxy.
     """
 
+    # Default screen correction for tests (100% = screens fully open)
+    solar_correction_percent: float = 100.0
+
     @property
     def model(self):
         return ModelProxy(self)

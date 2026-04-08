@@ -16,7 +16,6 @@ from .const import (
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
     MODE_DHW,
-    CONF_HAS_AC_UNITS,
 )
 from .coordinator import HeatingDataCoordinator
 
@@ -29,11 +28,9 @@ async def async_setup_entry(
     """Set up the select platform."""
     coordinator: HeatingDataCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    # Only create mode selects if user has AC capability
-    if not entry.data.get(CONF_HAS_AC_UNITS, False):
-        return
-
-    # Create a Select entity for each heating unit
+    # Create a mode select entity for each heating unit (#808).
+    # Always created regardless of has_ac_units — all users benefit from
+    # DHW, OFF, and Guest modes, not just those with cooling capability.
     entities = []
     for entity_id in coordinator.energy_sensors:
         entities.append(

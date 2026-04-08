@@ -66,10 +66,10 @@ DEFAULT_SOLAR_COEFF_COOLING = 0.40
 
 # Solar thermal battery: exponential decay factor applied per hour.
 # Models how solar energy absorbed by building mass is released over time.
-# 0.60 → ~20 % of a solar impact still effective after 3 hours (half-life ~1.4 h).
-# Effect: evening/night hours after a sunny afternoon see a non-zero residual
-# solar correction, preventing over-prediction of heating consumption.
-SOLAR_BATTERY_DECAY = 0.60
+# 0.75 → half-life ~2.4 h; good middle ground between light (furniture)
+# and heavy (concrete floor) thermal mass.  Per-installation calibration
+# available via diagnose_solar with apply_battery_decay: true.
+SOLAR_BATTERY_DECAY = 0.75
 
 # Minimum solar transmittance when screens are fully closed.
 # Models two physical realities:
@@ -99,9 +99,11 @@ MS_TO_KMH = 3.6
 MS_TO_KNOTS = 1.94384
 
 # Learning Constants
-PER_UNIT_LEARNING_RATE_CAP = 0.03   # 3% max EMA rate to prevent oscillation
+PER_UNIT_LEARNING_RATE_CAP = 0.03   # 3% max EMA rate for base/aux per-unit learning
 SOLAR_COEFF_CAP = 5.0               # Max solar coefficient (kW per full sun)
 COLD_START_SOLAR_DAMPING = 0.75     # Dampen cold-start solar estimates; base model noise inflates early samples
+NLMS_STEP_SIZE = 0.10               # NLMS mu for solar coefficient learning (converges in ~10 qualifying hours)
+NLMS_REGULARIZATION = 0.05          # NLMS epsilon: prevents noise-chasing at low solar power, shrinks east component
 LEARNING_BUFFER_THRESHOLD = 4
 TARGET_TDD_WINDOW = 0.5  # Minimum TDD accumulation for seamless rolling window efficiency
 MIN_EXTRAPOLATION_DELTA_T = 0.5  # Minimum Delta T (Degrees) required to trust extrapolation source

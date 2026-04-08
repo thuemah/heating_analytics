@@ -15,10 +15,13 @@ from .const import (
     MODE_GUEST_COOLING,
     MODE_DHW,
     MODES_EXCLUDED_FROM_GLOBAL_LEARNING,
+    NLMS_REGULARIZATION,
+    NLMS_STEP_SIZE,
     PER_UNIT_LEARNING_RATE_CAP,
     SOLAR_COEFF_CAP,
 )
 from .observation import HourlyObservation, ModelState, LearningConfig
+from .solar import SolarCalculator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -74,6 +77,7 @@ class LearningManager:
         unit_modes = obs.unit_modes
         is_cooldown_active = obs.was_cooldown_active
         solar_normalization_delta = obs.solar_normalization_delta
+        correction_percent = obs.correction_percent
 
         # From ModelState
         correlation_data = model.correlation_data
@@ -292,6 +296,7 @@ class LearningManager:
                 hourly_expected_base_per_unit,
                 aux_affected_entities, # Pass aux exclusion list
                 is_cooldown_active=is_cooldown_active,
+                correction_percent=correction_percent,
             )
 
         return {
@@ -402,6 +407,7 @@ class LearningManager:
         hourly_expected_base_per_unit: dict,
         aux_affected_entities: list[str] | None,
         is_cooldown_active: bool = False,
+        correction_percent: float = 100.0,
     ):
         """Process learning for individual units."""
         for entity_id in energy_sensors:
@@ -450,23 +456,42 @@ class LearningManager:
 
             unit_solar_impact = 0.0
 
+            # Reconstruct potential (pre-screen) solar vector for learning (#809).
+            # Coefficients learn against raw irradiance so they encode window
+            # physics, not screen state. Screen correction is applied at
+            # prediction time only.
+            transmittance = SolarCalculator._screen_transmittance(correction_percent)
+            if transmittance > 0.01:
+                potential_s = avg_solar_vector[0] / transmittance
+                potential_e = avg_solar_vector[1] / transmittance
+            else:
+                potential_s, potential_e = avg_solar_vector
+
             # Vector magnitude check for "sunny enough" threshold
-            s, e = avg_solar_vector
-            vector_magnitude = (s**2 + e**2) ** 0.5
+            # Use potential vector — learning should happen when sun shines,
+            # regardless of screen position.
+            vector_magnitude = (potential_s**2 + potential_e**2) ** 0.5
 
             if solar_enabled and vector_magnitude > 0.1 and not is_aux_active:
                 self._learn_unit_solar_coefficient(
                     entity_id, temp_key,
-                    expected_unit_base, actual_unit, avg_solar_vector,
+                    expected_unit_base, actual_unit, (potential_s, potential_e),
                     learning_rate, solar_coefficients_per_unit, learning_buffer_solar_per_unit,
                     avg_temp, balance_point,
                     unit_mode
                 )
 
             # Step 2: Calculate Solar Impact using (possibly updated) coefficients
+            # Use potential vector (not effective) because the coefficient already
+            # absorbs screen transmittance via NLMS learning against actual_impact
+            # which includes the screen effect.  Using effective here would
+            # double-count transmittance: coeff(≈phys×trans) × effective(=pot×trans)
+            # = phys×pot×trans², leaving residual solar in the normalized data.
             if solar_enabled:
                  unit_coeff = solar_calculator.calculate_unit_coefficient(entity_id, temp_key)
-                 unit_solar_impact = solar_calculator.calculate_unit_solar_impact(avg_solar_vector, unit_coeff)
+                 unit_solar_impact = solar_calculator.calculate_unit_solar_impact(
+                     (potential_s, potential_e), unit_coeff
+                 )
                  # Use unit_mode for normalization
                  unit_normalized = solar_calculator.normalize_for_learning(actual_unit, unit_solar_impact, unit_mode)
             else:
@@ -615,27 +640,34 @@ class LearningManager:
                  _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({actual_impact:.3f} kW)")
 
         else:
-            # Post-Jump Start: LMS Gradient Descent
-            # Cap per-unit learning rate at 3% to prevent oscillation
-            unit_learning_rate = min(learning_rate, PER_UNIT_LEARNING_RATE_CAP)
-
+            # Post-Jump Start: Normalized LMS (NLMS) (#809 A3)
+            # Standard LMS has gain-dependent instability: high-solar units
+            # (e.g. Toshiba with large south windows) get updates proportional
+            # to solar_s², causing oscillation. NLMS normalizes by input power,
+            # making convergence rate independent of solar magnitude.
+            # Epsilon acts as L2 regularization — when solar power is low,
+            # the effective step shrinks, preventing noise-chasing on the
+            # poorly-constrained east component.
             coeff_s = current_coeff.get("s", 0.0)
             coeff_e = current_coeff.get("e", 0.0)
 
             predicted_impact = coeff_s * solar_s + coeff_e * solar_e
             error = actual_impact - predicted_impact
 
-            # Gradient update
-            new_coeff_s = coeff_s + unit_learning_rate * error * solar_s
-            new_coeff_e = coeff_e + unit_learning_rate * error * solar_e
+            # NLMS: normalize step by input power + regularization
+            input_power = solar_s ** 2 + solar_e ** 2
+            step = NLMS_STEP_SIZE * error / (input_power + NLMS_REGULARIZATION)
 
-            # Clamp individually for safety, but allow negative components
+            new_coeff_s = coeff_s + step * solar_s
+            new_coeff_e = coeff_e + step * solar_e
+
+            # Clamp for safety
             new_coeff_s = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_s))
             new_coeff_e = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_e))
 
             new_coeff = {"s": new_coeff_s, "e": new_coeff_e}
 
-            _LOGGER.debug(f"Per-Unit Solar Learning [LMS EMA]: {entity_id} -> {new_coeff} (was {current_coeff})")
+            _LOGGER.debug(f"Per-Unit Solar Learning [NLMS]: {entity_id} -> {new_coeff} (was {current_coeff})")
             self._update_unit_solar_coefficient(entity_id, new_coeff, solar_coefficients_per_unit)
 
     def _learn_unit_model(

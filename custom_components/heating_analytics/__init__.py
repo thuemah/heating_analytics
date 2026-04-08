@@ -39,6 +39,7 @@ SERVICE_GET_FORECAST = "get_forecast"
 SERVICE_CALIBRATE_INERTIA = "calibrate_inertia"
 SERVICE_CALIBRATE_WIND_THRESHOLDS = "calibrate_wind_thresholds"
 SERVICE_DIAGNOSE_MODEL = "diagnose_model"
+SERVICE_DIAGNOSE_SOLAR = "diagnose_solar"
 SERVICE_RESET_SOLAR_LEARNING = "reset_solar_learning"
 SERVICE_RETRAIN_FROM_HISTORY = "retrain_from_history"
 SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
@@ -530,6 +531,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         SERVICE_DIAGNOSE_MODEL,
         handle_diagnose_model,
         schema=SERVICE_SCHEMA_DIAGNOSE,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    # Register Diagnose Solar Service
+    SERVICE_SCHEMA_DIAGNOSE_SOLAR = vol.Schema({
+        vol.Optional("entity_id"): cv.entity_id,
+        vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=365)),
+        vol.Optional("apply_battery_decay", default=False): bool,
+    })
+
+    async def handle_diagnose_solar(call: ServiceCall) -> dict:
+        """Handle the diagnose solar service call."""
+        entity_id = call.data.get("entity_id")
+        days = call.data.get("days", 30)
+        apply_decay = call.data.get("apply_battery_decay", False)
+        coord = _get_target_coordinator(hass, entity_id)
+        _LOGGER.info(f"Service called: diagnose_solar (days={days}, apply_battery_decay={apply_decay}, coordinator={coord.entry.entry_id})")
+        return coord.diagnose_solar(days_back=days, apply_battery_decay=apply_decay)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DIAGNOSE_SOLAR,
+        handle_diagnose_solar,
+        schema=SERVICE_SCHEMA_DIAGNOSE_SOLAR,
         supports_response=SupportsResponse.ONLY,
     )
 

@@ -94,12 +94,15 @@ class SolarCalculator:
             # Zone 3: Backside
             az_factor = BACKSIDE_FLOOR
 
-        # 3. Cloud Factor (Kasten-derived power law)
-        # Linear 1-cloud/100 overstates reduction at partial coverage.
-        # The power-law better matches empirical data: thin/partial clouds
-        # transmit more than a linear model predicts.
+        # 3. Cloud Factor (Kasten & Czeplak 1980)
+        # G/G_clear = 1 - 0.75 × (N/8)^3.4 where N is oktas.
+        # With cloud_frac = cloud_coverage/100 as fractional sky cover,
+        # the exponent 3.4 produces a nearly constant bias (~1%) across
+        # all cloud levels when using satellite/model-derived percentages,
+        # allowing per-unit coefficients to represent window physics
+        # rather than compensating for cloud-model error.
         cloud_frac = cloud_coverage / 100.0
-        cloud_factor = 1.0 - 0.75 * cloud_frac ** 1.5
+        cloud_factor = 1.0 - 0.75 * cloud_frac ** 3.4
 
         return elev_factor * az_factor * cloud_factor
 
@@ -118,9 +121,9 @@ class SolarCalculator:
         raw_elev_factor = max(0.0, math.cos(elev_rad))
         elev_factor = raw_elev_factor * intensity
 
-        # Cloud Factor (Kasten-derived power law — matches calculate_solar_factor)
+        # Cloud Factor (Kasten & Czeplak 1980 — matches calculate_solar_factor)
         cloud_frac = cloud_coverage / 100.0
-        cloud_factor = 1.0 - 0.75 * cloud_frac ** 1.5
+        cloud_factor = 1.0 - 0.75 * cloud_frac ** 3.4
 
         base_intensity = elev_factor * cloud_factor
 
@@ -172,16 +175,28 @@ class SolarCalculator:
         """
         return potential_solar_factor * self._screen_transmittance(correction_percent)
 
-    def calculate_unit_solar_impact(self, global_solar_vector: tuple[float, float], unit_coeff: dict[str, float]) -> float:
-        """Calculate solar impact in kW for a specific unit using its learned 2D coefficient vector.
+    def calculate_unit_solar_impact(
+        self,
+        global_solar_vector: tuple[float, float],
+        unit_coeff: dict[str, float],
+        screen_transmittance: float = 1.0,
+    ) -> float:
+        """Calculate solar impact in kW for a specific unit.
 
-        Formula: Impact = Coeff_S * Solar_S + Coeff_E * Solar_E
+        Since #809, coefficients are learned against the potential (pre-screen)
+        solar vector. The prediction path passes the potential vector and
+        screen_transmittance separately:
+
+            Impact = (Coeff_S × Potential_S + Coeff_E × Potential_E) × transmittance
+
+        For backward compatibility, callers that pass the effective (post-screen)
+        vector with screen_transmittance=1.0 get the same result as before.
         """
         solar_s, solar_e = global_solar_vector
         coeff_s = unit_coeff.get("s", 0.0)
         coeff_e = unit_coeff.get("e", 0.0)
 
-        impact = coeff_s * solar_s + coeff_e * solar_e
+        impact = (coeff_s * solar_s + coeff_e * solar_e) * screen_transmittance
         return max(0.0, impact)
 
     def calculate_unit_coefficient(self, entity_id: str, temp_key: str) -> dict[str, float]:
