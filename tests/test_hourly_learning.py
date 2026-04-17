@@ -91,11 +91,11 @@ async def test_hourly_learning_with_solar(hass: HomeAssistant):
         # Solar impact = 0.5 kWh for the test scenario.
         coordinator.solar.get_approx_sun_pos = MagicMock(return_value=(30.0, 180.0))
         coordinator.solar.calculate_solar_factor = MagicMock(return_value=1.0)
-        coordinator.solar.calculate_potential_solar_impact = MagicMock(return_value=(0.5, (0.5, 0.0), 1.0))
+        coordinator.solar.calculate_potential_solar_impact = MagicMock(return_value=(0.5, (0.5, 0.0, 0.0), 1.0))
         coordinator.solar.calculate_solar_impact_kw = MagicMock(return_value=0.5)
         coordinator.solar.apply_correction = MagicMock(side_effect=lambda base, impact, temp: base - impact)
         coordinator.solar.normalize_for_learning = MagicMock(side_effect=lambda actual, impact, temp: actual + impact)
-        coordinator.solar.calculate_unit_coefficient = MagicMock(return_value=1.0)
+        coordinator.solar.calculate_unit_coefficient = MagicMock(return_value={"s": 1.0, "e": 0.0, "w": 0.0})
         coordinator.solar.calculate_unit_solar_impact = MagicMock(return_value=0.5)
         coordinator.solar.calculate_saturation = MagicMock(side_effect=lambda net, solar, mode: (min(solar, net), max(0, solar - net), max(0, net - solar)))
 

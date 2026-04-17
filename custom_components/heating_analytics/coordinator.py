@@ -296,6 +296,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self.max_energy_delta = entry.data.get("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA)
         self.enable_lifetime_tracking = entry.data.get(CONF_ENABLE_LIFETIME_TRACKING, False)
 
+        # Hourly log retention (#820): configurable via config flow
+        from .const import CONF_HOURLY_LOG_RETENTION_DAYS, DEFAULT_HOURLY_LOG_RETENTION_DAYS
+        retention_days = entry.data.get(CONF_HOURLY_LOG_RETENTION_DAYS, DEFAULT_HOURLY_LOG_RETENTION_DAYS)
+        self._hourly_log_max_entries = int(retention_days) * 24
+
         # Solar Config
         self.solar_enabled = entry.data.get(CONF_SOLAR_ENABLED, DEFAULT_SOLAR_ENABLED)
         self.solar_azimuth = entry.data.get(CONF_SOLAR_AZIMUTH, DEFAULT_SOLAR_AZIMUTH)
@@ -1044,10 +1049,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         # --- 3. Mode contamination (from hourly log) ---
         from homeassistant.util import dt as dt_util
-        cutoff = None
-        if days_back:
-            now = dt_util.now()
-            cutoff_str = (now - timedelta(days=days_back)).date().isoformat()
+        now = dt_util.now()
+        cutoff_str = (now - timedelta(days=days_back)).date().isoformat() if days_back else None
 
         mode_stats: dict[str, dict[str, int]] = {}
         total_hours = 0
@@ -1130,9 +1133,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             solar_diag["avg_solar_factor"] = round(avg_solar, 3)
             solar_diag["avg_error_kwh"] = round(avg_error, 3)
             solar_diag["interpretation"] = (
-                "Positive correlation: solar hours have higher-than-expected consumption — solar model may be over-subtracting."
+                "Positive correlation: solar hours have higher-than-expected consumption — solar model may be under-subtracting."
                 if correlation > 0.15 else
-                "Negative correlation: solar hours have lower-than-expected consumption — solar model may be under-subtracting."
+                "Negative correlation: solar hours have lower-than-expected consumption — solar model may be over-subtracting."
                 if correlation < -0.15 else
                 "No significant correlation — solar model appears well-calibrated."
             )
@@ -1209,11 +1212,15 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         def _get_unit_accum(eid: str) -> dict:
             if eid not in unit_accum:
                 unit_accum[eid] = {
-                    # Normal equations for 30d implied coefficient
-                    "ss": 0.0, "ee": 0.0, "se": 0.0, "sI": 0.0, "eI": 0.0, "n": 0,
+                    # Normal equations for 30d implied coefficient (3x3: S, E, W)
+                    "ss": 0.0, "ee": 0.0, "ww": 0.0,
+                    "se": 0.0, "sw": 0.0, "ew": 0.0,
+                    "sI": 0.0, "eI": 0.0, "wI": 0.0, "n": 0,
                     # 3-window stability (each has own normal eqs)
                     "windows": [
-                        {"ss": 0.0, "ee": 0.0, "se": 0.0, "sI": 0.0, "eI": 0.0, "n": 0}
+                        {"ss": 0.0, "ee": 0.0, "ww": 0.0,
+                         "se": 0.0, "sw": 0.0, "ew": 0.0,
+                         "sI": 0.0, "eI": 0.0, "wI": 0.0, "n": 0}
                         for _ in range(3)
                     ],
                     # Delta accumulator
@@ -1253,7 +1260,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             solar_factor = entry.get("solar_factor") or 0.0
             solar_s = entry.get("solar_vector_s", 0.0)
             solar_e = entry.get("solar_vector_e", 0.0)
-            vector_mag = (solar_s ** 2 + solar_e ** 2) ** 0.5
+            solar_w = entry.get("solar_vector_w", 0.0)
+            vector_mag = (solar_s ** 2 + solar_e ** 2 + solar_w ** 2) ** 0.5
             correction = entry.get("correction_percent", 100.0)
             solar_impact_raw = entry.get("solar_impact_raw_kwh", 0.0)
             solar_impact_eff = entry.get("solar_impact_kwh", 0.0)
@@ -1329,21 +1337,25 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 # Coeff already absorbs transmittance via NLMS, so no extra factor.
                 diag_transmittance = _SC._screen_transmittance(correction) if correction is not None else 1.0
                 if diag_transmittance > 0.01:
-                    diag_potential = (solar_s / diag_transmittance, solar_e / diag_transmittance)
+                    diag_potential = (solar_s / diag_transmittance, solar_e / diag_transmittance, solar_w / diag_transmittance)
                 else:
-                    diag_potential = (solar_s, solar_e)
+                    diag_potential = (solar_s, solar_e, solar_w)
                 unit_coeff = self.solar.calculate_unit_coefficient(entity_id, entry.get("temp_key", "10"))
                 modeled_solar = self.solar.calculate_unit_solar_impact(diag_potential, unit_coeff)
                 delta = modeled_solar - implied_solar
 
                 total_qualifying += 1
 
-                # Normal equations (30d total)
+                # Normal equations (30d total, 3x3)
                 acc["ss"] += solar_s * solar_s
                 acc["ee"] += solar_e * solar_e
+                acc["ww"] += solar_w * solar_w
                 acc["se"] += solar_s * solar_e
+                acc["sw"] += solar_s * solar_w
+                acc["ew"] += solar_e * solar_w
                 acc["sI"] += solar_s * implied_solar
                 acc["eI"] += solar_e * implied_solar
+                acc["wI"] += solar_w * implied_solar
                 acc["n"] += 1
 
                 # Window assignment
@@ -1354,9 +1366,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                         w = acc["windows"][w_idx]
                         w["ss"] += solar_s * solar_s
                         w["ee"] += solar_e * solar_e
+                        w["ww"] += solar_w * solar_w
                         w["se"] += solar_s * solar_e
+                        w["sw"] += solar_s * solar_w
+                        w["ew"] += solar_e * solar_w
                         w["sI"] += solar_s * implied_solar
                         w["eI"] += solar_e * implied_solar
+                        w["wI"] += solar_w * implied_solar
                         w["n"] += 1
                         break
 
@@ -1384,25 +1400,67 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     hourly_residuals[hour].append(delta)
 
         # --- Build results ---
-        def _solve_normal(ss, ee, se, sI, eI, n, min_samples=10):
-            """Solve 2x2 normal equations for implied coefficient."""
+        def _solve_normal(a, n, min_samples=10):
+            """Solve normal equations for implied coefficient.
+
+            Attempts a 3x3 solve (S, E, W).  When the west dimension has
+            no variance (sum_ww ≈ 0, typical for legacy logs without
+            solar_vector_w), falls back to the 2x2 (S, E) system so that
+            diagnose_solar remains useful immediately after upgrading.
+
+            Args:
+                a: dict with keys ss, ee, ww, se, sw, ew, sI, eI, wI.
+                n: number of qualifying samples.
+            """
             if n < min_samples:
                 return None
-            det = ss * ee - se * se
-            if abs(det) < 1e-6:
-                return None
-            return {
-                "s": round((ee * sI - se * eI) / det, 4),
-                "e": round((ss * eI - se * sI) / det, 4),
-            }
+            ss, ee, ww = a["ss"], a["ee"], a["ww"]
+            se, sw, ew = a["se"], a["sw"], a["ew"]
+            sI, eI, wI = a["sI"], a["eI"], a["wI"]
+            # 3x3 determinant via cofactor expansion
+            det = (
+                ss * (ee * ww - ew * ew)
+                - se * (se * ww - ew * sw)
+                + sw * (se * ew - ee * sw)
+            )
+            if abs(det) > 1e-6:
+                # Full 3D solution
+                det_s = (
+                    sI * (ee * ww - ew * ew)
+                    - se * (eI * ww - ew * wI)
+                    + sw * (eI * ew - ee * wI)
+                )
+                det_e = (
+                    ss * (eI * ww - ew * wI)
+                    - sI * (se * ww - ew * sw)
+                    + sw * (se * wI - eI * sw)
+                )
+                det_w = (
+                    ss * (ee * wI - ew * eI)
+                    - se * (se * wI - eI * sw)
+                    + sI * (se * ew - ee * sw)
+                )
+                return {
+                    "s": round(det_s / det, 4),
+                    "e": round(det_e / det, 4),
+                    "w": round(det_w / det, 4),
+                }
+            # Fallback: 2D solve (S, E) when W dimension has no variance
+            # (legacy logs or insufficient afternoon data)
+            det_2d = ss * ee - se * se
+            if abs(det_2d) > 1e-6:
+                return {
+                    "s": round((ee * sI - se * eI) / det_2d, 4),
+                    "e": round((ss * eI - se * sI) / det_2d, 4),
+                    "w": 0.0,
+                }
+            return None
 
         per_unit = {}
         for entity_id, acc in unit_accum.items():
             current = self.solar.calculate_unit_coefficient(entity_id, "10")
 
-            implied_30d = _solve_normal(
-                acc["ss"], acc["ee"], acc["se"], acc["sI"], acc["eI"], acc["n"]
-            )
+            implied_30d = _solve_normal(acc, acc["n"])
 
             # Physical-space implied (undo screen transmittance)
             implied_physical = None
@@ -1417,12 +1475,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     implied_physical = {
                         "s": round(implied_30d["s"] / transmittance, 4),
                         "e": round(implied_30d["e"] / transmittance, 4),
+                        "w": round(implied_30d["w"] / transmittance, 4),
                     }
 
             # Stability windows
             stability = []
             for w in acc["windows"]:
-                coeff = _solve_normal(w["ss"], w["ee"], w["se"], w["sI"], w["eI"], w["n"], min_samples=5)
+                coeff = _solve_normal(w, w["n"], min_samples=5)
                 stability.append({"coefficient": coeff, "qualifying_hours": w["n"]})
 
             # Flags
@@ -1443,13 +1502,16 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             # Dominant component
             cs = abs(current.get("s", 0.0))
             ce = abs(current.get("e", 0.0))
-            total_c = cs + ce
+            cw = abs(current.get("w", 0.0))
+            total_c = cs + ce + cw
             dominant = "balanced"
             if total_c > 0.01:
                 if cs / total_c > 0.9:
                     dominant = "south"
                 elif ce / total_c > 0.9:
                     dominant = "east"
+                elif cw / total_c > 0.9:
+                    dominant = "west"
 
             per_unit[entity_id] = {
                 "current_coefficient": {k: round(v, 4) for k, v in current.items()},
@@ -1499,7 +1561,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     hours_sorted = sorted(hours, key=lambda x: x[0])
                     sim_battery = 0.0
                     for h, raw_solar, actual, expected in hours_sorted:
-                        sim_battery = sim_battery * candidate + raw_solar
+                        sim_battery = sim_battery * candidate + raw_solar * (1 - candidate)
                         # Post-sunset: solar_factor ~ 0 but battery > 0
                         if raw_solar < 0.01 and sim_battery > 0.05 and expected > 0.05:
                             # expected already includes current battery effect.
@@ -1977,7 +2039,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         avg_wind: float = 0.0,
         avg_solar: float = 0.0,
         is_aux_active: bool = False,
-        avg_solar_vector: tuple[float, float] | None = None
+        avg_solar_vector: tuple[float, float, float] | None = None
     ):
         """Close the gap at hour boundary by filling missing minutes.
 
@@ -2078,7 +2140,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
             s_vector_s = log.get("solar_vector_s")
             s_vector_e = log.get("solar_vector_e")
-            s_vector = (s_vector_s, s_vector_e) if s_vector_s is not None and s_vector_e is not None else None
+            s_vector_w = log.get("solar_vector_w", 0.0)
+            s_vector = (s_vector_s, s_vector_e, s_vector_w) if s_vector_s is not None and s_vector_e is not None else None
 
             res_actual = self.statistics.calculate_total_power(
                 temp=temp,
@@ -2555,7 +2618,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Fetch Solar Data
         potential_solar_factor = 0.0
         solar_factor = 0.0
-        solar_vector = (0.0, 0.0)
+        solar_vector = (0.0, 0.0, 0.0)
         if self.solar_enabled:
              elev, azim = self._get_sun_info_now()
              cloud = self._get_cloud_coverage()
@@ -2569,6 +2632,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
              solar_vector = self.solar.calculate_effective_solar_vector(
                  potential_solar_vector, self.solar_correction_percent
              )
+
+             # Expose current effective solar vector for fallback projection
+             self.data["solar_vector_s"] = round(solar_vector[0], 4)
+             self.data["solar_vector_e"] = round(solar_vector[1], 4)
+             self.data["solar_vector_w"] = round(solar_vector[2], 4)
 
              if ATTR_SOLAR_IMPACT not in self.data:
                  self.data[ATTR_SOLAR_IMPACT] = 0.0
@@ -3005,7 +3073,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         effective_wind: float,
         wind_bucket: str,
         avg_solar_factor: float,
-        avg_solar_vector: tuple[float, float],
+        avg_solar_vector: tuple[float, float, float],
         solar_impact_raw: float,
         effective_solar_impact: float,
         total_energy_kwh: float,
@@ -3200,7 +3268,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         avg_temp = 0.0
         calculated_effective_wind = 0.0
         avg_solar_factor = 0.0
-        avg_solar_vector = (0.0, 0.0)
+        avg_solar_vector = (0.0, 0.0, 0.0)
         wind_bucket = "normal"
         aux_fraction = 0.0
         is_aux_dominant = False  # For learning purposes
@@ -3219,7 +3287,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                  avg_solar_factor = self._collector.solar_sum / self._collector.sample_count
                  avg_solar_vector = (
                      self._collector.solar_vector_s_sum / self._collector.sample_count,
-                     self._collector.solar_vector_e_sum / self._collector.sample_count
+                     self._collector.solar_vector_e_sum / self._collector.sample_count,
+                     self._collector.solar_vector_w_sum / self._collector.sample_count,
                  )
 
              # Determine base wind bucket (always physical now)
@@ -3407,12 +3476,17 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             # Update global attr for consistency
             self.data[ATTR_SOLAR_IMPACT] = round(solar_impact, 3)
 
-        # Solar Thermal Battery: accumulate impact with exponential decay.
-        # Carries residual solar heat stored in building mass into post-solar hours,
-        # preventing over-prediction of consumption in the hours after peak sun.
-        # Only charge/decay when solar is enabled; on solar-disabled installs stays at 0.
+        # Solar Thermal Battery: EMA model of building thermal mass.
+        # The battery smooths solar impact across hours via exponential decay,
+        # modelling how thermal mass absorbs solar heat and releases it slowly.
+        # The (1 - decay) input factor is the exact discretisation of Newton's
+        # law of cooling: at steady state, effective solar = raw solar (no
+        # amplification).  The decay parameter controls only the time constant.
         if self.solar_enabled:
-            self._solar_battery_state = self._solar_battery_state * self.solar_battery_decay + solar_impact
+            self._solar_battery_state = (
+                self._solar_battery_state * self.solar_battery_decay
+                + solar_impact * (1 - self.solar_battery_decay)
+            )
         effective_solar_impact = self._solar_battery_state
 
         # Update Last Hour Data in Coordinator
@@ -3592,6 +3666,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "solar_factor": round(avg_solar_factor, 3),
                 "solar_vector_s": round(avg_solar_vector[0], 3),
                 "solar_vector_e": round(avg_solar_vector[1], 3),
+                "solar_vector_w": round(avg_solar_vector[2], 3),
                 "solar_impact_kwh": round(effective_solar_impact, 3),
                 "solar_impact_raw_kwh": round(solar_impact, 3),
                 "primary_entity": self.weather_entity,
@@ -3625,9 +3700,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             else:
                 self._hourly_log.append(log_entry)
 
-            # Retention Policy (keep last 2160 hours = 90 days)
-            if len(self._hourly_log) > 2160:
-                self._hourly_log = self._hourly_log[-2160:]
+            # Retention Policy (#820): configurable via hourly_log_retention_days.
+            # Use in-place deletion to preserve the list identity.
+            # Creating a new list (self._hourly_log = self._hourly_log[-N:])
+            # would sever the reference held by the cached ModelState,
+            # causing model.hourly_log to return stale data.
+            max_entries = self._hourly_log_max_entries
+            if len(self._hourly_log) > max_entries:
+                del self._hourly_log[:-max_entries]
 
             _LOGGER.info(f"Hourly Update: Temp={avg_temp:.1f}, Wind={wind_bucket}, Energy={total_energy_kwh:.2f}, Solar={avg_solar_factor:.2f}")
 
@@ -3948,14 +4028,12 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Solar battery pre-pass: accumulate decay across hours so that afternoon
         # solar gain reduces evening loss weights, matching Track A's solar battery model.
         solar_battery = 0.0
-        # Build ordered hour → raw_solar mapping for the 24-hour sequence.
-        hours_ordered = sorted(log_by_hour.keys())
         solar_residual_by_hour: dict[int, float] = {}
         for h in range(24):
             log_h = log_by_hour.get(h, {})
             raw_solar_h = log_h.get("solar_factor")
             raw_solar_h = raw_solar_h if raw_solar_h is not None else 0.0
-            solar_battery = solar_battery * self.solar_battery_decay + raw_solar_h
+            solar_battery = solar_battery * self.solar_battery_decay + raw_solar_h * (1 - self.solar_battery_decay)
             solar_residual_by_hour[h] = min(1.0, solar_battery)
 
         for record in mpc_records:
@@ -4101,7 +4179,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         for h in range(24):
             log_h = log_by_hour.get(h, {})
             raw_solar_h = log_h.get("solar_factor") or 0.0
-            solar_battery = solar_battery * self.solar_battery_decay + raw_solar_h
+            solar_battery = solar_battery * self.solar_battery_decay + raw_solar_h * (1 - self.solar_battery_decay)
             solar_residual_by_hour[h] = min(1.0, solar_battery)
 
         weather_data = []

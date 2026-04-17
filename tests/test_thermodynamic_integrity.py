@@ -44,7 +44,7 @@ def mock_coordinator():
     coord.solar = MagicMock()
     coord.solar.apply_correction = MagicMock(side_effect=lambda v, i, t: v)
     coord.solar.calculate_saturation.side_effect = lambda net, pot, val: (0.0, 0.0, net)
-    coord.solar.calculate_unit_coefficient.return_value = 0.0
+    coord.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
     coord.solar.calculate_unit_solar_impact.return_value = 0.0
 
     return coord

@@ -12,6 +12,7 @@ def mock_coordinator():
     coordinator._correlation_data = {}
     coordinator._aux_coefficients = {}
     coordinator._hourly_log = []
+    coordinator._hourly_log_max_entries = 2160
     coordinator._daily_history = {}
 
     # Mock methods used in import

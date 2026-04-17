@@ -38,10 +38,10 @@ async def test_weather_source_selection(hass, mock_entry):
     coordinator = HeatingDataCoordinator(hass, mock_entry)
     coordinator.solar = MagicMock()
     coordinator.solar.calculate_solar_factor.return_value = 0.0
-    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0, 0.0), 0.0)
     coordinator.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
     coordinator.solar.calculate_unit_solar_impact.return_value = 0.0
-    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
+    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
     coordinator.statistics = MagicMock()
     # Fix return value for calculate_total_power
     coordinator.statistics.calculate_total_power.return_value = {
@@ -119,10 +119,10 @@ async def test_mixed_source_selection(hass, mock_entry):
     coordinator = HeatingDataCoordinator(hass, mock_entry)
     coordinator.solar = MagicMock()
     coordinator.solar.calculate_solar_factor.return_value = 0.0
-    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0, 0.0), 0.0)
     coordinator.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
     coordinator.solar.calculate_unit_solar_impact.return_value = 0.0
-    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
+    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
     coordinator.statistics = MagicMock()
     # Fix return value for calculate_total_power
     coordinator.statistics.calculate_total_power.return_value = {
@@ -258,10 +258,10 @@ async def test_optional_gust_sensor(hass, mock_entry):
     coordinator = HeatingDataCoordinator(hass, mock_entry)
     coordinator.solar = MagicMock()
     coordinator.solar.calculate_solar_factor.return_value = 0.0
-    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+    coordinator.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0, 0.0), 0.0)
     coordinator.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
     coordinator.solar.calculate_unit_solar_impact.return_value = 0.0
-    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
+    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
     coordinator.statistics = MagicMock()
     # Fix return value for calculate_total_power
     coordinator.statistics.calculate_total_power.return_value = {

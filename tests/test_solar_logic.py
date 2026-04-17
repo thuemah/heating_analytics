@@ -44,7 +44,7 @@ def mock_coordinator():
         # Use simple coefficient of 1.0 for unit such that impact = factor * 1.0
         # If we set factor=0.4 (from current state test below), and we want result 0.4, coeff should be 1.0?
         # Or if we want specific result.
-        coord._solar_coefficients_per_unit = {"sensor.heater1": {"s": 1.0, "e": 0.0}}
+        coord._solar_coefficients_per_unit = {"sensor.heater1": {"s": 1.0, "e": 0.0, "w": 0.0}}
 
         return coord
 
@@ -79,6 +79,7 @@ def test_deviation_breakdown_solar_logic(mock_coordinator):
         coord.data["solar_factor"] = 0.4 # Need factor for new calc
         coord.data["solar_vector_s"] = 0.4
         coord.data["solar_vector_e"] = 0.0
+        coord.data["solar_vector_w"] = 0.0
 
         # New logic uses solar_factor * unit_coeff to get impact.
         # We set coeff=1.0 in fixture.
@@ -134,7 +135,7 @@ async def test_process_hourly_data_solar_logic(mock_coordinator):
 
     # Mock unit coefficient retrieval to return a known value
     # coord.solar is a SolarCalculator instance.
-    coord.solar.calculate_unit_coefficient = MagicMock(return_value=0.4) # Coeff 0.4
+    coord.solar.calculate_unit_coefficient = MagicMock(return_value={"s": 0.4, "e": 0.0, "w": 0.0}) # Coeff 0.4
 
     # Mock calculate_unit_solar_impact.
     # Factor=0.5, Coeff=0.4 -> Impact = 0.2
@@ -159,8 +160,9 @@ async def test_process_hourly_data_solar_logic(mock_coordinator):
 
     assert log_entry["expected_kwh"] == 0.8
 
-    # Solar Impact should be the SUM of units (0.2), not the old global calc
-    assert log_entry["solar_impact_kwh"] == 0.2
+    # Solar Impact is battery-smoothed (EMA): first hour with raw=0.2 gives
+    # state = 0 * decay + 0.2 * (1 - decay) = 0.2 * 0.25 = 0.05
+    assert log_entry["solar_impact_kwh"] == pytest.approx(0.05, abs=0.01)
 
     # Verify we called the new unit method
     coord.solar.calculate_unit_solar_impact.assert_called()

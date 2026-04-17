@@ -138,6 +138,7 @@ class ForecastManager:
 
                         # Solar Info for Reference Map
                         solar_factor = 0.0
+                        solar_vector = None
                         if self.coordinator.solar_enabled:
                             condition = f.get("condition")
                             cloud_cov = DEFAULT_CLOUD_COVERAGE
@@ -148,6 +149,7 @@ class ForecastManager:
 
                             elev, azim = self.coordinator.solar.get_approx_sun_pos(f_dt)
                             solar_factor = self.coordinator.solar.calculate_solar_factor(elev, azim, cloud_cov)
+                            solar_vector = self.coordinator.solar.calculate_solar_vector(elev, azim, cloud_cov)
 
                         if date_iso not in forecast_map:
                             forecast_map[date_iso] = {}
@@ -156,7 +158,8 @@ class ForecastManager:
                             "temp": temp,
                             "wind": eff_wind,
                             "bucket": bucket,
-                            "solar_factor": solar_factor
+                            "solar_factor": solar_factor,
+                            "solar_vector": solar_vector,
                         }
                 except (ValueError, TypeError):
                     pass
@@ -1080,6 +1083,7 @@ class ForecastManager:
         # Determine Solar Factor
         potential_factor = 0.0
         effective_factor = 0.0
+        effective_solar_vector = None
 
         if self.coordinator.solar_enabled:
             elev = item.get("elevation")
@@ -1093,7 +1097,11 @@ class ForecastManager:
                         elev, azimuth = self.coordinator.solar.get_approx_sun_pos(f_dt)
 
             if elev is not None:
+                # Scalar factor for solar optimizer (state classification)
                 potential_factor = self.coordinator.solar.calculate_solar_factor(elev, azimuth, forecast_cloud)
+
+                # 3D vector for per-unit solar impact prediction
+                potential_vector = self.coordinator.solar.calculate_solar_vector(elev, azimuth, forecast_cloud)
 
                 # Apply Screen Optimization
                 correction_percent = 100.0 # Default if optimization fails
@@ -1101,12 +1109,13 @@ class ForecastManager:
                 if screen_override is not None:
                     correction_percent = screen_override
                 else:
-                    # ML Prediction
+                    # ML Prediction — uses scalar factor for state classification
                     rec_state = self.coordinator.solar_optimizer.get_recommendation_state(inertia_val, potential_factor)
                     current_setting = self.coordinator.solar_correction_percent
                     correction_percent = self.coordinator.solar_optimizer.predict_correction_percent(rec_state, elev, azimuth, current_setting)
 
                 effective_factor = self.coordinator.solar.calculate_effective_solar_factor(potential_factor, correction_percent)
+                effective_solar_vector = self.coordinator.solar.calculate_effective_solar_vector(potential_vector, correction_percent)
 
         # Calculate via unified StatisticsManager logic
         # Determine Aux State
@@ -1127,7 +1136,8 @@ class ForecastManager:
             solar_impact=0.0, # Unused
             is_aux_active=is_aux,
             unit_modes=None, # Use current coordinator state modes (defaults to internal)
-            override_solar_factor=effective_factor
+            override_solar_factor=effective_factor,
+            override_solar_vector=effective_solar_vector,
         )
 
         predicted = res["total_kwh"]
@@ -1168,8 +1178,9 @@ class ForecastManager:
         wind_bucket = self.coordinator._get_wind_bucket(effective_wind)
         temp_key = str(int(round(avg_temp)))
 
-        # Determine Daily Solar Factor
+        # Determine Daily Solar Factor and Vector
         s_factor = 0.0
+        s_vector = None
         if self.coordinator.solar_enabled:
              condition = daily_item.get("condition")
              cloud_cov = DEFAULT_CLOUD_COVERAGE
@@ -1178,6 +1189,7 @@ class ForecastManager:
              elif condition and condition in CLOUD_COVERAGE_MAP:
                  cloud_cov = float(CLOUD_COVERAGE_MAP[condition])
              s_factor = self.coordinator.solar.estimate_daily_avg_solar_factor(target_date, cloud_cov)
+             s_vector = self.coordinator.solar.estimate_daily_avg_solar_vector(target_date, cloud_cov)
 
         # Calculate via unified StatisticsManager logic
         is_aux = False
@@ -1193,7 +1205,8 @@ class ForecastManager:
             solar_impact=0.0, # Unused
             is_aux_active=is_aux,
             unit_modes=None,
-            override_solar_factor=s_factor
+            override_solar_factor=s_factor,
+            override_solar_vector=s_vector,
         )
 
         predicted_24h = res["total_kwh"] * 24.0
@@ -1543,17 +1556,27 @@ class ForecastManager:
                 effective_wind=f_data.get("wind", 0.0),
                 solar_impact=0.0,
                 is_aux_active=False,  # Crucial: Plan always assumes Normal mode
-                override_solar_factor=f_data.get("solar_factor", 0.0)
+                override_solar_factor=f_data.get("solar_factor", 0.0),
+                override_solar_vector=f_data.get("solar_vector"),
             )
             planned_kwh = res_planned["total_kwh"]
 
             # Scenario B: What the model says SHOULD have happened (Actual Weather, Actual Mode)
+            # Hourly log already stores solar_vector_s/e/w — reconstruct 3-tuple
+            log_solar_vector = None
+            if log.get("solar_vector_s") is not None:
+                log_solar_vector = (
+                    log.get("solar_vector_s", 0.0),
+                    log.get("solar_vector_e", 0.0),
+                    log.get("solar_vector_w", 0.0),
+                )
             res_reality = self.coordinator.statistics.calculate_total_power(
                 temp=log["temp"],
                 effective_wind=log.get("effective_wind", 0.0),
                 solar_impact=0.0,
-                is_aux_active=log.get("auxiliary_active", False), # Use actual mode from the log
-                override_solar_factor=log.get("solar_factor", 0.0)
+                is_aux_active=log.get("auxiliary_active", False),
+                override_solar_factor=log.get("solar_factor", 0.0),
+                override_solar_vector=log_solar_vector,
             )
             reality_adjusted_kwh = res_reality["total_kwh"]
 
@@ -1577,17 +1600,25 @@ class ForecastManager:
                     effective_wind=f_data_curr.get("wind", 0.0),
                     solar_impact=0.0,
                     is_aux_active=False,
-                    override_solar_factor=f_data_curr.get("solar_factor", 0.0)
+                    override_solar_factor=f_data_curr.get("solar_factor", 0.0),
+                    override_solar_vector=f_data_curr.get("solar_vector"),
                 )
                 planned_rate = res_planned_rate["total_kwh"]
 
                 # Scenario B Rate (Actual Weather, Actual Mode)
+                # Live coordinator.data already has solar_vector_s/e/w
+                live_solar_vector = (
+                    self.coordinator.data.get("solar_vector_s", 0.0),
+                    self.coordinator.data.get("solar_vector_e", 0.0),
+                    self.coordinator.data.get("solar_vector_w", 0.0),
+                )
                 res_reality_rate = self.coordinator.statistics.calculate_total_power(
                     temp=current_temp,
                     effective_wind=self.coordinator.data.get("effective_wind", 0.0),
                     solar_impact=0.0,
                     is_aux_active=self.coordinator.auxiliary_heating_active,
-                    override_solar_factor=self.coordinator.data.get("solar_factor", 0.0)
+                    override_solar_factor=self.coordinator.data.get("solar_factor", 0.0),
+                    override_solar_vector=live_solar_vector,
                 )
                 reality_adjusted_rate = res_reality_rate["total_kwh"]
 

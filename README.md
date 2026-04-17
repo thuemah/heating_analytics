@@ -837,7 +837,7 @@ data:
 
 **Returns a diagnostic report with:**
 
-- **Per-unit coefficient analysis:** Current vs implied coefficients (back-calculated from hourly data via normal equations), stability across 3 time windows, saturation frequency, and dominant component (south vs east).
+- **Per-unit coefficient analysis:** Current vs implied coefficients (back-calculated from hourly data via 3×3 normal equations), stability across 3 time windows, saturation frequency, and dominant component (south, east, or west).
 - **Battery decay health:** Post-sunset residual analysis — detects if the thermal battery decays too fast or too slow. Includes a calibration sweep (0.50–0.95) with the recommended decay rate.
 - **Screen correction impact:** Compares prediction error at different screen positions (closed vs open) to detect screen-induced coefficient drift.
 - **Temporal bias:** Morning vs afternoon mean prediction delta — reveals timing errors in the cloud model or battery decay.
@@ -964,7 +964,7 @@ data:
 ## Logging & History
 
 **Hourly Logging:**
-- Keeps detailed log of the last 90 days
+- Keeps detailed log with configurable retention (90 / 180 / 365 days, default 90)
 - Includes: temperature, wind, humidity, expected vs actual energy
 - Available attributes on `sensor.heating_analytics_last_hour_deviation`:
   - `model_updated_temp_category`: Temperature bucket used for learning

@@ -104,6 +104,7 @@ SOLAR_COEFF_CAP = 5.0               # Max solar coefficient (kW per full sun)
 COLD_START_SOLAR_DAMPING = 0.75     # Dampen cold-start solar estimates; base model noise inflates early samples
 NLMS_STEP_SIZE = 0.10               # NLMS mu for solar coefficient learning (converges in ~10 qualifying hours)
 NLMS_REGULARIZATION = 0.05          # NLMS epsilon: prevents noise-chasing at low solar power, shrinks east component
+SOLAR_DEAD_ZONE_THRESHOLD = 15      # Consecutive zero-impact sunny hours before forcing coefficient reset
 LEARNING_BUFFER_THRESHOLD = 4
 TARGET_TDD_WINDOW = 0.5  # Minimum TDD accumulation for seamless rolling window efficiency
 MIN_EXTRAPOLATION_DELTA_T = 0.5  # Minimum Delta T (Degrees) required to trust extrapolation source
@@ -343,6 +344,9 @@ MODES_EXCLUDED_FROM_GLOBAL_LEARNING = frozenset({
 })
 
 CONF_HAS_AC_UNITS = "has_ac_units"
+CONF_HOURLY_LOG_RETENTION_DAYS = "hourly_log_retention_days"
+DEFAULT_HOURLY_LOG_RETENTION_DAYS = 90
+HOURLY_LOG_RETENTION_OPTIONS = [90, 180, 365]
 
 # --- Internal feature flags (not exposed in config flow) ---
 # #793: Use COP-weighted smearing for Track B instead of flat q/24.

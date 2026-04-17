@@ -260,7 +260,7 @@ async def test_calculate_total_power_respects_unit_modes(mock_coordinator):
     }
 
     # Mock Solar methods
-    mock_coordinator.solar.calculate_unit_coefficient.return_value = 1.0
+    mock_coordinator.solar.calculate_unit_coefficient.return_value = {"s": 1.0, "e": 0.0, "w": 0.0}
     mock_coordinator.solar.calculate_unit_solar_impact.return_value = 0.5
     # calculate_saturation returns (applied, wasted, final_net)
     mock_coordinator.solar.calculate_saturation = MagicMock(return_value=(0.5, 0.0, 10.0))

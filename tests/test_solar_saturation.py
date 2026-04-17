@@ -39,7 +39,7 @@ def coordinator(mock_hass):
     coord.solar = SolarCalculator(coord)
 
     # But mock the coefficient calculation to control the "Potential"
-    coord.solar.calculate_unit_coefficient = MagicMock(return_value=1.0)
+    coord.solar.calculate_unit_coefficient = MagicMock(return_value={"s": 1.0, "e": 0.0, "w": 0.0})
     coord.solar.calculate_unit_solar_impact = MagicMock(return_value=0.81)
 
     # Init internal structures
@@ -98,7 +98,7 @@ def test_solar_saturation_accounting(coordinator):
 
     # Mock Solar Calculation
     # We need calculate_unit_coefficient and calculate_unit_solar_impact to result in 0.81
-    coordinator.solar.calculate_unit_coefficient.return_value = 1.0
+    coordinator.solar.calculate_unit_coefficient.return_value = {"s": 1.0, "e": 0.0, "w": 0.0}
     coordinator.solar.calculate_unit_solar_impact.return_value = 0.81
 
     # Mode

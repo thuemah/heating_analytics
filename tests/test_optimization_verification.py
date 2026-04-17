@@ -20,7 +20,7 @@ class MockCoordinator(CoordinatorModelMixin):
         self._aux_coefficients = {}
         self.aux_affected_entities = []
         self.solar = MagicMock()
-        self.solar.calculate_unit_coefficient.return_value = 1.0
+        self.solar.calculate_unit_coefficient.return_value = {"s": 1.0, "e": 0.0, "w": 0.0}
         self.solar.calculate_unit_solar_impact.return_value = 0.0
         self.solar.apply_correction.side_effect = lambda net, solar, mode: net # No-op
         self.data = {ATTR_SOLAR_FACTOR: 0.0}

@@ -35,11 +35,11 @@ async def test_plan_revision_impact_calculation():
         coordinator.forecast._cached_reference_map = {
             "2023-11-01": {
                 # Hour 10: Forecast was cold (10 kWh)
-                10: {"temp": 0.0, "wind": 2.0, "solar_factor": 0.0},
+                10: {"temp": 0.0, "wind": 2.0, "solar_factor": 0.0, "solar_vector": None},
                 # Hour 11: Forecast was mild (5 kWh)
-                11: {"temp": 10.0, "wind": 1.0, "solar_factor": 0.1},
+                11: {"temp": 10.0, "wind": 1.0, "solar_factor": 0.1, "solar_vector": (0.05, 0.08, 0.0)},
                 # Hour 12 (Current): Forecast was mild (5 kWh)
-                12: {"temp": 10.0, "wind": 1.0, "solar_factor": 0.1},
+                12: {"temp": 10.0, "wind": 1.0, "solar_factor": 0.1, "solar_vector": (0.05, 0.08, 0.0)},
             }
         }
 
@@ -59,6 +59,9 @@ async def test_plan_revision_impact_calculation():
         coordinator._get_float_state = MagicMock(return_value=-1.0) # current_temp
         coordinator.data["effective_wind"] = 2.0
         coordinator.data["solar_factor"] = 0.0
+        coordinator.data["solar_vector_s"] = 0.0
+        coordinator.data["solar_vector_e"] = 0.0
+        coordinator.data["solar_vector_w"] = 0.0
         coordinator.auxiliary_heating_active = False
 
         # --- Mock the Model ---

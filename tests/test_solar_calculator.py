@@ -112,14 +112,15 @@ def test_calculate_solar_factor_azimuth_config(calculator, coordinator):
 
 def test_calculate_unit_solar_impact(calculator, coordinator):
     # Setup
-    unit_coeff = {'s': 2.5, 'e': 0.0}
-    global_factor = (1.0, 0.0)
+    unit_coeff = {'s': 2.5, 'e': 0.0, 'w': 0.0}
+    global_factor = (1.0, 0.0, 0.0)
 
     # Impact = Factor * Coeff
     assert calculator.calculate_unit_solar_impact(global_factor, unit_coeff) == 2.5
 
     # Factor 0.5
-    assert calculator.calculate_unit_solar_impact((0.5, 0.0), unit_coeff) == 1.25
+    assert calculator.calculate_unit_solar_impact((0.5, 0.0, 0.0), unit_coeff) == 1.25
+
 
 def test_calculate_unit_coefficient(calculator, coordinator):
     # 1. Global Default Fallback (Heating)
@@ -134,7 +135,7 @@ def test_calculate_unit_coefficient(calculator, coordinator):
 
     # 3. Learned Coefficient (Global per Unit, Not Temp-Stratified)
     # Setting a learned coefficient for the unit returns it for any temp key.
-    coordinator._solar_coefficients_per_unit["unit_1"] = {"s": 0.08, "e": 0.0}
+    coordinator._solar_coefficients_per_unit["unit_1"] = {"s": 0.08, "e": 0.0, "w": 0.0}
     assert calculator.calculate_unit_coefficient("unit_1", "10")["s"] == 0.08
 
     # 4. Same global coefficient returned for all temp keys regardless of mode.

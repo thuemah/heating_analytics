@@ -1,10 +1,10 @@
-"""Tests for solar battery decay and calibration sweep (#809 A1).
+"""Tests for solar battery decay — EMA model (#809 A1, #827).
 
 Verifies:
-- Battery exponential decay mechanics
-- Calibration sweep selects correct decay from synthetic data
-- apply_battery_decay flag persists the recommendation
-- Edge cases: no post-sunset data, single-day data
+- EMA battery mechanics: steady state = input (no amplification)
+- Decay-only behavior unchanged (exponential tail after sunset)
+- Calibration sweep uses EMA formula
+- Migration from old leaky-integrator model
 """
 import math
 import pytest
@@ -15,10 +15,10 @@ from custom_components.heating_analytics.const import SOLAR_BATTERY_DECAY
 
 
 class TestBatteryDecayMechanics:
-    """Basic exponential decay accumulator behavior."""
+    """EMA battery: state = state × decay + input × (1 - decay)."""
 
     def test_decay_reduces_state(self):
-        """Battery state decays each hour by the decay factor."""
+        """Battery state decays each hour by the decay factor (unchanged)."""
         state = 1.0
         decay = 0.80
         # After 1 hour with no new solar
@@ -32,25 +32,60 @@ class TestBatteryDecayMechanics:
             state = state * decay
         assert state == pytest.approx(0.80 ** 5, rel=1e-6)
 
-    def test_decay_plus_charging(self):
-        """Battery charges when solar is active, carries into post-solar hours."""
+    def test_ema_charging_no_amplification(self):
+        """EMA battery reaches steady state = input (no amplification).
+
+        The old leaky integrator converged to input/(1-decay) = 2.5× at
+        decay=0.60.  The EMA converges to exactly input.
+        """
+        state = 0.0
+        decay = 0.60
+        solar_input = 0.5
+
+        # Run until convergence
+        for _ in range(50):
+            state = state * decay + solar_input * (1 - decay)
+
+        assert state == pytest.approx(solar_input, abs=1e-6), (
+            f"EMA steady state {state:.4f} should equal input {solar_input}"
+        )
+
+    def test_ema_charging_carries_into_dark(self):
+        """Battery charges during sun, carries residual into post-solar hours."""
         state = 0.0
         decay = 0.80
+        solar_input = 0.5
 
-        # 3 sunny hours with 0.5 kWh solar each
+        # 3 sunny hours with EMA formula
         for _ in range(3):
-            state = state * decay + 0.5
+            state = state * decay + solar_input * (1 - decay)
 
-        # State should be sum of decayed contributions
-        expected = 0.5 * 0.80**2 + 0.5 * 0.80 + 0.5
+        # State should be sum of EMA contributions
+        factor = 1 - decay  # 0.20
+        expected = solar_input * factor * (decay**2 + decay + 1)
         assert state == pytest.approx(expected)
 
-        # 2 dark hours (no new solar)
+        # 2 dark hours (no new solar) — same decay as before
+        state_after_sun = state
         for _ in range(2):
             state = state * decay
-        # Should still have residual
-        assert state > 0.1
-        assert state == pytest.approx(expected * decay**2)
+        assert state > 0.01
+        assert state == pytest.approx(state_after_sun * decay**2)
+
+    def test_ema_steady_state_independent_of_decay(self):
+        """Steady state is always equal to input, regardless of decay value.
+
+        This is the key property: decay controls only the time constant
+        (how quickly the battery responds), not the amplitude.
+        """
+        solar_input = 0.4
+        for decay in [0.50, 0.60, 0.75, 0.85, 0.95]:
+            state = 0.0
+            for _ in range(200):  # enough iterations for any decay
+                state = state * decay + solar_input * (1 - decay)
+            assert state == pytest.approx(solar_input, abs=1e-4), (
+                f"At decay={decay}: steady state {state:.4f} != input {solar_input}"
+            )
 
     def test_half_life_at_default(self):
         """Current default decay has expected half-life."""
@@ -67,6 +102,22 @@ class TestBatteryDecayMechanics:
         """Decay 0.60 has half-life of ~1.4 hours."""
         half_life = math.log(0.5) / math.log(0.60)
         assert 1.0 < half_life < 1.8
+
+
+class TestBatteryMigration:
+    """Migration from old leaky-integrator to EMA model."""
+
+    def test_migration_scales_by_one_minus_decay(self):
+        """Old state is multiplied by (1 - decay) to match new steady state."""
+        decay = 0.75
+        old_steady_state = 0.5 / (1 - decay)  # 2.0 (amplified)
+        migrated = old_steady_state * (1 - decay)
+        assert migrated == pytest.approx(0.5)  # back to input level
+
+    def test_migration_preserves_zero_state(self):
+        """Zero battery state is unchanged by migration."""
+        for decay in [0.60, 0.75, 0.85]:
+            assert 0.0 * (1 - decay) == 0.0
 
 
 class TestDiagnoseSolarCalibrationSweep:
@@ -86,7 +137,7 @@ class TestDiagnoseSolarCalibrationSweep:
         # Mock solar calculator methods
         coord.solar = MagicMock()
         coord.solar.calculate_unit_coefficient = MagicMock(
-            return_value={"s": 1.0, "e": 0.0}
+            return_value={"s": 1.0, "e": 0.0, "w": 0.0}
         )
         coord.solar.calculate_unit_solar_impact = MagicMock(return_value=0.0)
 
@@ -98,6 +149,7 @@ class TestDiagnoseSolarCalibrationSweep:
 
         Simulates a building where the true battery decay is `decay_truth`.
         Solar peaks at noon, then battery carries residual into evening.
+        Uses the EMA formula to match the production model.
         """
         entries = []
         battery = 0.0
@@ -109,7 +161,7 @@ class TestDiagnoseSolarCalibrationSweep:
             else:
                 raw_solar = 0.0
 
-            battery = battery * decay_truth + raw_solar
+            battery = battery * decay_truth + raw_solar * (1 - decay_truth)
 
             # Solar vector (simplified: all south)
             solar_s = raw_solar
@@ -129,6 +181,7 @@ class TestDiagnoseSolarCalibrationSweep:
                 "solar_factor": solar_factor,
                 "solar_vector_s": solar_s,
                 "solar_vector_e": solar_e,
+                "solar_vector_w": 0.0,
                 "solar_impact_raw_kwh": raw_solar,
                 "solar_impact_kwh": battery * 0.5,
                 "actual_kwh": actual,

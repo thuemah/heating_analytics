@@ -43,10 +43,10 @@ def coordinator(hass):
 
         # Mock Solar — get_approx_sun_pos must return (elev, azimuth) tuple
         coord.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
-        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0, 0.0), 0.0)
         coord.solar.calculate_solar_factor.return_value = 0.0
         coord.solar.calculate_unit_solar_impact.return_value = 0.0
-        coord.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
+        coord.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
 
         # Mock Statistics — calculate_total_power must return a proper dict
         coord.statistics.calculate_total_power.return_value = {
@@ -241,10 +241,10 @@ async def test_cooldown_default_all_affected(hass):
         }
         coord.forecast.get_forecast_for_hour.return_value = None
         coord.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
-        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0, 0.0), 0.0)
         coord.solar.calculate_solar_factor.return_value = 0.0
         coord.solar.calculate_unit_solar_impact.return_value = 0.0
-        coord.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0}
+        coord.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
         coord.statistics.calculate_total_power.return_value = {
             "total_kwh": 5.0, "global_base_kwh": 5.0, "global_aux_reduction_kwh": 0.0,
             "breakdown": {"base_kwh": 5.0, "aux_reduction_kwh": 0.0, "solar_reduction_kwh": 0.0},

@@ -27,7 +27,7 @@ def coordinator(hass):
 
         # Mock Solar — get_approx_sun_pos must return (elev, azimuth) tuple
         coord.solar.get_approx_sun_pos.return_value = (0.0, 180.0)
-        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0), 0.0)
+        coord.solar.calculate_potential_solar_impact.return_value = (0.0, (0.0, 0.0, 0.0), 0.0)
 
         # Configure the MockStats to behave predictably
         mock_stats_instance = MockStats.return_value

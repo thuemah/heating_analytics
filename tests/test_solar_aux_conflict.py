@@ -38,7 +38,7 @@ async def test_solar_aux_dual_interference(hass: HomeAssistant):
 
         # 3. Setup Solar Mocks
         # We need significant solar impact. Let's say 0.5 kWh.
-        coordinator.solar.calculate_unit_coefficient = MagicMock(return_value=1.0)
+        coordinator.solar.calculate_unit_coefficient = MagicMock(return_value={"s": 1.0, "e": 0.0, "w": 0.0})
         coordinator.solar.calculate_unit_solar_impact = MagicMock(return_value=0.5)
 
         # We also need to mock normalize_for_learning because process_learning uses it
@@ -77,7 +77,8 @@ async def test_solar_aux_dual_interference(hass: HomeAssistant):
         last_log = coordinator._hourly_log[-1]
 
         # Check Impacts were recorded correctly
-        assert last_log["solar_impact_kwh"] == 0.5
+        # Solar impact is battery-smoothed (EMA): first hour = raw * (1 - decay)
+        assert last_log["solar_impact_kwh"] == pytest.approx(0.5 * 0.25, abs=0.01)
         assert last_log["aux_impact_kwh"] == 1.0
 
         # Verify Guard Logic

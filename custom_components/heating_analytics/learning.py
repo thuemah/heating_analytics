@@ -19,14 +19,33 @@ from .const import (
     NLMS_STEP_SIZE,
     PER_UNIT_LEARNING_RATE_CAP,
     SOLAR_COEFF_CAP,
+    SOLAR_DEAD_ZONE_THRESHOLD,
 )
 from .observation import HourlyObservation, ModelState, LearningConfig
 from .solar import SolarCalculator
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _pad_solar_vector(v: tuple) -> tuple[float, float, float]:
+    """Ensure a solar vector is a 3-tuple (S, E, W).
+
+    Legacy callers may pass a 2-tuple (S, E); pad with W=0.0.
+    """
+    if len(v) >= 3:
+        return (v[0], v[1], v[2])
+    return (v[0], v[1], 0.0)
+
+
 class LearningManager:
     """Manages machine learning logic for Heating Analytics."""
+
+    def __init__(self):
+        # Dead zone counter: tracks consecutive qualifying hours where
+        # actual_impact is clamped to 0 despite sun shining.  When a unit
+        # is stuck (base model too low → no learnable signal), the counter
+        # triggers a coefficient reset so cold-start can re-learn.
+        self._dead_zone_counts: dict[str, int] = {}
 
     def process_learning(
         self,
@@ -283,7 +302,7 @@ class LearningManager:
         if should_run_per_unit:
             self._process_per_unit_learning(
                 temp_key, wind_bucket, avg_temp,
-                avg_solar_vector, # Pass 2D vector for per-unit learning
+                avg_solar_vector, # Pass 3D vector for per-unit learning
                 total_energy_kwh, base_expected_kwh,
                 energy_sensors, hourly_delta_per_unit,
                 solar_enabled, learning_rate,
@@ -330,7 +349,7 @@ class LearningManager:
             bucket_counts=kwargs.get("hourly_bucket_counts", {}),
             avg_humidity=None,
             solar_factor=0.0,
-            solar_vector=kwargs.get("avg_solar_vector", (0.0, 0.0)),
+            solar_vector=_pad_solar_vector(kwargs.get("avg_solar_vector", (0.0, 0.0, 0.0))),
             solar_impact_raw=kwargs.get("solar_impact", 0.0),
             effective_solar_impact=kwargs.get("solar_impact", 0.0),
             total_energy_kwh=kwargs.get("total_energy_kwh", 0.0),
@@ -384,7 +403,7 @@ class LearningManager:
         temp_key: str,
         wind_bucket: str,
         avg_temp: float,
-        avg_solar_vector: tuple[float, float],
+        avg_solar_vector: tuple[float, float, float],
         total_energy_kwh: float,
         base_expected_kwh: float,
         energy_sensors: list[str],
@@ -464,18 +483,19 @@ class LearningManager:
             if transmittance > 0.01:
                 potential_s = avg_solar_vector[0] / transmittance
                 potential_e = avg_solar_vector[1] / transmittance
+                potential_w = avg_solar_vector[2] / transmittance
             else:
-                potential_s, potential_e = avg_solar_vector
+                potential_s, potential_e, potential_w = avg_solar_vector
 
             # Vector magnitude check for "sunny enough" threshold
             # Use potential vector — learning should happen when sun shines,
             # regardless of screen position.
-            vector_magnitude = (potential_s**2 + potential_e**2) ** 0.5
+            vector_magnitude = (potential_s**2 + potential_e**2 + potential_w**2) ** 0.5
 
             if solar_enabled and vector_magnitude > 0.1 and not is_aux_active:
                 self._learn_unit_solar_coefficient(
                     entity_id, temp_key,
-                    expected_unit_base, actual_unit, (potential_s, potential_e),
+                    expected_unit_base, actual_unit, (potential_s, potential_e, potential_w),
                     learning_rate, solar_coefficients_per_unit, learning_buffer_solar_per_unit,
                     avg_temp, balance_point,
                     unit_mode
@@ -490,7 +510,7 @@ class LearningManager:
             if solar_enabled:
                  unit_coeff = solar_calculator.calculate_unit_coefficient(entity_id, temp_key)
                  unit_solar_impact = solar_calculator.calculate_unit_solar_impact(
-                     (potential_s, potential_e), unit_coeff
+                     (potential_s, potential_e, potential_w), unit_coeff
                  )
                  # Use unit_mode for normalization
                  unit_normalized = solar_calculator.normalize_for_learning(actual_unit, unit_solar_impact, unit_mode)
@@ -545,7 +565,7 @@ class LearningManager:
         temp_key: str,
         expected_unit_base: float,
         actual_unit: float,
-        avg_solar_vector: tuple[float, float],
+        avg_solar_vector: tuple[float, float, float],
         learning_rate: float,
         solar_coefficients_per_unit: dict,
         learning_buffer_solar_per_unit: dict,
@@ -553,7 +573,7 @@ class LearningManager:
         balance_point: float,
         unit_mode: str,
     ):
-        """Update 2D solar coefficient vector for a specific unit (Buffered or EMA)."""
+        """Update 3D solar coefficient vector (S, E, W) for a specific unit (Buffered or NLMS)."""
         actual_impact = 0.0
         if unit_mode == MODE_HEATING:
             # Heating: Sun reduces consumption
@@ -566,10 +586,11 @@ class LearningManager:
             return
 
         # Clamping
+        raw_impact = actual_impact
         actual_impact = max(0.0, actual_impact)
 
-        solar_s, solar_e = avg_solar_vector
-        vector_magnitude = (solar_s**2 + solar_e**2) ** 0.5
+        solar_s, solar_e, solar_w = avg_solar_vector
+        vector_magnitude = (solar_s**2 + solar_e**2 + solar_w**2) ** 0.5
 
         if vector_magnitude <= 0.01:
             return
@@ -577,44 +598,117 @@ class LearningManager:
         # Get Current Coefficient Vector (global per unit — solar gain is temperature-independent)
         current_coeff = solar_coefficients_per_unit.get(entity_id)
 
+        # --- Dead Zone Detection ---
+        # When the base model is too low (expected < actual during sun),
+        # actual_impact clamps to 0 and NLMS receives no signal.  The
+        # coefficient is trapped — it can't learn because the base model
+        # is wrong, and the base model stays wrong because the coefficient
+        # is wrong (no solar normalization).  After SOLAR_DEAD_ZONE_THRESHOLD
+        # consecutive qualifying hours with zero impact, force a coefficient
+        # reset so cold-start can re-learn from fresh data.
+        if actual_impact == 0.0 and raw_impact < 0.0 and current_coeff is not None:
+            count = self._dead_zone_counts.get(entity_id, 0) + 1
+            self._dead_zone_counts[entity_id] = count
+            if count >= SOLAR_DEAD_ZONE_THRESHOLD:
+                del solar_coefficients_per_unit[entity_id]
+                # Clear stale buffer so cold-start begins fresh
+                learning_buffer_solar_per_unit.pop(entity_id, None)
+                self._dead_zone_counts[entity_id] = 0
+                _LOGGER.warning(
+                    "Solar dead zone detected: reset %s after %d consecutive "
+                    "zero-impact qualifying hours (base model too low to "
+                    "produce learnable signal)",
+                    entity_id, count,
+                )
+            return
+        else:
+            # Any non-zero impact resets the counter
+            self._dead_zone_counts.pop(entity_id, None)
+
         # --- Buffered Learning Logic (Cold Start) ---
         if current_coeff is None:
             if entity_id not in learning_buffer_solar_per_unit:
                 learning_buffer_solar_per_unit[entity_id] = []
 
             buffer_list = learning_buffer_solar_per_unit[entity_id]
-            # Store tuple of (s, e, impact)
-            buffer_list.append((solar_s, solar_e, actual_impact))
+            # Store tuple of (s, e, w, impact)
+            buffer_list.append((solar_s, solar_e, solar_w, actual_impact))
 
-            # Need more data for 2D least squares (minimum 2 points, usually want more for stability)
+            # Need enough data for 3D least squares
             if len(buffer_list) >= LEARNING_BUFFER_THRESHOLD:
-                # Solve 2x2 normal equations
+                # Guard: if all impact values are zero, the base model is too
+                # low to produce signal (dead zone during cold-start).  Discard
+                # the buffer and keep collecting — the default coefficient
+                # (0.35) provides solar normalization for the base model via
+                # calculate_unit_coefficient, which will gradually raise the
+                # base model until actual_impact becomes positive.
+                if all(item[3] == 0.0 for item in buffer_list):
+                    buffer_list.clear()
+                    _LOGGER.debug(
+                        "Solar cold-start buffer discarded for %s: all %d "
+                        "samples had zero impact (base model recovering)",
+                        entity_id, LEARNING_BUFFER_THRESHOLD,
+                    )
+                    return
+
+                # Solve 3x3 normal equations (Gram matrix A, moment vector b)
+                # A = [[ss, se, sw], [se, ee, ew], [sw, ew, ww]]
+                # b = [sI, eI, wI]
+                # Note: sum_ew is always ~0 because E and W have disjoint support.
                 sum_s2 = sum(item[0]**2 for item in buffer_list)
                 sum_e2 = sum(item[1]**2 for item in buffer_list)
+                sum_w2 = sum(item[2]**2 for item in buffer_list)
                 sum_se = sum(item[0] * item[1] for item in buffer_list)
-                sum_s_I = sum(item[0] * item[2] for item in buffer_list)
-                sum_e_I = sum(item[1] * item[2] for item in buffer_list)
+                sum_sw = sum(item[0] * item[2] for item in buffer_list)
+                sum_ew = sum(item[1] * item[2] for item in buffer_list)
+                sum_s_I = sum(item[0] * item[3] for item in buffer_list)
+                sum_e_I = sum(item[1] * item[3] for item in buffer_list)
+                sum_w_I = sum(item[2] * item[3] for item in buffer_list)
 
-                determinant = (sum_s2 * sum_e2) - (sum_se**2)
+                # 3x3 determinant via cofactor expansion along first row
+                determinant = (
+                    sum_s2 * (sum_e2 * sum_w2 - sum_ew**2)
+                    - sum_se * (sum_se * sum_w2 - sum_ew * sum_sw)
+                    + sum_sw * (sum_se * sum_ew - sum_e2 * sum_sw)
+                )
 
-                # Full 2D solution when sun angles are diverse enough
+                # Full 3D solution when sun angles are diverse enough
                 if abs(determinant) > 1e-6:
-                    new_coeff_s = ((sum_e2 * sum_s_I) - (sum_se * sum_e_I)) / determinant
-                    new_coeff_e = ((sum_s2 * sum_e_I) - (sum_se * sum_s_I)) / determinant
+                    # Cramer's rule: replace each column with b and compute determinant
+                    det_s = (
+                        sum_s_I * (sum_e2 * sum_w2 - sum_ew**2)
+                        - sum_se * (sum_e_I * sum_w2 - sum_ew * sum_w_I)
+                        + sum_sw * (sum_e_I * sum_ew - sum_e2 * sum_w_I)
+                    )
+                    det_e = (
+                        sum_s2 * (sum_e_I * sum_w2 - sum_ew * sum_w_I)
+                        - sum_s_I * (sum_se * sum_w2 - sum_ew * sum_sw)
+                        + sum_sw * (sum_se * sum_w_I - sum_e_I * sum_sw)
+                    )
+                    det_w = (
+                        sum_s2 * (sum_e2 * sum_w_I - sum_ew * sum_e_I)
+                        - sum_se * (sum_se * sum_w_I - sum_e_I * sum_sw)
+                        + sum_s_I * (sum_se * sum_ew - sum_e2 * sum_sw)
+                    )
 
-                    new_coeff_s = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_s))
-                    new_coeff_e = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_e))
+                    new_coeff_s = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, det_s / determinant))
+                    new_coeff_e = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, det_e / determinant))
+                    new_coeff_w = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, det_w / determinant))
 
-                    new_coeff = {"s": new_coeff_s * COLD_START_SOLAR_DAMPING, "e": new_coeff_e * COLD_START_SOLAR_DAMPING}
-                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start]: {entity_id} -> {new_coeff} (2D Least Squares, {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
+                    new_coeff = {
+                        "s": new_coeff_s * COLD_START_SOLAR_DAMPING,
+                        "e": new_coeff_e * COLD_START_SOLAR_DAMPING,
+                        "w": new_coeff_w * COLD_START_SOLAR_DAMPING,
+                    }
+                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start]: {entity_id} -> {new_coeff} (3D Least Squares, {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
                 else:
                     # Collinear fallback: sun observed from a narrow angle range (e.g. winter).
-                    # We can only identify the coefficient along the dominant direction.
-                    # Project all observations onto that direction and solve 1D LS,
-                    # then decompose back. LMS updates will refine both components over time.
+                    # Project all observations onto the dominant direction and solve 1D LS,
+                    # then decompose back. NLMS updates will refine all components over time.
                     dir_s = sum(item[0] for item in buffer_list)
                     dir_e = sum(item[1] for item in buffer_list)
-                    dir_norm = (dir_s**2 + dir_e**2) ** 0.5
+                    dir_w = sum(item[2] for item in buffer_list)
+                    dir_norm = (dir_s**2 + dir_e**2 + dir_w**2) ** 0.5
 
                     if dir_norm < 1e-6:
                         _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> zero-magnitude vectors, skipping.")
@@ -622,17 +716,22 @@ class LearningManager:
 
                     d_s = dir_s / dir_norm
                     d_e = dir_e / dir_norm
+                    d_w = dir_w / dir_norm
 
-                    sum_proj_I = sum((item[0] * d_s + item[1] * d_e) * item[2] for item in buffer_list)
-                    sum_proj2 = sum((item[0] * d_s + item[1] * d_e) ** 2 for item in buffer_list)
+                    sum_proj_I = sum((item[0] * d_s + item[1] * d_e + item[2] * d_w) * item[3] for item in buffer_list)
+                    sum_proj2 = sum((item[0] * d_s + item[1] * d_e + item[2] * d_w) ** 2 for item in buffer_list)
 
                     if sum_proj2 < 1e-6:
                         _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> degenerate projection, skipping.")
                         return
 
                     c_scalar = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, sum_proj_I / sum_proj2))
-                    new_coeff = {"s": c_scalar * d_s * COLD_START_SOLAR_DAMPING, "e": c_scalar * d_e * COLD_START_SOLAR_DAMPING}
-                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start 1D]: {entity_id} -> {new_coeff} (collinear fallback, dir=({d_s:.2f},{d_e:.2f}), {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
+                    new_coeff = {
+                        "s": c_scalar * d_s * COLD_START_SOLAR_DAMPING,
+                        "e": c_scalar * d_e * COLD_START_SOLAR_DAMPING,
+                        "w": c_scalar * d_w * COLD_START_SOLAR_DAMPING,
+                    }
+                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start 1D]: {entity_id} -> {new_coeff} (collinear fallback, dir=({d_s:.2f},{d_e:.2f},{d_w:.2f}), {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
 
                 self._update_unit_solar_coefficient(entity_id, new_coeff, solar_coefficients_per_unit)
                 buffer_list.clear()
@@ -646,26 +745,29 @@ class LearningManager:
             # to solar_s², causing oscillation. NLMS normalizes by input power,
             # making convergence rate independent of solar magnitude.
             # Epsilon acts as L2 regularization — when solar power is low,
-            # the effective step shrinks, preventing noise-chasing on the
-            # poorly-constrained east component.
+            # the effective step shrinks, preventing noise-chasing on
+            # poorly-constrained components.
             coeff_s = current_coeff.get("s", 0.0)
             coeff_e = current_coeff.get("e", 0.0)
+            coeff_w = current_coeff.get("w", 0.0)
 
-            predicted_impact = coeff_s * solar_s + coeff_e * solar_e
+            predicted_impact = coeff_s * solar_s + coeff_e * solar_e + coeff_w * solar_w
             error = actual_impact - predicted_impact
 
             # NLMS: normalize step by input power + regularization
-            input_power = solar_s ** 2 + solar_e ** 2
+            input_power = solar_s ** 2 + solar_e ** 2 + solar_w ** 2
             step = NLMS_STEP_SIZE * error / (input_power + NLMS_REGULARIZATION)
 
             new_coeff_s = coeff_s + step * solar_s
             new_coeff_e = coeff_e + step * solar_e
+            new_coeff_w = coeff_w + step * solar_w
 
             # Clamp for safety
             new_coeff_s = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_s))
             new_coeff_e = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_e))
+            new_coeff_w = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_w))
 
-            new_coeff = {"s": new_coeff_s, "e": new_coeff_e}
+            new_coeff = {"s": new_coeff_s, "e": new_coeff_e, "w": new_coeff_w}
 
             _LOGGER.debug(f"Per-Unit Solar Learning [NLMS]: {entity_id} -> {new_coeff} (was {current_coeff})")
             self._update_unit_solar_coefficient(entity_id, new_coeff, solar_coefficients_per_unit)
@@ -836,14 +938,17 @@ class LearningManager:
     def _update_unit_solar_coefficient(self, entity_id, value: dict[str, float], solar_coefficients_per_unit):
         """Update the solar coefficient data structure (global per unit, not temp-stratified).
 
-        Coefficients are clamped to >= 0: solar gain can only reduce heating
-        demand, never increase it.  A negative value indicates a confounding
-        variable (e.g. a scheduled pre-heating routine that coincides with
-        morning sun) and must not propagate into the model.
+        All three components (south, east, west) are clamped to >= 0.
+        Each represents solar gain through windows facing one cardinal
+        direction — a window can only receive gain, never produce negative
+        gain.  This is a true physics invariant with the 3-component
+        decomposition (unlike the old 2D system where it was a modeling
+        decision).
         """
         solar_coefficients_per_unit[entity_id] = {
             "s": round(max(0.0, value.get("s", 0.0)), 5),
-            "e": round(max(0.0, value.get("e", 0.0)), 5)
+            "e": round(max(0.0, value.get("e", 0.0)), 5),
+            "w": round(max(0.0, value.get("w", 0.0)), 5),
         }
 
     def _increment_observation_count(self, entity_id, temp_key, wind_bucket, observation_counts):

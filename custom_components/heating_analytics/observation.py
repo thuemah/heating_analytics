@@ -74,7 +74,7 @@ class HourlyObservation:
 
     # --- Solar (aggregated over the hour) ---
     solar_factor: float
-    solar_vector: tuple[float, float]  # (south, east)
+    solar_vector: tuple[float, float, float]  # (south, east, west)
     solar_impact_raw: float  # Raw hourly solar impact (before battery)
     effective_solar_impact: float  # Battery-smoothed solar impact
 
@@ -108,7 +108,7 @@ class HourlyObservation:
 
     # --- Solar optimizer context ---
     recommendation_state: str = "none"
-    correction_percent: float = 0.0
+    correction_percent: float = 100.0  # 100% = screens open (no reduction)
     potential_solar_factor: float = 0.0
 
     # --- Solar normalization for global model (#801) ---
@@ -355,6 +355,7 @@ class ObservationCollector:
         "solar_sum",
         "solar_vector_s_sum",
         "solar_vector_e_sum",
+        "solar_vector_w_sum",
         "bucket_counts",
         "aux_count",
         "sample_count",
@@ -382,6 +383,7 @@ class ObservationCollector:
         self.solar_sum: float = 0.0
         self.solar_vector_s_sum: float = 0.0
         self.solar_vector_e_sum: float = 0.0
+        self.solar_vector_w_sum: float = 0.0
         self.bucket_counts: dict[str, int] = {
             "normal": 0,
             "high_wind": 0,
@@ -415,6 +417,7 @@ class ObservationCollector:
         self.solar_sum = 0.0
         self.solar_vector_s_sum = 0.0
         self.solar_vector_e_sum = 0.0
+        self.solar_vector_w_sum = 0.0
         for k in self.bucket_counts:
             self.bucket_counts[k] = 0
         self.aux_count = 0
@@ -437,7 +440,7 @@ class ObservationCollector:
         effective_wind: float,
         wind_bucket: str,
         solar_factor: float,
-        solar_vector: tuple[float, float],
+        solar_vector: tuple[float, float, float],
         is_aux_active: bool,
         current_time: datetime,
         humidity: float | None = None,
@@ -453,6 +456,7 @@ class ObservationCollector:
         self.solar_sum += solar_factor
         self.solar_vector_s_sum += solar_vector[0]
         self.solar_vector_e_sum += solar_vector[1]
+        self.solar_vector_w_sum += solar_vector[2]
         self.correction_sum += correction_percent
         self.bucket_counts[wind_bucket] += 1
         if is_aux_active:

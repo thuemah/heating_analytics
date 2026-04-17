@@ -12,6 +12,7 @@ from custom_components.heating_analytics.const import (
     NLMS_STEP_SIZE,
     NLMS_REGULARIZATION,
     SOLAR_COEFF_CAP,
+    SOLAR_DEAD_ZONE_THRESHOLD,
     COLD_START_SOLAR_DAMPING,
     LEARNING_BUFFER_THRESHOLD,
     MODE_HEATING,
@@ -24,7 +25,7 @@ def _run_nlms_learning(
     entity_id: str,
     true_coeff_s: float,
     true_coeff_e: float,
-    solar_vectors: list[tuple[float, float]],
+    solar_vectors: list[tuple[float, float, float]],
     solar_coefficients: dict,
     solar_buffers: dict,
     unit_mode: str = MODE_HEATING,
@@ -36,7 +37,7 @@ def _run_nlms_learning(
     Returns list of (step, coeff_s, coeff_e) for convergence analysis.
     """
     history = []
-    for solar_s, solar_e in solar_vectors:
+    for solar_s, solar_e, solar_w in solar_vectors:
         true_impact = true_coeff_s * solar_s + true_coeff_e * solar_e
         if unit_mode == MODE_HEATING:
             actual_unit = max(0.0, base_kwh - true_impact)
@@ -48,7 +49,7 @@ def _run_nlms_learning(
             temp_key="10",
             expected_unit_base=base_kwh,
             actual_unit=actual_unit,
-            avg_solar_vector=(solar_s, solar_e),
+            avg_solar_vector=(solar_s, solar_e, solar_w),
             learning_rate=0.01,
             solar_coefficients_per_unit=solar_coefficients,
             learning_buffer_solar_per_unit=solar_buffers,
@@ -72,7 +73,7 @@ class TestNLMSConvergence:
         buffers = {}
 
         # 20 samples of moderate south sun at varying azimuths
-        vectors = [(0.5, 0.1)] * 5 + [(0.6, -0.05)] * 5 + [(0.4, 0.15)] * 10
+        vectors = [(0.5, 0.1, 0.0)] * 5 + [(0.6, -0.05, 0.0)] * 5 + [(0.4, 0.15, 0.0)] * 10
         history = _run_nlms_learning(
             manager, "unit_south", 1.5, 0.1, vectors, coeffs, buffers,
         )
@@ -90,10 +91,10 @@ class TestNLMSConvergence:
 
         # Diverse sun angles to resolve both components
         vectors = (
-            [(0.6, 0.3)] * 5
-            + [(0.3, 0.5)] * 5
-            + [(0.5, 0.4)] * 5
-            + [(0.7, 0.2)] * 5
+            [(0.6, 0.3, 0.0)] * 5
+            + [(0.3, 0.5, 0.0)] * 5
+            + [(0.5, 0.4, 0.0)] * 5
+            + [(0.7, 0.2, 0.0)] * 5
         )
         history = _run_nlms_learning(
             manager, "unit_se", 1.0, 0.8, vectors, coeffs, buffers,
@@ -109,7 +110,7 @@ class TestNLMSConvergence:
         coeffs = {}
         buffers = {}
 
-        vectors = [(0.5, 0.1)] * 20
+        vectors = [(0.5, 0.1, 0.0)] * 20
         history = _run_nlms_learning(
             manager, "unit_cool", 0.8, 0.0, vectors, coeffs, buffers,
             unit_mode=MODE_COOLING, base_kwh=3.0,
@@ -130,7 +131,7 @@ class TestNLMSGainIndependence:
         # Low solar magnitude (~0.3)
         coeffs_low = {}
         buffers_low = {}
-        vectors_low = [(0.25, 0.10)] * 20
+        vectors_low = [(0.25, 0.10, 0.0)] * 20
         history_low = _run_nlms_learning(
             manager, "unit_low", true_s, true_e,
             vectors_low, coeffs_low, buffers_low,
@@ -139,7 +140,7 @@ class TestNLMSGainIndependence:
         # High solar magnitude (~0.8)
         coeffs_high = {}
         buffers_high = {}
-        vectors_high = [(0.70, 0.28)] * 20
+        vectors_high = [(0.70, 0.28, 0.0)] * 20
         history_high = _run_nlms_learning(
             manager, "unit_high", true_s, true_e,
             vectors_high, coeffs_high, buffers_high,
@@ -170,7 +171,7 @@ class TestNLMSRegularization:
         buffers = {}
 
         # Pure south vectors — east component has no signal
-        vectors = [(0.5, 0.0)] * 20
+        vectors = [(0.5, 0.0, 0.0)] * 20
         _run_nlms_learning(
             manager, "unit_pure_s", 1.0, 0.0, vectors, coeffs, buffers,
         )
@@ -198,7 +199,7 @@ class TestColdStartToNLMSTransition:
             true_impact = true_s * solar_s + true_e * solar_e
             actual = max(0.0, 2.0 - true_impact)
             manager._learn_unit_solar_coefficient(
-                "unit_trans", "10", 2.0, actual, (solar_s, solar_e),
+                "unit_trans", "10", 2.0, actual, (solar_s, solar_e, 0.0),
                 0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
             )
 
@@ -211,7 +212,7 @@ class TestColdStartToNLMSTransition:
         true_impact = true_s * solar_s + true_e * solar_e
         actual = max(0.0, 2.0 - true_impact)
         manager._learn_unit_solar_coefficient(
-            "unit_trans", "10", 2.0, actual, (solar_s, solar_e),
+            "unit_trans", "10", 2.0, actual, (solar_s, solar_e, 0.0),
             0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
         )
 
@@ -222,12 +223,12 @@ class TestColdStartToNLMSTransition:
         assert len(buffers.get("unit_trans", [])) == 0
 
         # Phase 3: NLMS refinement (10 more samples)
-        vectors = [(0.5, 0.12)] * 5 + [(0.6, 0.08)] * 5
-        for solar_s, solar_e in vectors:
+        vectors = [(0.5, 0.12, 0.0)] * 5 + [(0.6, 0.08, 0.0)] * 5
+        for solar_s, solar_e, solar_w in vectors:
             true_impact = true_s * solar_s + true_e * solar_e
             actual = max(0.0, 2.0 - true_impact)
             manager._learn_unit_solar_coefficient(
-                "unit_trans", "10", 2.0, actual, (solar_s, solar_e),
+                "unit_trans", "10", 2.0, actual, (solar_s, solar_e, solar_w),
                 0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
             )
 
@@ -242,12 +243,12 @@ class TestColdStartToNLMSTransition:
     def test_zero_vector_skipped(self):
         """Samples with zero solar vector are ignored (no division by zero)."""
         manager = LearningManager()
-        coeffs = {"unit_z": {"s": 1.0, "e": 0.0}}
+        coeffs = {"unit_z": {"s": 1.0, "e": 0.0, "w": 0.0}}
         buffers = {}
 
         # Zero vector should be silently skipped
         manager._learn_unit_solar_coefficient(
-            "unit_z", "10", 2.0, 1.5, (0.0, 0.0),
+            "unit_z", "10", 2.0, 1.5, (0.0, 0.0, 0.0),
             0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
         )
 
@@ -260,12 +261,214 @@ class TestColdStartToNLMSTransition:
         from custom_components.heating_analytics.const import MODE_OFF
 
         manager = LearningManager()
-        coeffs = {"unit_off": {"s": 1.0, "e": 0.0}}
+        coeffs = {"unit_off": {"s": 1.0, "e": 0.0, "w": 0.0}}
         buffers = {}
 
         manager._learn_unit_solar_coefficient(
-            "unit_off", "10", 2.0, 1.5, (0.5, 0.1),
+            "unit_off", "10", 2.0, 1.5, (0.5, 0.1, 0.0),
             0.01, coeffs, buffers, 5.0, 15.0, MODE_OFF,
         )
 
         assert coeffs["unit_off"]["s"] == 1.0
+
+
+class TestDeadZoneDetection:
+    """Dead zone: base model too low → actual_impact clamps to 0 → NLMS stuck."""
+
+    def test_dead_zone_resets_coefficient_after_threshold(self):
+        """After SOLAR_DEAD_ZONE_THRESHOLD consecutive zero-impact hours,
+        the coefficient is deleted so cold-start can re-learn.
+        """
+        manager = LearningManager()
+        coeffs = {"unit_stuck": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        buffers = {}
+
+        # Simulate dead zone: base=0.03, actual=0.18, sun shining
+        # actual_impact = max(0, 0.03 - 0.18) = 0
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD):
+            manager._learn_unit_solar_coefficient(
+                "unit_stuck", "10",
+                expected_unit_base=0.03,
+                actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0,
+                balance_point=15.0,
+                unit_mode=MODE_HEATING,
+            )
+
+        # Coefficient should have been deleted (reset to cold-start)
+        assert "unit_stuck" not in coeffs
+
+    def test_dead_zone_counter_resets_on_positive_impact(self):
+        """A single hour with positive actual_impact resets the counter."""
+        manager = LearningManager()
+        coeffs = {"unit_recover": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        buffers = {}
+
+        # Accumulate near-threshold dead zone hours
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD - 2):
+            manager._learn_unit_solar_coefficient(
+                "unit_recover", "10",
+                expected_unit_base=0.03, actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0, balance_point=15.0,
+                unit_mode=MODE_HEATING,
+            )
+
+        # One hour with positive impact (base model caught up)
+        manager._learn_unit_solar_coefficient(
+            "unit_recover", "10",
+            expected_unit_base=0.50, actual_unit=0.30,
+            avg_solar_vector=(0.3, 0.1, 0.2),
+            learning_rate=0.01,
+            solar_coefficients_per_unit=coeffs,
+            learning_buffer_solar_per_unit=buffers,
+            avg_temp=12.0, balance_point=15.0,
+            unit_mode=MODE_HEATING,
+        )
+
+        # Counter should be reset — coefficient still exists
+        assert "unit_recover" in coeffs
+        assert manager._dead_zone_counts.get("unit_recover", 0) == 0
+
+    def test_dead_zone_not_triggered_for_cold_start(self):
+        """Units without existing coefficients (cold-start) don't trigger
+        dead zone reset — they stay in buffering mode.  With all-zero
+        impact, the buffer is discarded each time it fills (not solved
+        to produce a (0,0,0) coefficient).
+        """
+        manager = LearningManager()
+        coeffs = {}  # No existing coefficient
+        buffers = {}
+
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD + 5):
+            manager._learn_unit_solar_coefficient(
+                "unit_new", "10",
+                expected_unit_base=0.03, actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0, balance_point=15.0,
+                unit_mode=MODE_HEATING,
+            )
+
+        # Should NOT have created a coefficient (all-zero buffers discarded)
+        assert "unit_new" not in coeffs
+        # Dead zone counter should not have incremented (no current_coeff)
+        assert manager._dead_zone_counts.get("unit_new", 0) == 0
+
+    def test_dead_zone_not_triggered_without_sun(self):
+        """Zero vector magnitude doesn't count toward dead zone."""
+        manager = LearningManager()
+        coeffs = {"unit_dark": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        buffers = {}
+
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD + 5):
+            manager._learn_unit_solar_coefficient(
+                "unit_dark", "10",
+                expected_unit_base=0.03, actual_unit=0.18,
+                avg_solar_vector=(0.0, 0.0, 0.0),  # No sun
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0, balance_point=15.0,
+                unit_mode=MODE_HEATING,
+            )
+
+        # Coefficient should NOT have been reset (no sun = early return)
+        assert "unit_dark" in coeffs
+
+    def test_dead_zone_reset_clears_stale_buffer(self):
+        """Dead zone reset should also clear any stale solar buffer."""
+        manager = LearningManager()
+        coeffs = {"unit_buf": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        buffers = {"unit_buf": [(0.3, 0.1, 0.2, 0.05)]}  # Stale sample
+
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD):
+            manager._learn_unit_solar_coefficient(
+                "unit_buf", "10",
+                expected_unit_base=0.03, actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0, balance_point=15.0,
+                unit_mode=MODE_HEATING,
+            )
+
+        assert "unit_buf" not in coeffs
+        assert "unit_buf" not in buffers  # Buffer also cleared
+
+    def test_cold_start_discards_all_zero_impact_buffer(self):
+        """Cold-start with all-zero impact samples discards buffer instead
+        of creating a (0,0,0) coefficient that re-enters the dead zone.
+        """
+        manager = LearningManager()
+        coeffs = {}  # No coefficient — cold-start mode
+        buffers = {}
+
+        # Feed LEARNING_BUFFER_THRESHOLD samples with zero impact
+        for _ in range(LEARNING_BUFFER_THRESHOLD):
+            manager._learn_unit_solar_coefficient(
+                "unit_reentry", "10",
+                expected_unit_base=0.03, actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0, balance_point=15.0,
+                unit_mode=MODE_HEATING,
+            )
+
+        # Should NOT have created a coefficient (buffer was discarded)
+        assert "unit_reentry" not in coeffs
+        # Buffer should be empty (cleared after discard)
+        assert len(buffers.get("unit_reentry", [])) == 0
+
+    def test_post_reset_recovery_with_improving_base(self):
+        """After dead zone reset, once base model recovers enough to produce
+        positive actual_impact, cold-start completes successfully.
+        """
+        manager = LearningManager()
+        coeffs = {"unit_recov": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        buffers = {}
+
+        # Phase 1: Trigger dead zone reset
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD):
+            manager._learn_unit_solar_coefficient(
+                "unit_recov", "10",
+                expected_unit_base=0.03, actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0, balance_point=15.0,
+                unit_mode=MODE_HEATING,
+            )
+        assert "unit_recov" not in coeffs
+
+        # Phase 2: Base model has recovered (expected > actual now)
+        for _ in range(LEARNING_BUFFER_THRESHOLD):
+            manager._learn_unit_solar_coefficient(
+                "unit_recov", "10",
+                expected_unit_base=0.50, actual_unit=0.30,
+                avg_solar_vector=(0.3, 0.1, 0.2),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0, balance_point=15.0,
+                unit_mode=MODE_HEATING,
+            )
+
+        # Cold-start should have completed with real signal
+        assert "unit_recov" in coeffs
+        # Coefficient should be non-trivial (not all zeros)
+        coeff = coeffs["unit_recov"]
+        assert coeff["s"] > 0.0 or coeff["e"] > 0.0 or coeff["w"] > 0.0

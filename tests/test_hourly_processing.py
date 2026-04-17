@@ -95,3 +95,77 @@ async def test_csv_append_trigger(hass: HomeAssistant):
         await coordinator._process_hourly_data(current_time)
 
         coordinator.storage.append_hourly_log_csv.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_log_retention_default_90_days(hass: HomeAssistant):
+    """Test that default retention (no config) keeps 2160 entries (90 days)."""
+    entry = MagicMock()
+    entry.data = {"balance_point": 17.0}  # No hourly_log_retention_days key
+
+    with patch("custom_components.heating_analytics.storage.Store"):
+        coordinator = HeatingDataCoordinator(hass, entry)
+        assert coordinator._hourly_log_max_entries == 90 * 24  # 2160
+
+
+@pytest.mark.asyncio
+async def test_log_retention_configurable_365_days(hass: HomeAssistant):
+    """Test that 365-day retention keeps 8760 entries."""
+    entry = MagicMock()
+    entry.data = {"balance_point": 17.0, "hourly_log_retention_days": 365}
+
+    with patch("custom_components.heating_analytics.storage.Store"):
+        coordinator = HeatingDataCoordinator(hass, entry)
+        coordinator._async_save_data = AsyncMock()
+
+        assert coordinator._hourly_log_max_entries == 365 * 24  # 8760
+
+        # Fill log just past the limit
+        coordinator._hourly_log = [{"id": i, "temp": 0.0} for i in range(8760)]
+
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0]
+        coordinator._collector.temp_sum = 0.0
+
+        current_time = datetime(2023, 10, 27, 13, 0, 0)
+        await coordinator._process_hourly_data(current_time)
+
+        # Should append 1, total 8761 -> Truncate to 8760
+        assert len(coordinator._hourly_log) == 8760
+        assert coordinator._hourly_log[-1]["timestamp"] == current_time.isoformat()
+        assert coordinator._hourly_log[0]["id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_log_retention_configurable_180_days(hass: HomeAssistant):
+    """Test that 180-day retention keeps 4320 entries."""
+    entry = MagicMock()
+    entry.data = {"balance_point": 17.0, "hourly_log_retention_days": 180}
+
+    with patch("custom_components.heating_analytics.storage.Store"):
+        coordinator = HeatingDataCoordinator(hass, entry)
+        assert coordinator._hourly_log_max_entries == 180 * 24  # 4320
+
+
+@pytest.mark.asyncio
+async def test_log_retention_preserves_list_identity(hass: HomeAssistant):
+    """Test that retention trimming preserves list object identity (ModelState refs)."""
+    entry = MagicMock()
+    entry.data = {"balance_point": 17.0, "hourly_log_retention_days": 90}
+
+    with patch("custom_components.heating_analytics.storage.Store"):
+        coordinator = HeatingDataCoordinator(hass, entry)
+        coordinator._async_save_data = AsyncMock()
+
+        coordinator._hourly_log = [{"id": i, "temp": 0.0} for i in range(2160)]
+        original_list_id = id(coordinator._hourly_log)
+
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0]
+        coordinator._collector.temp_sum = 0.0
+
+        current_time = datetime(2023, 10, 27, 13, 0, 0)
+        await coordinator._process_hourly_data(current_time)
+
+        # List identity must be preserved (in-place deletion)
+        assert id(coordinator._hourly_log) == original_list_id

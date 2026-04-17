@@ -29,7 +29,7 @@ def base_context():
         "total_energy_kwh": 20.0,
         "base_expected_kwh": 20.0,
         "solar_impact": 0.0,
-        "avg_solar_vector": (0.0, 0.0),
+        "avg_solar_vector": (0.0, 0.0, 0.0),
         "is_aux_active": False,
         "aux_impact": 0.0,
         "learning_enabled": True,

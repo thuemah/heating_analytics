@@ -71,14 +71,14 @@ class TestPreScreenLearningRobustness:
 
         # Simulate 20 hours of diverse sun
         potential_vectors = [
-            (0.6, 0.2), (0.5, 0.3), (0.7, 0.1), (0.4, 0.25),
-            (0.55, 0.15), (0.65, 0.08), (0.45, 0.22), (0.5, 0.18),
-            (0.6, 0.12), (0.58, 0.2), (0.5, 0.1), (0.6, 0.15),
-            (0.55, 0.25), (0.7, 0.05), (0.45, 0.3), (0.5, 0.2),
-            (0.6, 0.1), (0.55, 0.15), (0.65, 0.2), (0.5, 0.25),
+            (0.6, 0.2, 0.0), (0.5, 0.3, 0.0), (0.7, 0.1, 0.0), (0.4, 0.25, 0.0),
+            (0.55, 0.15, 0.0), (0.65, 0.08, 0.0), (0.45, 0.22, 0.0), (0.5, 0.18, 0.0),
+            (0.6, 0.12, 0.0), (0.58, 0.2, 0.0), (0.5, 0.1, 0.0), (0.6, 0.15, 0.0),
+            (0.55, 0.25, 0.0), (0.7, 0.05, 0.0), (0.45, 0.3, 0.0), (0.5, 0.2, 0.0),
+            (0.6, 0.1, 0.0), (0.55, 0.15, 0.0), (0.65, 0.2, 0.0), (0.5, 0.25, 0.0),
         ]
 
-        for pot_s, pot_e in potential_vectors:
+        for pot_s, pot_e, pot_w in potential_vectors:
             # Physical heat gain = phys_coeff × potential × transmittance
             true_impact = (true_coeff_s * pot_s + true_coeff_e * pot_e) * transmittance
             actual_unit = max(0.0, base_kwh - true_impact)
@@ -90,7 +90,7 @@ class TestPreScreenLearningRobustness:
                 temp_key="10",
                 expected_unit_base=base_kwh,
                 actual_unit=actual_unit,
-                avg_solar_vector=(pot_s, pot_e),
+                avg_solar_vector=(pot_s, pot_e, pot_w),
                 learning_rate=0.01,
                 solar_coefficients_per_unit=coeffs,
                 learning_buffer_solar_per_unit=buffers,
@@ -99,7 +99,7 @@ class TestPreScreenLearningRobustness:
                 unit_mode=MODE_HEATING,
             )
 
-        return coeffs.get("unit_screen", {"s": 0.0, "e": 0.0})
+        return coeffs.get("unit_screen", {"s": 0.0, "e": 0.0, "w": 0.0})
 
     def test_learning_converges_with_screens_closed(self):
         """Learning still converges when screens are nearly closed (10%).
@@ -125,7 +125,7 @@ class TestPreScreenLearningRobustness:
         so coeff × potential × 1.0 = phys_coeff × potential.
         """
         true_s, true_e = 1.2, 0.3
-        test_potential = (0.5, 0.15)
+        test_potential = (0.5, 0.15, 0.0)
 
         coeff = self._learn_with_screen(100.0, true_s, true_e)
 
@@ -165,7 +165,7 @@ class TestPreScreenLearningRobustness:
             actual = max(0.0, 2.0 - true_impact)
 
             manager._learn_unit_solar_coefficient(
-                "unit_vary", "10", 2.0, actual, (pot_s, pot_e),
+                "unit_vary", "10", 2.0, actual, (pot_s, pot_e, 0.0),
                 0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
             )
 
@@ -181,13 +181,14 @@ class TestTransmittanceReconstruction:
 
     def test_roundtrip_potential_effective_potential(self):
         """potential → effective → reconstruct potential matches original."""
-        potential = (0.6, 0.25)
+        potential = (0.6, 0.25, 0.0)
         for pct in [0, 25, 50, 75, 100]:
             t = SolarCalculator._screen_transmittance(pct)
-            effective = (potential[0] * t, potential[1] * t)
-            recovered = (effective[0] / t, effective[1] / t)
+            effective = (potential[0] * t, potential[1] * t, potential[2] * t)
+            recovered = (effective[0] / t, effective[1] / t, effective[2] / t)
             assert recovered[0] == pytest.approx(potential[0], abs=1e-10)
             assert recovered[1] == pytest.approx(potential[1], abs=1e-10)
+            assert recovered[2] == pytest.approx(potential[2], abs=1e-10)
 
     def test_floor_prevents_division_amplification(self):
         """At 0% correction, floor prevents extreme amplification."""
@@ -210,8 +211,8 @@ class TestPredictionPathUsesTransmittance:
 
         calc = SolarCalculator(MockCoord())
 
-        coeff = {"s": 1.5, "e": 0.3}
-        potential_vector = (0.6, 0.2)
+        coeff = {"s": 1.5, "e": 0.3, "w": 0.0}
+        potential_vector = (0.6, 0.2, 0.0)
 
         # Full transmittance
         impact_full = calc.calculate_unit_solar_impact(potential_vector, coeff, 1.0)

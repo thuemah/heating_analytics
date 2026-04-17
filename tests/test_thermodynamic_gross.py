@@ -29,7 +29,7 @@ async def test_hourly_thermodynamic_gross(hass: HomeAssistant):
         })
 
         # Setup Solar Mock
-        coordinator.solar.calculate_unit_coefficient = MagicMock(return_value=1.0)
+        coordinator.solar.calculate_unit_coefficient = MagicMock(return_value={"s": 1.0, "e": 0.0, "w": 0.0})
         coordinator.solar.calculate_unit_solar_impact = MagicMock(return_value=0.5)
 
         # 1. Setup Hourly Data
@@ -72,12 +72,14 @@ async def test_hourly_thermodynamic_gross(hass: HomeAssistant):
 
         assert log["actual_kwh"] == 5.0
         assert log["aux_impact_kwh"] == 2.0
-        assert log["solar_impact_kwh"] == 0.5
+        # Solar impact is battery-smoothed (EMA): first hour = raw * (1 - decay)
+        assert log["solar_impact_kwh"] == pytest.approx(0.5 * 0.25, abs=0.01)
 
         # THE NEW FIELD
-        # Should be Actual + Aux + Solar
+        # Should be Actual + Aux + Solar (battery-smoothed)
+        # 5.0 + 2.0 + 0.125 = 7.125
         assert "thermodynamic_gross_kwh" in log
-        assert log["thermodynamic_gross_kwh"] == 7.5
+        assert log["thermodynamic_gross_kwh"] == pytest.approx(5.0 + 2.0 + 0.5 * 0.25, abs=0.01)
 
 
 def test_daily_thermodynamic_gross():

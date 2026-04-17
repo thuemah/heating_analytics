@@ -84,8 +84,9 @@ def test_aux_impact_neighbor_logic(mock_coordinator):
 def test_solar_coefficient_neighbor_logic(mock_coordinator):
     """Test global solar coefficient lookup (not temp-stratified since ad5f41f)."""
     mock_coordinator._solar_coefficients_per_unit = {
-        "unit_1": {"s": 0.6, "e": 0.0}
+        "unit_1": {"s": 0.6, "e": 0.0, "w": 0.0}
     }
+
     # Global coefficient returned for any temp key.
     assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "10")["s"] == 0.6
     assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "9")["s"] == 0.6

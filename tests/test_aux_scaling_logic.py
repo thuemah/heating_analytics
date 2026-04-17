@@ -16,7 +16,7 @@ class MockCoordinator(CoordinatorModelMixin):
         self.balance_point = 15.0
         self.solar = MagicMock()
         self.solar.calculate_saturation.side_effect = lambda net, pot, mode: (0.0, 0.0, net)
-        self.solar.calculate_unit_coefficient.return_value = 0.0
+        self.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
         self.solar.calculate_unit_solar_impact.return_value = 0.0
 
         # Internal structures

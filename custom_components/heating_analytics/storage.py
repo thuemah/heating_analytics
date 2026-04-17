@@ -35,13 +35,15 @@ _LOGGER = logging.getLogger(__name__)
 def _sanitize_solar_coeff(value: dict) -> dict:
     """Clamp solar coefficient components to >= 0.
 
-    Solar gain can only reduce heating demand — negative coefficients
-    are physically impossible and indicate confounding variables or
-    storage from a pre-clamp version.
+    Each component represents solar gain through windows facing one
+    cardinal direction (south, east, west).  Solar gain can only reduce
+    heating demand — negative coefficients are physically impossible.
+    All three components are clamped to >= 0.
     """
     return {
         "s": round(max(0.0, value.get("s", 0.0)), 5),
         "e": round(max(0.0, value.get("e", 0.0)), 5),
+        "w": round(max(0.0, value.get("w", 0.0)), 5),
     }
 
 
@@ -192,8 +194,9 @@ class StorageManager:
                                 break
                             elif isinstance(coeff, (int, float)):
                                 migrated = {
-                                    "s": round(coeff * (-math.cos(az_rad)), 5),
-                                    "e": round(coeff * math.sin(az_rad), 5)
+                                    "s": round(coeff * max(0.0, -math.cos(az_rad)), 5),
+                                    "e": round(coeff * max(0.0, math.sin(az_rad)), 5),
+                                    "w": round(coeff * max(0.0, -math.sin(az_rad)), 5),
                                 }
                                 break
                         if migrated is not None:
@@ -229,28 +232,39 @@ class StorageManager:
                 self.coordinator._learning_buffer_aux_per_unit = {}
 
             # Load learning buffer solar per unit
-            # New format: {entity_id: [(s, e, impact), ...]}  (flat list, not nested by temp_key)
-            # Old format: {entity_id: {temp_key: [(s, e, impact), ...]}}
+            # Current format: {entity_id: [(s, e, w, impact), ...]}  (flat list, not nested by temp_key)
+            # Old formats: {entity_id: [(s, e, impact), ...]} or {entity_id: {temp_key: [(s, e, impact), ...]}}
             loaded_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
             if isinstance(loaded_buffer_solar, dict):
                 self.coordinator._learning_buffer_solar_per_unit = {}
 
                 for entity_id, value in loaded_buffer_solar.items():
                     if isinstance(value, list):
-                        # New format: already a flat list of (s, e, impact) tuples
-                        self.coordinator._learning_buffer_solar_per_unit[entity_id] = [
-                            tuple(item) if isinstance(item, list) else item for item in value
-                            if isinstance(item, (list, tuple)) and len(item) == 3
-                        ]
+                        # Flat list of (s, e, w, impact) tuples (new) or (s, e, impact) tuples (old).
+                        # Old 3-element tuples are migrated to 4-element by inserting w=0.0.
+                        migrated_buffer = []
+                        for item in value:
+                            if isinstance(item, (list, tuple)):
+                                t = tuple(item) if isinstance(item, list) else item
+                                if len(t) == 4:
+                                    migrated_buffer.append(t)
+                                elif len(t) == 3:
+                                    # Old format (s, e, impact) → (s, e, 0.0, impact)
+                                    migrated_buffer.append((t[0], t[1], 0.0, t[2]))
+                        self.coordinator._learning_buffer_solar_per_unit[entity_id] = migrated_buffer
                     elif isinstance(value, dict):
                         # Old format: nested by temp_key — flatten all samples into one list
+                        # Old tuples are (s, e, impact) → migrate to (s, e, 0.0, impact)
                         merged = []
                         for temp_key, buffer_list in value.items():
                             if not isinstance(buffer_list, list):
                                 continue
                             for item in buffer_list:
-                                if isinstance(item, (list, tuple)) and len(item) == 3 and not any(isinstance(x, (int, float)) and isinstance(x, bool) for x in item):
-                                    merged.append(tuple(item) if isinstance(item, list) else item)
+                                if isinstance(item, (list, tuple)) and len(item) in (3, 4) and not any(isinstance(x, (int, float)) and isinstance(x, bool) for x in item):
+                                    t = tuple(item) if isinstance(item, list) else item
+                                    if len(t) == 3:
+                                        t = (t[0], t[1], 0.0, t[2])
+                                    merged.append(t)
                         if merged:
                             self.coordinator._learning_buffer_solar_per_unit[entity_id] = merged
                             _LOGGER.info(f"Migrated temp-stratified solar buffer for unit {entity_id}: {len(merged)} samples merged")
@@ -518,6 +532,16 @@ class StorageManager:
             self.coordinator.data["learned_u_coefficient"] = self.coordinator._learned_u_coefficient
             self.coordinator._last_midnight_indoor_temp = data.get("last_midnight_indoor_temp")
             self.coordinator._solar_battery_state = data.get("solar_battery_state", 0.0)
+            # One-time migration: leaky integrator → EMA battery model.
+            # Old states are amplified by 1/(1-decay); scale down to match
+            # the new steady-state (output = input, no amplification).
+            if data.get("battery_model") != "ema":
+                decay = self.coordinator.solar_battery_decay
+                self.coordinator._solar_battery_state *= (1 - decay)
+                _LOGGER.info(
+                    "Migrated solar battery state to EMA model (×%.2f)",
+                    1 - decay,
+                )
 
             # Load cached forecast (Restore to Long Term Cache immediately)
             cached_daily_raw = data.get("cached_daily_forecast")
@@ -742,21 +766,9 @@ class StorageManager:
                         _LOGGER.debug(f"Skipping save (rate limit): {elapsed:.1f}s < {self._save_debounce_seconds}s")
                         return
 
-                # Pruning: Retain last 730 days (2 years) of daily history to prevent bloat
-                history_retention_days = 730
-                cutoff_date = (now.date() - timedelta(days=history_retention_days)).isoformat()
-
-                # Optimized pruning: Only prune if size suggests it's needed (e.g., > 800 items)
-                # This avoids iterating dictionary keys on every save
-                if len(self.coordinator._daily_history) > (history_retention_days + 100):
-                     keys_to_remove = [
-                         k for k in self.coordinator._daily_history
-                         if k < cutoff_date
-                     ]
-                     if keys_to_remove:
-                         for k in keys_to_remove:
-                             del self.coordinator._daily_history[k]
-                         _LOGGER.info(f"Pruned {len(keys_to_remove)} old daily history entries (older than {cutoff_date})")
+                # Daily history: one entry per day (~200 bytes each).  Even 10 years
+                # is only ~730 KB — negligible on any hardware.  No pruning; this
+                # gives compare_periods unlimited range (#820).
 
                 data = {
                     "correlation_data": self.coordinator._correlation_data,
@@ -800,6 +812,7 @@ class StorageManager:
                     "learned_u_coefficient": self.coordinator._learned_u_coefficient,
                     "last_midnight_indoor_temp": self.coordinator._last_midnight_indoor_temp,
                     "solar_battery_state": self.coordinator._solar_battery_state,
+                    "battery_model": "ema",
                     "tdd_accumulated": self.coordinator.data.get(ATTR_TDD, 0.0),
                     "forecast_today": self.coordinator.data.get(ATTR_FORECAST_TODAY, 0.0),
                     "predicted_kwh": self.coordinator.data.get(ATTR_PREDICTED, 0.0),
@@ -910,6 +923,7 @@ class StorageManager:
             "solar_coefficients_per_unit": self.coordinator._solar_coefficients_per_unit,
             "learning_buffer_solar_per_unit": self.coordinator._learning_buffer_solar_per_unit,
             "solar_battery_state": self.coordinator._solar_battery_state,
+            "battery_model": "ema",
         }
 
         def _write_json():
@@ -989,6 +1003,14 @@ class StorageManager:
             self.coordinator.data["learned_u_coefficient"] = self.coordinator._learned_u_coefficient
             self.coordinator._last_midnight_indoor_temp = data.get("last_midnight_indoor_temp")
             self.coordinator._solar_battery_state = data.get("solar_battery_state", 0.0)
+            # One-time migration: leaky integrator → EMA battery model.
+            if data.get("battery_model") != "ema":
+                decay = self.coordinator.solar_battery_decay
+                self.coordinator._solar_battery_state *= (1 - decay)
+                _LOGGER.info(
+                    "Migrated solar battery state to EMA model (×%.2f)",
+                    1 - decay,
+                )
 
             self.coordinator.forecast._cached_long_term_hourly = data.get("cached_long_term_hourly")
             self.coordinator.forecast._cached_long_term_daily = data.get("cached_long_term_daily")
@@ -1029,7 +1051,23 @@ class StorageManager:
                 eid: _sanitize_solar_coeff(v) if isinstance(v, dict) else v
                 for eid, v in raw_solar.items()
             }
-            self.coordinator._learning_buffer_solar_per_unit = data.get("learning_buffer_solar_per_unit", {})
+            # Migrate old 3-element (s, e, impact) buffer tuples to 4-element (s, e, w, impact)
+            raw_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
+            migrated_buffer_solar = {}
+            for eid, buf in raw_buffer_solar.items():
+                if not isinstance(buf, list):
+                    continue
+                migrated = []
+                for item in buf:
+                    if isinstance(item, (list, tuple)):
+                        t = tuple(item) if isinstance(item, list) else item
+                        if len(t) == 4:
+                            migrated.append(t)
+                        elif len(t) == 3:
+                            migrated.append((t[0], t[1], 0.0, t[2]))
+                if migrated:
+                    migrated_buffer_solar[eid] = migrated
+            self.coordinator._learning_buffer_solar_per_unit = migrated_buffer_solar
 
             # Restore Unit Modes
             self.coordinator._unit_modes = data.get("unit_modes", {})
@@ -1626,6 +1664,14 @@ class StorageManager:
 
                     # Backfill to ensure consistency and enrich any other potential partial days
                     self.coordinator._backfill_daily_from_hourly()
+
+                # Trim hourly log AFTER daily history rebuild so that imported
+                # days beyond the retention window are still aggregated into
+                # daily_history before being dropped (#820).
+                if not is_weather_only:
+                    max_entries = self.coordinator._hourly_log_max_entries
+                    if len(self.coordinator._hourly_log) > max_entries:
+                        del self.coordinator._hourly_log[:-max_entries]
 
                 await self.async_save_data(force=True)
 

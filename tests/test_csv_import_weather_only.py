@@ -20,6 +20,7 @@ def mock_coordinator():
 
     coord.balance_point = 15.0
     coord._hourly_log = []
+    coord._hourly_log_max_entries = 2160
     coord._daily_history = {}
     coord._calculate_effective_wind = lambda ws, wg: ws
     coord._get_wind_bucket = lambda w: "normal"

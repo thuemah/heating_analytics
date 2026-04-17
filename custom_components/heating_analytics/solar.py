@@ -106,10 +106,21 @@ class SolarCalculator:
 
         return elev_factor * az_factor * cloud_factor
 
-    def calculate_solar_vector(self, elevation: float, azimuth: float, cloud_coverage: float) -> tuple[float, float]:
-        """Calculate 2D solar vector (South, East) components."""
+    def calculate_solar_vector(self, elevation: float, azimuth: float, cloud_coverage: float) -> tuple[float, float, float]:
+        """Calculate 3D solar vector (South, East, West) components.
+
+        Each component uses max(0, ...) to produce non-negative basis functions:
+        - South: max(0, -cos(az)) — positive when sun is south of E-W line
+        - East:  max(0,  sin(az)) — positive in morning (az 0-180)
+        - West:  max(0, -sin(az)) — positive in afternoon (az 180-360)
+
+        This allows all three per-unit coefficients to be physically clamped
+        to >= 0 (each window direction can only receive solar gain, never
+        produce negative gain).  East and West are orthogonal by construction
+        (disjoint temporal support).
+        """
         if elevation <= 0.0:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
 
         # Elevation Factor
         safe_elev = max(1.0, elevation)
@@ -127,12 +138,13 @@ class SolarCalculator:
 
         base_intensity = elev_factor * cloud_factor
 
-        # 2D Decomposition
-        # South is positive (-cos), East is positive (+sin)
-        solar_south = base_intensity * (-math.cos(math.radians(azimuth)))
-        solar_east = base_intensity * math.sin(math.radians(azimuth))
+        # 3D Decomposition — non-negative basis functions
+        az_rad = math.radians(azimuth)
+        solar_south = base_intensity * max(0.0, -math.cos(az_rad))
+        solar_east = base_intensity * max(0.0, math.sin(az_rad))
+        solar_west = base_intensity * max(0.0, -math.sin(az_rad))
 
-        return solar_south, solar_east
+        return solar_south, solar_east, solar_west
 
     @staticmethod
     def _screen_transmittance(correction_percent: float) -> float:
@@ -155,11 +167,11 @@ class SolarCalculator:
         mn = DEFAULT_SOLAR_MIN_TRANSMITTANCE
         return mn + (1.0 - mn) * (correction_percent / 100.0)
 
-    def calculate_effective_solar_vector(self, potential_solar_vector: tuple[float, float], correction_percent: float) -> tuple[float, float]:
+    def calculate_effective_solar_vector(self, potential_solar_vector: tuple[float, float, float], correction_percent: float) -> tuple[float, float, float]:
         """Calculate effective solar vector after applying screens/correction."""
-        s, e = potential_solar_vector
+        s, e, w = potential_solar_vector
         factor = self._screen_transmittance(correction_percent)
-        return s * factor, e * factor
+        return s * factor, e * factor, w * factor
 
     def calculate_effective_solar_factor(self, potential_solar_factor: float, correction_percent: float) -> float:
         """Calculate effective solar factor after applying screens/correction.
@@ -177,7 +189,7 @@ class SolarCalculator:
 
     def calculate_unit_solar_impact(
         self,
-        global_solar_vector: tuple[float, float],
+        global_solar_vector: tuple[float, float, float],
         unit_coeff: dict[str, float],
         screen_transmittance: float = 1.0,
     ) -> float:
@@ -187,20 +199,22 @@ class SolarCalculator:
         solar vector. The prediction path passes the potential vector and
         screen_transmittance separately:
 
-            Impact = (Coeff_S × Potential_S + Coeff_E × Potential_E) × transmittance
+            Impact = (Coeff_S × Pot_S + Coeff_E × Pot_E + Coeff_W × Pot_W) × transmittance
 
-        For backward compatibility, callers that pass the effective (post-screen)
-        vector with screen_transmittance=1.0 get the same result as before.
+        With the 3-component decomposition (S, E, W), all basis functions and
+        coefficients are non-negative, so the dot product is always >= 0.
+        The max(0, ...) clamp is retained as defense-in-depth.
         """
-        solar_s, solar_e = global_solar_vector
+        solar_s, solar_e, solar_w = global_solar_vector
         coeff_s = unit_coeff.get("s", 0.0)
         coeff_e = unit_coeff.get("e", 0.0)
+        coeff_w = unit_coeff.get("w", 0.0)
 
-        impact = (coeff_s * solar_s + coeff_e * solar_e) * screen_transmittance
+        impact = (coeff_s * solar_s + coeff_e * solar_e + coeff_w * solar_w) * screen_transmittance
         return max(0.0, impact)
 
     def calculate_unit_coefficient(self, entity_id: str, temp_key: str) -> dict[str, float]:
-        """Calculate 2D solar coefficient vector for a specific unit.
+        """Calculate 3D solar coefficient vector (S, E, W) for a specific unit.
 
         Solar gain is a physical property of the window (area, orientation, shading) and is
         independent of outdoor temperature. The coefficient is therefore stored and looked up
@@ -210,7 +224,7 @@ class SolarCalculator:
         1. Learned coefficient for this unit (global, not temp-stratified).
         2. Mode-appropriate global default (optimized for heat pumps).
         """
-        # Check storage structure: {unit: {"s": float, "e": float}}
+        # Check storage structure: {unit: {"s": float, "e": float, "w": float}}
         coeff = self.coordinator.model.solar_coefficients_per_unit.get(entity_id)
         if coeff is not None:
             return coeff
@@ -234,8 +248,9 @@ class SolarCalculator:
         # Decompose global scalar default along the configured primary azimuth
         az_rad = math.radians(self.coordinator.solar_azimuth)
         return {
-            "s": default_scalar * (-math.cos(az_rad)),
-            "e": default_scalar * math.sin(az_rad)
+            "s": default_scalar * max(0.0, -math.cos(az_rad)),
+            "e": default_scalar * max(0.0, math.sin(az_rad)),
+            "w": default_scalar * max(0.0, -math.sin(az_rad)),
         }
 
     def apply_correction(self, base_kwh: float, solar_impact: float, val: str | float) -> float:
@@ -437,3 +452,23 @@ class SolarCalculator:
             total_factor += factor
 
         return total_factor / 24.0
+
+    def estimate_daily_avg_solar_vector(self, date_obj: date, cloud_coverage: float = 50.0) -> tuple[float, float, float]:
+        """Estimate the average solar vector (S, E, W) for a given day (24h).
+
+        Each component is averaged independently across 24 hourly samples.
+        The result represents the expected mean solar contribution per hour
+        from each cardinal direction.
+        """
+        total_s, total_e, total_w = 0.0, 0.0, 0.0
+        start_dt = dt_util.start_of_local_day(dt_util.now().replace(year=date_obj.year, month=date_obj.month, day=date_obj.day))
+
+        for i in range(24):
+            check_dt = start_dt + timedelta(hours=i)
+            elev, azim = self.get_approx_sun_pos(check_dt)
+            s, e, w = self.calculate_solar_vector(elev, azim, cloud_coverage)
+            total_s += s
+            total_e += e
+            total_w += w
+
+        return total_s / 24.0, total_e / 24.0, total_w / 24.0

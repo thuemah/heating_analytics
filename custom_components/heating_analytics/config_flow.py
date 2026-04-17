@@ -1,4 +1,30 @@
-"""Config flow for Heating Analytics integration."""
+"""Config flow for Heating Analytics integration.
+
+Architecture notes for contributors
+------------------------------------
+- ``_schema_advanced()`` is shared by both ``async_step_advanced`` and
+  ``async_step_reconfigure_advanced``.
+- ``_build_final_data`` is called from 4 places (2 create, 2 reconfigure).
+  It handles all normalisation: source derivation, boolean cleanup, unit
+  conversion, key stripping.  New config fields should be normalised here.
+- ``SelectSelector`` returns **string** values.  Convert to the correct type
+  in ``_build_final_data`` before storage (see CONF_HOURLY_LOG_RETENTION_DAYS).
+- ``_needs_feature_config_step()`` always returns True — wind tuning is always
+  shown.  Do not "optimise" this to conditionally skip the step.
+- Wind *sensor* fields are behind ``_CONF_DEDICATED_WIND`` (UI-only, not
+  stored).  Wind *tuning* is outside the toggle — accessible to all users.
+- Wind thresholds are only converted from display-unit to m/s when
+  ``wind_from_user`` is True (form values).  ``setdefault`` values are already
+  in m/s and must not be double-converted.
+
+Translation notes
+~~~~~~~~~~~~~~~~~
+Two files: ``translations/en.json`` and ``translations/nb.json``.
+No ``strings.json`` — HA loads translations directly.  Config flow steps
+``advanced`` and ``reconfigure_advanced`` have **identical data/data_description
+keys** — both must be updated when adding a new field.  Use ``replace_all``
+when editing both blocks simultaneously.
+"""
 from __future__ import annotations
 
 import logging
@@ -49,6 +75,9 @@ from .const import (
     CONF_TRACK_C,
     CONF_MPC_ENTRY_ID,
     CONF_MPC_MANAGED_SENSOR,
+    CONF_HOURLY_LOG_RETENTION_DAYS,
+    DEFAULT_HOURLY_LOG_RETENTION_DAYS,
+    HOURLY_LOG_RETENTION_OPTIONS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -175,6 +204,12 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not data.get(key):
                 data.pop(key, None)
 
+        # Hourly log retention: SelectSelector returns a string, store as int (#820).
+        if CONF_HOURLY_LOG_RETENTION_DAYS in data:
+            data[CONF_HOURLY_LOG_RETENTION_DAYS] = int(data[CONF_HOURLY_LOG_RETENTION_DAYS])
+        else:
+            data[CONF_HOURLY_LOG_RETENTION_DAYS] = DEFAULT_HOURLY_LOG_RETENTION_DAYS
+
         # Ensure wind tuning fields have defaults.  Defaults are in m/s and
         # must NOT be converted — only user-submitted values (in display units)
         # need conversion.
@@ -281,6 +316,18 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema[vol.Optional("max_energy_delta", default=g("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA))] = (
             selector.NumberSelector(
                 selector.NumberSelectorConfig(min=0.5, max=15.0, step=0.5, unit_of_measurement="kWh")
+            )
+        )
+        schema[vol.Optional(
+            CONF_HOURLY_LOG_RETENTION_DAYS,
+            default=g(CONF_HOURLY_LOG_RETENTION_DAYS, DEFAULT_HOURLY_LOG_RETENTION_DAYS),
+        )] = selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=[
+                    selector.SelectOptionDict(value=str(v), label=f"{v} days")
+                    for v in HOURLY_LOG_RETENTION_OPTIONS
+                ],
+                mode=selector.SelectSelectorMode.DROPDOWN,
             )
         )
         return vol.Schema(schema)

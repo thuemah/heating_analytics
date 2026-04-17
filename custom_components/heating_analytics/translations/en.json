@@ -52,7 +52,8 @@
           "secondary_weather_entity": "Secondary Weather Provider",
           "forecast_crossover_day": "Forecast Crossover Day",
           "csv_auto_logging": "Enable CSV Logging",
-          "max_energy_delta": "Spike Protection Threshold"
+          "max_energy_delta": "Spike Protection Threshold",
+          "hourly_log_retention_days": "Hourly Log Retention"
         },
         "data_description": {
           "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Only recommended for homes with very high thermal mass (concrete/stone) or heat pumps with a high minimum modulation level. Significantly slows down the learning curve — full model characterisation may take an entire heating season.",
@@ -64,7 +65,8 @@
           "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting). Useful for validating a new weather source before switching.",
           "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions.",
           "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
-          "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model."
+          "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
+          "hourly_log_retention_days": "How many days of hourly-resolution data to keep. Longer retention enables cross-seasonal retraining and deeper diagnostics. 90 days is conservative (recommended for Raspberry Pi); 365 days uses approximately 9 MB of storage. Reducing this value permanently deletes hourly data beyond the new limit — daily summaries are not affected."
         }
       },
       "feature_config": {
@@ -140,7 +142,8 @@
           "secondary_weather_entity": "Secondary Weather Provider",
           "forecast_crossover_day": "Forecast Crossover Day",
           "csv_auto_logging": "Enable CSV Logging",
-          "max_energy_delta": "Spike Protection Threshold"
+          "max_energy_delta": "Spike Protection Threshold",
+          "hourly_log_retention_days": "Hourly Log Retention"
         },
         "data_description": {
           "daily_learning_mode": "When enabled, the model learns once per day at midnight (Track B) instead of every hour (Track A). Only recommended for homes with very high thermal mass (concrete/stone) or heat pumps with a high minimum modulation level. Significantly slows down the learning curve — full model characterisation may take an entire heating season.",
@@ -152,7 +155,8 @@
           "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting). Useful for validating a new weather source before switching.",
           "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions.",
           "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
-          "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model."
+          "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
+          "hourly_log_retention_days": "How many days of hourly-resolution data to keep. Longer retention enables cross-seasonal retraining and deeper diagnostics. 90 days is conservative (recommended for Raspberry Pi); 365 days uses approximately 9 MB of storage. Reducing this value permanently deletes hourly data beyond the new limit — daily summaries are not affected."
         }
       },
       "reconfigure_feature_config": {

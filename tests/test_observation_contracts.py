@@ -36,7 +36,7 @@ class TestObservationCollector:
         c = ObservationCollector()
         c.accumulate_weather(
             temp=5.0, effective_wind=3.0, wind_bucket="normal",
-            solar_factor=0.5, solar_vector=(0.1, 0.2),
+            solar_factor=0.5, solar_vector=(0.1, 0.2, 0.0),
             is_aux_active=True, current_time=datetime(2023, 1, 1, 12, 5),
         )
         c.energy_hour = 1.5
@@ -110,8 +110,8 @@ class TestObservationCollector:
         c = ObservationCollector()
         t = datetime(2023, 1, 1, 12, 0)
 
-        c.accumulate_weather(5.0, 3.0, "normal", 0.5, (0.1, 0.2), False, t)
-        c.accumulate_weather(6.0, 4.0, "high_wind", 0.6, (0.3, 0.4), True, t)
+        c.accumulate_weather(5.0, 3.0, "normal", 0.5, (0.1, 0.2, 0.0), False, t)
+        c.accumulate_weather(6.0, 4.0, "high_wind", 0.6, (0.3, 0.4, 0.0), True, t)
 
         assert c.sample_count == 2
         assert c.temp_sum == pytest.approx(11.0)
@@ -119,6 +119,7 @@ class TestObservationCollector:
         assert c.solar_sum == pytest.approx(1.1)
         assert c.solar_vector_s_sum == pytest.approx(0.4)
         assert c.solar_vector_e_sum == pytest.approx(0.6)
+        assert c.solar_vector_w_sum == pytest.approx(0.0)
         assert c.bucket_counts["normal"] == 1
         assert c.bucket_counts["high_wind"] == 1
         assert c.aux_count == 1  # Only second call had is_aux_active=True
@@ -157,7 +158,7 @@ class TestHourlyObservation:
             hour=12, avg_temp=5.0, inertia_temp=5.5, temp_key="6",
             effective_wind=3.0, wind_bucket="normal",
             bucket_counts={"normal": 30}, avg_humidity=65.0, solar_factor=0.1,
-            solar_vector=(0.1, 0.2), solar_impact_raw=0.05,
+            solar_vector=(0.1, 0.2, 0.0), solar_impact_raw=0.05,
             effective_solar_impact=0.04, total_energy_kwh=1.5,
             learning_energy_kwh=1.4, guest_impact_kwh=0.1,
             expected_kwh=1.3, base_expected_kwh=1.6,
@@ -205,7 +206,7 @@ class TestLearningLegacyRoundtrip:
             "total_energy_kwh": 1.0,
             "base_expected_kwh": 1.0,
             "solar_impact": 0.0,
-            "avg_solar_vector": (0.0, 0.0),
+            "avg_solar_vector": (0.0, 0.0, 0.0),
             "is_aux_active": False,
             "aux_impact": 0.0,
             "learning_enabled": True,

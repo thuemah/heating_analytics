@@ -79,7 +79,7 @@ class StatisticsManager:
         is_aux_active: bool,
         unit_modes: dict[str, str] | None = None,
         override_solar_factor: float | None = None,
-        override_solar_vector: tuple[float, float] | None = None,
+        override_solar_vector: tuple[float, float, float] | None = None,
         detailed: bool = True,
         known_aux_impact_kwh: float | None = None,
     ) -> dict:
@@ -152,8 +152,9 @@ class StatisticsManager:
 
             az_rad = math.radians(self.coordinator.solar_azimuth)
             effective_solar_vector = (
-                curr_solar_factor * (-math.cos(az_rad)),
-                curr_solar_factor * math.sin(az_rad)
+                curr_solar_factor * max(0.0, -math.cos(az_rad)),
+                curr_solar_factor * max(0.0,  math.sin(az_rad)),
+                curr_solar_factor * max(0.0, -math.sin(az_rad)),
             )
 
         # Reconstruct potential (pre-screen) vector for coefficient dot product
@@ -161,6 +162,7 @@ class StatisticsManager:
             potential_solar_vector = (
                 effective_solar_vector[0] / screen_transmittance,
                 effective_solar_vector[1] / screen_transmittance,
+                effective_solar_vector[2] / screen_transmittance,
             )
         else:
             potential_solar_vector = effective_solar_vector
@@ -1228,8 +1230,9 @@ class StatisticsManager:
                     if s_factor is not None:
                         az_rad = math.radians(self.coordinator.solar_azimuth)
                         s_vector = (
-                            s_factor * (-math.cos(az_rad)),
-                            s_factor * math.sin(az_rad)
+                            s_factor * max(0.0, -math.cos(az_rad)),
+                            s_factor * max(0.0,  math.sin(az_rad)),
+                            s_factor * max(0.0, -math.sin(az_rad)),
                         )
 
                     res = self.calculate_total_power(
@@ -1355,15 +1358,17 @@ class StatisticsManager:
         s_factor = log.get("solar_factor") # Can be None
         s_vector_s = log.get("solar_vector_s")
         s_vector_e = log.get("solar_vector_e")
+        s_vector_w = log.get("solar_vector_w", 0.0)
         unit_modes = log.get("unit_modes")
 
         if s_vector_s is not None and s_vector_e is not None:
-            s_vector = (s_vector_s, s_vector_e)
+            s_vector = (s_vector_s, s_vector_e, s_vector_w)
         elif s_factor is not None:
             az_rad = math.radians(self.coordinator.solar_azimuth)
             s_vector = (
-                s_factor * (-math.cos(az_rad)),
-                s_factor * math.sin(az_rad)
+                s_factor * max(0.0, -math.cos(az_rad)),
+                s_factor * max(0.0,  math.sin(az_rad)),
+                s_factor * max(0.0, -math.sin(az_rad)),
             )
         else:
             s_vector = None
@@ -1721,13 +1726,14 @@ class StatisticsManager:
              unit_coeff = self.coordinator.solar.calculate_unit_coefficient(entity_id, temp_key)
              eff_solar_vector = (
                  self.coordinator.data.get("solar_vector_s", 0.0),
-                 self.coordinator.data.get("solar_vector_e", 0.0)
+                 self.coordinator.data.get("solar_vector_e", 0.0),
+                 self.coordinator.data.get("solar_vector_w", 0.0),
              )
              # Reconstruct potential vector; coeff already absorbs transmittance
              scr_pct = self.coordinator.solar_correction_percent
              scr_t = SolarCalculator._screen_transmittance(scr_pct)
              if scr_t > 0.01:
-                 pot_vec = (eff_solar_vector[0] / scr_t, eff_solar_vector[1] / scr_t)
+                 pot_vec = (eff_solar_vector[0] / scr_t, eff_solar_vector[1] / scr_t, eff_solar_vector[2] / scr_t)
              else:
                  pot_vec = eff_solar_vector
              unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(pot_vec, unit_coeff)

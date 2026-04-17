@@ -75,7 +75,7 @@ The observation → learning pipeline communicates through explicit typed contra
 7.  **StorageManager (`storage.py`):**
     *   **Role:** The Librarian.
     *   **Duty:** Handles JSON persistence, schema migrations (e.g., HDD -> TDD), and backfilling missing metadata. Canonical write-path for all model state.
-    *   **Data Lifecycle:** Manages the promotion of high-resolution `hourly_log` data into aggregated `daily_history` summaries. This ensures that while granular data (logs) is rotated (90 days), the statistical backbone (history) persists indefinitely (2 years).
+    *   **Data Lifecycle:** Manages the promotion of high-resolution `hourly_log` data into aggregated `daily_history` summaries. Hourly log retention is user-configurable (90 / 180 / 365 days, default 90). Daily history grows indefinitely (~200 bytes/day) with no retention limit.
 
 ---
 
@@ -134,13 +134,17 @@ Standard solar integration is difficult because "1000W of sun" doesn't mean "100
     *   The Base Model continues to learn during sunny periods by using **Normalized Energy** (Actual + Estimated Solar).
     *   **Solar Coefficient Learning:** If `Solar_Factor > 0.1`, the system specifically trains the solar coefficients to improve future normalization.
 
-4.  **2D Solar Vector Model:**
-    *   The sun's position is decomposed into a **South** (`S`) and **East** (`E`) component using pure geometry — no manual azimuth input required.
-    *   Each unit learns a matching 2D coefficient vector `(Coeff_S, Coeff_E)` that captures its effective window orientation empirically.
-    *   `Unit_Solar_Impact = Coeff_S × Potential_S + Coeff_E × Potential_E`  (screen transmittance is implicit in the learned coefficient)
+4.  **3D Solar Vector Model (#832):**
+    *   The sun's position is decomposed into three non-negative cardinal direction components using `max(0, ...)` basis functions — no manual azimuth input required:
+        - **South**: `max(0, -cos(azimuth))` × base_intensity — positive when sun is south of E-W line
+        - **East**: `max(0, sin(azimuth))` × base_intensity — positive in morning (azimuth 0–180°)
+        - **West**: `max(0, -sin(azimuth))` × base_intensity — positive in afternoon (azimuth 180–360°)
+    *   Each unit learns a matching 3D coefficient vector `(Coeff_S, Coeff_E, Coeff_W)` that captures its effective window orientation empirically. All three coefficients are clamped to `>= 0` — this is a true physics invariant (each window direction can only receive solar gain, never produce negative gain).
+    *   `Unit_Solar_Impact = Coeff_S × Pot_S + Coeff_E × Pot_E + Coeff_W × Pot_W`  (screen transmittance is implicit in the learned coefficient)
+    *   East and West are **orthogonal by construction** — they have disjoint temporal support (E is zero whenever W is non-zero, and vice versa). This gives well-conditioned NLMS learning and clean cold-start least squares without cross-contamination.
     *   Coefficients are learned against the **potential** (pre-screen) solar vector. Because the learning target (`base − actual`) inherently includes the screen effect, the coefficient converges to `physical_window_coeff × average_screen_transmittance`. This is a deliberate trade-off: using the potential vector keeps the learning signal strong even when screens are closed (avoiding vector-magnitude stalls), while the implicit transmittance coupling is slowly tracked by NLMS. Windowless rooms correctly converge to near-zero coefficients regardless of screen state.
-    *   Learning uses **Normalized LMS (NLMS)** instead of standard LMS gradient descent. NLMS divides the step by the input power (`solar_s² + solar_e² + ε`), making convergence rate independent of the solar vector magnitude. This prevents gain-dependent instability where high-solar units oscillate while low-solar units converge. The regularization constant `ε = 0.05` naturally shrinks the east coefficient when the east signal is weak (typical at high latitudes where the sun tracks a narrow arc).
-    *   During cold-start (no learned coefficients yet), an initial scalar default is decomposed along a 180° (south) assumption until real data replaces it.
+    *   Learning uses **Normalized LMS (NLMS)** instead of standard LMS gradient descent. NLMS divides the step by the input power (`solar_s² + solar_e² + solar_w² + ε`), making convergence rate independent of the solar vector magnitude. This prevents gain-dependent instability where high-solar units oscillate while low-solar units converge. The regularization constant `ε = 0.05` naturally shrinks poorly-constrained components when their signal is weak.
+    *   During cold-start (no learned coefficients yet), a 3×3 least squares solver initialises all three coefficients from the first 4 qualifying hours. A collinear fallback handles degenerate cases (e.g. all data from one half of the day). An initial scalar default is decomposed along a 180° (south) assumption until real data replaces it.
 
 5.  **Air Mass Transmittance:**
     *   Solar attenuation at low sun angles is handled by a physics-based Air Mass Transmittance model (`intensity = 0.7 ** (1 / sin(elevation))`), replacing arbitrary elevation cutoff zones.
@@ -152,10 +156,19 @@ Standard solar integration is difficult because "1000W of sun" doesn't mean "100
 7.  **Screen Transmittance Floor:**
     *   When solar screens are closed, a minimum transmittance floor (20%) is enforced. This captures real physics beyond window transmittance: solar radiation heats exterior walls, roof surfaces, and the ground around the building, transferring heat inward through conduction regardless of screen position. The floor keeps the prediction path responsive to solar conditions even at 0% correction.
 
-8.  **Solar Thermal Battery:**
-    *   Instead of an instantaneous subtraction, solar gain is modeled as charging an exponential decay accumulator (`_solar_battery_state`). The absorbed heat releases gradually into the building mass over the following hours, dampening instant compensation loops and matching real-world thermal inertia.
-    *   Default decay rate is 0.75 (25% loss per hour, half-life ~2.4 hours), a middle ground between lightweight (furniture, interior surfaces) and heavier (concrete, floor heating) construction. Light-frame buildings may benefit from a faster decay (~0.60), while heavy masonry may need a slower one (~0.88). Per-installation calibration via `diagnose_solar` is recommended once 2+ weeks of data is available.
-    *   The `diagnose_solar` service includes a calibration sweep that tests decay rates from 0.50 to 0.95 against post-sunset residuals and recommends the optimal value. The `apply_battery_decay` parameter persists the recommendation to `entry.data` without requiring config flow changes.
+8.  **Solar Thermal Battery (EMA model):**
+    *   Solar gain is modeled as an exponential moving average: `state = state × decay + solar_impact × (1 − decay)`. This is the exact discrete-time solution of Newton's law of cooling for a first-order thermal system. At steady state, the effective solar impact equals the raw solar input — no amplification. The decay parameter controls only the time constant (how quickly the building releases stored heat).
+    *   The previous leaky-integrator formula (`state = state × decay + solar_impact`) amplified the solar signal by `1/(1−decay)`, violating energy conservation. At decay 0.75 this meant 4× amplification; at 0.85, 6.7×. The EMA model eliminates this.
+    *   Default decay rate is 0.75 (half-life ~2.4 hours), a middle ground between lightweight and heavy construction. Per-installation calibration via `diagnose_solar` with `apply_battery_decay: true` is recommended.
+    *   The `diagnose_solar` calibration sweep tests decay rates 0.50–0.95 against post-sunset residuals using the same EMA formula.
+
+9.  **Solar Model and COP — Deliberate Trade-off:**
+    *   The solar model operates entirely in the **electrical** domain (kWh from the meter), but solar gain is a **thermal** phenomenon. The per-unit solar coefficient is therefore not a pure physical constant — it converges to `physical_window_coeff × E[1/COP]`, where the expectation is weighted by qualifying sunny hours. For a typical Norwegian installation this effective COP is ~3.8.
+    *   This creates temperature-dependent prediction errors: at cold temperatures (COP=3.0) the model under-credits solar by ~21%; at mild temperatures (COP=4.3) it over-credits by ~13%. However, the base model's temperature buckets absorb the residual through EMA learning — the bucket contamination and the coefficient error cancel to first order. The residual second-order error is ~20 Wh/hour, well below measurement noise.
+    *   **Temperature-stratifying the solar coefficient was evaluated and rejected.** Most temperature buckets see only 2–10 qualifying sunny hours per year. NLMS with 3 samples is pure noise. The current design — one global coefficient + bucket absorption of the COP residual — is the correct trade-off between model complexity and data availability.
+    *   The battery decay has a similar COP mismatch: it charges at daytime COP and discharges at evening COP. The error is ~7–21 Wh/hour (0.5–2% of hourly consumption) and is not worth correcting.
+    *   The largest COP-related error (~70 Wh) occurs near the balance point on very sunny days, where the coefficient's embedded average COP triggers solar saturation slightly early. This affects ~50–100 hours/year and contributes ~5 kWh annually — negligible against a 15,000–25,000 kWh annual total.
+    *   **Total annual impact of COP-blindness: ~15–20 kWh (~0.1%).** No correction is needed. For Track C installations with explicit COP parameters, the solar model could theoretically be enhanced, but the improvement does not justify the complexity.
 
 ### E. Auxiliary Heating (Dynamic Coefficients)
 For hybrid systems (Heat Pump + Fireplace/Heater), the system does not use a separate "Fireplace Mode" curve. Instead, it learns an **Auxiliary Coefficient**.
@@ -536,6 +549,11 @@ To protect the user's hardware (specifically SD cards on Raspberry Pi), the inte
 1.  **Buffer First:** High-frequency sensor data is aggregated in memory (RAM).
 2.  **Hourly Flush:** Data is written to disk (`.storage/heating_analytics`) only **once per hour**, or immediately upon system shutdown/restart.
 3.  **Crash Recovery:** In the event of a power loss or ungraceful shutdown (where RAM buffer is lost), the **Gap Handling Logic** uses cumulative sensor counters to mathematically reconstruct the total consumption during the downtime.
+
+### Retention Policy
+
+*   **`hourly_log`:** Configurable via `hourly_log_retention_days` in the config flow (90 / 180 / 365 days, default 90). Trimmed in-place at every hour boundary using `del self._hourly_log[:-max_entries]` to preserve the list identity referenced by the cached `ModelState`. 90 days ≈ 2 MB JSON; 365 days ≈ 9 MB. Conservative default protects resource-constrained hardware (Raspberry Pi with SD card).
+*   **`daily_history`:** No retention limit. One entry per day (~200 bytes). 10 years ≈ 730 KB. The cost is negligible on any hardware, and unlimited retention gives `compare_periods` full historical range.
 
 ### Hourly Vectors (High-Fidelity History)
 Previously, the system stored daily averages (Avg Temp, Total kWh). This caused 'aliasing' errors where a cold morning + warm afternoon averaged to a mild day, losing the thermodynamic context of the heating spikes.

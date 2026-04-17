@@ -19,7 +19,7 @@ class MockCoordinator(CoordinatorModelMixin):
         self._correlation_data = {}
         self._aux_coefficients = {}
         self.solar = MagicMock()
-        self.solar.calculate_unit_coefficient.return_value = 0.0
+        self.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
         self.solar.calculate_unit_solar_impact.return_value = 0.0
         self.solar.apply_correction.side_effect = lambda n, s, m: n - s if m == "heating" else n + s
         self.solar.calculate_saturation.side_effect = lambda n, s, m: (0.0, 0.0, n)
