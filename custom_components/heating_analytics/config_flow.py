@@ -50,6 +50,12 @@ from .const import (
     CONF_WIND_UNIT,
     CONF_ENABLE_LIFETIME_TRACKING,
     CONF_SOLAR_ENABLED,
+    CONF_SCREEN_SOUTH,
+    CONF_SCREEN_EAST,
+    CONF_SCREEN_WEST,
+    DEFAULT_SCREEN_SOUTH,
+    DEFAULT_SCREEN_EAST,
+    DEFAULT_SCREEN_WEST,
     DEFAULT_WIND_UNIT,
     WIND_UNIT_MS,
     WIND_UNIT_KMH,
@@ -299,6 +305,14 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
             ),
             vol.Optional(CONF_ENABLE_LIFETIME_TRACKING, default=g(CONF_ENABLE_LIFETIME_TRACKING, False)): selector.BooleanSelector(),
+            # Per-direction screen presence (#826).  Default True for all three so
+            # behaviour matches pre-1.3.3 (single composite floor) on upgrade.
+            # Uncheck a direction if that facade has no external screens — its
+            # transmittance then stays at 1.0 regardless of the slider, and the
+            # solar coefficient for that direction encodes pure window physics.
+            vol.Optional(CONF_SCREEN_SOUTH, default=g(CONF_SCREEN_SOUTH, DEFAULT_SCREEN_SOUTH)): selector.BooleanSelector(),
+            vol.Optional(CONF_SCREEN_EAST, default=g(CONF_SCREEN_EAST, DEFAULT_SCREEN_EAST)): selector.BooleanSelector(),
+            vol.Optional(CONF_SCREEN_WEST, default=g(CONF_SCREEN_WEST, DEFAULT_SCREEN_WEST)): selector.BooleanSelector(),
             # Derive dedicated-wind default from whether a wind sensor is already configured
             vol.Optional(_CONF_DEDICATED_WIND, default=bool(g("wind_speed_sensor"))): selector.BooleanSelector(),
         }
@@ -318,9 +332,13 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 selector.NumberSelectorConfig(min=0.5, max=15.0, step=0.5, unit_of_measurement="kWh")
             )
         )
+        # SelectSelector compares defaults against string option values; the
+        # stored retention value is an int (converted in _build_final_data),
+        # so cast to str here or the form falls back to the first option on
+        # reconfigure and a no-op submit would overwrite the user's choice.
         schema[vol.Optional(
             CONF_HOURLY_LOG_RETENTION_DAYS,
-            default=g(CONF_HOURLY_LOG_RETENTION_DAYS, DEFAULT_HOURLY_LOG_RETENTION_DAYS),
+            default=str(g(CONF_HOURLY_LOG_RETENTION_DAYS, DEFAULT_HOURLY_LOG_RETENTION_DAYS)),
         )] = selector.SelectSelector(
             selector.SelectSelectorConfig(
                 options=[

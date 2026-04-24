@@ -137,6 +137,40 @@ async def test_log_retention_configurable_365_days(hass: HomeAssistant):
 
 
 @pytest.mark.asyncio
+async def test_log_entry_records_balance_point(hass: HomeAssistant):
+    """Hourly log entries must record the active balance point (#856 A)."""
+    entry = MagicMock()
+    entry.data = {"balance_point": 14.0}
+
+    with patch("custom_components.heating_analytics.storage.Store"):
+        coordinator = HeatingDataCoordinator(hass, entry)
+        coordinator._async_save_data = AsyncMock()
+        coordinator.balance_point = 14.0
+
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0]
+        coordinator._collector.temp_sum = 0.0
+
+        current_time = datetime(2023, 10, 27, 13, 0, 0)
+        await coordinator._process_hourly_data(current_time)
+
+        assert coordinator._hourly_log[-1]["bp_at_log_time"] == 14.0
+
+        # BP change mid-run is reflected on the next entry without touching
+        # previous ones — diagnostics reads both and can flag the transition.
+        coordinator.balance_point = 16.5
+        coordinator._collector.sample_count = 1
+        coordinator._collector.wind_values = [0.0]
+        coordinator._collector.temp_sum = 0.0
+
+        next_time = datetime(2023, 10, 27, 14, 0, 0)
+        await coordinator._process_hourly_data(next_time)
+
+        assert coordinator._hourly_log[-2]["bp_at_log_time"] == 14.0
+        assert coordinator._hourly_log[-1]["bp_at_log_time"] == 16.5
+
+
+@pytest.mark.asyncio
 async def test_log_retention_configurable_180_days(hass: HomeAssistant):
     """Test that 180-day retention keeps 4320 entries."""
     entry = MagicMock()

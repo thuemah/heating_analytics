@@ -149,7 +149,8 @@ class TestWeekComparisonExplanation:
                 {"curr_temp": 5, "ref_temp": 5, "curr_wind": 5, "ref_wind": 5, "ref_solar":0, "curr_solar":0}
              ))
 
-             sensor._build_current_period_days = MagicMock(side_effect=Exception("Boom"))
+             # #878 narrowed this handler to (ValueError, KeyError, AttributeError).
+             sensor._build_current_period_days = MagicMock(side_effect=ValueError("Boom"))
 
              attrs = sensor.extra_state_attributes
 

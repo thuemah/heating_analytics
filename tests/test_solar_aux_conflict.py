@@ -78,7 +78,7 @@ async def test_solar_aux_dual_interference(hass: HomeAssistant):
 
         # Check Impacts were recorded correctly
         # Solar impact is battery-smoothed (EMA): first hour = raw * (1 - decay)
-        assert last_log["solar_impact_kwh"] == pytest.approx(0.5 * 0.25, abs=0.01)
+        assert last_log["solar_impact_kwh"] == pytest.approx(0.5 * 0.20, abs=0.01)
         assert last_log["aux_impact_kwh"] == 1.0
 
         # Verify Guard Logic

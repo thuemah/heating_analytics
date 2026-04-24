@@ -132,7 +132,12 @@ def test_sun_position_exception_handling(solar_calc):
     """Test that exceptions are handled gracefully."""
     dt_obj = datetime(2024, 6, 21, 12, 0, 0, tzinfo=timezone.utc)
 
-    with patch('custom_components.heating_analytics.solar.sun_elevation', side_effect=Exception("Test error"), create=True), \
+    # astral raises ValueError on malformed observer/datetime; the handler
+    # was narrowed to (TypeError, ValueError) in #878.  Observer is also
+    # patched because astral is not installed in the unit-test env; in
+    # production the `astral>=2.2` manifest requirement guarantees it.
+    with patch('custom_components.heating_analytics.solar.Observer', MagicMock(), create=True), \
+         patch('custom_components.heating_analytics.solar.sun_elevation', side_effect=ValueError("Test error"), create=True), \
          patch('custom_components.heating_analytics.solar.HAS_ASTRAL', True):
         elevation, azimuth = solar_calc.get_approx_sun_pos(dt_obj)
 

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta
 
 from custom_components.heating_analytics.const import SOLAR_BATTERY_DECAY
+from custom_components.heating_analytics.diagnostics import DiagnosticsEngine
 
 
 class TestBatteryDecayMechanics:
@@ -90,8 +91,8 @@ class TestBatteryDecayMechanics:
     def test_half_life_at_default(self):
         """Current default decay has expected half-life."""
         half_life = math.log(0.5) / math.log(SOLAR_BATTERY_DECAY)
-        # 0.75 → ~2.4h
-        assert 2.0 < half_life < 3.0
+        # 0.80 → ~3.1h
+        assert 3.0 < half_life < 3.5
 
     def test_half_life_at_080(self):
         """Decay 0.80 has half-life of ~3.1 hours."""
@@ -205,7 +206,7 @@ class TestDiagnoseSolarCalibrationSweep:
 
         from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 
-        result = HeatingDataCoordinator.diagnose_solar(coord, days_back=30)
+        result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
 
         assert "global" in result
         calibration = result["global"].get("battery_calibration", {})
@@ -220,7 +221,7 @@ class TestDiagnoseSolarCalibrationSweep:
         coord = self._make_coordinator_with_log([])
         from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 
-        result = HeatingDataCoordinator.diagnose_solar(coord, days_back=30)
+        result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         # Should not crash — graceful empty result
         assert "global" in result
         assert result["global"]["qualifying_hours"] == 0

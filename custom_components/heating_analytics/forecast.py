@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, date
 
 from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfSpeed
+from homeassistant.exceptions import HomeAssistantError
 
 from .helpers import convert_speed_to_ms, get_last_year_iso_date
 from .explanation import WeatherImpactAnalyzer, ExplanationFormatter
@@ -398,7 +399,9 @@ class ForecastManager:
                     forecasts = state.attributes.get("forecast")
                     _LOGGER.debug(f"Fetched {len(forecasts)} {forecast_type} items from {entity_id} (attribute fallback)")
 
-        except Exception as e:
+        except (TypeError, ValueError, KeyError, AttributeError, HomeAssistantError) as e:
+            # HomeAssistantError covers ServiceNotFound / ServiceValidationError
+            # when the weather entity or service disappears mid-call (#878).
             if self.coordinator.hass.is_running:
                 _LOGGER.warning(f"Could not fetch {forecast_type} forecasts from {entity_id}: {e}")
 

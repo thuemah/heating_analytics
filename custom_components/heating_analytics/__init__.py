@@ -38,6 +38,7 @@ SERVICE_EXIT_COOLDOWN = "exit_cooldown"
 SERVICE_GET_FORECAST = "get_forecast"
 SERVICE_CALIBRATE_INERTIA = "calibrate_inertia"
 SERVICE_CALIBRATE_WIND_THRESHOLDS = "calibrate_wind_thresholds"
+SERVICE_CALIBRATE_UNIT_THRESHOLDS = "calibrate_unit_thresholds"
 SERVICE_DIAGNOSE_MODEL = "diagnose_model"
 SERVICE_DIAGNOSE_SOLAR = "diagnose_solar"
 SERVICE_RESET_SOLAR_LEARNING = "reset_solar_learning"
@@ -54,6 +55,11 @@ SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
 SERVICE_SCHEMA_CALIBRATE_WIND = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days", default=60): vol.All(vol.Coerce(int), vol.Range(min=1, max=180)),
+})
+
+SERVICE_SCHEMA_CALIBRATE_UNIT_THRESHOLDS = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=7, max=180)),
 })
 
 SERVICE_SCHEMA_IMPORT = vol.Schema({
@@ -92,6 +98,8 @@ SERVICE_SCHEMA_RESET_ACCURACY = vol.Schema({
 SERVICE_SCHEMA_RESET_SOLAR = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,  # Instance targeting
     vol.Optional("unit_entity_id"): cv.entity_id,  # Unit filter (which sensor to reset)
+    vol.Optional("replay_from_history", default=False): cv.boolean,
+    vol.Optional("days_back"): vol.All(vol.Coerce(int), vol.Range(min=1, max=730)),
 })
 
 SERVICE_SCHEMA_BACKUP = vol.Schema({
@@ -174,7 +182,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = HeatingDataCoordinator(hass, entry)
     try:
         await coordinator.async_config_entry_first_refresh()
-    except Exception as ex:
+    except Exception as ex:  # noqa: BLE001 — HA config-entry setup boundary; any failure maps to ConfigEntryNotReady
         raise ConfigEntryNotReady(f"Timeout while waiting for initial data: {ex}") from ex
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
@@ -277,23 +285,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Register Reset Solar Learning Service
-    async def handle_reset_solar_learning(call: ServiceCall):
+    async def handle_reset_solar_learning(call: ServiceCall) -> dict:
         """Handle the reset solar learning service call."""
         entity_id = call.data.get("entity_id")
         unit_entity_id = call.data.get("unit_entity_id")
+        replay_from_history = call.data.get("replay_from_history", False)
+        days_back = call.data.get("days_back")
 
         coord = _get_target_coordinator(hass, entity_id)
-        if unit_entity_id:
-            _LOGGER.info(f"Service called to reset solar learning for unit {unit_entity_id} (coordinator={coord.entry.entry_id})")
-        else:
-            _LOGGER.info(f"Service called to reset solar learning for all units (coordinator={coord.entry.entry_id})")
-        await coord.async_reset_solar_learning_data(unit_entity_id)
+        scope = f"unit {unit_entity_id}" if unit_entity_id else "all units"
+        replay_suffix = (
+            f" + replay from history (days_back={days_back})"
+            if replay_from_history else ""
+        )
+        _LOGGER.info(
+            f"Service called: reset_solar_learning for {scope}{replay_suffix} "
+            f"(coordinator={coord.entry.entry_id})"
+        )
+        return await coord.async_reset_solar_learning_data(
+            unit_entity_id,
+            replay_from_history=replay_from_history,
+            days_back=days_back,
+        )
 
     hass.services.async_register(
         DOMAIN,
         SERVICE_RESET_SOLAR_LEARNING,
         handle_reset_solar_learning,
         schema=SERVICE_SCHEMA_RESET_SOLAR,
+        supports_response=SupportsResponse.ONLY,
     )
 
     # Register Retrain From History Service
@@ -441,6 +461,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         SERVICE_CALIBRATE_WIND_THRESHOLDS,
         handle_calibrate_wind_thresholds,
         schema=SERVICE_SCHEMA_CALIBRATE_WIND,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    # Register Calibrate Unit Thresholds Service
+    async def handle_calibrate_unit_thresholds(call: ServiceCall) -> dict:
+        """Handle the calibrate unit thresholds service call.
+
+        Recomputes per-unit min-base thresholds from dark-hour actuals.
+        Safe to call anytime; thresholds update in-place and are persisted
+        on the next storage save.  Returns the same diagnostic dict that
+        startup calibration logs.
+        """
+        entity_id = call.data.get("entity_id")
+        days = call.data.get("days", 30)
+
+        target_coordinator = _get_target_coordinator(hass, entity_id)
+        _LOGGER.debug(
+            "Handling calibrate_unit_thresholds for %d days (coordinator: %s)",
+            days, target_coordinator.entry.entry_id,
+        )
+        result = target_coordinator._calibrate_per_unit_min_base_thresholds(
+            sample_days=days,
+        )
+        if result.get("status") == "ok" and (
+            result.get("updated") or result.get("rejected")
+        ):
+            await target_coordinator._async_save_data(force=True)
+        return result
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CALIBRATE_UNIT_THRESHOLDS,
+        handle_calibrate_unit_thresholds,
+        schema=SERVICE_SCHEMA_CALIBRATE_UNIT_THRESHOLDS,
         supports_response=SupportsResponse.ONLY,
     )
 

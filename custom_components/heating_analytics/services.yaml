@@ -235,7 +235,11 @@ compare_periods:
 
 reset_solar_learning:
   name: Reset Solar Learning
-  description: Reset the learned solar coefficients for a specific unit or all units within an instance.
+  description: >-
+    Reset the learned solar coefficients for a specific unit or all units
+    within an instance. Optionally refit coefficients from the stored hourly
+    log immediately after reset — a "solar-only retrain" that leaves the
+    base model and U-coefficient untouched.
   fields:
     entity_id:
       name: Instance
@@ -249,6 +253,26 @@ reset_solar_learning:
       selector:
         entity:
           domain: sensor
+    replay_from_history:
+      name: Refit from History
+      description: >-
+        After resetting, replay the stored hourly log through the NLMS
+        learner so coefficients are refitted against the existing base
+        model. Use when the base has stabilised but solar coefficients
+        are known to be wrong (e.g. after changing screen config, or
+        when diagnose_solar shows large implied-vs-learned divergence).
+        Base, aux, and U-coefficient tables are NOT touched.
+      default: false
+      selector:
+        boolean:
+    days_back:
+      name: Days Back (optional)
+      description: Limit the NLMS replay to the most recent N days of logged data. Only applies when Refit from History is enabled. Leave empty to use all available history.
+      selector:
+        number:
+          min: 1
+          max: 730
+          mode: box
 
 exit_cooldown:
   name: Exit Auxiliary Cooldown
@@ -308,6 +332,35 @@ calibrate_wind_thresholds:
       selector:
         number:
           min: 1
+          max: 180
+          mode: box
+
+calibrate_unit_thresholds:
+  name: Calibrate Per-Unit Min-Base Thresholds
+  description: >-
+    Recomputes each sensor's solar-learning noise-floor threshold from
+    dark-hour (solar_factor < 0.05) heating-mode actuals.  Replaces
+    the global 0.15 kWh fallback with a per-unit p10 value, allowing small
+    loads and low-min-modulation heat pumps to participate in NLMS,
+    inequality, and shutdown-detection gates at their own calibrated
+    noise floor.  Safety guards:  requires 14+ days of log data and 20+
+    dark-hour samples per unit, clamps to [0.03, 0.30] kWh, limits change
+    to ±50 % per run.  Runs automatically at every startup — this service
+    is for on-demand recalibration.
+  fields:
+    entity_id:
+      name: Entity
+      description: The Heating Analytics sensor to target (optional, defaults to primary instance).
+      selector:
+        entity:
+          integration: heating_analytics
+    days:
+      name: Days Back to Analyze
+      description: Number of days of historical dark-hour data to evaluate (7-180).
+      default: 30
+      selector:
+        number:
+          min: 7
           max: 180
           mode: box
 

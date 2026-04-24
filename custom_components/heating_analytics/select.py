@@ -29,8 +29,8 @@ async def async_setup_entry(
     coordinator: HeatingDataCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     # Create a mode select entity for each heating unit (#808).
-    # Always created regardless of has_ac_units — all users benefit from
-    # DHW, OFF, and Guest modes, not just those with cooling capability.
+    # Always created: DHW, OFF, and Guest modes benefit every install,
+    # independent of cooling capability.
     entities = []
     for entity_id in coordinator.energy_sensors:
         entities.append(

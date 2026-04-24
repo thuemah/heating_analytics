@@ -146,11 +146,35 @@ def hass():
 _original_mock_getattr = MagicMock.__getattr__
 
 def _patched_mock_getattr(self, name):
-    if name == "_collector":
+    if name in ("_collector", "collector"):
+        # Share one real ObservationCollector between ``_collector``
+        # (legacy private attribute still used within coordinator) and
+        # ``collector`` (new public accessor used by managers).  Both
+        # access paths must resolve to the same object so tests that
+        # prime collector state via ``coord._collector.delta_per_unit[…]``
+        # are visible when managers read via ``coord.collector.…``.
         from custom_components.heating_analytics.observation import ObservationCollector
-        collector = ObservationCollector()
-        object.__setattr__(self, "_collector", collector)
-        return collector
+        existing = self.__dict__.get("_collector")
+        if existing is None:
+            existing = ObservationCollector()
+            object.__setattr__(self, "_collector", existing)
+            object.__setattr__(self, "collector", existing)
+        elif "collector" not in self.__dict__:
+            object.__setattr__(self, "collector", existing)
+        return existing
+    # Coordinator exposes runtime state as public @property over
+    # underlying ``_X`` fields (daily_individual, aux_cooldown_active,
+    # aux_affected_set).  Properties do not fire on MagicMock, so when
+    # a test sets ``coord._aux_affected_set = set(...)`` and manager
+    # code reads ``coord.aux_affected_set``, the latter would resolve to
+    # an auto-MagicMock.  Forward public-name reads to the ``_X`` dict
+    # entry when tests have primed it; otherwise fall through to
+    # MagicMock's auto-attribute machinery.
+    _PUBLIC_ALIASES = ("daily_individual", "aux_cooldown_active", "aux_affected_set")
+    if name in _PUBLIC_ALIASES:
+        underscore_name = f"_{name}"
+        if underscore_name in self.__dict__:
+            return self.__dict__[underscore_name]
     if name == "model":
         # Build a ModelState-like namespace that delegates to the mock's
         # own _fields.  This lets ``coordinator.model.hourly_log`` resolve
@@ -168,3 +192,5 @@ def _patched_mock_getattr(self, name):
 
 MagicMock.__getattr__ = _patched_mock_getattr
 NonCallableMagicMock.__getattr__ = _patched_mock_getattr
+
+

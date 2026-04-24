@@ -7,6 +7,8 @@ from typing import Callable
 from .const import (
     COLD_START_SOLAR_DAMPING,
     ENERGY_GUARD_THRESHOLD,
+    INEQUALITY_MARGIN,
+    INEQUALITY_STEP_SIZE,
     LEARNING_BUFFER_THRESHOLD,
     MODE_HEATING,
     MODE_COOLING,
@@ -18,8 +20,14 @@ from .const import (
     NLMS_REGULARIZATION,
     NLMS_STEP_SIZE,
     PER_UNIT_LEARNING_RATE_CAP,
+    SNR_WEIGHT_FLOOR,
+    SNR_WEIGHT_K,
+    SOLAR_BATTERY_DECAY,
     SOLAR_COEFF_CAP,
     SOLAR_DEAD_ZONE_THRESHOLD,
+    SOLAR_LEARNING_MIN_BASE,
+    SOLAR_SHUTDOWN_MIN_BASE,
+    SOLAR_SHUTDOWN_MIN_MAGNITUDE,
 )
 from .observation import HourlyObservation, ModelState, LearningConfig
 from .solar import SolarCalculator
@@ -35,6 +43,124 @@ def _pad_solar_vector(v: tuple) -> tuple[float, float, float]:
     if len(v) >= 3:
         return (v[0], v[1], v[2])
     return (v[0], v[1], 0.0)
+
+
+def _resolve_min_base(
+    entity_id: str,
+    unit_min_base: dict[str, float] | None,
+    fallback: float,
+) -> float:
+    """Return the effective min-base threshold for one unit (#871).
+
+    Per-unit overrides take precedence over the global fallback.  Empty
+    dict / None preserves legacy behaviour.  Centralises the resolution
+    so NLMS, inequality, and shutdown gates stay in lock-step.
+
+    Non-dict inputs (including MagicMock in tests and any malformed
+    storage load) fall back to the global constant rather than raising,
+    mirroring the defensive posture of the storage-load path.
+    """
+    if not isinstance(unit_min_base, dict) or not unit_min_base:
+        return fallback
+    v = unit_min_base.get(entity_id)
+    if isinstance(v, (int, float)) and v > 0.0:
+        return float(v)
+    return fallback
+
+
+def compute_snr_weight(
+    solar_factor: float,
+    solar_dominant_entities,
+    total_units: int,
+    *,
+    floor: float = SNR_WEIGHT_FLOOR,
+    k: float = SNR_WEIGHT_K,
+) -> float:
+    """Signal-to-noise weight for base-model EMA (#866).
+
+    Exogenous weight — a function of observed sun geometry and shutdown
+    flags only, never of a learned state.  This keeps the weighted EMA
+    unbiased (the weight is independent of the target) while down-weighting
+    hours where the target carries more noise than signal.
+
+    Shape:
+        w = max(floor, 1 − k × solar_factor) × (n_clean / n_total)
+
+    - Dark hour (solar_factor ≈ 0) → weight ≈ 1.0
+    - Sunny hour decays linearly toward ``floor`` as solar_factor grows
+    - Per-unit shutdown scaling: fraction of units NOT in the hour's
+      ``solar_dominant_entities`` list.  All-shutdown → 0.  Prevents
+      a single shut-down unit from zeroing base learning for the whole
+      hour when other units are still observable (the over-aggressive
+      global w=0 flagged by the physics analysis in #862).
+
+    Parameters
+    ----------
+    solar_factor:
+        Hour's Kasten cloud-corrected geometric solar factor, in [0, 1].
+    solar_dominant_entities:
+        Iterable of entity_ids flagged as shutdown for this hour (from
+        :func:`detect_solar_shutdown_entities`).  May be None/empty.
+    total_units:
+        Count of learnable energy sensors for this hour.  Used to compute
+        the clean fraction.  Zero or negative → unit-scaling disabled.
+    floor, k:
+        Weight-function parameters (defaults from const.py).
+    """
+    sf = max(0.0, float(solar_factor or 0.0))
+    w = max(floor, 1.0 - k * sf)
+    if total_units > 0 and solar_dominant_entities:
+        n_shutdown = len(solar_dominant_entities)
+        n_clean = max(0, total_units - n_shutdown)
+        if n_clean == 0:
+            return 0.0
+        w *= n_clean / total_units
+    return w
+
+
+def count_active_learnable_units(
+    energy_sensors,
+    unit_modes: dict,
+    expected_base_per_unit: dict,
+    *,
+    min_base: float = SOLAR_LEARNING_MIN_BASE,
+    unit_min_base: dict[str, float] | None = None,
+) -> int:
+    """Count units that *could* be observable as a base-learning signal this hour.
+
+    Used as the denominator for the SNR weight's per-unit shutdown
+    scaling.  Without this, an hour where all VPs are in shutdown but
+    several small loads (termostat / varmekabel / socket) are also
+    configured under ``energy_sensors`` would still get a non-zero
+    weight because the denominator sees the small loads too.  But the
+    small loads are not the signal-bearers — the VPs are.  When the
+    VPs shut down, the hour is genuinely contaminated and the base
+    EMA should freeze.
+
+    Active = heating-mode + ``expected_base ≥ min_base``.  Cooling, OFF,
+    DHW, and guest modes are excluded (they don't contribute to global
+    base learning anyway).  Units below ``SOLAR_LEARNING_MIN_BASE``
+    are excluded because they cycle below the level where shutdown
+    detection meaningfully applies.
+
+    Falls back to ``len(energy_sensors)`` when called with empty
+    expected-base mapping (e.g. cold-start before any base data exists)
+    so existing call sites don't change behaviour during initial
+    warm-up.
+    """
+    if not expected_base_per_unit:
+        return len(energy_sensors) if energy_sensors else 0
+    n = 0
+    for sid in energy_sensors:
+        mode = unit_modes.get(sid, MODE_HEATING)
+        if mode != MODE_HEATING:
+            continue
+        threshold = _resolve_min_base(sid, unit_min_base, min_base)
+        if expected_base_per_unit.get(sid, 0.0) >= threshold:
+            n += 1
+    # Defensive: if nothing matches, fall back to total count rather than
+    # zero out the SNR denominator.
+    return n if n > 0 else (len(energy_sensors) if energy_sensors else 0)
 
 
 class LearningManager:
@@ -96,7 +222,10 @@ class LearningManager:
         unit_modes = obs.unit_modes
         is_cooldown_active = obs.was_cooldown_active
         solar_normalization_delta = obs.solar_normalization_delta
+        solar_factor = obs.solar_factor
+        battery_filtered_potential = obs.battery_filtered_potential
         correction_percent = obs.correction_percent
+        solar_dominant_entities = obs.solar_dominant_entities
 
         # From ModelState
         correlation_data = model.correlation_data
@@ -122,6 +251,7 @@ class LearningManager:
         aux_affected_entities = config.aux_affected_entities
         has_guest_activity = config.has_guest_activity
         per_unit_learning_enabled = config.per_unit_learning_enabled
+        unit_min_base = config.unit_min_base  # #871: per-unit threshold overrides
 
         # --- Original logic (unchanged) ---
 
@@ -264,16 +394,42 @@ class LearningManager:
 
             else:
                 # --- NORMAL MODE ---
-                # Update Base Model
+                # Update Base Model.
+                #
+                # Target is raw ``total_energy_kwh`` (no delta compensation);
+                # step size is scaled by the hour's signal-to-noise weight.
+                # Aux-path above is unchanged — aux learning is a different
+                # physical mechanism and does not share the COP-ceiling /
+                # shutdown-contamination failure modes that motivated SNR.
+                if solar_enabled:
+                    base_target = total_energy_kwh
+                    snr_w = compute_snr_weight(
+                        solar_factor,
+                        solar_dominant_entities,
+                        total_units=count_active_learnable_units(
+                            energy_sensors,
+                            unit_modes,
+                            hourly_expected_base_per_unit,
+                            unit_min_base=unit_min_base,
+                        ),
+                    )
+                    base_effective_rate = learning_rate * snr_w
+                else:
+                    base_target = total_energy_kwh
+                    base_effective_rate = learning_rate
+
                 if base_expected_kwh == 0.0:
-                    # Cold Start: Use Buffered Learning
+                    # Cold Start: Use Buffered Learning.
+                    # Shutdown hours (weight = 0) must NOT contaminate the
+                    # cold-start buffer with near-zero actuals.
                     if temp_key not in learning_buffer_global:
                         learning_buffer_global[temp_key] = {}
                     if wind_bucket not in learning_buffer_global[temp_key]:
                         learning_buffer_global[temp_key][wind_bucket] = []
 
                     buffer_list = learning_buffer_global[temp_key][wind_bucket]
-                    buffer_list.append(normalized_actual)
+                    if base_effective_rate > 0.0:
+                        buffer_list.append(base_target)
 
                     if len(buffer_list) >= LEARNING_BUFFER_THRESHOLD:
                         avg_val = sum(buffer_list) / len(buffer_list)
@@ -284,13 +440,13 @@ class LearningManager:
                         correlation_data[temp_key][wind_bucket] = round(new_base_prediction, 5)
                         buffer_list.clear()
                     else:
-                        _LOGGER.debug(f"Global Buffered Learning [Collecting]: T={temp_key} W={wind_bucket} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({normalized_actual:.3f} kWh)")
+                        _LOGGER.debug(f"Global Buffered Learning [Collecting]: T={temp_key} W={wind_bucket} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({base_target:.3f} kWh)")
                         # While buffering, keep prediction at 0 until jump start
                         new_base_prediction = 0.0
 
                 else:
                     # EMA Update
-                    new_base_prediction = base_expected_kwh + learning_rate * (normalized_actual - base_expected_kwh)
+                    new_base_prediction = base_expected_kwh + base_effective_rate * (base_target - base_expected_kwh)
                     if temp_key not in correlation_data:
                         correlation_data[temp_key] = {}
                     correlation_data[temp_key][wind_bucket] = round(new_base_prediction, 5)
@@ -316,6 +472,11 @@ class LearningManager:
                 aux_affected_entities, # Pass aux exclusion list
                 is_cooldown_active=is_cooldown_active,
                 correction_percent=correction_percent,
+                solar_dominant_entities=solar_dominant_entities,
+                screen_config=config.screen_config,
+                unit_min_base=unit_min_base,
+                solar_factor=solar_factor,
+                battery_filtered_potential=battery_filtered_potential,
             )
 
         return {
@@ -427,6 +588,11 @@ class LearningManager:
         aux_affected_entities: list[str] | None,
         is_cooldown_active: bool = False,
         correction_percent: float = 100.0,
+        solar_dominant_entities: tuple[str, ...] = (),
+        screen_config: tuple[bool, bool, bool] | None = None,
+        solar_factor: float = 0.0,
+        battery_filtered_potential: tuple[float, float, float] | None = None,
+        unit_min_base: dict[str, float] | None = None,
     ):
         """Process learning for individual units."""
         for entity_id in energy_sensors:
@@ -475,30 +641,71 @@ class LearningManager:
 
             unit_solar_impact = 0.0
 
-            # Reconstruct potential (pre-screen) solar vector for learning (#809).
-            # Coefficients learn against raw irradiance so they encode window
-            # physics, not screen state. Screen correction is applied at
-            # prediction time only.
-            transmittance = SolarCalculator._screen_transmittance(correction_percent)
-            if transmittance > 0.01:
-                potential_s = avg_solar_vector[0] / transmittance
-                potential_e = avg_solar_vector[1] / transmittance
-                potential_w = avg_solar_vector[2] / transmittance
-            else:
-                potential_s, potential_e, potential_w = avg_solar_vector
+            # Reconstruct potential (pre-screen) solar vector for learning
+            # (#809, per-direction since #826).  Coefficients learn against raw
+            # irradiance so they encode window physics, not screen state.
+            # Screen correction is applied at prediction time only.
+            potential_s, potential_e, potential_w = SolarCalculator.reconstruct_potential_vector(
+                avg_solar_vector, correction_percent, screen_config
+            )
 
             # Vector magnitude check for "sunny enough" threshold
             # Use potential vector — learning should happen when sun shines,
             # regardless of screen position.
             vector_magnitude = (potential_s**2 + potential_e**2 + potential_w**2) ** 0.5
 
-            if solar_enabled and vector_magnitude > 0.1 and not is_aux_active:
+            # Solar shutdown skip (#838): when a VP unit was detected as
+            # solar-dominant this hour (thermostat cut compressor in sun),
+            # its actual_impact = base - 0 = base would inflate the NLMS
+            # coefficient.  Skip solar learning for this entity; the other
+            # entities in the same hour continue to learn normally.
+            is_solar_shutdown = entity_id in solar_dominant_entities
+
+            # Per-unit override applies uniformly to both gates; only the
+            # fallback constants differ.  Compute the override lookup once
+            # so that a future divergence between SOLAR_LEARNING_MIN_BASE
+            # and SOLAR_SHUTDOWN_MIN_BASE cannot pass silently as two
+            # identical-by-coincidence _resolve_min_base() returns.
+            unit_override = (unit_min_base or {}).get(entity_id)
+            if unit_override is not None and unit_override > 0.0:
+                nlms_threshold = shutdown_threshold = float(unit_override)
+            else:
+                nlms_threshold = SOLAR_LEARNING_MIN_BASE
+                shutdown_threshold = SOLAR_SHUTDOWN_MIN_BASE
+            if (
+                solar_enabled
+                and vector_magnitude > 0.1
+                and not is_aux_active
+                and not is_solar_shutdown
+                and expected_unit_base >= nlms_threshold
+            ):
                 self._learn_unit_solar_coefficient(
                     entity_id, temp_key,
                     expected_unit_base, actual_unit, (potential_s, potential_e, potential_w),
                     learning_rate, solar_coefficients_per_unit, learning_buffer_solar_per_unit,
                     avg_temp, balance_point,
                     unit_mode
+                )
+            elif (
+                # Inequality learning for shutdown hours.
+                # Runs in parallel to NLMS: while NLMS is gated on
+                # ``not is_solar_shutdown`` above, this branch fires
+                # specifically WHEN the unit was flagged shutdown.  The
+                # two paths converge toward the same physical coefficient
+                # from opposite sides (NLMS from above, inequality from
+                # below).
+                solar_enabled
+                and is_solar_shutdown
+                and not is_aux_active
+                and expected_unit_base >= shutdown_threshold
+                and unit_mode == MODE_HEATING  # cooling semantics inverted — out of scope
+                and battery_filtered_potential is not None
+            ):
+                self._update_unit_solar_inequality(
+                    entity_id=entity_id,
+                    expected_unit_base=expected_unit_base,
+                    battery_filtered_potential=battery_filtered_potential,
+                    solar_coefficients_per_unit=solar_coefficients_per_unit,
                 )
 
             # Step 2: Calculate Solar Impact using (possibly updated) coefficients
@@ -507,15 +714,20 @@ class LearningManager:
             # which includes the screen effect.  Using effective here would
             # double-count transmittance: coeff(≈phys×trans) × effective(=pot×trans)
             # = phys×pot×trans², leaving residual solar in the normalized data.
+            #
+            # Per-unit base EMA uses raw ``actual_unit`` as target (same
+            # rationale as the global path): the hour's SNR weight is
+            # combined into the existing headroom multiplier further
+            # below.  ``unit_solar_impact`` is retained for the headroom
+            # calculation.
             if solar_enabled:
-                 unit_coeff = solar_calculator.calculate_unit_coefficient(entity_id, temp_key)
-                 unit_solar_impact = solar_calculator.calculate_unit_solar_impact(
-                     (potential_s, potential_e, potential_w), unit_coeff
-                 )
-                 # Use unit_mode for normalization
-                 unit_normalized = solar_calculator.normalize_for_learning(actual_unit, unit_solar_impact, unit_mode)
+                unit_coeff = solar_calculator.calculate_unit_coefficient(entity_id, temp_key)
+                unit_solar_impact = solar_calculator.calculate_unit_solar_impact(
+                    (potential_s, potential_e, potential_w), unit_coeff
+                )
             else:
-                 unit_normalized = actual_unit
+                unit_solar_impact = 0.0
+            unit_normalized = actual_unit
 
             # Step 3: Learn Base or Aux Model
             if is_aux_active:
@@ -551,12 +763,71 @@ class LearningManager:
                             learning_buffer_per_unit, correlation_data_per_unit, observation_counts
                         )
             else:
-                # Learn Normal Model
+                # Learn Normal Model.
+                # Headroom-weighted EMA rate (#838): when the unsaturated
+                # unit_solar_impact approaches or exceeds expected_unit_base,
+                # the normalization target (actual + solar_impact) reflects
+                # an inflated coefficient, not reality.  Slowing the EMA in
+                # proportion to the remaining headroom breaks the second
+                # link of the feedback loop without touching the formula.
+                # At full saturation (solar >= base) → multiplier = 0.
+                # Dark hours (solar ≈ 0) → multiplier = 1 (unchanged).
+                #
+                # The headroom multiplier is composed with the hour's SNR
+                # weight.  Both attenuate the step size for the same class
+                # of noisy hours (high solar impact) but for different
+                # reasons — headroom on saturation-per-unit, SNR on
+                # hour-level solar presence.  Multiplying them is
+                # conservative: any hour downweighted by either mechanism
+                # stays downweighted.
+                if solar_enabled and expected_unit_base > 0.0:
+                    headroom_multiplier = max(
+                        0.0,
+                        (expected_unit_base - unit_solar_impact) / expected_unit_base,
+                    )
+                    headroom_multiplier = min(1.0, headroom_multiplier)
+                else:
+                    headroom_multiplier = 1.0
+
+                snr_w = compute_snr_weight(
+                    solar_factor,
+                    solar_dominant_entities,
+                    total_units=count_active_learnable_units(
+                        energy_sensors,
+                        unit_modes,
+                        hourly_expected_base_per_unit,
+                        unit_min_base=unit_min_base,
+                    ),
+                )
+                rate_multiplier = headroom_multiplier * snr_w
+
+                # Cooling-at-cold guard (#869 follow-up to #862/#868).
+                # A unit left in cooling mode across a full season (the
+                # seasonal-automation pattern) produces idle-compressor
+                # consumption on cold nights that would contaminate the
+                # heating-dominated per-unit base bucket.  Skip the update
+                # for cooling units when the hour's outdoor temperature is
+                # below balance_point − 2.  Matches the transition-zone
+                # boundary in diagnose_solar.temperature_stratified.
+                # Only the per-unit base EMA is gated — global base
+                # learning is unaffected (the cooling-idle contamination
+                # is small there, <1 % seasonal bias) and per-unit solar
+                # NLMS is already gated on vector_magnitude.  Retrain
+                # paths are NOT guarded — they replay the log faithfully
+                # so historical data is preserved for mode-stratified
+                # future work (#869).
+                if (
+                    unit_mode == MODE_COOLING
+                    and avg_temp < (balance_point - 2.0)
+                ):
+                    continue
+
                 self._learn_unit_model(
                     entity_id, temp_key, wind_bucket,
                     expected_unit_base, unit_normalized,
                     learning_rate,
-                    learning_buffer_per_unit, correlation_data_per_unit, observation_counts
+                    learning_buffer_per_unit, correlation_data_per_unit, observation_counts,
+                    rate_multiplier=rate_multiplier,
                 )
 
     def _learn_unit_solar_coefficient(
@@ -782,9 +1053,15 @@ class LearningManager:
         learning_rate: float,
         learning_buffer_per_unit: dict,
         correlation_data_per_unit: dict,
-        observation_counts: dict
+        observation_counts: dict,
+        rate_multiplier: float = 1.0,
     ):
-        """Update correlation model for a specific unit (Buffered or EMA)."""
+        """Update correlation model for a specific unit (Buffered or EMA).
+
+        rate_multiplier (#838): applied to the EMA rate (not the buffer
+        phase) to support solar-headroom throttling.  Defaults to 1.0
+        so aux-fallback and legacy callers keep existing behaviour.
+        """
 
         # Check if we have actual learned data for this exact temp/wind combination
         has_exact_model = (
@@ -828,8 +1105,11 @@ class LearningManager:
             # Get the actual learned value (not fallback)
             current_model_val = correlation_data_per_unit[entity_id][temp_key][wind_bucket]
 
-            # Cap per-unit learning rate at 3% to prevent oscillation on high-hysteresis units
-            unit_learning_rate = min(learning_rate, PER_UNIT_LEARNING_RATE_CAP)
+            # Cap per-unit learning rate at 3% to prevent oscillation on high-hysteresis units.
+            # Headroom multiplier (#838) further throttles the rate when
+            # unit_solar_impact approaches expected_unit_base — preventing
+            # inflated solar normalization from drifting the base model up.
+            unit_learning_rate = min(learning_rate, PER_UNIT_LEARNING_RATE_CAP) * rate_multiplier
             new_pred_unit = current_model_val + unit_learning_rate * (unit_normalized - current_model_val)
 
             _LOGGER.debug(f"Per-Unit Learning [EMA]: {entity_id} T={temp_key} W={wind_bucket} -> {new_pred_unit:.3f} kWh (was {current_model_val:.3f}, rate={unit_learning_rate:.1%})")
@@ -951,6 +1231,104 @@ class LearningManager:
             "w": round(max(0.0, value.get("w", 0.0)), 5),
         }
 
+    def _update_unit_solar_inequality(
+        self,
+        entity_id: str,
+        expected_unit_base: float,
+        battery_filtered_potential: tuple[float, float, float],
+        solar_coefficients_per_unit: dict,
+        *,
+        margin: float = INEQUALITY_MARGIN,
+        step_size: float = INEQUALITY_STEP_SIZE,
+    ) -> str:
+        """Inequality-constraint update for solar-shutdown hours (#865).
+
+        A shutdown hour (``actual ≈ 0`` on a unit that has meaningful base
+        demand while solar is high) carries a lower-bound signal:
+
+            coeff · potential ≥ base
+
+        The NLMS equality path discards these hours because ``actual_impact =
+        base − actual ≈ base`` would inflate the coefficient unrealistically.
+        This method uses the same hours with a different semantics: enforce
+        the inequality via projected gradient, raising coefficients only,
+        never lowering.  NLMS on modulating hours handles the downward
+        correction — together, the two paths converge from below (inequality)
+        and above (NLMS).
+
+        Signal source is **battery-filtered** per-direction potential, not
+        the instantaneous vector: shutdown is an accumulated phenomenon
+        (the room overheated over hours), and the battery EMA matches that
+        timescale (decay 0.80, half-life ~3.1h).
+
+        Parameters
+        ----------
+        entity_id:
+            Unit being updated.
+        expected_unit_base:
+            Current per-unit bucket value (kWh).  Gates the update via
+            ``SOLAR_SHUTDOWN_MIN_BASE`` at the call site.
+        battery_filtered_potential:
+            3-tuple ``(pot_s, pot_e, pot_w)`` from the coordinator's
+            ``_potential_battery_s/e/w`` (live) or local replay state.
+        solar_coefficients_per_unit:
+            Current coefficients; mutated in place.
+        margin:
+            Conservative factor on the constraint (default 0.9).  Requires
+            ``coeff·potential ≥ 0.9 · base`` rather than strict ``≥ base``.
+            Prevents the learner from chasing the hard edge where
+            shutdown detection might be a false positive.
+        step_size:
+            Projected-gradient step (default ``INEQUALITY_STEP_SIZE = 0.05``,
+            half of NLMS_STEP_SIZE).  Conservative — a single anomaly hour
+            cannot drive the coefficient far.
+
+        Returns
+        -------
+        One of: ``"updated"`` (constraint violated, update applied),
+        ``"non_binding"`` (constraint satisfied, no update),
+        ``"zero_magnitude"`` (battery-filtered potential too small).
+        """
+        pot_s, pot_e, pot_w = battery_filtered_potential
+        mag_total = pot_s + pot_e + pot_w  # all non-negative by construction
+        if mag_total <= 0.01:
+            # Battery not yet populated, or very low sun — inequality has
+            # no direction to learn against.  Skip rather than update.
+            return "zero_magnitude"
+
+        current = solar_coefficients_per_unit.get(entity_id) or {"s": 0.0, "e": 0.0, "w": 0.0}
+        coeff_s = float(current.get("s", 0.0))
+        coeff_e = float(current.get("e", 0.0))
+        coeff_w = float(current.get("w", 0.0))
+
+        predicted_impact = coeff_s * pot_s + coeff_e * pot_e + coeff_w * pot_w
+        constraint_target = margin * expected_unit_base
+
+        if predicted_impact >= constraint_target:
+            return "non_binding"
+
+        # Constraint violated — distribute the deficit proportional to the
+        # non-negative potential magnitude in each direction.  A direction
+        # with zero potential this hour gets no update (the battery carries
+        # history across hours, so a direction with recent activity still
+        # gets updated when its own pot component is above zero).
+        deficit = constraint_target - predicted_impact
+        new_s = coeff_s + step_size * deficit * (pot_s / mag_total)
+        new_e = coeff_e + step_size * deficit * (pot_e / mag_total)
+        new_w = coeff_w + step_size * deficit * (pot_w / mag_total)
+
+        # Apply non-negative + CAP clamps consistent with NLMS path.
+        new_s = max(0.0, min(SOLAR_COEFF_CAP, new_s))
+        new_e = max(0.0, min(SOLAR_COEFF_CAP, new_e))
+        new_w = max(0.0, min(SOLAR_COEFF_CAP, new_w))
+
+        self._update_unit_solar_coefficient(
+            entity_id,
+            {"s": new_s, "e": new_e, "w": new_w},
+            solar_coefficients_per_unit,
+        )
+        return "updated"
+
     def _increment_observation_count(self, entity_id, temp_key, wind_bucket, observation_counts):
         """Increment observation count."""
         if entity_id not in observation_counts:
@@ -973,16 +1351,40 @@ class LearningManager:
         learning_rate: float,
         get_predicted_kwh_fn: Callable[[str, str, float], float],
         actual_temp: float,
+        solar_normalization_delta: float = 0.0,
+        snr_weight: float = 1.0,
     ) -> str:
-        """Process a single historical data point to train global models."""
-        normalized_actual = actual_kwh
+        """Process a single historical data point to train global models.
+
+        Target is raw ``actual_kwh`` and the EMA step is scaled by
+        ``snr_weight``.  Dark hours retain full rate, sunny hours
+        contribute proportionally, shutdown hours zero.  Caller is
+        responsible for computing the weight via
+        :func:`compute_snr_weight` from the hour's ``solar_factor`` and
+        ``solar_dominant_entities``.
+
+        ``actual_kwh`` for the aux path is taken at face value — aux
+        learning does not share the COP-ceiling / shutdown-contamination
+        failure modes that motivated the SNR formulation.  Aux on sunny
+        hours is rare (aux typically fires in cold dark conditions) so
+        the residual bias is small and bounded.
+
+        ``solar_normalization_delta`` is still consumed by the aux path
+        below — aux learning on sunny hours needs the dark-equivalent
+        target so solar-induced reductions are not mis-attributed as aux
+        reductions.  The base path ignores it entirely.
+        """
+        normalized_actual = actual_kwh  # raw — SNR weight carries signal-quality
+        effective_rate = learning_rate * max(0.0, snr_weight)
 
         if is_aux_active:
             base_prediction = get_predicted_kwh_fn(temp_key, wind_bucket, actual_temp)
             if base_prediction <= ENERGY_GUARD_THRESHOLD:
                 return "skipped_no_base_model"
 
-            implied_aux_reduction = base_prediction - normalized_actual
+            # Aux path always uses delta-compensated actual, see docstring.
+            aux_target = max(0.0, actual_kwh + solar_normalization_delta)
+            implied_aux_reduction = base_prediction - aux_target
             implied_aux_reduction = max(0.0, implied_aux_reduction)
 
             if temp_key not in aux_coefficients:
@@ -994,11 +1396,27 @@ class LearningManager:
             return "updated_aux_model"
 
         else:
+            current_pred = correlation_data.get(temp_key, {}).get(wind_bucket, 0.0)
+
+            if effective_rate <= 0.0 and current_pred == 0.0:
+                # SNR-weighted cold-start protection: a zero-weight hour
+                # (all-shutdown) must not seed the bucket with actual≈0.
+                # Return early without mutating correlation_data so tests
+                # can assert "no bucket written".
+                return "skipped_zero_weight"
+
             if temp_key not in correlation_data:
                 correlation_data[temp_key] = {}
-            current_pred = correlation_data[temp_key].get(wind_bucket, 0.0)
 
-            new_pred = current_pred + learning_rate * (normalized_actual - current_pred) if current_pred != 0.0 else normalized_actual
+            if current_pred != 0.0:
+                new_pred = current_pred + effective_rate * (normalized_actual - current_pred)
+            else:
+                # Cold start: first non-zero sample seeds the bucket.
+                # Under SNR the first sample may be weighted down; we still
+                # seed from the raw value here because EMA needs a
+                # starting point.  Subsequent samples with high weight
+                # will dominate quickly via higher effective_rate.
+                new_pred = normalized_actual
             correlation_data[temp_key][wind_bucket] = round(new_pred, 5)
             return "updated_base_model"
 
@@ -1111,18 +1529,44 @@ class LearningManager:
 
             weight = norm_weights[h]
 
-            total_kwh = 0.0
+            # #854 F1: split strategy contributions by type so solar
+            # normalization is applied only to DirectMeter (raw-electrical)
+            # values.  WeightedSmear already embeds solar attenuation in its
+            # synthetic values via the smearing weights — adding
+            # `solar_normalization_delta` on top would be double-correction.
+            #
+            # On pure Track C installs this guard is a no-op in practice
+            # (no non-MPC units → delta is always 0), but it protects
+            # mixed installs (MPC + unmetered resistive backup) where
+            # delta is nonzero and would otherwise contaminate the
+            # MPC-synthetic portion of the hourly sum.
+            direct_kwh = 0.0
+            smear_kwh = 0.0
+            has_direct = False
             for strategy in strategies.values():
                 contrib = strategy.get_hourly_contribution(h, weight, log_entry)
-                if contrib is not None:
-                    total_kwh += contrib
+                if contrib is None:
+                    continue
+                if isinstance(strategy, WeightedSmear):
+                    smear_kwh += contrib
+                else:
+                    direct_kwh += contrib
+                    has_direct = True
 
-            # Apply saturation-aware solar normalization (#792).
-            # The delta was pre-computed during Track A and stored in the log.
-            # dark_actual = actual + (heating_solar_applied - cooling_solar_applied)
+            # Apply saturation-aware solar normalization (#792) to the
+            # DirectMeter sum only.  The delta was pre-computed from
+            # non-MPC units' NLMS coefficients in Track A and stored in
+            # the log; by construction it represents the solar correction
+            # needed for raw-electrical values, not smeared-synthetic.
+            # Suppressed entirely when no DirectMeter contributed this
+            # hour — otherwise a nonzero delta would be applied against
+            # direct_kwh=0 and leak into the total, inflating smear-only
+            # (pure Track C) buckets.
             solar_delta = log_entry.get("solar_normalization_delta", 0.0)
-            if solar_delta:
-                total_kwh = max(0.0, total_kwh + solar_delta)
+            if solar_delta and has_direct:
+                direct_kwh = max(0.0, direct_kwh + solar_delta)
+
+            total_kwh = direct_kwh + smear_kwh
 
             if total_kwh <= 0.0:
                 continue
@@ -1216,3 +1660,352 @@ class LearningManager:
                 else:
                     new_val = cur + learning_rate * (unit_kwh - cur)
                     correlation_per_unit[sid][h_temp_key][h_wind_bucket] = round(new_val, 5)
+
+    # -------------------------------------------------------------------------
+    # Retrain-time helpers (NLMS replay + on-the-fly solar_normalization_delta)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _reconstruct_potential(
+        entry: dict,
+        solar_calculator,
+        screen_config,
+    ) -> tuple[tuple[float, float, float], float]:
+        """Return ((pot_s, pot_e, pot_w), vector_magnitude) for an entry.
+
+        Mirrors the reconstruction used in live per-unit solar learning
+        (learning.py:_process_per_unit_learning): divides each cardinal
+        effective component by its direction's transmittance, using the
+        coordinator's screen_config.  Returns zero vector + magnitude 0
+        for entries without solar vector data.
+        """
+        correction = entry.get("correction_percent", 100.0)
+        effective = (
+            entry.get("solar_vector_s", 0.0),
+            entry.get("solar_vector_e", 0.0),
+            entry.get("solar_vector_w", 0.0),
+        )
+        pot_s, pot_e, pot_w = solar_calculator.reconstruct_potential_vector(
+            effective, correction, screen_config
+        )
+        magnitude = (pot_s * pot_s + pot_e * pot_e + pot_w * pot_w) ** 0.5
+        return (pot_s, pot_e, pot_w), magnitude
+
+    def compute_on_the_fly_solar_delta(
+        self,
+        entry: dict,
+        *,
+        solar_calculator,
+        screen_config,
+        solar_coefficients_per_unit: dict,
+        energy_sensors: list[str],
+    ) -> float:
+        """Recompute ``solar_normalization_delta`` for a single hour using
+        the CURRENT solar coefficients rather than the stored value.
+
+        ``solar_normalization_delta`` is live-computed as
+        ``solar_heating_applied - solar_cooling_applied`` from
+        ``calculate_total_power``'s saturation-aware breakdown.  During
+        retrain we don't replay that full pipeline — we approximate by
+        summing per-unit ``coeff · potential`` and signing by mode.  The
+        approximation ignores saturation (solar impact clamped at unit
+        base demand).  In heating-dominated regimes during spring retrain
+        this is accurate; saturation is rare on mild days.  The stored
+        delta this replaces carried far worse error: it was computed with
+        whatever (possibly wildly wrong) coefficient was live at log time.
+
+        Mode resolution mirrors :func:`_compute_excluded_mode_energy` and
+        :func:`statistics.py._get_unit_mode_for_hour`: the log's
+        ``unit_modes`` dict only stores entries whose mode is NOT
+        ``MODE_HEATING`` (coordinator.py filters the default out to
+        reduce log clutter).  Iterating ``unit_modes.items()`` therefore
+        walks only the non-heating minority — on any all-heating hour
+        (the dominant case) the dict is empty and the function returns
+        zero.  Historical bug: retrain's Pass 3 refinement silently
+        reverted to Pass 1 priming behaviour because this function
+        always returned 0 for the typical hour.  The fix iterates
+        ``energy_sensors`` (the canonical list of tracked units) and
+        resolves each sensor's mode by treating absence from
+        ``unit_modes`` as ``MODE_HEATING`` implicitly.
+        """
+        (pot_s, pot_e, pot_w), magnitude = self._reconstruct_potential(
+            entry, solar_calculator, screen_config
+        )
+        if magnitude <= 0.01:
+            return 0.0
+        unit_modes = entry.get("unit_modes", {}) or {}
+        heating_total = 0.0
+        cooling_total = 0.0
+        for entity_id in energy_sensors:
+            mode = unit_modes.get(entity_id, MODE_HEATING)
+            coeff = solar_coefficients_per_unit.get(entity_id)
+            if not coeff:
+                continue
+            impact = max(
+                0.0,
+                coeff.get("s", 0.0) * pot_s
+                + coeff.get("e", 0.0) * pot_e
+                + coeff.get("w", 0.0) * pot_w,
+            )
+            if mode == MODE_HEATING:
+                heating_total += impact
+            elif mode == MODE_COOLING:
+                cooling_total += impact
+            # OFF / DHW / Guest modes contribute nothing
+        return heating_total - cooling_total
+
+    def replay_solar_nlms(
+        self,
+        entries: list[dict],
+        *,
+        solar_calculator,
+        screen_config,
+        correlation_data_per_unit: dict,
+        solar_coefficients_per_unit: dict,
+        learning_buffer_solar_per_unit: dict,
+        energy_sensors: list[str],
+        learning_rate: float,
+        balance_point: float,
+        aux_affected_entities: list | None = None,
+        unit_strategies: dict | None = None,
+        daily_history: dict | None = None,
+        return_diagnostics: bool = False,
+        unit_min_base: dict[str, float] | None = None,
+    ):
+        """Re-run NLMS solar coefficient learning over historical entries.
+
+        Iterates qualifying sunny hours, reconstructs potential vectors
+        from the stored effective + correction, and calls the same
+        :meth:`_learn_unit_solar_coefficient` update path used by live
+        learning.
+
+        Unit base reference (``expected_unit_base``) resolution follows
+        live-learning semantics per strategy type:
+
+        - ``DirectMeter`` sensors use ``correlation_data_per_unit``
+          (populated by the preceding base-replay pass).
+        - ``WeightedSmear(use_synthetic=True)`` sensors (i.e. the MPC-
+          managed sensor on a Track C installation) use
+          ``daily_history[date_str]["track_c_distribution"][hour]
+          .synthetic_kwh_el`` — the same MPC-derived thermal/COP value
+          live learning would have seen via ``calculate_total_power``'s
+          per-unit breakdown.  Comparing against per-unit correlation
+          would be apple-to-pear because Track C never populates
+          per-unit for WeightedSmear sensors (``_replay_per_unit_models``
+          only handles DirectMeter).  On Track B fallback days (no
+          ``track_c_distribution`` stored), we fall back to per-unit —
+          which for the MPC sensor is likely partial raw electrical and
+          below threshold, so NLMS skips that hour rather than guess.
+
+        Returns the number of per-unit coefficient updates attempted.
+        When ``return_diagnostics=True``, returns a dict with the update
+        count plus per-reason skip counters — useful when the integer
+        return looks suspicious (e.g. zero on a real install that was
+        expected to have qualifying hours).
+        """
+        from .observation import DirectMeter, WeightedSmear
+        aux_set = set(aux_affected_entities or [])
+        strategies = unit_strategies or {}
+        # ``daily_history`` retained in signature for call-site stability;
+        # no longer consumed because WeightedSmear sensors are skipped
+        # rather than attempting a synthetic-based NLMS signal (see
+        # WeightedSmear-skip block below).
+        _ = daily_history
+        updates = 0
+        # Per-reason skip counters for diagnostics.  Names describe the
+        # first guard that rejected the entry/unit; a single hour can be
+        # counted in at most one bucket per unit.
+        diag = {
+            "entries_considered": 0,
+            "entry_skipped_aux": 0,
+            "entry_skipped_poisoned": 0,
+            "entry_skipped_disabled": 0,  # learning_status == "disabled"
+            "entry_skipped_low_magnitude": 0,
+            "entry_skipped_missing_temp_key": 0,
+            "unit_skipped_aux_list": 0,
+            "unit_skipped_shutdown": 0,
+            "unit_skipped_excluded_mode": 0,
+            "unit_skipped_weighted_smear": 0,  # MPC-managed; no coherent solar signal
+            "unit_skipped_below_threshold": 0,
+            "inequality_updates": 0,            # #865
+            "inequality_non_binding": 0,        # constraint satisfied, no update
+            "inequality_skipped_low_battery": 0,  # battery not yet populated
+            "inequality_skipped_mode": 0,       # cooling/OFF — out of scope
+            "inequality_skipped_base": 0,       # below SOLAR_SHUTDOWN_MIN_BASE
+        }
+
+        # Local per-direction potential battery (#865).  Chronological
+        # EMA over the log mirrors coordinator-side state; replay starts
+        # from zeros because we have no earlier context.  Decay fixed at
+        # SOLAR_BATTERY_DECAY default — replay does not thread the
+        # user's calibrated value (rare tuning, not worth the coupling
+        # for a retrain-only path).
+        battery_s = 0.0
+        battery_e = 0.0
+        battery_w = 0.0
+        battery_decay = SOLAR_BATTERY_DECAY
+
+        for entry in entries:
+            diag["entries_considered"] += 1
+
+            # Reconstruct hour potential and update battery FIRST, before
+            # any entry-skip filter.  Live coordinator decays the battery
+            # every hour regardless of aux/poisoned/dark state — replay
+            # must match or aux-stretches and poisoned periods leave a
+            # stale battery vector that inflates the inequality update on
+            # the next qualifying shutdown hour.
+            (pot_s, pot_e, pot_w), magnitude = self._reconstruct_potential(
+                entry, solar_calculator, screen_config
+            )
+            battery_s = battery_s * battery_decay + pot_s * (1 - battery_decay)
+            battery_e = battery_e * battery_decay + pot_e * (1 - battery_decay)
+            battery_w = battery_w * battery_decay + pot_w * (1 - battery_decay)
+
+            if entry.get("auxiliary_active", False):
+                diag["entry_skipped_aux"] += 1
+                continue
+            # Match live ``_is_poisoned`` semantics (coordinator.py:922-930):
+            # all three statuses must be skipped for solar NLMS replay or the
+            # retrain produces a coefficient grounded in user-disabled or
+            # data-poisoned hours that live learning would never have seen.
+            # Counters are split so post-retrain diagnostics distinguish a
+            # user-toggle ("disabled") from a data-quality skip ("poisoned").
+            status = entry.get("learning_status", "unknown")
+            if status == "disabled":
+                diag["entry_skipped_disabled"] += 1
+                continue
+            if status.startswith("skipped_") or status == "cooldown_post_aux":
+                diag["entry_skipped_poisoned"] += 1
+                continue
+
+            if magnitude <= 0.1:
+                diag["entry_skipped_low_magnitude"] += 1
+                continue
+            temp_key = entry.get("temp_key")
+            wind_bucket = entry.get("wind_bucket", "normal")
+            if temp_key is None:
+                diag["entry_skipped_missing_temp_key"] += 1
+                continue
+            unit_modes = entry.get("unit_modes", {}) or {}
+            unit_breakdown = entry.get("unit_breakdown", {}) or {}
+            shutdown_entities = set(entry.get("solar_dominant_entities", []) or [])
+            avg_temp = entry.get("temp", 0.0) or 0.0
+
+            for entity_id in energy_sensors:
+                # aux_affected_entities is NOT a solar-NLMS exclusion list.
+                # Live learning only uses it for cooldown-path aux coefficient
+                # handling (learning.py:_process_per_unit_learning lines
+                # 446-451 and 551-556).  Hours where aux itself was active
+                # are already filtered at the entry level via
+                # auxiliary_active.  Historical bug: an earlier version of
+                # this replay skipped entity_id in aux_affected_entities
+                # unconditionally, which blocked 100 % of solar hours on
+                # installs where the config-flow default (= all energy
+                # sensors) had left aux_affected_entities == energy_sensors.
+                # The counter below is retained (always 0 post-fix) so
+                # regressions that reintroduce the bug are immediately
+                # visible in diagnostics.
+                if entity_id in shutdown_entities:
+                    # Inequality learning: replace the NLMS skip with an
+                    # inequality update that uses the battery-filtered
+                    # potential.  Requires heating mode and meaningful
+                    # base demand — same gates as the live wiring in
+                    # _process_per_unit_learning.
+                    unit_mode_sd = unit_modes.get(entity_id, MODE_HEATING)
+                    if unit_mode_sd != MODE_HEATING:
+                        diag["inequality_skipped_mode"] += 1
+                        diag["unit_skipped_shutdown"] += 1
+                        continue
+                    # Resolve base via same per-unit path as NLMS branch
+                    # below.  WeightedSmear sensors: same as NLMS — skip.
+                    strategy_sd = strategies.get(entity_id)
+                    if isinstance(strategy_sd, WeightedSmear) and strategy_sd.use_synthetic:
+                        diag["unit_skipped_weighted_smear"] = diag.get(
+                            "unit_skipped_weighted_smear", 0
+                        ) + 1
+                        continue
+                    unit_buckets_sd = correlation_data_per_unit.get(entity_id, {}).get(temp_key, {})
+                    expected_base_sd = unit_buckets_sd.get(wind_bucket, 0.0) if unit_buckets_sd else 0.0
+                    shutdown_threshold_sd = _resolve_min_base(
+                        entity_id, unit_min_base, SOLAR_SHUTDOWN_MIN_BASE
+                    )
+                    if expected_base_sd < shutdown_threshold_sd:
+                        diag["inequality_skipped_base"] += 1
+                        diag["unit_skipped_shutdown"] += 1
+                        continue
+                    ineq_status = self._update_unit_solar_inequality(
+                        entity_id=entity_id,
+                        expected_unit_base=expected_base_sd,
+                        battery_filtered_potential=(battery_s, battery_e, battery_w),
+                        solar_coefficients_per_unit=solar_coefficients_per_unit,
+                    )
+                    if ineq_status == "updated":
+                        diag["inequality_updates"] += 1
+                    elif ineq_status == "non_binding":
+                        diag["inequality_non_binding"] += 1
+                    else:  # "zero_magnitude"
+                        diag["inequality_skipped_low_battery"] += 1
+                    # Inequality path does not run NLMS on this (entity, hour).
+                    continue
+                unit_mode = unit_modes.get(entity_id, MODE_HEATING)
+                if unit_mode in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
+                    diag["unit_skipped_excluded_mode"] += 1
+                    continue
+                # Resolve the unit's expected base per live-learning
+                # semantics.
+                #
+                # WeightedSmear(use_synthetic=True) sensors (MPC-managed in
+                # Track C) are SKIPPED entirely to mirror live exclusion at
+                # coordinator.py:4391-4397 (#776).  Rationale: solar NLMS
+                # requires a dark-equivalent baseline compared against a
+                # with-sun actual.  MPC provides only with-sun data —
+                # ``kwh_th_sh`` (thermal delivered that day) and
+                # ``kwh_el_sh`` (electrical consumed that day).  The
+                # Track C smearing in :mod:`thermodynamics` applies
+                # ``solar_factor`` weighting so ``synthetic_kwh_el``
+                # already has solar implicit in its per-hour attribution;
+                # after Jensen-rescaling (``sum(synthetic_kwh_el) ==
+                # total_kwh_el``) the per-hour difference against
+                # ``kwh_el_sh`` encodes COP variance, not solar.  There is
+                # no coherent pure-MPC dark baseline, therefore no
+                # meaningful NLMS signal for MPC sensors.  Solar
+                # coefficient for these sensors falls back to
+                # ``DEFAULT_SOLAR_COEFF_HEATING`` via
+                # :meth:`SolarCalculator.calculate_unit_coefficient`.
+                #
+                # DirectMeter sensors (including any non-MPC units on a
+                # Track C install) read their per-unit correlation
+                # normally.
+                strategy = strategies.get(entity_id)
+                if isinstance(strategy, WeightedSmear) and strategy.use_synthetic:
+                    diag["unit_skipped_weighted_smear"] = diag.get(
+                        "unit_skipped_weighted_smear", 0
+                    ) + 1
+                    continue
+                unit_buckets = correlation_data_per_unit.get(entity_id, {}).get(temp_key, {})
+                expected_unit_base = unit_buckets.get(wind_bucket, 0.0) if unit_buckets else 0.0
+                nlms_threshold = _resolve_min_base(
+                    entity_id, unit_min_base, SOLAR_LEARNING_MIN_BASE
+                )
+                if expected_unit_base < nlms_threshold:
+                    diag["unit_skipped_below_threshold"] += 1
+                    continue
+                actual_unit = unit_breakdown.get(entity_id, 0.0)
+                self._learn_unit_solar_coefficient(
+                    entity_id=entity_id,
+                    temp_key=temp_key,
+                    expected_unit_base=expected_unit_base,
+                    actual_unit=actual_unit,
+                    avg_solar_vector=(pot_s, pot_e, pot_w),
+                    learning_rate=learning_rate,
+                    solar_coefficients_per_unit=solar_coefficients_per_unit,
+                    learning_buffer_solar_per_unit=learning_buffer_solar_per_unit,
+                    avg_temp=avg_temp,
+                    balance_point=balance_point,
+                    unit_mode=unit_mode,
+                )
+                updates += 1
+        if return_diagnostics:
+            diag["updates"] = updates
+            return diag
+        return updates

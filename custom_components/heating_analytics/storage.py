@@ -5,6 +5,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import os
 from datetime import datetime, timedelta
 
@@ -47,6 +48,162 @@ def _sanitize_solar_coeff(value: dict) -> dict:
     }
 
 
+def _migrate_pre_v3(
+    data: dict,
+    *,
+    solar_azimuth: float = 0.0,
+    solar_battery_decay: float = 0.80,
+) -> dict:
+    """Bundle every pre-v3 inline migration into a single versioned step.
+
+    Installations saved with STORAGE_VERSION <= 2 may carry any combination
+    of legacy shapes accumulated across the 1.x series.  This function
+    applies each transform in one pass so ``async_load_data`` can assume
+    canonical v3 shape.  Idempotent: running on already-canonical data
+    is a no-op (every branch guards on shape).
+
+    NOTE: mutates ``data`` in-place and returns the same object.  Callers
+    pass dicts they own (the HA Store migrate hook and restore path),
+    so the in-place contract is safe in practice.
+
+    Sources (now removed from async_load_data):
+      - temp-stratified -> flat ``solar_coefficients_per_unit``
+      - ``(s, e, impact)`` -> ``(s, e, w, impact)`` solar buffer tuples
+      - temp-stratified dict -> flat list in ``learning_buffer_solar_per_unit``
+      - legacy float -> ``{"normal": float}`` in ``aux_coefficients``
+      - ``with_auxiliary_heating`` bucket removal across 4 structures
+      - ``with_auxiliary_heating`` -> global ``aux_coefficients`` translation
+      - ``hdd`` -> ``tdd`` rename in ``daily_history`` + ``hourly_log``
+      - ``load`` -> ``actual_kwh`` rename in ``hourly_vectors``
+      - leaky-integrator -> EMA ``solar_battery_state`` scaling
+      - ``unknown`` -> ``primary`` rename in ``forecast_history``
+    """
+    # --- solar_coefficients_per_unit: temp-stratified nested dict -> flat dict.
+    solar_coeffs = data.get("solar_coefficients_per_unit")
+    if isinstance(solar_coeffs, dict):
+        az_rad = math.radians(solar_azimuth)
+        migrated_coeffs: dict = {}
+        for entity_id, value in solar_coeffs.items():
+            if not isinstance(value, dict):
+                continue
+            if "s" in value or "e" in value:
+                migrated_coeffs[entity_id] = _sanitize_solar_coeff(value)
+                continue
+            for coeff in value.values():
+                if isinstance(coeff, dict) and ("s" in coeff or "e" in coeff):
+                    migrated_coeffs[entity_id] = _sanitize_solar_coeff(coeff)
+                    break
+                if isinstance(coeff, (int, float)) and not isinstance(coeff, bool):
+                    migrated_coeffs[entity_id] = _sanitize_solar_coeff({
+                        "s": coeff * max(0.0, -math.cos(az_rad)),
+                        "e": coeff * max(0.0, math.sin(az_rad)),
+                        "w": coeff * max(0.0, -math.sin(az_rad)),
+                    })
+                    break
+        data["solar_coefficients_per_unit"] = migrated_coeffs
+
+    # --- learning_buffer_solar_per_unit: dict-of-lists -> flat list;
+    #     3-tuple (s, e, impact) -> 4-tuple (s, e, 0.0, impact).
+    solar_buffer = data.get("learning_buffer_solar_per_unit")
+    if isinstance(solar_buffer, dict):
+        migrated_buffer: dict = {}
+        for entity_id, value in solar_buffer.items():
+            if isinstance(value, list):
+                samples = value
+            elif isinstance(value, dict):
+                samples = [s for bucket in value.values() if isinstance(bucket, list) for s in bucket]
+            else:
+                continue
+            out: list = []
+            for item in samples:
+                if not isinstance(item, (list, tuple)):
+                    continue
+                t = tuple(item)
+                if len(t) == 4:
+                    out.append(t)
+                elif len(t) == 3:
+                    out.append((t[0], t[1], 0.0, t[2]))
+            migrated_buffer[entity_id] = out
+        data["learning_buffer_solar_per_unit"] = migrated_buffer
+
+    # --- aux_coefficients: legacy float -> {"normal": float}.
+    aux_coeffs = data.get("aux_coefficients")
+    if isinstance(aux_coeffs, dict):
+        for temp_key, val in list(aux_coeffs.items()):
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                aux_coeffs[temp_key] = {"normal": float(val)}
+
+    # --- correlation_data: with_auxiliary_heating -> aux_coefficients (savings = base - aux).
+    correlation = data.get("correlation_data")
+    if isinstance(correlation, dict):
+        if not isinstance(aux_coeffs, dict):
+            aux_coeffs = {}
+            data["aux_coefficients"] = aux_coeffs
+        for temp_key, buckets in correlation.items():
+            if not isinstance(buckets, dict) or "with_auxiliary_heating" not in buckets:
+                continue
+            aux_val = buckets.pop("with_auxiliary_heating")
+            # Explicit ``is None`` check: a legitimate ``normal = 0.0``
+            # baseline (mild bucket with no heating demand in calm weather)
+            # must NOT fall through to ``high_wind`` — that would let a
+            # windy-cold baseline mask the zero and overstate aux savings.
+            # Matches pre-v3 inline semantics exactly.
+            base_val = buckets.get("normal")
+            if base_val is None:
+                base_val = buckets.get("high_wind")
+            if base_val is not None and base_val > 0:
+                savings = max(0.0, base_val - aux_val)
+                if savings > 0:
+                    aux_coeffs[temp_key] = {"normal": round(savings, 3)}
+
+    # --- with_auxiliary_heating removal across per-unit structures.
+    for key in ("correlation_data_per_unit", "learning_buffer_per_unit", "observation_counts"):
+        per_unit = data.get(key)
+        if not isinstance(per_unit, dict):
+            continue
+        for temp_data in per_unit.values():
+            if not isinstance(temp_data, dict):
+                continue
+            for buckets in temp_data.values():
+                if isinstance(buckets, dict):
+                    buckets.pop("with_auxiliary_heating", None)
+
+    # --- daily_history: hdd -> tdd, hourly_vectors.load -> actual_kwh.
+    daily_history = data.get("daily_history")
+    if isinstance(daily_history, dict):
+        for entry in daily_history.values():
+            if not isinstance(entry, dict):
+                continue
+            if "hdd" in entry and "tdd" not in entry:
+                entry["tdd"] = entry.pop("hdd")
+            vectors = entry.get("hourly_vectors")
+            if isinstance(vectors, dict) and "load" in vectors and "actual_kwh" not in vectors:
+                vectors["actual_kwh"] = vectors.pop("load")
+
+    # --- hourly_log: hdd -> tdd.
+    hourly_log = data.get("hourly_log")
+    if isinstance(hourly_log, list):
+        for entry in hourly_log:
+            if isinstance(entry, dict) and "hdd" in entry and "tdd" not in entry:
+                entry["tdd"] = entry.pop("hdd")
+
+    # --- solar_battery_state: leaky-integrator -> EMA scaling.
+    if data.get("battery_model") != "ema":
+        prev = data.get("solar_battery_state", 0.0)
+        if isinstance(prev, (int, float)) and not isinstance(prev, bool):
+            data["solar_battery_state"] = prev * (1 - solar_battery_decay)
+        data["battery_model"] = "ema"
+
+    # --- forecast_history: unknown -> primary source rename.
+    forecast_history = data.get("forecast_history")
+    if isinstance(forecast_history, list):
+        for entry in forecast_history:
+            if isinstance(entry, dict) and entry.get("source") == "unknown":
+                entry["source"] = "primary"
+
+    return data
+
+
 class StorageManager:
     """Manages data persistence (JSON, CSV)."""
 
@@ -59,9 +216,47 @@ class StorageManager:
         self._store = Store(coordinator.hass, STORAGE_VERSION, _instance_key)
         # Legacy store used once for migration from the old shared key (< 1.2.5).
         self._legacy_store = Store(coordinator.hass, STORAGE_VERSION, STORAGE_KEY)
+        # Wire the migration hook.  HA's ``Store`` does not accept a
+        # ``async_migrate_func`` constructor kwarg — instead, it invokes
+        # ``self._async_migrate_func`` via normal attribute lookup, which
+        # respects instance-dict overrides before class-MRO.  Binding our
+        # bound method as an instance attribute is valid Python and the
+        # minimum-invasive wiring: no subclass, no conftest collision
+        # (conftest mocks ``homeassistant.helpers.storage`` and a
+        # module-level subclass resolves to a ``MagicMock`` in tests).
+        self._store._async_migrate_func = self._async_migrate  # type: ignore[method-assign]
+        self._legacy_store._async_migrate_func = self._async_migrate  # type: ignore[method-assign]
         self._last_save_time = None
         self._save_debounce_seconds = 60
         self._save_lock = asyncio.Lock()
+
+    async def _async_migrate(
+        self,
+        old_major_version: int,
+        old_minor_version: int,
+        old_data: dict,
+    ) -> dict:
+        """HA storage migration hook (HA >= 2022.11 signature).
+
+        Dispatches to version-specific migration steps.  Future schema
+        bumps add another branch here and a new ``_migrate_vN_to_vN_plus_1``
+        function.
+        """
+        if not isinstance(old_data, dict):
+            return old_data
+
+        if old_major_version < 3:
+            _LOGGER.info(
+                "Heating Analytics: migrating storage v%d -> v3 (bundled pre-v3 transforms)",
+                old_major_version,
+            )
+            old_data = _migrate_pre_v3(
+                old_data,
+                solar_azimuth=getattr(self.coordinator, "solar_azimuth", 0.0),
+                solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", 0.80),
+            )
+
+        return old_data
 
     def _cleanup_removed_sensors(self, target_dict: dict, log_context: str | None = None) -> None:
         """Removes entries for sensors that are no longer tracked."""
@@ -145,24 +340,9 @@ class StorageManager:
             loaded_correlation_per_unit = data.get("correlation_data_per_unit", {})
             if isinstance(loaded_correlation_per_unit, dict):
                 self.coordinator._correlation_data_per_unit = loaded_correlation_per_unit
-
-                # Cleanup: Remove sensors that are no longer in configuration
                 self._cleanup_removed_sensors(
                     self.coordinator._correlation_data_per_unit, "correlation data"
                 )
-
-                # MIGRATION: Convert old Aux Buckets (Unit Specific) to Coefficients
-                # Iterate through units, temps, and buckets to find "with_auxiliary_heating"
-                if self.coordinator._correlation_data_per_unit:
-                    for entity_id, temps in self.coordinator._correlation_data_per_unit.items():
-                        for temp_key, buckets in temps.items():
-                            if "with_auxiliary_heating" in buckets:
-                                # We remove it. We do NOT try to migrate it to a coefficient because
-                                # we are switching to "Cold Start" learning for unit aux.
-                                # Migrating an absolute value to a reduction coeff is risky without base context.
-                                del buckets["with_auxiliary_heating"]
-                                _LOGGER.info(f"Removed legacy 'with_auxiliary_heating' bucket for unit {entity_id} T={temp_key}. Unit will relearn aux impact.")
-
             else:
                 _LOGGER.warning("Loaded correlation_data_per_unit is not a dictionary.")
 
@@ -172,37 +352,16 @@ class StorageManager:
                 self.coordinator._aux_coefficients_per_unit = loaded_aux_coefficients_per_unit
                 self._cleanup_removed_sensors(self.coordinator._aux_coefficients_per_unit)
 
-            # Load unit solar coefficients
-            # New format: {entity_id: {"s": float, "e": float}}  (global per unit, not temp-stratified)
-            # Old format: {entity_id: {temp_key: {"s": float, "e": float}}} or {entity_id: {temp_key: float}}
+            # Load unit solar coefficients — canonical v3 shape is
+            # {entity_id: {"s": float, "e": float, "w": float}}.  Legacy
+            # temp-stratified and scalar forms are flattened by the v3 migration.
             loaded_solar_coefficients_per_unit = data.get("solar_coefficients_per_unit", {})
             if isinstance(loaded_solar_coefficients_per_unit, dict):
-                import math
-                self.coordinator._solar_coefficients_per_unit = {}
-                az_rad = math.radians(self.coordinator.solar_azimuth)
-
-                for entity_id, value in loaded_solar_coefficients_per_unit.items():
-                    if isinstance(value, dict) and ("s" in value or "e" in value):
-                        # New format: already a flat coefficient dict
-                        self.coordinator._solar_coefficients_per_unit[entity_id] = _sanitize_solar_coeff(value)
-                    elif isinstance(value, dict):
-                        # Old format: nested by temp_key — flatten by picking the first valid entry
-                        migrated = None
-                        for temp_key, coeff in value.items():
-                            if isinstance(coeff, dict) and ("s" in coeff or "e" in coeff):
-                                migrated = coeff
-                                break
-                            elif isinstance(coeff, (int, float)):
-                                migrated = {
-                                    "s": round(coeff * max(0.0, -math.cos(az_rad)), 5),
-                                    "e": round(coeff * max(0.0, math.sin(az_rad)), 5),
-                                    "w": round(coeff * max(0.0, -math.sin(az_rad)), 5),
-                                }
-                                break
-                        if migrated is not None:
-                            self.coordinator._solar_coefficients_per_unit[entity_id] = _sanitize_solar_coeff(migrated)
-                            _LOGGER.info(f"Migrated temp-stratified solar coefficient for unit {entity_id} to global: {migrated}")
-
+                self.coordinator._solar_coefficients_per_unit = {
+                    entity_id: _sanitize_solar_coeff(value)
+                    for entity_id, value in loaded_solar_coefficients_per_unit.items()
+                    if isinstance(value, dict)
+                }
                 self._cleanup_removed_sensors(self.coordinator._solar_coefficients_per_unit)
             else:
                 self.coordinator._solar_coefficients_per_unit = {}
@@ -231,49 +390,34 @@ class StorageManager:
             else:
                 self.coordinator._learning_buffer_aux_per_unit = {}
 
-            # Load learning buffer solar per unit
-            # Current format: {entity_id: [(s, e, w, impact), ...]}  (flat list, not nested by temp_key)
-            # Old formats: {entity_id: [(s, e, impact), ...]} or {entity_id: {temp_key: [(s, e, impact), ...]}}
+            # Load learning buffer solar per unit — canonical v3 shape is
+            # {entity_id: [(s, e, w, impact), ...]}.  Legacy 3-tuple and
+            # temp-stratified dict forms are flattened by the v3 migration.
             loaded_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
             if isinstance(loaded_buffer_solar, dict):
-                self.coordinator._learning_buffer_solar_per_unit = {}
-
-                for entity_id, value in loaded_buffer_solar.items():
-                    if isinstance(value, list):
-                        # Flat list of (s, e, w, impact) tuples (new) or (s, e, impact) tuples (old).
-                        # Old 3-element tuples are migrated to 4-element by inserting w=0.0.
-                        migrated_buffer = []
-                        for item in value:
-                            if isinstance(item, (list, tuple)):
-                                t = tuple(item) if isinstance(item, list) else item
-                                if len(t) == 4:
-                                    migrated_buffer.append(t)
-                                elif len(t) == 3:
-                                    # Old format (s, e, impact) → (s, e, 0.0, impact)
-                                    migrated_buffer.append((t[0], t[1], 0.0, t[2]))
-                        self.coordinator._learning_buffer_solar_per_unit[entity_id] = migrated_buffer
-                    elif isinstance(value, dict):
-                        # Old format: nested by temp_key — flatten all samples into one list
-                        # Old tuples are (s, e, impact) → migrate to (s, e, 0.0, impact)
-                        merged = []
-                        for temp_key, buffer_list in value.items():
-                            if not isinstance(buffer_list, list):
-                                continue
-                            for item in buffer_list:
-                                if isinstance(item, (list, tuple)) and len(item) in (3, 4) and not any(isinstance(x, (int, float)) and isinstance(x, bool) for x in item):
-                                    t = tuple(item) if isinstance(item, list) else item
-                                    if len(t) == 3:
-                                        t = (t[0], t[1], 0.0, t[2])
-                                    merged.append(t)
-                        if merged:
-                            self.coordinator._learning_buffer_solar_per_unit[entity_id] = merged
-                            _LOGGER.info(f"Migrated temp-stratified solar buffer for unit {entity_id}: {len(merged)} samples merged")
-                        else:
-                            self.coordinator._learning_buffer_solar_per_unit[entity_id] = []
-
+                self.coordinator._learning_buffer_solar_per_unit = {
+                    entity_id: [tuple(s) if isinstance(s, list) else s for s in value]
+                    for entity_id, value in loaded_buffer_solar.items()
+                    if isinstance(value, list)
+                }
                 self._cleanup_removed_sensors(self.coordinator._learning_buffer_solar_per_unit)
             else:
                 self.coordinator._learning_buffer_solar_per_unit = {}
+
+            # Load per-unit min-base thresholds (#871).  Absent on legacy
+            # installs → empty dict → all gate sites fall back to the
+            # global SOLAR_*_MIN_BASE constants.  First-startup calibration
+            # in coordinator fills this when ≥14 days of log data exist.
+            loaded_thresholds = data.get("per_unit_min_base_thresholds", {})
+            if isinstance(loaded_thresholds, dict):
+                self.coordinator._per_unit_min_base_thresholds = {
+                    eid: float(v)
+                    for eid, v in loaded_thresholds.items()
+                    if isinstance(v, (int, float)) and v > 0.0
+                }
+                self._cleanup_removed_sensors(self.coordinator._per_unit_min_base_thresholds)
+            else:
+                self.coordinator._per_unit_min_base_thresholds = {}
 
             # Load solar optimizer model
             loaded_solar_optimizer = data.get("solar_optimizer_data", {})
@@ -293,92 +437,29 @@ class StorageManager:
                 self.coordinator._observation_counts = loaded_observation_counts
                 self._cleanup_removed_sensors(self.coordinator._observation_counts)
 
-            # Load aux coefficients
+            # Load aux coefficients — canonical v3 shape is
+            # {temp_key: {bucket: float}}.  Legacy float-at-temp entries are
+            # expanded to {"normal": float} by the v3 migration.
             loaded_aux_coeff = data.get("aux_coefficients", {})
             if isinstance(loaded_aux_coeff, dict):
-                self.coordinator._aux_coefficients = {}
-                # MIGRATION: Convert legacy float coefficients to dict format (wind buckets)
-                for temp_key, val in loaded_aux_coeff.items():
-                    if isinstance(val, (int, float)):
-                        # Legacy format: float value. Migrate to { "normal": value }
-                        self.coordinator._aux_coefficients[temp_key] = {"normal": float(val)}
-                        _LOGGER.info(f"Migrated legacy Aux coefficient for T={temp_key}: {val} -> normal={val}")
-                    elif isinstance(val, dict):
-                        # New format: Dict of buckets
-                        self.coordinator._aux_coefficients[temp_key] = val
-                    else:
-                        _LOGGER.warning(f"Invalid format for aux coefficient T={temp_key}: {val}")
+                self.coordinator._aux_coefficients = {
+                    temp_key: val
+                    for temp_key, val in loaded_aux_coeff.items()
+                    if isinstance(val, dict)
+                }
 
-            # MIGRATION: Convert old Aux Buckets to Coefficients (Global)
-            # We look for "with_auxiliary_heating" in correlation_data
-            # and convert it to a subtractive coefficient (kW savings)
-            if self.coordinator._correlation_data:
-                for temp_key, buckets in self.coordinator._correlation_data.items():
-                    if "with_auxiliary_heating" in buckets:
-                        aux_val = buckets["with_auxiliary_heating"]
-
-                        # Find a physical baseline
-                        base_val = buckets.get("normal")
-                        if base_val is None:
-                            base_val = buckets.get("high_wind")
-
-                        if base_val is not None and base_val > 0:
-                            # Savings = Base - Aux (kW)
-                            savings = base_val - aux_val
-                            # Clamp to positive savings (Aux shouldn't increase consumption ideally, or we treat it as 0)
-                            savings = max(0.0, savings)
-
-                            # Store if significant
-                            if savings > 0:
-                                self.coordinator._aux_coefficients[temp_key] = round(savings, 3)
-                                _LOGGER.info(f"Migrated Aux Bucket for T={temp_key}: Base={base_val}, Aux={aux_val} -> Coeff={savings:.3f} kW")
-
-                        # Mark for cleanup - delete key so it doesn't persist
-                        del buckets["with_auxiliary_heating"]
-
-            # MIGRATION: Clean up "with_auxiliary_heating" from per-unit data structures
-            if self.coordinator._correlation_data_per_unit:
-                for entity_id, temp_data in self.coordinator._correlation_data_per_unit.items():
-                    for temp_key, buckets in list(temp_data.items()):
-                        if "with_auxiliary_heating" in buckets:
-                            _LOGGER.info(f"Removing legacy 'with_auxiliary_heating' bucket from {entity_id} at T={temp_key}")
-                            del buckets["with_auxiliary_heating"]
-
-            if self.coordinator._learning_buffer_per_unit:
-                for entity_id, temp_data in self.coordinator._learning_buffer_per_unit.items():
-                    for temp_key, buckets in list(temp_data.items()):
-                        if "with_auxiliary_heating" in buckets:
-                            _LOGGER.info(f"Removing legacy 'with_auxiliary_heating' buffer from {entity_id} at T={temp_key}")
-                            del buckets["with_auxiliary_heating"]
-
-            if self.coordinator._observation_counts:
-                for entity_id, temp_data in self.coordinator._observation_counts.items():
-                    for temp_key, buckets in list(temp_data.items()):
-                        if "with_auxiliary_heating" in buckets:
-                            _LOGGER.info(f"Removing legacy 'with_auxiliary_heating' count from {entity_id} at T={temp_key}")
-                            del buckets["with_auxiliary_heating"]
-
-            # Load daily history
+            # Load daily history — v3 shape uses 'tdd' and 'actual_kwh'.
+            # Legacy 'hdd' and 'load' keys are renamed by the v3 migration.
             loaded_daily_history = data.get("daily_history", {})
             if isinstance(loaded_daily_history, dict):
-                # MIGRATION: Rename 'hdd' to 'tdd' in historical entries
                 for entry in loaded_daily_history.values():
+                    # Defensive: corrupt hourly_vectors should be dropped rather
+                    # than crash downstream stats; not a schema migration.
                     if not entry:
                         continue
-                    if "hdd" in entry and "tdd" not in entry:
-                        entry["tdd"] = entry.pop("hdd")
-
-                    # VALIDATION: Ensure hourly_vectors is a dictionary if present
-                    if "hourly_vectors" in entry:
-                        if not isinstance(entry["hourly_vectors"], dict):
-                            _LOGGER.warning("Invalid hourly_vectors format in daily_history entry. Resetting to None.")
-                            entry["hourly_vectors"] = None
-                        else:
-                            # MIGRATION: Rename 'load' to 'actual_kwh' in vectors (Clarity Refactor)
-                            vectors = entry["hourly_vectors"]
-                            if "load" in vectors and "actual_kwh" not in vectors:
-                                vectors["actual_kwh"] = vectors.pop("load")
-
+                    if "hourly_vectors" in entry and not isinstance(entry["hourly_vectors"], dict):
+                        _LOGGER.warning("Invalid hourly_vectors format in daily_history entry. Resetting to None.")
+                        entry["hourly_vectors"] = None
                 self.coordinator._daily_history = loaded_daily_history
             else:
                 _LOGGER.warning("Loaded daily_history is not a dictionary.")
@@ -419,13 +500,10 @@ class StorageManager:
                     self.coordinator._lifetime_individual, "lifetime tracking"
                 )
 
-            # Load hourly log
+            # Load hourly log — v3 shape uses 'tdd'.  Legacy 'hdd' is renamed
+            # by the v3 migration.
             loaded_hourly_log = data.get("hourly_log", [])
             if isinstance(loaded_hourly_log, list):
-                # MIGRATION: Rename 'hdd' to 'tdd' in logs
-                for entry in loaded_hourly_log:
-                    if isinstance(entry, dict) and "hdd" in entry and "tdd" not in entry:
-                        entry["tdd"] = entry.pop("hdd")
                 self.coordinator._hourly_log = loaded_hourly_log
             else:
                 _LOGGER.warning("Loaded hourly_log is not a list.")
@@ -532,16 +610,13 @@ class StorageManager:
             self.coordinator.data["learned_u_coefficient"] = self.coordinator._learned_u_coefficient
             self.coordinator._last_midnight_indoor_temp = data.get("last_midnight_indoor_temp")
             self.coordinator._solar_battery_state = data.get("solar_battery_state", 0.0)
-            # One-time migration: leaky integrator → EMA battery model.
-            # Old states are amplified by 1/(1-decay); scale down to match
-            # the new steady-state (output = input, no amplification).
-            if data.get("battery_model") != "ema":
-                decay = self.coordinator.solar_battery_decay
-                self.coordinator._solar_battery_state *= (1 - decay)
-                _LOGGER.info(
-                    "Migrated solar battery state to EMA model (×%.2f)",
-                    1 - decay,
-                )
+            # Per-direction potential battery (#865).  Default 0.0 on
+            # missing — the EMA repopulates within a few sunny hours
+            # post-upgrade.  No migration needed; pre-1.3.3 storage has
+            # no concept of this state.
+            self.coordinator._potential_battery_s = data.get("potential_battery_s", 0.0)
+            self.coordinator._potential_battery_e = data.get("potential_battery_e", 0.0)
+            self.coordinator._potential_battery_w = data.get("potential_battery_w", 0.0)
 
             # Load cached forecast (Restore to Long Term Cache immediately)
             cached_daily_raw = data.get("cached_daily_forecast")
@@ -604,12 +679,10 @@ class StorageManager:
             if "forecast_history" in data:
                 self.coordinator.forecast._forecast_history = data["forecast_history"]
                 forecast_history_loaded = True
-                # Migration: Convert "unknown" sources to "primary" for historical continuity
-                # AND NEW: Populate source_breakdown from hourly logs where available
+                # Populate source_breakdown from hourly logs where missing.
+                # Post-load enrichment (depends on loaded _hourly_log), not
+                # a schema migration.
                 for entry in self.coordinator.forecast._forecast_history:
-                    if entry.get("source") == "unknown":
-                        entry["source"] = "primary"
-
                     if "source_breakdown" not in entry:
                         date_key = entry.get("date")
                         if date_key:
@@ -713,12 +786,9 @@ class StorageManager:
             self.coordinator.statistics.calculate_temp_stats()
             self.coordinator.statistics.calculate_potential_savings()
 
-            # Invalidate cached ModelState so the model property picks up the loaded data.
-            self.coordinator._invalidate_model_cache()
-
             _LOGGER.info(f"Loaded correlation data: {len(self.coordinator._correlation_data)} temp points, {len(self.coordinator._daily_history)} days history")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — top-level storage load boundary; surfaces via persistent_notification
             _LOGGER.error(f"Error loading data: {e}", exc_info=True)
             # Notify user of unexpected load errors
             self.coordinator.hass.components.persistent_notification.create(
@@ -812,6 +882,9 @@ class StorageManager:
                     "learned_u_coefficient": self.coordinator._learned_u_coefficient,
                     "last_midnight_indoor_temp": self.coordinator._last_midnight_indoor_temp,
                     "solar_battery_state": self.coordinator._solar_battery_state,
+                    "potential_battery_s": self.coordinator._potential_battery_s,
+                    "potential_battery_e": self.coordinator._potential_battery_e,
+                    "potential_battery_w": self.coordinator._potential_battery_w,
                     "battery_model": "ema",
                     "tdd_accumulated": self.coordinator.data.get(ATTR_TDD, 0.0),
                     "forecast_today": self.coordinator.data.get(ATTR_FORECAST_TODAY, 0.0),
@@ -841,17 +914,17 @@ class StorageManager:
                     "aux_coefficients": self.coordinator._aux_coefficients,
                     "aux_coefficients_per_unit": self.coordinator._aux_coefficients_per_unit,
                     "learning_buffer_global": self.coordinator._learning_buffer_global,
-                    "learning_buffer_per_unit": self.coordinator._learning_buffer_per_unit,
                     "learning_buffer_aux_per_unit": self.coordinator._learning_buffer_aux_per_unit,
                     "solar_coefficients_per_unit": self.coordinator._solar_coefficients_per_unit,
                     "learning_buffer_solar_per_unit": self.coordinator._learning_buffer_solar_per_unit,
+                    "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
                     "unit_modes": self.coordinator._unit_modes,
                     "solar_optimizer_data": self.coordinator.solar_optimizer.get_data(),
                 }
                 await self._store.async_save(data)
                 self._last_save_time = now
                 _LOGGER.debug("Data saved successfully")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — periodic save; crashing coordinator on transient disk error is worse than logging
                 _LOGGER.error(f"Error saving data: {e}")
 
     async def async_reset_learning_data(self):
@@ -870,7 +943,6 @@ class StorageManager:
         self.coordinator._learning_buffer_solar_per_unit.clear()
         # Clear daily learning U-coefficient
         self.coordinator._learned_u_coefficient = None
-        self.coordinator._invalidate_model_cache()
         await self.async_save_data(force=True)
         _LOGGER.info("Learning data reset successfully.")
 
@@ -922,7 +994,11 @@ class StorageManager:
             "learning_buffer_aux_per_unit": self.coordinator._learning_buffer_aux_per_unit,
             "solar_coefficients_per_unit": self.coordinator._solar_coefficients_per_unit,
             "learning_buffer_solar_per_unit": self.coordinator._learning_buffer_solar_per_unit,
+            "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
             "solar_battery_state": self.coordinator._solar_battery_state,
+            "potential_battery_s": self.coordinator._potential_battery_s,
+            "potential_battery_e": self.coordinator._potential_battery_e,
+            "potential_battery_w": self.coordinator._potential_battery_w,
             "battery_model": "ema",
         }
 
@@ -937,7 +1013,7 @@ class StorageManager:
         try:
             await self.coordinator.hass.async_add_executor_job(_write_json)
             _LOGGER.info(f"Backup completed successfully to {file_path}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — service handler; re-raises after logging so HA surfaces the error
             _LOGGER.error(f"Backup failed: {e}")
             raise e
 
@@ -957,6 +1033,15 @@ class StorageManager:
 
             if "correlation_data" not in data and "daily_history" not in data:
                  raise ValueError("Invalid backup file: Missing critical keys.")
+
+            # Run schema migration on the backup file so pre-v3 snapshots
+            # restore cleanly.  HA Store's migrate hook does not apply to
+            # ad-hoc JSON backups.
+            data = _migrate_pre_v3(
+                data,
+                solar_azimuth=getattr(self.coordinator, "solar_azimuth", 0.0),
+                solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", 0.80),
+            )
 
             # Apply Data
             self.coordinator._correlation_data.clear()
@@ -1003,14 +1088,10 @@ class StorageManager:
             self.coordinator.data["learned_u_coefficient"] = self.coordinator._learned_u_coefficient
             self.coordinator._last_midnight_indoor_temp = data.get("last_midnight_indoor_temp")
             self.coordinator._solar_battery_state = data.get("solar_battery_state", 0.0)
-            # One-time migration: leaky integrator → EMA battery model.
-            if data.get("battery_model") != "ema":
-                decay = self.coordinator.solar_battery_decay
-                self.coordinator._solar_battery_state *= (1 - decay)
-                _LOGGER.info(
-                    "Migrated solar battery state to EMA model (×%.2f)",
-                    1 - decay,
-                )
+            # Per-direction potential battery (#865) — see async_load_data.
+            self.coordinator._potential_battery_s = data.get("potential_battery_s", 0.0)
+            self.coordinator._potential_battery_e = data.get("potential_battery_e", 0.0)
+            self.coordinator._potential_battery_w = data.get("potential_battery_w", 0.0)
 
             self.coordinator.forecast._cached_long_term_hourly = data.get("cached_long_term_hourly")
             self.coordinator.forecast._cached_long_term_daily = data.get("cached_long_term_daily")
@@ -1045,29 +1126,20 @@ class StorageManager:
             self.coordinator._aux_coefficients_per_unit = data.get("aux_coefficients_per_unit", {})
             self.coordinator._learning_buffer_aux_per_unit = data.get("learning_buffer_aux_per_unit", {})
 
-            # Restore Unit Solar Data (clamp components >= 0)
+            # Restore Unit Solar Data (clamp components >= 0).  Shape is
+            # already canonical v3 after the migration above.
             raw_solar = data.get("solar_coefficients_per_unit", {})
             self.coordinator._solar_coefficients_per_unit = {
-                eid: _sanitize_solar_coeff(v) if isinstance(v, dict) else v
+                eid: _sanitize_solar_coeff(v)
                 for eid, v in raw_solar.items()
+                if isinstance(v, dict)
             }
-            # Migrate old 3-element (s, e, impact) buffer tuples to 4-element (s, e, w, impact)
             raw_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
-            migrated_buffer_solar = {}
-            for eid, buf in raw_buffer_solar.items():
-                if not isinstance(buf, list):
-                    continue
-                migrated = []
-                for item in buf:
-                    if isinstance(item, (list, tuple)):
-                        t = tuple(item) if isinstance(item, list) else item
-                        if len(t) == 4:
-                            migrated.append(t)
-                        elif len(t) == 3:
-                            migrated.append((t[0], t[1], 0.0, t[2]))
-                if migrated:
-                    migrated_buffer_solar[eid] = migrated
-            self.coordinator._learning_buffer_solar_per_unit = migrated_buffer_solar
+            self.coordinator._learning_buffer_solar_per_unit = {
+                eid: [tuple(s) if isinstance(s, list) else s for s in buf]
+                for eid, buf in raw_buffer_solar.items()
+                if isinstance(buf, list)
+            }
 
             # Restore Unit Modes
             self.coordinator._unit_modes = data.get("unit_modes", {})
@@ -1075,7 +1147,6 @@ class StorageManager:
             # Restore Solar Optimizer
             self.coordinator.solar_optimizer.set_data(data.get("solar_optimizer_data", {}))
 
-            self.coordinator._invalidate_model_cache()
             await self.async_save_data(force=True)
 
             self.coordinator.statistics.calculate_temp_stats()
@@ -1083,7 +1154,7 @@ class StorageManager:
 
             _LOGGER.info("System restored successfully.")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — service handler; re-raises after logging so HA surfaces the error
             _LOGGER.error(f"Restore failed: {e}")
             raise e
 
@@ -1112,7 +1183,7 @@ class StorageManager:
                         existing_header = next(reader)
                     except StopIteration:
                         pass # Empty file
-            except Exception as e:
+            except (OSError, UnicodeDecodeError, csv.Error) as e:
                 _LOGGER.error(f"Error reading CSV header from {file_path}: {e}")
                 return
 
@@ -1128,7 +1199,7 @@ class StorageManager:
                     with open(file_path, 'r', newline='', encoding='utf-8') as f:
                         reader = csv.DictReader(f)
                         rows_to_rewrite = list(reader)
-                except Exception as e:
+                except (OSError, UnicodeDecodeError, csv.Error) as e:
                      _LOGGER.error(f"Error reading full CSV for migration {file_path}: {e}")
                      return
 
@@ -1147,7 +1218,7 @@ class StorageManager:
                     # Atomic replacement
                     os.replace(temp_path, file_path)
 
-                except Exception as e:
+                except (OSError, csv.Error) as e:
                     _LOGGER.error(f"Error rewriting CSV {file_path}: {e}")
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
@@ -1158,7 +1229,7 @@ class StorageManager:
                     with open(file_path, 'a', newline='', encoding='utf-8') as f:
                         writer = csv.DictWriter(f, fieldnames=existing_header)
                         writer.writerow(row)
-                except Exception as e:
+                except (OSError, csv.Error) as e:
                     _LOGGER.error(f"Error appending to CSV {file_path}: {e}")
         else:
             # NEW FILE
@@ -1171,7 +1242,7 @@ class StorageManager:
                     writer = csv.DictWriter(f, fieldnames=current_keys)
                     writer.writeheader()
                     writer.writerow(row)
-            except Exception as e:
+            except (OSError, csv.Error) as e:
                 _LOGGER.error(f"Error creating CSV {file_path}: {e}")
 
     async def append_hourly_log_csv(self, log_entry: dict):
@@ -1216,7 +1287,7 @@ class StorageManager:
 
         try:
              await self.coordinator.hass.async_add_executor_job(_write_row)
-        except Exception as e:
+        except (OSError, csv.Error) as e:
              _LOGGER.warning(f"Failed to write to hourly CSV: {e}")
 
     async def append_daily_log_csv(self, log_entry: dict):
@@ -1233,7 +1304,7 @@ class StorageManager:
 
         try:
              await self.coordinator.hass.async_add_executor_job(_write_row)
-        except Exception as e:
+        except (OSError, csv.Error) as e:
              _LOGGER.warning(f"Failed to write to daily CSV: {e}")
 
     async def export_csv_data(self, file_path: str, export_type: str):
@@ -1350,7 +1421,7 @@ class StorageManager:
         try:
             await self.coordinator.hass.async_add_executor_job(_write_csv)
             _LOGGER.info("CSV Export completed.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — service handler; re-raises after logging so HA surfaces the error
              _LOGGER.error(f"CSV Export failed: {e}")
              raise e
 
@@ -1685,6 +1756,6 @@ class StorageManager:
             else:
                 _LOGGER.info("No new entries to import from CSV.")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — service handler; re-raises after logging so HA surfaces the error
             _LOGGER.error(f"CSV Import failed: {e}", exc_info=True)
             raise e

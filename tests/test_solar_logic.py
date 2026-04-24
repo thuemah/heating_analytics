@@ -161,8 +161,8 @@ async def test_process_hourly_data_solar_logic(mock_coordinator):
     assert log_entry["expected_kwh"] == 0.8
 
     # Solar Impact is battery-smoothed (EMA): first hour with raw=0.2 gives
-    # state = 0 * decay + 0.2 * (1 - decay) = 0.2 * 0.25 = 0.05
-    assert log_entry["solar_impact_kwh"] == pytest.approx(0.05, abs=0.01)
+    # state = 0 * decay + 0.2 * (1 - decay) = 0.2 * 0.20 = 0.04
+    assert log_entry["solar_impact_kwh"] == pytest.approx(0.04, abs=0.01)
 
     # Verify we called the new unit method
     coord.solar.calculate_unit_solar_impact.assert_called()

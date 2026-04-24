@@ -67,7 +67,7 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
             self._cached_stats = stats
             self._cached_time = now
             return stats
-        except Exception as e:
+        except (TypeError, KeyError, ZeroDivisionError) as e:
             _LOGGER.error("Error calculating model stats: %s", e, exc_info=True)
             # Return proper structure with all expected keys (5-tuple)
             empty_weather_stats = {
@@ -452,7 +452,7 @@ class HeatingModelComparisonDaySensor(HeatingModelComparisonBaseSensor):
             formatter = ExplanationFormatter()
             daily_summary = formatter.format_day_comparison(analysis)
 
-        except Exception as e:
+        except (TypeError, AttributeError, KeyError) as e:
             _LOGGER.warning(f"Failed to generate daily explanation: {e}")
             daily_summary = self._generate_fallback_summary(curr, last)
 
@@ -528,7 +528,8 @@ class HeatingModelComparisonWeekSensor(HeatingModelComparisonBaseSensor):
         try:
             current_days = self._build_current_period_days(start_week, end_week)
             last_year_days = self._build_last_year_period_days(ly_start, ly_end)
-        except Exception as e:
+        except (TypeError, ValueError, KeyError, AttributeError) as e:
+            # TypeError covers round(None, 2) on degenerate last-year lookups.
             _LOGGER.warning(f"Failed to build period data for week comparison: {e}")
             # If we can't build the lists, use empty lists for hybrid calculation
             current_days = []
@@ -550,7 +551,7 @@ class HeatingModelComparisonWeekSensor(HeatingModelComparisonBaseSensor):
             formatter = ExplanationFormatter()
             weekly_summary = formatter.format_period_comparison(analysis)
 
-        except Exception as e:
+        except (TypeError, AttributeError, KeyError) as e:
             _LOGGER.warning(f"Failed to generate explanation: {e}")
             # Fallback to existing logic (keep current implementation as backup)
             weekly_summary = self._generate_fallback_summary(curr, last)
@@ -659,7 +660,8 @@ class HeatingModelComparisonMonthSensor(HeatingModelComparisonBaseSensor):
         try:
             current_days = self._build_current_period_days(start_month, end_month)
             last_year_days = self._build_last_year_period_days(ly_start, ly_end)
-        except Exception as e:
+        except (TypeError, ValueError, KeyError, AttributeError) as e:
+            # TypeError covers round(None, 2) on degenerate last-year lookups.
             _LOGGER.warning(f"Failed to build period data for month comparison: {e}")
             # If we can't build the lists, use empty lists for hybrid calculation
             current_days = []
@@ -681,7 +683,7 @@ class HeatingModelComparisonMonthSensor(HeatingModelComparisonBaseSensor):
             formatter = ExplanationFormatter()
             monthly_summary = formatter.format_period_comparison(analysis)
 
-        except Exception as e:
+        except (TypeError, AttributeError, KeyError) as e:
             _LOGGER.warning(f"Failed to generate monthly explanation: {e}")
             monthly_summary = self._generate_fallback_summary(curr, last)
 

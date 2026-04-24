@@ -140,7 +140,7 @@ class StatisticsManager:
             screen_pct = float(self.coordinator.solar_correction_percent)
         except (TypeError, ValueError):
             screen_pct = 100.0
-        screen_transmittance = SolarCalculator._screen_transmittance(screen_pct)
+        screen_cfg = getattr(self.coordinator, "screen_config", None)
 
         if override_solar_vector is not None:
             effective_solar_vector = override_solar_vector
@@ -157,15 +157,10 @@ class StatisticsManager:
                 curr_solar_factor * max(0.0, -math.sin(az_rad)),
             )
 
-        # Reconstruct potential (pre-screen) vector for coefficient dot product
-        if screen_transmittance > 0.01:
-            potential_solar_vector = (
-                effective_solar_vector[0] / screen_transmittance,
-                effective_solar_vector[1] / screen_transmittance,
-                effective_solar_vector[2] / screen_transmittance,
-            )
-        else:
-            potential_solar_vector = effective_solar_vector
+        # Reconstruct potential (pre-screen) vector for coefficient dot product.
+        potential_solar_vector = SolarCalculator.reconstruct_potential_vector(
+            effective_solar_vector, screen_pct, screen_cfg
+        )
 
         # --- Track A: Global Model (Top-Down / Master) ---
         # 1. Global Base Prediction
@@ -203,7 +198,7 @@ class StatisticsManager:
         aux_affected_set = None
         if effective_aux_active:
             if hasattr(self.coordinator, "_aux_affected_set"):
-                aux_affected_set = self.coordinator._aux_affected_set
+                aux_affected_set = self.coordinator.aux_affected_set
             elif self.coordinator.aux_affected_entities:
                 aux_affected_set = set(self.coordinator.aux_affected_entities)
 
@@ -997,7 +992,7 @@ class StatisticsManager:
              remainder_aux = t_aux * remaining_fraction
 
              # Check if Aux is active OR has produced impact (Mixed Mode)
-             live_aux_impact = self.coordinator._collector.aux_impact_hour
+             live_aux_impact = self.coordinator.collector.aux_impact_hour
              if self.coordinator.auxiliary_heating_active or live_aux_impact > 0.001:
                  aux_hours_count += fraction
                  aux_hours_list.append(dt_util.now().hour)
@@ -1516,7 +1511,7 @@ class StatisticsManager:
         minutes_passed = now.minute
 
         for entity_id in self.coordinator.energy_sensors:
-            actual_so_far = self.coordinator._daily_individual.get(entity_id, 0.0)
+            actual_so_far = self.coordinator.daily_individual.get(entity_id, 0.0)
 
             hist_expected, hist_obs_count, hist_hours = self._calculate_historical_expectations(
                 entity_id, processed_logs
@@ -1554,7 +1549,7 @@ class StatisticsManager:
             # Suppress deviation warnings for aux-affected units during cooldown
             # (thermal lag bias makes the base model unreliable for these units)
             cooldown_suppressed = False
-            if is_unusual and self.coordinator._aux_cooldown_active:
+            if is_unusual and self.coordinator.aux_cooldown_active:
                 affected_set = self.coordinator.aux_affected_entities or []
                 if entity_id in affected_set:
                     cooldown_suppressed = True
@@ -1696,8 +1691,8 @@ class StatisticsManager:
         temp_key_curr = str(int(round(current_temp_val)))
         count = self.coordinator._get_unit_observation_count(entity_id, temp_key_curr, current_wind_bucket)
 
-        if entity_id in self.coordinator._hourly_expected_per_unit:
-            expected_val = self.coordinator._hourly_expected_per_unit[entity_id]
+        if entity_id in self.coordinator.collector.expected_per_unit:
+            expected_val = self.coordinator.collector.expected_per_unit[entity_id]
         else:
             # We need the current effective wind for fallback projection
             eff_wind = self.coordinator.data.get("effective_wind", 0.0)
@@ -1729,13 +1724,13 @@ class StatisticsManager:
                  self.coordinator.data.get("solar_vector_e", 0.0),
                  self.coordinator.data.get("solar_vector_w", 0.0),
              )
-             # Reconstruct potential vector; coeff already absorbs transmittance
+             # Reconstruct potential vector per direction (#826); coeff
+             # already absorbs avg per-direction transmittance.
              scr_pct = self.coordinator.solar_correction_percent
-             scr_t = SolarCalculator._screen_transmittance(scr_pct)
-             if scr_t > 0.01:
-                 pot_vec = (eff_solar_vector[0] / scr_t, eff_solar_vector[1] / scr_t, eff_solar_vector[2] / scr_t)
-             else:
-                 pot_vec = eff_solar_vector
+             scr_cfg = getattr(self.coordinator, "screen_config", None)
+             pot_vec = SolarCalculator.reconstruct_potential_vector(
+                 eff_solar_vector, scr_pct, scr_cfg
+             )
              unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(pot_vec, unit_coeff)
 
              mode = MODE_HEATING if current_temp < self.coordinator.balance_point else MODE_COOLING

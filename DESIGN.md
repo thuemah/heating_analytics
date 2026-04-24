@@ -142,7 +142,7 @@ Standard solar integration is difficult because "1000W of sun" doesn't mean "100
     *   Each unit learns a matching 3D coefficient vector `(Coeff_S, Coeff_E, Coeff_W)` that captures its effective window orientation empirically. All three coefficients are clamped to `>= 0` — this is a true physics invariant (each window direction can only receive solar gain, never produce negative gain).
     *   `Unit_Solar_Impact = Coeff_S × Pot_S + Coeff_E × Pot_E + Coeff_W × Pot_W`  (screen transmittance is implicit in the learned coefficient)
     *   East and West are **orthogonal by construction** — they have disjoint temporal support (E is zero whenever W is non-zero, and vice versa). This gives well-conditioned NLMS learning and clean cold-start least squares without cross-contamination.
-    *   Coefficients are learned against the **potential** (pre-screen) solar vector. Because the learning target (`base − actual`) inherently includes the screen effect, the coefficient converges to `physical_window_coeff × average_screen_transmittance`. This is a deliberate trade-off: using the potential vector keeps the learning signal strong even when screens are closed (avoiding vector-magnitude stalls), while the implicit transmittance coupling is slowly tracked by NLMS. Windowless rooms correctly converge to near-zero coefficients regardless of screen state.
+    *   Coefficients are learned against the **potential** (pre-screen) solar vector. Because the learning target (`base − actual`) inherently includes the screen effect, each direction's coefficient converges to `physical_window_coeff × avg_transmittance` for *that direction*. Per #826, screen transmittance is per-direction: a configured-screened facade ramps from `SCREEN_DIRECT_TRANSMITTANCE` (0.08, screen fabric × glass) at slider 0% up to 1.0 at slider 100%; an unscreened facade is fixed at 1.0 regardless of slider. Closing the south-facade slider therefore does not pull down the model's east-window estimate when only the south facade is screened. Pre-1.3.3 used a single global floor (0.20) which over-coupled the three directions; the legacy fallback (when no screen config is stored) now uses a composite floor of 0.30 representing the typical Nordic mix of partly-screened buildings. Windowless rooms still correctly converge to near-zero coefficients regardless of slider state.
     *   Learning uses **Normalized LMS (NLMS)** instead of standard LMS gradient descent. NLMS divides the step by the input power (`solar_s² + solar_e² + solar_w² + ε`), making convergence rate independent of the solar vector magnitude. This prevents gain-dependent instability where high-solar units oscillate while low-solar units converge. The regularization constant `ε = 0.05` naturally shrinks poorly-constrained components when their signal is weak.
     *   During cold-start (no learned coefficients yet), a 3×3 least squares solver initialises all three coefficients from the first 4 qualifying hours. A collinear fallback handles degenerate cases (e.g. all data from one half of the day). An initial scalar default is decomposed along a 180° (south) assumption until real data replaces it.
 
@@ -159,7 +159,7 @@ Standard solar integration is difficult because "1000W of sun" doesn't mean "100
 8.  **Solar Thermal Battery (EMA model):**
     *   Solar gain is modeled as an exponential moving average: `state = state × decay + solar_impact × (1 − decay)`. This is the exact discrete-time solution of Newton's law of cooling for a first-order thermal system. At steady state, the effective solar impact equals the raw solar input — no amplification. The decay parameter controls only the time constant (how quickly the building releases stored heat).
     *   The previous leaky-integrator formula (`state = state × decay + solar_impact`) amplified the solar signal by `1/(1−decay)`, violating energy conservation. At decay 0.75 this meant 4× amplification; at 0.85, 6.7×. The EMA model eliminates this.
-    *   Default decay rate is 0.75 (half-life ~2.4 hours), a middle ground between lightweight and heavy construction. Per-installation calibration via `diagnose_solar` with `apply_battery_decay: true` is recommended.
+    *   Default decay rate is 0.80 (half-life ~3.1 hours, `log(0.5) / log(0.80) ≈ 3.106 h`), a middle ground between lightweight and heavy construction. Raised from 0.75 (half-life ~2.4 h) in v1.3.3 to better match typical Norwegian construction with concrete floor slabs. Per-installation calibration via `diagnose_solar` with `apply_battery_decay: true` is recommended.
     *   The `diagnose_solar` calibration sweep tests decay rates 0.50–0.95 against post-sunset residuals using the same EMA formula.
 
 9.  **Solar Model and COP — Deliberate Trade-off:**
@@ -552,15 +552,30 @@ To protect the user's hardware (specifically SD cards on Raspberry Pi), the inte
 
 ### Retention Policy
 
-*   **`hourly_log`:** Configurable via `hourly_log_retention_days` in the config flow (90 / 180 / 365 days, default 90). Trimmed in-place at every hour boundary using `del self._hourly_log[:-max_entries]` to preserve the list identity referenced by the cached `ModelState`. 90 days ≈ 2 MB JSON; 365 days ≈ 9 MB. Conservative default protects resource-constrained hardware (Raspberry Pi with SD card).
+*   **`hourly_log`:** Configurable via `hourly_log_retention_days` in the config flow (90 / 180 / 365 days, default 90). Trimmed at every hour boundary with `del self._hourly_log[:-max_entries]`. 90 days ≈ 2 MB JSON; 365 days ≈ 9 MB. Conservative default protects resource-constrained hardware (Raspberry Pi with SD card).
 *   **`daily_history`:** No retention limit. One entry per day (~200 bytes). 10 years ≈ 730 KB. The cost is negligible on any hardware, and unlimited retention gives `compare_periods` full historical range.
 
 ### Hourly Vectors (High-Fidelity History)
 Previously, the system stored daily averages (Avg Temp, Total kWh). This caused 'aliasing' errors where a cold morning + warm afternoon averaged to a mild day, losing the thermodynamic context of the heating spikes.
 
-The system now stores **Hourly Vectors** in the daily history: arrays of 24 hourly values for Temperature, Wind, TDD, and Actual Load.
-*   **Structure:** `{ "temp": [v0..v23], "load": [v0..v23], ... }`
+The system now stores **Hourly Vectors** in the daily history: arrays of 24 hourly values for Temperature, Wind, TDD, and Actual kWh.
+*   **Structure:** `{ "temp": [v0..v23], "actual_kwh": [v0..v23], ... }`
 *   **Benefit:** Enables precise 'What-If' re-simulations and accurate model updates even years later, as the specific conditions for every hour are preserved.
+
+### Schema Migration
+
+`STORAGE_VERSION` is bumped whenever the persisted dict gains/drops a top-level key, changes a value's type, or restructures a nested map. Each bump owns one migration step (`_migrate_vN_to_vN_plus_1(data, ...)` in `storage.py`) registered in `StorageManager._async_migrate` and invoked by HA's `Store.async_migrate_func` on first load after upgrade.
+
+Current chain:
+
+| From | To | Function | What |
+|------|----|----------|------|
+| 1 | 2 | (retroactive) | `solar_correction_percent` support added |
+| 2 | 3 | `_migrate_pre_v3` | Bundled pre-v3 cleanup (#874): temp-stratified → flat solar coefficients; `(s, e, impact)` → `(s, e, w, impact)` solar buffer; legacy float → `{"normal": float}` aux coefficients; `with_auxiliary_heating` bucket removal across 4 structures; `with_auxiliary_heating` → `aux_coefficients` translation; `hdd` → `tdd` rename; `load` → `actual_kwh` rename; leaky-integrator → EMA battery scaling; forecast-history `unknown` → `primary` rename |
+
+Invariant: a migration function emits canonical v-target shape directly — `async_load_data` does not compensate for legacy shapes post-migration. The load path's `isinstance(val, dict)` filters will silently drop malformed migration output, so emitting `round(savings, 3)` where a `{"normal": …}` dict is expected results in data loss (this was #874's blocker).
+
+Migrations must be idempotent and cover both the canonical and legacy input paths in tests.
 
 ---
 
@@ -639,3 +654,17 @@ The model treats identical outdoor temperatures as thermodynamically equivalent,
 **Observed symptom:** After a deep cold spell the model consistently *underestimates* actual heat demand during the recovery phase. Conversely, when temperatures drop from a mild baseline the model tends to *overestimate* demand at the same outdoor temperatures. The asymmetry is most pronounced near +1 °C to +3 °C.
 
 **Why it is not fixed:** A correct remedy would require either a multi-day thermal state variable (e.g., an exponentially smoothed 48–72 h temperature integrator) or asymmetric inertia coefficients conditioned on the direction of thermal travel. Both approaches introduce meaningful implementation complexity, require sufficient historical data to calibrate, and carry a real risk of making predictions worse in the statistically dominant case (normal, non-extreme temperature transitions) in order to improve them in the rare case (transition out of a deep cold spell, which occurs only a handful of times per winter season). The current pragmatic decision is to accept this limitation and document it here rather than risk destabilising the model's everyday accuracy.
+
+### Cooling-at-cold exclusion (1.3.3)
+
+Units in `MODE_COOLING` with outdoor temperature below `balance_point − 2` are excluded from per-unit base-EMA updates. This addresses the seasonal-automation pattern where a user sets cooling mode for an entire summer and the unit idles (low standby consumption) on cold nights — otherwise those idle hours would contaminate heating-dominated per-unit buckets that the same unit's heating-mode operation would later read from.
+
+**Edge cases the guard does NOT cover:**
+
+-   **Commercial or data-center cooling at cold temperatures.** A unit actively cooling a server room at 5 °C produces real cooling demand. The guard discards this data. On residential installations this scenario is essentially absent; on commercial deployments it becomes lost signal.
+-   **High balance-point installations.** With `balance_point = 20 °C` the threshold sits at 18 °C, which may be legitimate shoulder-season cooling temperature. Some real cooling signal is excluded at high BP values. The BP-relative threshold was chosen for consistency with `diagnose_solar.temperature_stratified` but does not scale perfectly across the full BP range.
+-   **Mode misconfiguration.** A unit persistently set to cooling mode while the user actually needs heating has its per-unit bucket under-populated. The guard does not target this, but the effect compounds.
+
+**Why it is not fully fixed:** The proper remedy is mode-stratified per-unit base buckets — `correlation_data_per_unit[entity_id][mode][temp_key][wind_bucket]` — so cooling and heating have separate bucket tables at every temperature. That is a substantive data-structure change affecting all per-unit learning and prediction paths, requiring a storage migration and careful routing at ~6 call sites. Tracked in a dedicated issue for the 1.4.x cycle. The one-line guard in 1.3.3 covers the ~90 % of cases that matter to residential Nordic installations, which is where our validation base sits.
+
+**Global base is not guarded.** The same cooling-at-cold standby consumption also appears in `learning_energy_kwh` which feeds the global base. Measurement: on a typical residential install this contributes <1 % seasonal bias because standby consumption is 10–30 W versus heating consumption of 1.5–2.0 kWh/h. Tolerated; revisited only if field data shows it matters.

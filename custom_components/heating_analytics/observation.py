@@ -14,9 +14,93 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Protocol, runtime_checkable
 
-from .const import MODE_HEATING, MODES_EXCLUDED_FROM_GLOBAL_LEARNING
+from .const import (
+    MODE_HEATING,
+    MODES_EXCLUDED_FROM_GLOBAL_LEARNING,
+    SOLAR_SHUTDOWN_ACTUAL_FLOOR,
+    SOLAR_SHUTDOWN_RATIO,
+    SOLAR_SHUTDOWN_MIN_BASE,
+    SOLAR_SHUTDOWN_MIN_MAGNITUDE,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def detect_solar_shutdown_entities(
+    *,
+    solar_enabled: bool,
+    is_aux_dominant: bool,
+    potential_vector: tuple[float, float, float],
+    energy_sensors: list[str],
+    unit_modes: dict[str, str],
+    unit_actual_kwh: dict[str, float],
+    unit_expected_base_kwh: dict[str, float],
+    unit_min_base: dict[str, float] | None = None,
+) -> tuple[str, ...]:
+    """Detect VP units whose thermostat cut the compressor during sun (#838).
+
+    A unit is flagged solar-dominant when it reports near-zero consumption
+    during sunny conditions with significant expected base demand — the
+    signature of a heat pump thermostat shutdown in a sun-warmed room.
+    Learning on such hours would inflate the solar coefficient because
+    actual_impact = base - 0 = base.
+
+    Detection is purely a function of this-hour data — no historical
+    tracking, no circular dependencies on the learned coefficient.
+
+    Magnitude uses the potential (pre-screen) vector so closed screens
+    don't hide a sunny hour from detection, matching the learning-side
+    reconstruction in LearningManager._process_per_unit_learning.
+
+    Args:
+        solar_enabled: Skip detection entirely when solar is disabled.
+        is_aux_dominant: Skip during aux regime — aux already freezes base.
+        potential_vector: (S, E, W) pre-screen solar vector.
+        energy_sensors: Candidate entity IDs.
+        unit_modes: {entity_id: MODE_*}; only MODE_HEATING is considered.
+        unit_actual_kwh: {entity_id: metered kWh this hour}.
+        unit_expected_base_kwh: {entity_id: base-expected kWh this hour}.
+        unit_min_base: Optional per-unit base thresholds (#871).  When
+            provided, overrides SOLAR_SHUTDOWN_MIN_BASE per entity;
+            absent entries fall back to the global constant.  Lets
+            small loads and low-min-modulation heat pumps participate
+            in shutdown detection at their own calibrated noise floor.
+
+    Returns:
+        Tuple of entity IDs flagged as solar-dominant (possibly empty).
+    """
+    if not solar_enabled or is_aux_dominant:
+        return ()
+
+    magnitude = (
+        potential_vector[0] ** 2
+        + potential_vector[1] ** 2
+        + potential_vector[2] ** 2
+    ) ** 0.5
+    if magnitude < SOLAR_SHUTDOWN_MIN_MAGNITUDE:
+        return ()
+
+    # Defensive: only accept dict-shaped overrides.  Anything else
+    # (None, MagicMock, malformed storage load) falls back to the global
+    # constant — mirrors the same posture in learning._resolve_min_base.
+    overrides = unit_min_base if isinstance(unit_min_base, dict) else {}
+    flagged: list[str] = []
+    for entity_id in energy_sensors:
+        if unit_modes.get(entity_id, MODE_HEATING) != MODE_HEATING:
+            continue
+        actual = unit_actual_kwh.get(entity_id, 0.0)
+        base = unit_expected_base_kwh.get(entity_id, 0.0)
+        override_val = overrides.get(entity_id)
+        if isinstance(override_val, (int, float)) and override_val > 0.0:
+            threshold = float(override_val)
+        else:
+            threshold = SOLAR_SHUTDOWN_MIN_BASE
+        if base < threshold:
+            continue
+        ratio = actual / base if base > 0 else 1.0
+        if actual < SOLAR_SHUTDOWN_ACTUAL_FLOOR or ratio < SOLAR_SHUTDOWN_RATIO:
+            flagged.append(entity_id)
+    return tuple(flagged)
 
 
 @dataclass(frozen=True)
@@ -46,6 +130,17 @@ class LearningConfig:
     # Per-unit Track A override (active under daily_learning_mode)
     # None = follow learning_enabled.
     per_unit_learning_enabled: bool | None = None
+
+    # Per-direction screen presence (#826).  None = legacy / use composite floor.
+    # When set, controls how correction_percent attenuates each cardinal
+    # direction independently in :meth:`SolarCalculator._screen_transmittance_vector`.
+    screen_config: tuple[bool, bool, bool] | None = None
+
+    # Per-unit min-base thresholds (#871).  Maps entity_id → calibrated
+    # noise floor (kWh) used to gate NLMS, inequality, and shutdown
+    # detection per unit.  None or empty → all gate sites fall back to
+    # the global SOLAR_*_MIN_BASE constants (legacy behaviour).
+    unit_min_base: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +214,26 @@ class HourlyObservation:
 
     # --- Cooldown state at observation time ---
     was_cooldown_active: bool = False
+
+    # --- Solar shutdown regime (#838) ---
+    # Detected at hour boundary when VP units report near-zero consumption
+    # during sunny conditions with significant expected base demand.  Used
+    # by LearningManager to (a) skip NLMS coefficient updates that would
+    # otherwise learn actual_impact = base, and (b) slow per-unit base EMA
+    # via headroom weighting.  Defaults ensure zero impact on existing code.
+    is_solar_dominant: bool = False
+    solar_dominant_entities: tuple[str, ...] = ()
+
+    # Battery-filtered per-direction potential (#865). Consumed by the
+    # inequality learner which operates on shutdown-flagged hours.  The
+    # inequality cares about accumulated sun presence (thermal-mass time
+    # constant ~3h) rather than the instantaneous hour's vector, because
+    # shutdown is an accumulated phenomenon — the room overheated over
+    # hours, not within one.  Lives on the observation so it's available
+    # at the per-unit learning site without threading an extra argument.
+    # Defaults to zeros for legacy call paths (replay builds its own via
+    # a local EMA over the log; live path fills from coordinator state).
+    battery_filtered_potential: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 @dataclass

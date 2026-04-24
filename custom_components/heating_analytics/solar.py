@@ -18,6 +18,7 @@ from .const import (
     DEFAULT_SOLAR_COEFF_HEATING,
     DEFAULT_SOLAR_COEFF_COOLING,
     DEFAULT_SOLAR_MIN_TRANSMITTANCE,
+    SCREEN_DIRECT_TRANSMITTANCE,
     ENERGY_GUARD_THRESHOLD,
     MODE_HEATING,
     MODE_COOLING,
@@ -147,45 +148,145 @@ class SolarCalculator:
         return solar_south, solar_east, solar_west
 
     @staticmethod
-    def _screen_transmittance(correction_percent: float) -> float:
-        """Map screen open-percentage to effective transmittance fraction.
+    def _screen_transmittance_vector(
+        correction_percent: float,
+        screen_config: tuple[bool, bool, bool] | None = None,
+    ) -> tuple[float, float, float]:
+        """Map screen open-percentage to per-direction transmittance (S, E, W).
 
-        Applies a physically-motivated floor (DEFAULT_SOLAR_MIN_TRANSMITTANCE)
-        so that a fully-closed screen (correction_percent = 0) still passes a
-        baseline of solar energy through:
+        Per-direction model (#826).  Each cardinal direction is treated
+        independently based on whether its facade has external screens:
 
-            effective = MIN + (1 - MIN) * (correction_percent / 100)
+            screened    : t = SCREEN_DIRECT_TRANSMITTANCE + (1 - mn) * pct/100
+                          (mn ≈ 0.08, pure screen-fabric × glass at 0 %)
 
-        At 0 %:   effective = MIN   (~screen G-value + unmonitored windows)
-        At 100 %: effective = 1.0   (fully open, unchanged behaviour)
+            unscreened  : t = 1.0  (always, regardless of slider)
 
-        The floor keeps the effective solar vector non-zero even when all
-        screens are down, which prevents solar-coefficient learning from
-        stalling (vector_magnitude guard in _learn_unit_solar_coefficient)
-        and stops the base thermal model from absorbing residual solar gain.
-        """
-        mn = DEFAULT_SOLAR_MIN_TRANSMITTANCE
-        return mn + (1.0 - mn) * (correction_percent / 100.0)
-
-    def calculate_effective_solar_vector(self, potential_solar_vector: tuple[float, float, float], correction_percent: float) -> tuple[float, float, float]:
-        """Calculate effective solar vector after applying screens/correction."""
-        s, e, w = potential_solar_vector
-        factor = self._screen_transmittance(correction_percent)
-        return s * factor, e * factor, w * factor
-
-    def calculate_effective_solar_factor(self, potential_solar_factor: float, correction_percent: float) -> float:
-        """Calculate effective solar factor after applying screens/correction.
+        When ``screen_config`` is None (legacy / pre-1.3.3 storage), all three
+        directions fall back to the composite floor DEFAULT_SOLAR_MIN_TRANSMITTANCE
+        (≈ 0.30) which represents a typical Nordic residential building with
+        partial screen coverage.
 
         Args:
-            potential_solar_factor: The raw calculated solar factor (Screens Up).
-            correction_percent: The percentage of solar gain allowed (0-100).
-                                100 = No screens (Full Gain).
-                                0 = Full screens (No Gain).
+            correction_percent: Slider position 0–100.  100 = screens open
+                (no reduction), 0 = screens fully closed.
+            screen_config: (south_has_screen, east_has_screen, west_has_screen).
+                None = legacy composite floor for all directions.
 
         Returns:
-            The effective solar factor used for impact calculations.
+            (t_south, t_east, t_west) each in [floor, 1.0].
         """
-        return potential_solar_factor * self._screen_transmittance(correction_percent)
+        pct = max(0.0, min(100.0, correction_percent))
+        ratio = pct / 100.0
+        # Treat malformed / missing screen_config as legacy.  Defensive
+        # because mock coordinators in tests may yield empty tuples or
+        # truthy MagicMock values; falling back keeps unrelated tests
+        # green while the proper config path stays exercised.
+        if (
+            screen_config is None
+            or not hasattr(screen_config, "__len__")
+            or len(screen_config) != 3
+        ):
+            mn = DEFAULT_SOLAR_MIN_TRANSMITTANCE
+            t = mn + (1.0 - mn) * ratio
+            return t, t, t
+        mn = SCREEN_DIRECT_TRANSMITTANCE
+        t_screened = mn + (1.0 - mn) * ratio
+        s_has, e_has, w_has = screen_config
+        return (
+            t_screened if s_has else 1.0,
+            t_screened if e_has else 1.0,
+            t_screened if w_has else 1.0,
+        )
+
+    @staticmethod
+    def reconstruct_potential_vector(
+        effective_vec: tuple[float, float, float],
+        correction_percent: float,
+        screen_config: tuple[bool, bool, bool] | None = None,
+        *,
+        min_transmittance: float = 0.01,
+    ) -> tuple[float, float, float]:
+        """Reconstruct the pre-screen potential vector from the effective vector.
+
+        Per CLAUDE.md invariant #2 — when potential is constant within the
+        hour, ``effective_avg / transmittance(correction_avg) == potential``
+        because both vector and correction_percent are linearly accumulated
+        per-minute by the collector.  Per direction since #826: each cardinal
+        direction undoes its own transmittance (1.0 for unscreened facades).
+
+        Below ``min_transmittance`` the reconstruction is undefined; the
+        component is returned unchanged.  Matches the historical guard at
+        every call site (pre-#876).
+        """
+        t_s, t_e, t_w = SolarCalculator._screen_transmittance_vector(
+            correction_percent, screen_config
+        )
+        return (
+            effective_vec[0] / t_s if t_s > min_transmittance else effective_vec[0],
+            effective_vec[1] / t_e if t_e > min_transmittance else effective_vec[1],
+            effective_vec[2] / t_w if t_w > min_transmittance else effective_vec[2],
+        )
+
+    @staticmethod
+    def _screen_transmittance(
+        correction_percent: float,
+        screen_config: tuple[bool, bool, bool] | None = None,
+    ) -> float:
+        """Scalar transmittance — average across the three directions.
+
+        Retained for diagnostics, factor-style fallbacks, and any code path
+        that does not have a per-direction vector to operate on.  Per-direction
+        callers MUST use :meth:`_screen_transmittance_vector` to avoid the
+        cross-direction coupling that motivated #826.
+
+        With ``screen_config=None`` this returns the composite legacy floor
+        ramp identical to pre-1.3.3 behaviour but with floor 0.30 instead of
+        0.20.
+        """
+        s, e, w = SolarCalculator._screen_transmittance_vector(
+            correction_percent, screen_config
+        )
+        return (s + e + w) / 3.0
+
+    def _resolve_screen_config(
+        self,
+        screen_config: tuple[bool, bool, bool] | None,
+    ) -> tuple[bool, bool, bool] | None:
+        """Resolve a per-call override against the coordinator default."""
+        if screen_config is not None:
+            return screen_config
+        cfg = getattr(self.coordinator, "screen_config", None)
+        return cfg
+
+    def calculate_effective_solar_vector(
+        self,
+        potential_solar_vector: tuple[float, float, float],
+        correction_percent: float,
+        screen_config: tuple[bool, bool, bool] | None = None,
+    ) -> tuple[float, float, float]:
+        """Calculate effective solar vector after per-direction screen attenuation."""
+        s, e, w = potential_solar_vector
+        cfg = self._resolve_screen_config(screen_config)
+        t_s, t_e, t_w = self._screen_transmittance_vector(correction_percent, cfg)
+        return s * t_s, e * t_e, w * t_w
+
+    def calculate_effective_solar_factor(
+        self,
+        potential_solar_factor: float,
+        correction_percent: float,
+        screen_config: tuple[bool, bool, bool] | None = None,
+    ) -> float:
+        """Calculate effective scalar solar factor (legacy, direction-agnostic).
+
+        Uses the average of the three per-direction transmittances since the
+        scalar factor has no direction information.  Direction-aware callers
+        should use :meth:`calculate_effective_solar_vector`.
+        """
+        cfg = self._resolve_screen_config(screen_config)
+        return potential_solar_factor * self._screen_transmittance(
+            correction_percent, cfg
+        )
 
     def calculate_unit_solar_impact(
         self,
@@ -432,7 +533,7 @@ class SolarCalculator:
             azimuth = sun_azimuth(observer, dt_obj)
 
             return elevation, azimuth
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             _LOGGER.warning(f"Failed to calculate sun position for {dt_obj}: {e}")
             return 0.0, 0.0
 

@@ -134,6 +134,8 @@ from .const import (
     CONFIDENCE_HIGH_ERROR_MAX,
     CONFIDENCE_MEDIUM_ERROR_MAX,
     FORECAST_COMPARISON_FACTOR,
+    LEARNING_BUFFER_THRESHOLD,
+    SOLAR_DEAD_ZONE_THRESHOLD,
 )
 from .helpers import convert_speed_to_ms
 from .coordinator import HeatingDataCoordinator
@@ -1536,6 +1538,76 @@ class HeatingDeviceDailySensor(HeatingAnalyticsBaseSensor):
 
         attrs["correlation_data_points"] = total_observations
 
+        # 3. Solar coefficients and learning state (#862 suite)
+        # Exposes per-unit solar state so users can inspect what each unit
+        # has learned from sun observations.  Values come from live in-memory
+        # state (no 30-day log iteration) so the attribute update is O(1).
+        # ``isinstance(..., dict)`` guard: when running under a mocked
+        # coordinator in unit tests, ``solar_coefficients_per_unit.get(...)``
+        # returns a MagicMock which would fail the arithmetic below.
+        solar_coeff = self.coordinator.model.solar_coefficients_per_unit.get(
+            self.source_entity_id
+        )
+        if isinstance(solar_coeff, dict):
+            attrs["solar_coefficient_s"] = round(solar_coeff.get("s", 0.0), 4)
+            attrs["solar_coefficient_e"] = round(solar_coeff.get("e", 0.0), 4)
+            attrs["solar_coefficient_w"] = round(solar_coeff.get("w", 0.0), 4)
+
+            # Instantaneous solar impact for this unit: coeff · effective_vector.
+            # Display-level estimate — the hour-boundary prediction path uses
+            # potential (pre-screen) vector and the coefficient absorbs average
+            # transmittance per direction, so this can differ by a few percent
+            # when instantaneous screen position deviates from the coefficient's
+            # baked-in average.  Sufficient for UI.
+            sv_s = self.coordinator.data.get("solar_vector_s", 0.0)
+            sv_e = self.coordinator.data.get("solar_vector_e", 0.0)
+            sv_w = self.coordinator.data.get("solar_vector_w", 0.0)
+            impact = self.coordinator.solar.calculate_unit_solar_impact(
+                (sv_s, sv_e, sv_w), solar_coeff, screen_transmittance=1.0
+            )
+            if isinstance(impact, (int, float)):
+                attrs["solar_impact_current_kwh"] = round(impact, 3)
+
+                # Saturation: what fraction of this unit's dark-equivalent
+                # demand is currently being covered by solar.
+                # predicted_hourly + impact = dark-equivalent base.
+                if isinstance(predicted_hourly, (int, float)):
+                    dark_equivalent = predicted_hourly + impact
+                    if dark_equivalent > 0.01:
+                        attrs["solar_impact_saturation_pct"] = round(
+                            100.0 * impact / dark_equivalent, 1
+                        )
+                    else:
+                        attrs["solar_impact_saturation_pct"] = 0.0
+
+        # Learning state: single string that summarises cold-start vs
+        # NLMS-converged vs dead-zone-warning.  Avoids exposing raw
+        # counters; surfaces the three states the user actually needs
+        # to act on.
+        buffer = self.coordinator._learning_buffer_solar_per_unit.get(
+            self.source_entity_id, []
+        )
+        dead_zone_count = self.coordinator.learning._dead_zone_counts.get(
+            self.source_entity_id, 0
+        )
+        if not isinstance(dead_zone_count, int):
+            # Mocked coordinator in tests returns MagicMock; treat as 0.
+            dead_zone_count = 0
+        coeff_present = isinstance(solar_coeff, dict) and solar_coeff
+        buffer_len = len(buffer) if isinstance(buffer, (list, tuple)) else 0
+
+        if not coeff_present and buffer_len == 0:
+            attrs["solar_learning_status"] = "cold_start"
+        elif not coeff_present:
+            # In cold-start buffer accumulation, pre-Cramer.
+            attrs["solar_learning_status"] = f"buffering_{buffer_len}/{LEARNING_BUFFER_THRESHOLD}"
+        elif dead_zone_count >= 10:
+            # Dead-zone threshold is SOLAR_DEAD_ZONE_THRESHOLD (15); warn
+            # when approaching so users notice before auto-reset fires.
+            attrs["solar_learning_status"] = f"dead_zone_warning_{dead_zone_count}/{SOLAR_DEAD_ZONE_THRESHOLD}"
+        else:
+            attrs["solar_learning_status"] = "learning"
+
         return attrs
 
 class HeatingDeviceLifetimeSensor(HeatingAnalyticsBaseSensor):
@@ -1639,7 +1711,7 @@ class HeatingWeekAheadForecastSensor(HeatingAnalyticsBaseSensor):
             self._cached_stats = stats
             self._cached_time = now
             return stats
-        except Exception as e:
+        except (TypeError, KeyError, AttributeError) as e:
             _LOGGER.error("Error calculating week ahead forecast: %s", e)
             return {
                 "total_kwh": 0.0,

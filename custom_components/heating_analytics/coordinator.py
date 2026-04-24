@@ -18,7 +18,9 @@ from .solar import SolarCalculator
 from .thermodynamics import ThermodynamicEngine
 from .forecast import ForecastManager
 from .statistics import StatisticsManager
-from .learning import LearningManager
+from .learning import LearningManager, compute_snr_weight, count_active_learnable_units
+from .diagnostics import DiagnosticsEngine
+from .retrain import RetrainEngine
 from .storage import StorageManager
 from .solar_optimizer import SolarOptimizer
 from .const import (
@@ -83,9 +85,15 @@ from .const import (
     CONF_ENABLE_LIFETIME_TRACKING,
     CONF_SOLAR_ENABLED,
     CONF_SOLAR_AZIMUTH,
+    CONF_SCREEN_SOUTH,
+    CONF_SCREEN_EAST,
+    CONF_SCREEN_WEST,
     DEFAULT_SOLAR_ENABLED,
     DEFAULT_SOLAR_AZIMUTH,
     DEFAULT_SOLAR_CORRECTION,
+    DEFAULT_SCREEN_SOUTH,
+    DEFAULT_SCREEN_EAST,
+    DEFAULT_SCREEN_WEST,
     CONF_AUX_AFFECTED_ENTITIES,
     DEFAULT_SOLAR_LEARNING_RATE,
     DEFAULT_SOLAR_COEFF_HEATING,
@@ -121,6 +129,8 @@ from .const import (
     MODE_GUEST_COOLING,
     MODE_DHW,
     MODES_EXCLUDED_FROM_GLOBAL_LEARNING,
+    SNR_WEIGHT_FLOOR,
+    SNR_WEIGHT_K,
     DEFAULT_CSV_AUTO_LOGGING,
     DEFAULT_CSV_HOURLY_PATH,
     DEFAULT_CSV_DAILY_PATH,
@@ -150,7 +160,6 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self.entry = entry
 
         # Internal state
-        self._model_cache = None  # Lazy-created by self.model property (#775)
         self._correlation_data = {} # { "temp": { "wind_bucket": avg_kwh_per_hour } }
         self._correlation_data_per_unit = {} # { entity_id: { "temp": { "wind_bucket": avg_kwh_per_hour } } }
         # { entity_id: { "temp_key": { "wind_bucket": count } } }
@@ -163,10 +172,35 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # New Per-Unit Solar State
         self._solar_coefficients_per_unit = {} # { entity_id: { "temp": coeff } }
 
+        # Per-unit min-base thresholds (#871).  Populated from dark-hour
+        # p10 by :meth:`_calibrate_per_unit_min_base_thresholds` at startup
+        # and via the ``calibrate_unit_thresholds`` service.  Empty dict
+        # means all gate sites (NLMS / inequality / shutdown) fall back
+        # to the global SOLAR_*_MIN_BASE constants (0.15).  Survives
+        # ``reset_solar_learning`` — these are hardware noise floors, not
+        # learned coefficients.
+        self._per_unit_min_base_thresholds: dict[str, float] = {}
+
         # Solar thermal battery: accumulates solar impact across hours with exponential decay.
         # Carries residual solar heat (stored in building mass) into post-solar hours.
         # Reset to 0 on restart — recovers within a few hours.
         self._solar_battery_state: float = 0.0
+
+        # Per-direction potential battery (#865).  Separate from
+        # ``_solar_battery_state`` (which accumulates post-coefficient
+        # solar impact for display); these accumulate the **pre-coefficient**
+        # potential vector per cardinal direction.  Fed to the inequality
+        # learner which needs to see accumulated sun presence, not
+        # instantaneous hour magnitude, because shutdown is an accumulated
+        # thermal-mass phenomenon.  Same decay (``solar_battery_decay``,
+        # default 0.80) for physical consistency — the building's thermal
+        # mass responds to sun on the same timescale regardless of which
+        # downstream consumer is looking at it.  Persisted via storage so
+        # a restart doesn't reset the signal the inequality learner relies
+        # on for its first few shutdown hours.
+        self._potential_battery_s: float = 0.0
+        self._potential_battery_e: float = 0.0
+        self._potential_battery_w: float = 0.0
 
         # Hour-scoped accumulators — delegated to ObservationCollector (#775).
         # The collector owns all hourly state; the coordinator keeps
@@ -247,6 +281,23 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self._last_energy_values = {} # { entity_id: value_at_last_update }
         self._learned_u_coefficient = None
         self._last_midnight_indoor_temp = None
+        # #855 Option B: count days where Track C was enabled but MPC did not
+        # produce a distribution, so the midnight sync skipped bucket + U
+        # updates to avoid mixing MPC-synthetic and raw-electrical semantics.
+        # Runtime counter — resets on HA restart by design (diagnostic only).
+        self._track_c_outage_count_session = 0
+
+        # Track C pre-midnight snapshot (#855 follow-up).  The midnight sync
+        # runs at 00:xx of the new day and processes yesterday's data.  If
+        # MPC happens to be unavailable at exactly that moment (HA startup
+        # race, service loading, busy kernel), we lose the entire day.  We
+        # pre-fetch the MPC buffer at 22:00, 23:00, and 23:55 the evening
+        # before; the midnight sync falls back to the most recent snapshot
+        # when the live call fails.  Transient state — not persisted; a
+        # restart between 23:55 and 00:01 loses the snapshot and falls
+        # through to the Option B skip (acceptable edge case).
+        self._track_c_snapshot: dict | None = None
+        self._track_c_last_snapshot_slot: str | None = None
 
         # Hourly aggregates are now owned by ObservationCollector (see above).
         # Only daily-scoped accumulators remain here.
@@ -305,6 +356,18 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self.solar_enabled = entry.data.get(CONF_SOLAR_ENABLED, DEFAULT_SOLAR_ENABLED)
         self.solar_azimuth = entry.data.get(CONF_SOLAR_AZIMUTH, DEFAULT_SOLAR_AZIMUTH)
         self.solar_correction_percent = DEFAULT_SOLAR_CORRECTION
+        # Per-direction screen presence (#826).  Tuple aligned with the 3D
+        # solar vector ordering (south, east, west).  Default True for all
+        # three on upgrade so legacy installations keep behaviour close to
+        # the pre-1.3.3 single-floor model (with the floor itself raised
+        # 0.20 → 0.30).  Users can uncheck a direction in the config flow
+        # if a facade has no external screens; that direction's
+        # transmittance then stays at 1.0 regardless of the slider.
+        self.screen_config: tuple[bool, bool, bool] = (
+            bool(entry.data.get(CONF_SCREEN_SOUTH, DEFAULT_SCREEN_SOUTH)),
+            bool(entry.data.get(CONF_SCREEN_EAST, DEFAULT_SCREEN_EAST)),
+            bool(entry.data.get(CONF_SCREEN_WEST, DEFAULT_SCREEN_WEST)),
+        )
 
         # Load Thermal Inertia Profile (Default to Normal/4h if missing)
         inertia_setting = self.entry.data.get(CONF_THERMAL_INERTIA, DEFAULT_THERMAL_INERTIA_HOURS)
@@ -342,6 +405,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self.forecast = ForecastManager(self)
         self.statistics = StatisticsManager(self)
         self.learning = LearningManager()
+        self._diagnostics = DiagnosticsEngine(self)
+        self._retrain = RetrainEngine(self)
         self.storage = StorageManager(self)
 
         # CSV Auto-logging configuration
@@ -364,6 +429,27 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if updated_count > 0:
             _LOGGER.info(f"Backfilled/Enriched {updated_count} daily history entries. Saving data.")
             await self._async_save_data(force=True)
+
+        # Per-unit min-base calibration.  Runs opportunistically on
+        # every startup once ≥14 days of log data exist.  Rate-of-change
+        # clamp (±50 %) protects against a single anomalous week.  Results
+        # persisted next save; no-op when data is insufficient.
+        # Defensive: a malformed log entry (corrupt storage, manual edit)
+        # must not block integration load — calibration is recoverable
+        # next startup or via the ``calibrate_unit_thresholds`` service.
+        try:
+            cal_result = self._calibrate_per_unit_min_base_thresholds()
+            if cal_result.get("status") == "ok" and (
+                cal_result.get("updated") or cal_result.get("rejected")
+            ):
+                await self._async_save_data(force=True)
+        except Exception as e:  # noqa: BLE001 — one-shot startup calibration; log-and-skip beats blocking boot
+            _LOGGER.warning(
+                "Per-unit min-base calibration failed at startup: %s. "
+                "Falling back to global SOLAR_*_MIN_BASE constants. "
+                "Run the 'calibrate_unit_thresholds' service after "
+                "investigating the log data.", e,
+            )
 
     async def _async_save_data(self, force: bool = False):
         """Save data to storage."""
@@ -464,8 +550,35 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         await self._async_save_data(force=True)
 
-    async def async_reset_solar_learning_data(self, entity_id: str | None = None):
-        """Reset solar learning data for a specific unit or all units."""
+    async def async_reset_solar_learning_data(
+        self,
+        entity_id: str | None = None,
+        replay_from_history: bool = False,
+        days_back: int | None = None,
+    ) -> dict:
+        """Reset solar learning data for a specific unit or all units.
+
+        When ``replay_from_history`` is True, the reset is followed by an
+        NLMS replay over the stored hourly log so coefficients are refitted
+        against the existing base model. This is the "solar-only retrain"
+        path — base/aux/U-coefficient tables are never touched, only solar
+        coefficients and their cold-start buffers. Useful after the base
+        model has stabilised but the solar coefficients are known to be
+        wrong (e.g. screen-config change, or divergence detected in
+        ``diagnose_solar``).
+
+        When ``entity_id`` is given, both the reset and the replay are
+        scoped to that unit — other units' coefficients are preserved.
+        The per-unit filter is applied by passing a single-element
+        ``energy_sensors`` list to :meth:`LearningManager.replay_solar_nlms`.
+
+        Returns a dict describing what happened (always — SupportsResponse.ONLY):
+
+        - ``status``: "reset"
+        - ``unit_entity_id``: the filter (or None for all units)
+        - ``replay_from_history``: bool
+        - ``solar_replay_diagnostics``: dict from ``replay_solar_nlms`` or None
+        """
         if entity_id:
             if entity_id in self._solar_coefficients_per_unit:
                 del self._solar_coefficients_per_unit[entity_id]
@@ -479,7 +592,51 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             self._learning_buffer_solar_per_unit.clear()
             _LOGGER.info("Solar learning reset for all units")
 
+        solar_replay_diagnostics: dict | None = None
+        if replay_from_history:
+            # Scope replay to matching subset of the log.
+            if days_back is not None:
+                from homeassistant.util import dt as dt_util
+                from datetime import timedelta
+                cutoff_str = (dt_util.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                entries = [e for e in self._hourly_log if e.get("timestamp", "") >= cutoff_str]
+            else:
+                entries = list(self._hourly_log)
+
+            # Per-unit filter: pass a single-element energy_sensors list so
+            # replay_solar_nlms naturally skips all other units.  No change
+            # to replay_solar_nlms required.
+            sensors_for_replay = [entity_id] if entity_id else self.energy_sensors
+
+            solar_replay_diagnostics = self.learning.replay_solar_nlms(
+                entries,
+                solar_calculator=self.solar,
+                screen_config=getattr(self, "screen_config", None),
+                correlation_data_per_unit=self._correlation_data_per_unit,
+                solar_coefficients_per_unit=self._solar_coefficients_per_unit,
+                learning_buffer_solar_per_unit=self._learning_buffer_solar_per_unit,
+                energy_sensors=sensors_for_replay,
+                learning_rate=self.learning_rate,
+                balance_point=self.balance_point,
+                aux_affected_entities=self.aux_affected_entities,
+                unit_strategies=self._unit_strategies,
+                daily_history=self._daily_history,
+                unit_min_base=self._per_unit_min_base_thresholds or None,
+                return_diagnostics=True,
+            )
+            _LOGGER.info(
+                f"Solar NLMS replay: {solar_replay_diagnostics.get('updates', 0)} updates "
+                f"over {len(entries)} entries (unit={entity_id or 'all'})"
+            )
+
         await self._async_save_data(force=True)
+
+        return {
+            "status": "reset",
+            "unit_entity_id": entity_id,
+            "replay_from_history": replay_from_history,
+            "solar_replay_diagnostics": solar_replay_diagnostics,
+        }
 
     async def async_migrate_aux_coefficients(self, new_aux_affected_entities: list[str]):
         """Migrate auxiliary coefficients when the affected entities list changes.
@@ -724,920 +881,222 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Import historical data from CSV."""
         await self.storage.import_csv_data(file_path, mapping, update_model)
 
-    async def retrain_from_history(self, days_back: int | None = None, reset_first: bool = False, experimental_cop_smear: bool = False) -> dict:
-        """Retrain the learning model from existing hourly log data.
-
-        Track A (daily_learning_mode=False): replays each logged hour through
-        learn_from_historical_import(), honouring aux/base routing.
-
-        Track B (daily_learning_mode=True): groups hours by day and applies the
-        same midnight EMA logic as the live calibration. Thermal mass correction
-        is applied when an indoor_temp_sensor is configured AND the hourly log
-        contains 'indoor_temp' entries; otherwise it is skipped gracefully.
-        """
-        if reset_first:
-            self._correlation_data.clear()
-            self._correlation_data_per_unit.clear()
-            self._aux_coefficients.clear()
-            self._aux_coefficients_per_unit.clear()
-            self._learning_buffer_global.clear()
-            self._learning_buffer_per_unit.clear()
-            self._learning_buffer_aux_per_unit.clear()
-            self._solar_coefficients_per_unit.clear()
-            self._learning_buffer_solar_per_unit.clear()
-            self._observation_counts.clear()
-            self._learned_u_coefficient = None
-            self._invalidate_model_cache()
-            _LOGGER.info("retrain_from_history: Model reset before retraining.")
-
-        if days_back is not None:
-            from homeassistant.util import dt as dt_util
-            from datetime import timedelta
-            cutoff_str = (dt_util.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-            entries = [e for e in self._hourly_log if e.get("timestamp", "") >= cutoff_str]
-        else:
-            entries = list(self._hourly_log)
-
-        if not entries:
-            return {"status": "no_data", "entries_processed": 0, "days_processed": 0, "learning_count": 0}
-
-        learning_count = 0
-
-        def _is_poisoned(entry: dict, daily_mode: bool = False) -> bool:
-            s = entry.get("learning_status", "unknown")
-            # In daily_learning_mode, "disabled" is the normal state for every hour
-            # (Track A is blocked from writing to correlation_data). These hours
-            # contain valid sensor data and must NOT be filtered out for Track B/C
-            # daily aggregation.  Only genuine data-quality issues are poisoned.
-            if daily_mode and s == "disabled":
-                return False
-            return s == "disabled" or s.startswith("skipped_") or s == "cooldown_post_aux"
-
-        if self.daily_learning_mode:
-            # Daily learning: batch aggregation per calendar day using strategy dispatch (#776).
-            # Poisoned hours are excluded before grouping so the <22-hour guard
-            # automatically rejects days with too many bad hours.
-            daily_batches: dict[str, list] = {}
-            for entry in entries:
-                if not _is_poisoned(entry, daily_mode=True):
-                    daily_batches.setdefault(entry["timestamp"][:10], []).append(entry)
-
-            days_processed = 0
-            for date_str, day_entries in sorted(daily_batches.items()):
-                if len(day_entries) < 22:
-                    _LOGGER.debug(f"retrain_from_history: Skipping {date_str} — {len(day_entries)}/24 hours")
-                    continue
-
-                total_kwh = sum(e.get("actual_kwh", 0.0) for e in day_entries)
-                daily_tdd = sum(e.get("tdd", 0.0) for e in day_entries)
-
-                if daily_tdd < 0.5 or total_kwh <= 0:
-                    continue
-
-                # Mode filtering (#789): exclude OFF/DHW/Guest/Cooling from retrain.
-                excluded_kwh = self._compute_excluded_mode_energy(day_entries)
-                total_kwh -= excluded_kwh
-
-                if total_kwh <= 0:
-                    continue
-
-                # Determine q_adjusted for U-coefficient.
-                track_c_daily = self._daily_history.get(date_str, {}).get("track_c_kwh")
-                if self.track_c_enabled and track_c_daily is not None:
-                    q_adjusted = track_c_daily
-                    # Backward compat: days stored before non-MPC inclusion.
-                    if self.mpc_managed_sensor and "track_c_kwh_non_mpc" not in self._daily_history.get(date_str, {}):
-                        non_mpc_retrain = 0.0
-                        for log_entry in day_entries:
-                            breakdown = log_entry.get("unit_breakdown", {})
-                            for sid in self.energy_sensors:
-                                if sid != self.mpc_managed_sensor:
-                                    non_mpc_retrain += breakdown.get(sid, 0.0)
-                        q_adjusted += non_mpc_retrain
-                else:
-                    q_adjusted = total_kwh
-                    if self.thermal_mass_kwh_per_degree > 0.0:
-                        from datetime import date as _date, timedelta as _td
-                        prev_day_str = (
-                            _date.fromisoformat(date_str) - _td(days=1)
-                        ).isoformat()
-                        end_temp = self._daily_history.get(date_str, {}).get("midnight_indoor_temp")
-                        start_temp = self._daily_history.get(prev_day_str, {}).get("midnight_indoor_temp")
-                        if end_temp is not None and start_temp is not None:
-                            delta_t_indoor = end_temp - start_temp
-                            q_adjusted = total_kwh - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
-
-                if q_adjusted <= 0:
-                    continue
-
-                # U-coefficient update.
-                observed_u = q_adjusted / daily_tdd
-                if self._learned_u_coefficient is None:
-                    self._learned_u_coefficient = observed_u
-                else:
-                    self._learned_u_coefficient += DEFAULT_DAILY_LEARNING_RATE * (
-                        observed_u - self._learned_u_coefficient
-                    )
-
-                # Bucket learning: Track C uses strategy dispatch, Track B uses flat daily.
-                track_c_dist = self._daily_history.get(date_str, {}).get("track_c_distribution")
-                if track_c_dist:
-                    self._apply_strategies_to_global_model(day_entries, track_c_dist)
-                else:
-                    # Check for stored COP-smeared distribution, or generate
-                    # on-the-fly if experimental_cop_smear is active (#793).
-                    track_b_cop_dist = self._daily_history.get(date_str, {}).get("track_b_cop_distribution")
-                    if not track_b_cop_dist and experimental_cop_smear:
-                        cop_smeared = await self._try_track_b_cop_smearing(
-                            day_entries, q_adjusted, date_str,
-                        )
-                        if cop_smeared is not None:
-                            _LOGGER.info(f"retrain COP-smear (#793): {date_str} -> {cop_smeared} bucket updates")
-                            # Per-unit replay + continue — bucket writing already done
-                            self._replay_per_unit_models(day_entries)
-                            learning_count += 1
-                            days_processed += 1
-                            continue
-                    if track_b_cop_dist:
-                        self._apply_strategies_to_global_model(day_entries, track_b_cop_dist)
-                    else:
-                        # Track B flattened daily bucket learning.
-                        # Apply accumulated solar normalization delta (#792).
-                        retrain_solar_delta = sum(
-                            e.get("solar_normalization_delta", 0.0) for e in day_entries
-                        )
-                        q_retrain_normalized = max(0.0, q_adjusted + retrain_solar_delta)
-                        q_hourly_avg = q_retrain_normalized / 24.0
-                        avg_temp_retrain = sum(e.get("temp", 0.0) for e in day_entries) / len(day_entries)
-                        daily_wind_retrain = sum(e.get("effective_wind", 0.0) for e in day_entries) / len(day_entries)
-                        flat_temp_key = str(int(round(avg_temp_retrain)))
-                        flat_wind_bucket = self._get_wind_bucket(daily_wind_retrain)
-
-                        if flat_temp_key not in self._correlation_data:
-                            self._correlation_data[flat_temp_key] = {}
-                        current_pred = self._correlation_data[flat_temp_key].get(flat_wind_bucket, 0.0)
-
-                        if current_pred == 0.0:
-                            self._correlation_data[flat_temp_key][flat_wind_bucket] = round(q_hourly_avg, 5)
-                        else:
-                            new_pred = current_pred + self.learning_rate * (q_hourly_avg - current_pred)
-                            self._correlation_data[flat_temp_key][flat_wind_bucket] = round(new_pred, 5)
-
-                # Per-unit model replay for DirectMeter sensors (needed for isolate_sensor).
-                self._replay_per_unit_models(day_entries)
-
-                learning_count += 1
-                days_processed += 1
-
-            self.data["learned_u_coefficient"] = self._learned_u_coefficient
-            self._invalidate_model_cache()
-            await self.storage.async_save_data(force=True)
-
-            _LOGGER.info(
-                f"retrain_from_history: Completed. "
-                f"{days_processed} days learned, U-coefficient={self._learned_u_coefficient}"
-            )
-            return {
-                "status": "completed",
-                "mode": "strategy_dispatch",
-                "entries_processed": len(entries),
-                "days_processed": days_processed,
-                "learning_count": learning_count,
-                "learned_u_coefficient": round(self._learned_u_coefficient, 4) if self._learned_u_coefficient is not None else None,
-            }
-
-        else:
-            # Track A: per-hour replay
-            temp_history: list[float] = []
-            skipped = 0
-
-            for entry in entries:
-                actual_kwh = entry.get("actual_kwh")
-                if actual_kwh is None:
-                    skipped += 1
-                    continue
-
-                temp = entry.get("temp", 0.0)
-                wind_bucket = entry.get("wind_bucket", "normal")
-                is_aux = entry.get("auxiliary_active", False)
-
-                if len(temp_history) >= 4:
-                    temp_history.pop(0)
-                temp_history.append(temp)
-
-                # Skip poisoned hours — but only after updating temp_history so the
-                # inertia sliding window stays accurate for subsequent hours.
-                if _is_poisoned(entry):
-                    skipped += 1
-                    continue
-
-                inertia_avg = sum(temp_history) / len(temp_history)
-                temp_key = str(int(round(inertia_avg)))
-
-                status = self.learning.learn_from_historical_import(
-                    temp_key=temp_key,
-                    wind_bucket=wind_bucket,
-                    actual_kwh=actual_kwh,
-                    is_aux_active=is_aux,
-                    correlation_data=self._correlation_data,
-                    aux_coefficients=self._aux_coefficients,
-                    learning_rate=self.learning_rate,
-                    get_predicted_kwh_fn=self._get_predicted_kwh,
-                    actual_temp=temp,
-                )
-                if "skipped" not in status:
-                    learning_count += 1
-                else:
-                    skipped += 1
-
-            self._invalidate_model_cache()
-            await self.storage.async_save_data(force=True)
-
-            _LOGGER.info(
-                f"retrain_from_history Track A: Completed. "
-                f"{learning_count} entries learned, {skipped} skipped."
-            )
-            return {
-                "status": "completed",
-                "mode": "track_a_hourly",
-                "entries_processed": len(entries),
-                "days_processed": len({e["timestamp"][:10] for e in entries}),
-                "learning_count": learning_count,
-                "skipped": skipped,
-            }
+    async def retrain_from_history(
+        self,
+        days_back: int | None = None,
+        reset_first: bool = False,
+        experimental_cop_smear: bool = False,
+    ) -> dict:
+        """Delegates to :class:`retrain.RetrainEngine`."""
+        return await self._retrain.retrain_from_history(
+            days_back=days_back,
+            reset_first=reset_first,
+            experimental_cop_smear=experimental_cop_smear,
+        )
 
     def diagnose_model(self, days_back: int = 30) -> dict:
-        """Analyze the learned model and history for data quality issues.
+        """Delegates to :class:`diagnostics.DiagnosticsEngine`."""
+        return self._diagnostics.diagnose_model(days_back)
 
-        Returns a diagnostic dict with monotonicity check, bucket
-        population, mode contamination, solar correlation, and
-        Track B specifics.  Designed as a service response.
+    def _calibrate_per_unit_min_base_thresholds(
+        self,
+        *,
+        sample_days: int = 30,
+        require_min_hours_of_log: int | None = None,
+    ) -> dict:
+        """Compute per-unit min-base noise floor from dark-hour actuals (#871).
+
+        Replaces the global 0.15 kWh gate with a per-sensor p10 of
+        dark-hour (``solar_factor < PER_UNIT_MIN_BASE_DARK_SOLAR_FACTOR``)
+        metered consumption.  Dark-hour filtering isolates the non-solar
+        base-demand distribution; p10 captures the operating-noise floor
+        without being skewed by the tail of idle samples.
+
+        Safety guards (in order):
+            1. Requires ≥ ``PER_UNIT_MIN_BASE_MIN_HOURS_OF_LOG`` hours of
+               log data overall (14 × 24 by default).  Fresh installs
+               skip calibration and continue on the global fallback.
+            2. Requires ≥ ``PER_UNIT_MIN_BASE_MIN_SAMPLES`` dark-hour
+               samples per unit.  Under-sampled units keep their prior
+               value (or skip entirely if never calibrated).
+            3. Rejects when ``p10 / median(dark_samples)`` exceeds
+               ``PER_UNIT_MIN_BASE_MAX_P10_MEDIAN_RATIO``.  A legitimate
+               noise floor sits far below typical consumption; a ratio
+               near 1.0 indicates an always-on load (electric boiler
+               mislabeled as heat-pump heating, sensor scoped to a
+               shared circuit) where p10 is not a noise floor at all.
+               Primary physics-grounded filter.
+            4. Clamps p10 from below to ``PER_UNIT_MIN_BASE_FLOOR``;
+               absolute ceiling ``PER_UNIT_MIN_BASE_CEILING`` acts as
+               a safety net behind the ratio-guard.
+            5. Limits rate-of-change to
+               ``PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE`` per run (±50 %
+               vs previous value).  Protects against a single anomalous
+               week flipping the threshold.
+
+        Only heating-mode samples contribute.  Aux-active hours and guest
+        modes are excluded — matches the live learning exclusion set.
+
+        Returns a diagnostic dict usable by the ``calibrate_unit_thresholds``
+        service and the startup log; ``self._per_unit_min_base_thresholds``
+        is updated in-place.
         """
-        from .const import MODES_EXCLUDED_FROM_GLOBAL_LEARNING
-
-        result: dict = {}
-
-        # --- 1. Monotonicity check per wind bucket ---
-        monotonicity: dict[str, dict] = {}
-        for wind_bucket in ("normal", "high_wind", "extreme_wind"):
-            # Collect (temp_key_int, kwh) pairs for this bucket.
-            points: list[tuple[int, float]] = []
-            for temp_key_str, buckets in self._correlation_data.items():
-                if wind_bucket in buckets:
-                    try:
-                        points.append((int(temp_key_str), buckets[wind_bucket]))
-                    except (ValueError, TypeError):
-                        continue
-            if len(points) < 2:
-                monotonicity[wind_bucket] = {
-                    "status": "insufficient_data",
-                    "points": len(points),
-                }
-                continue
-
-            points.sort(key=lambda p: p[0], reverse=True)  # warmest first
-            inversions = []
-            for i in range(len(points) - 1):
-                t_warm, kwh_warm = points[i]
-                t_cold, kwh_cold = points[i + 1]
-                if kwh_cold < kwh_warm:
-                    inversions.append({
-                        "from_temp": t_warm,
-                        "to_temp": t_cold,
-                        "kwh_warm": round(kwh_warm, 4),
-                        "kwh_cold": round(kwh_cold, 4),
-                        "delta": round(kwh_warm - kwh_cold, 4),
-                    })
-            monotonicity[wind_bucket] = {
-                "status": "monotonic" if not inversions else "inversions_found",
-                "points": len(points),
-                "temp_range": [points[-1][0], points[0][0]],
-                "inversions": inversions,
-            }
-        result["monotonicity"] = monotonicity
-
-        # --- 2. Bucket population ---
-        bucket_pop: dict[str, dict] = {}
-        total_observations = 0
-        for temp_key_str, buckets in self._correlation_data.items():
-            for wind_bucket, kwh in buckets.items():
-                if wind_bucket not in bucket_pop:
-                    bucket_pop[wind_bucket] = {"count": 0, "temp_keys": []}
-                bucket_pop[wind_bucket]["count"] += 1
-                bucket_pop[wind_bucket]["temp_keys"].append(temp_key_str)
-                total_observations += 1
-
-        # Check for under-sampled buckets via learning buffers.
-        buffered_buckets = 0
-        for temp_key_str, buckets in self._learning_buffer_global.items():
-            for wind_bucket, samples in buckets.items():
-                if samples:
-                    buffered_buckets += 1
-
-        bucket_summary = {
-            "total_buckets_learned": total_observations,
-            "buffered_pending": buffered_buckets,
-            "per_wind_bucket": {
-                wb: {"bucket_count": info["count"], "temp_range": [
-                    min(info["temp_keys"], key=int) if info["temp_keys"] else None,
-                    max(info["temp_keys"], key=int) if info["temp_keys"] else None,
-                ]}
-                for wb, info in bucket_pop.items()
-            },
-        }
-        result["bucket_population"] = bucket_summary
-
-        # --- 3. Mode contamination (from hourly log) ---
+        from datetime import timedelta
         from homeassistant.util import dt as dt_util
-        now = dt_util.now()
-        cutoff_str = (now - timedelta(days=days_back)).date().isoformat() if days_back else None
+        from .const import (
+            MODE_HEATING,
+            PER_UNIT_MIN_BASE_CEILING,
+            PER_UNIT_MIN_BASE_DARK_SOLAR_FACTOR,
+            PER_UNIT_MIN_BASE_FLOOR,
+            PER_UNIT_MIN_BASE_MAX_P10_MEDIAN_RATIO,
+            PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE,
+            PER_UNIT_MIN_BASE_MIN_HOURS_OF_LOG,
+            PER_UNIT_MIN_BASE_MIN_SAMPLES,
+        )
 
-        mode_stats: dict[str, dict[str, int]] = {}
-        total_hours = 0
-        excluded_kwh_total = 0.0
+        min_hours = (
+            PER_UNIT_MIN_BASE_MIN_HOURS_OF_LOG
+            if require_min_hours_of_log is None
+            else require_min_hours_of_log
+        )
+        total_hours = len(self._hourly_log)
+        result = {
+            "total_log_hours": total_hours,
+            "required_log_hours": min_hours,
+            "sample_days": sample_days,
+            "status": "ok",
+            "units": {},
+            "updated": {},
+            "rejected": {},
+            "skipped": {},
+        }
+        if total_hours < min_hours:
+            result["status"] = "insufficient_log_data"
+            return result
 
+        cutoff_iso = (dt_util.now() - timedelta(days=sample_days)).date().isoformat()
+
+        # Collect dark-hour actuals per unit.
+        samples: dict[str, list[float]] = {sid: [] for sid in self.energy_sensors}
         for entry in self._hourly_log:
             ts = entry.get("timestamp", "")
-            if cutoff_str and ts[:10] < cutoff_str:
+            if ts[:10] < cutoff_iso:
                 continue
-            total_hours += 1
-            day = ts[:10]
-            if day not in mode_stats:
-                mode_stats[day] = {"total_hours": 0, "excluded_hours": 0, "excluded_kwh": 0.0, "modes": {}}
-            mode_stats[day]["total_hours"] += 1
-
-            unit_modes = entry.get("unit_modes", {})
-            breakdown = entry.get("unit_breakdown", {})
-            for sid, kwh in breakdown.items():
-                mode = unit_modes.get(sid, "heating")
-                if mode != "heating":
-                    mode_stats[day]["modes"][mode] = mode_stats[day]["modes"].get(mode, 0) + 1
-                if mode in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
-                    mode_stats[day]["excluded_hours"] += 1
-                    mode_stats[day]["excluded_kwh"] += kwh
-                    excluded_kwh_total += kwh
-
-        # Summarize — only report days with excluded energy.
-        contaminated_days = {
-            day: stats for day, stats in mode_stats.items()
-            if stats["excluded_hours"] > 0
-        }
-        result["mode_contamination"] = {
-            "days_analyzed": len(mode_stats),
-            "total_hours_analyzed": total_hours,
-            "contaminated_days": len(contaminated_days),
-            "total_excluded_kwh": round(excluded_kwh_total, 2),
-            "details": dict(sorted(contaminated_days.items())[-10:]),  # Last 10 affected days
-        }
-
-        # --- 4. Solar correlation ---
-        # Use a low threshold (> 0.01) to capture any hour with measurable solar.
-        # The 0.05 threshold used in learning is too strict for diagnostics —
-        # we want to see if there's ANY solar signal in the data.
-        solar_errors: list[tuple[float, float]] = []
-        for entry in self._hourly_log:
-            ts = entry.get("timestamp", "")
-            if cutoff_str and ts[:10] < cutoff_str:
+            if entry.get("auxiliary_active", False):
                 continue
-            solar_f = entry.get("solar_factor")
-            actual = entry.get("actual_kwh")
-            expected = entry.get("expected_kwh")
-            if solar_f is not None and actual is not None and expected is not None and solar_f > 0.01:
-                solar_errors.append((solar_f, actual - expected))
-
-        solar_diag: dict = {"qualifying_hours": len(solar_errors)}
-
-        # Report max solar_factor seen in the period regardless of qualification.
-        all_solar_factors = [
-            entry.get("solar_factor", 0.0) for entry in self._hourly_log
-            if (not cutoff_str or entry.get("timestamp", "")[:10] >= cutoff_str)
-            and entry.get("solar_factor") is not None
-        ]
-        if all_solar_factors:
-            solar_diag["max_solar_factor_in_period"] = round(max(all_solar_factors), 3)
-            solar_diag["hours_with_any_solar"] = sum(1 for f in all_solar_factors if f > 0.0)
-
-        if len(solar_errors) >= 10:
-            avg_solar = sum(s for s, _ in solar_errors) / len(solar_errors)
-            avg_error = sum(e for _, e in solar_errors) / len(solar_errors)
-            # Simple correlation: positive = solar hours have positive error (under-predicted solar reduction)
-            n = len(solar_errors)
-            mean_s = avg_solar
-            mean_e = avg_error
-            cov = sum((s - mean_s) * (e - mean_e) for s, e in solar_errors) / n
-            var_s = sum((s - mean_s) ** 2 for s, _ in solar_errors) / n
-            var_e = sum((e - mean_e) ** 2 for _, e in solar_errors) / n
-            denom = (var_s * var_e) ** 0.5
-            correlation = round(cov / denom, 3) if denom > 0 else 0.0
-            solar_diag["correlation_solar_vs_error"] = correlation
-            solar_diag["avg_solar_factor"] = round(avg_solar, 3)
-            solar_diag["avg_error_kwh"] = round(avg_error, 3)
-            solar_diag["interpretation"] = (
-                "Positive correlation: solar hours have higher-than-expected consumption — solar model may be under-subtracting."
-                if correlation > 0.15 else
-                "Negative correlation: solar hours have lower-than-expected consumption — solar model may be over-subtracting."
-                if correlation < -0.15 else
-                "No significant correlation — solar model appears well-calibrated."
-            )
-        result["solar_correlation"] = solar_diag
-
-        # --- 5. Track B diagnostics ---
-        track_b_days: list[dict] = []
-        for day_key, day_data in sorted(self._daily_history.items()):
-            if cutoff_str and day_key < cutoff_str:
+            solar_factor = entry.get("solar_factor") or 0.0
+            if solar_factor >= PER_UNIT_MIN_BASE_DARK_SOLAR_FACTOR:
                 continue
-            if "kwh" not in day_data:
-                continue
-            track_b_entry: dict = {
-                "date": day_key,
-                "raw_kwh": round(day_data["kwh"], 2),
-                "temp_avg": round(day_data.get("temp", 0.0), 1),
-                "tdd": round(day_data.get("tdd", 0.0), 2),
-                "wind_avg": round(day_data.get("wind", 0.0), 1),
+            unit_modes = entry.get("unit_modes", {}) or {}
+            unit_breakdown = entry.get("unit_breakdown", {}) or {}
+            for sid in self.energy_sensors:
+                mode = unit_modes.get(sid, MODE_HEATING)
+                if mode != MODE_HEATING:
+                    continue
+                if sid not in unit_breakdown:
+                    continue
+                actual = unit_breakdown.get(sid, 0.0)
+                if actual is None or actual < 0.0:
+                    continue
+                samples[sid].append(float(actual))
+
+        def _p10(values: list[float]) -> float:
+            if not values:
+                return 0.0
+            s = sorted(values)
+            # Nearest-rank p10, 1-indexed: idx = ceil(0.10 × n) - 1 in 0-indexed.
+            # math.ceil is required (not round): round underestimates the
+            # rank for n ∈ {21..25} — and Python's banker's rounding flips
+            # n=25 to 2 rather than 3 — which would bias calibrated
+            # thresholds downward and let noisy low-base hours through
+            # the NLMS gate.
+            idx = max(0, math.ceil(0.10 * len(s)) - 1)
+            return s[idx]
+
+        for sid in self.energy_sensors:
+            dark = samples.get(sid, [])
+            n = len(dark)
+            prior = self._per_unit_min_base_thresholds.get(sid)
+            unit_report = {
+                "dark_samples": n,
+                "prior": prior,
+                "p10_actual": None,
+                "effective": prior,
+                "method": "prior" if prior is not None else "fallback",
             }
-            if "track_c_kwh" in day_data:
-                track_b_entry["track_c_kwh"] = round(day_data["track_c_kwh"], 2)
-                track_b_entry["track"] = "C"
-            elif "track_b_cop_distribution" in day_data:
-                track_b_entry["track"] = "B_cop_smeared"
-            else:
-                track_b_entry["track"] = "B_flat" if self.daily_learning_mode else "A"
-            if "midnight_indoor_temp" in day_data:
-                track_b_entry["midnight_indoor_temp"] = day_data["midnight_indoor_temp"]
-            track_b_days.append(track_b_entry)
+            if n < PER_UNIT_MIN_BASE_MIN_SAMPLES:
+                unit_report["status"] = "skipped_low_samples"
+                result["skipped"][sid] = unit_report
+                result["units"][sid] = unit_report
+                continue
 
-        result["daily_history"] = {
-            "days": len(track_b_days),
-            "entries": track_b_days[-30:],  # Last 30 days
-        }
+            p10 = _p10(dark)
+            unit_report["p10_actual"] = round(p10, 5)
 
-        result["config_summary"] = {
-            "daily_learning_mode": self.daily_learning_mode,
-            "track_c_enabled": self.track_c_enabled,
-            "balance_point": self.balance_point,
-            "learning_rate": self.learning_rate,
-            "wind_threshold": self.wind_threshold,
-            "extreme_wind_threshold": self.extreme_wind_threshold,
-            "solar_enabled": self.solar_enabled,
-            "learned_u_coefficient": round(self._learned_u_coefficient, 4) if self._learned_u_coefficient else None,
-            "energy_sensors": self.energy_sensors,
-        }
+            # Ratio-guard (primary filter): a legitimate noise floor
+            # sits far below typical consumption.  A sorted-dark-sample
+            # distribution where p10 approaches the median means the
+            # sensor is measuring an always-on load rather than a
+            # modulating heat pump — no noise floor exists to calibrate.
+            sorted_dark = sorted(dark)
+            median = sorted_dark[len(sorted_dark) // 2]
+            unit_report["median_actual"] = round(median, 5)
+            if median > 0.0 and p10 > PER_UNIT_MIN_BASE_MAX_P10_MEDIAN_RATIO * median:
+                unit_report["status"] = "rejected_constant_load"
+                unit_report["p10_over_median"] = round(p10 / median, 3)
+                _LOGGER.warning(
+                    "Per-unit min-base calibration rejected for %s: "
+                    "p10=%.3f kWh is %.0f%% of median=%.3f — distribution "
+                    "suggests an always-on load, not a modulating heat pump. "
+                    "Keeping %s.",
+                    sid, p10, 100.0 * p10 / median, median,
+                    f"prior {prior:.3f}" if prior else "global fallback",
+                )
+                result["rejected"][sid] = unit_report
+                result["units"][sid] = unit_report
+                continue
 
+            # Absolute ceiling (safety net behind the ratio-guard).
+            if p10 > PER_UNIT_MIN_BASE_CEILING:
+                unit_report["status"] = "rejected_above_ceiling"
+                _LOGGER.warning(
+                    "Per-unit min-base calibration rejected for %s: p10=%.3f kWh "
+                    "exceeds ceiling %.3f — keeping %s.",
+                    sid, p10, PER_UNIT_MIN_BASE_CEILING,
+                    f"prior {prior:.3f}" if prior else "global fallback",
+                )
+                result["rejected"][sid] = unit_report
+                result["units"][sid] = unit_report
+                continue
+
+            candidate = max(PER_UNIT_MIN_BASE_FLOOR, p10)
+
+            # Rate-of-change clamp vs prior value.
+            if prior is not None and prior > 0.0:
+                lo = prior * (1.0 - PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE)
+                hi = prior * (1.0 + PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE)
+                clamped = min(hi, max(lo, candidate))
+                if clamped != candidate:
+                    unit_report["rate_clamped_from"] = round(candidate, 5)
+                candidate = max(PER_UNIT_MIN_BASE_FLOOR, clamped)
+
+            new_value = round(candidate, 5)
+            self._per_unit_min_base_thresholds[sid] = new_value
+            unit_report["effective"] = new_value
+            unit_report["method"] = "auto"
+            unit_report["status"] = "updated"
+            result["updated"][sid] = unit_report
+            result["units"][sid] = unit_report
+
+        _LOGGER.info(
+            "Per-unit min-base calibration complete: updated=%d, rejected=%d, skipped=%d",
+            len(result["updated"]), len(result["rejected"]), len(result["skipped"]),
+        )
         return result
 
     def diagnose_solar(self, days_back: int = 30, apply_battery_decay: bool = False) -> dict:
-        """Analyze per-unit solar coefficient health and global solar model quality.
-
-        Single-pass over hourly_log. Returns a diagnostic dict with per-unit
-        coefficient validation, global battery/screen health, and temporal bias.
-        Includes battery decay calibration: sweeps decay rates 0.50-0.95 to find
-        the optimal value for this building. Designed as a service response (#810).
-        """
-        from datetime import timedelta, date as _date
-        from homeassistant.util import dt as dt_util
-        from .const import (
-            MODE_HEATING, MODE_COOLING, MODE_OFF, MODE_DHW,
-            MODE_GUEST_HEATING, MODE_GUEST_COOLING,
-        )
-        from .solar import SolarCalculator as _SC
-
-        now = dt_util.now()
-        cutoff = (now - timedelta(days=days_back)).date().isoformat()
-
-        # --- Accumulators ---
-        # Per-unit: normal equations for implied coefficient (3 windows + 30d total)
-        window_boundaries = [days_back, int(days_back * 2 / 3), int(days_back / 3), 0]
-        unit_accum: dict[str, dict] = {}  # entity_id -> accumulators
-
-        def _get_unit_accum(eid: str) -> dict:
-            if eid not in unit_accum:
-                unit_accum[eid] = {
-                    # Normal equations for 30d implied coefficient (3x3: S, E, W)
-                    "ss": 0.0, "ee": 0.0, "ww": 0.0,
-                    "se": 0.0, "sw": 0.0, "ew": 0.0,
-                    "sI": 0.0, "eI": 0.0, "wI": 0.0, "n": 0,
-                    # 3-window stability (each has own normal eqs)
-                    "windows": [
-                        {"ss": 0.0, "ee": 0.0, "ww": 0.0,
-                         "se": 0.0, "sw": 0.0, "ew": 0.0,
-                         "sI": 0.0, "eI": 0.0, "wI": 0.0, "n": 0}
-                        for _ in range(3)
-                    ],
-                    # Delta accumulator
-                    "sum_delta": 0.0, "delta_n": 0,
-                    # Temporal bias
-                    "morning_delta": 0.0, "morning_n": 0,
-                    "afternoon_delta": 0.0, "afternoon_n": 0,
-                    # Saturation counter
-                    "saturated": 0, "qualifying": 0,
-                }
-            return unit_accum[eid]
-
-        # Global accumulators
-        excluded = {"aux": 0, "guest": 0, "saturated": 0, "low_vector": 0, "no_base": 0, "legacy": 0}
-        total_qualifying = 0
-
-        # Battery calibration: collect per-day hourly sequences for decay sweep.
-        # Key = date string, value = list of (hour, solar_impact_raw, actual, expected)
-        day_sequences: dict[str, list[tuple]] = {}
-        # Battery health: post-sunset hours (using current decay)
-        battery_residuals: list[float] = []
-
-        # Screen stratification
-        screen_closed_errors: list[float] = []  # correction < 50, solar_factor > 0.3
-        screen_open_errors: list[float] = []    # correction > 80, solar_factor > 0.3
-
-        # Hour-of-day residual curve (hours 6-18)
-        hourly_residuals: dict[int, list[float]] = {h: [] for h in range(6, 19)}
-
-        # --- Single pass ---
-        for entry in self._hourly_log:
-            ts = entry.get("timestamp", "")
-            if ts[:10] < cutoff:
-                continue
-
-            hour = entry.get("hour", -1)
-            solar_factor = entry.get("solar_factor") or 0.0
-            solar_s = entry.get("solar_vector_s", 0.0)
-            solar_e = entry.get("solar_vector_e", 0.0)
-            solar_w = entry.get("solar_vector_w", 0.0)
-            vector_mag = (solar_s ** 2 + solar_e ** 2 + solar_w ** 2) ** 0.5
-            correction = entry.get("correction_percent", 100.0)
-            solar_impact_raw = entry.get("solar_impact_raw_kwh", 0.0)
-            solar_impact_eff = entry.get("solar_impact_kwh", 0.0)
-            aux_active = entry.get("auxiliary_active", False)
-            guest_kwh = entry.get("guest_impact_kwh", 0.0)
-            unit_modes = entry.get("unit_modes", {})
-            unit_breakdown = entry.get("unit_breakdown", {})
-            unit_expected_base = entry.get("unit_expected_breakdown", {})
-
-            # Battery health: post-sunset hours with residual battery charge
-            if solar_factor < 0.01 and solar_impact_eff > 0.05:
-                actual_total = entry.get("actual_kwh", 0.0)
-                expected_total = entry.get("expected_kwh", 0.0)
-                if expected_total > 0.05:
-                    battery_residuals.append(actual_total - expected_total)
-
-            # Collect day sequences for battery decay calibration sweep
-            day_key = ts[:10]
-            actual_total = entry.get("actual_kwh", 0.0)
-            expected_total = entry.get("expected_kwh", 0.0)
-            if day_key not in day_sequences:
-                day_sequences[day_key] = []
-            day_sequences[day_key].append((hour, solar_impact_raw, actual_total, expected_total))
-
-            # Days-ago for window assignment
-            try:
-                days_ago = (now.date() - _date.fromisoformat(ts[:10])).days
-            except (ValueError, TypeError):
-                days_ago = 0
-
-            # Per-unit analysis
-            for entity_id in self.energy_sensors:
-                mode = unit_modes.get(entity_id, MODE_HEATING)
-                if mode in (MODE_OFF, MODE_DHW, MODE_GUEST_HEATING, MODE_GUEST_COOLING):
-                    if mode in (MODE_GUEST_HEATING, MODE_GUEST_COOLING):
-                        excluded["guest"] += 1
-                    continue
-
-                if aux_active:
-                    excluded["aux"] += 1
-                    continue
-
-                if vector_mag < 0.01:
-                    excluded["low_vector"] += 1
-                    continue
-
-                actual_unit = unit_breakdown.get(entity_id, 0.0)
-                base_unit = unit_expected_base.get(entity_id)
-                if base_unit is None:
-                    excluded["no_base"] += 1
-                    continue
-
-                # Implied solar reduction
-                if mode == MODE_HEATING:
-                    implied_solar = base_unit - actual_unit
-                elif mode == MODE_COOLING:
-                    implied_solar = actual_unit - base_unit
-                else:
-                    continue
-
-                # Check saturation
-                acc = _get_unit_accum(entity_id)
-                acc["qualifying"] += 1
-                if mode == MODE_HEATING and actual_unit < 0.05 * base_unit and base_unit > 0.05:
-                    acc["saturated"] += 1
-                    excluded["saturated"] += 1
-                    continue
-
-                implied_solar = max(0.0, implied_solar)
-
-                # Modeled solar for this unit.
-                # Reconstruct potential vector from effective + screen transmittance.
-                # Coeff already absorbs transmittance via NLMS, so no extra factor.
-                diag_transmittance = _SC._screen_transmittance(correction) if correction is not None else 1.0
-                if diag_transmittance > 0.01:
-                    diag_potential = (solar_s / diag_transmittance, solar_e / diag_transmittance, solar_w / diag_transmittance)
-                else:
-                    diag_potential = (solar_s, solar_e, solar_w)
-                unit_coeff = self.solar.calculate_unit_coefficient(entity_id, entry.get("temp_key", "10"))
-                modeled_solar = self.solar.calculate_unit_solar_impact(diag_potential, unit_coeff)
-                delta = modeled_solar - implied_solar
-
-                total_qualifying += 1
-
-                # Normal equations (30d total, 3x3)
-                acc["ss"] += solar_s * solar_s
-                acc["ee"] += solar_e * solar_e
-                acc["ww"] += solar_w * solar_w
-                acc["se"] += solar_s * solar_e
-                acc["sw"] += solar_s * solar_w
-                acc["ew"] += solar_e * solar_w
-                acc["sI"] += solar_s * implied_solar
-                acc["eI"] += solar_e * implied_solar
-                acc["wI"] += solar_w * implied_solar
-                acc["n"] += 1
-
-                # Window assignment
-                for w_idx in range(3):
-                    w_start = window_boundaries[w_idx]
-                    w_end = window_boundaries[w_idx + 1]
-                    if w_end <= days_ago < w_start:
-                        w = acc["windows"][w_idx]
-                        w["ss"] += solar_s * solar_s
-                        w["ee"] += solar_e * solar_e
-                        w["ww"] += solar_w * solar_w
-                        w["se"] += solar_s * solar_e
-                        w["sw"] += solar_s * solar_w
-                        w["ew"] += solar_e * solar_w
-                        w["sI"] += solar_s * implied_solar
-                        w["eI"] += solar_e * implied_solar
-                        w["wI"] += solar_w * implied_solar
-                        w["n"] += 1
-                        break
-
-                # Delta
-                acc["sum_delta"] += delta
-                acc["delta_n"] += 1
-
-                # Temporal bias
-                if 6 <= hour <= 11:
-                    acc["morning_delta"] += delta
-                    acc["morning_n"] += 1
-                elif 12 <= hour <= 17:
-                    acc["afternoon_delta"] += delta
-                    acc["afternoon_n"] += 1
-
-                # Screen stratification (global)
-                if solar_factor > 0.3:
-                    if correction < 50:
-                        screen_closed_errors.append(delta)
-                    elif correction > 80:
-                        screen_open_errors.append(delta)
-
-                # Hour-of-day residual
-                if 6 <= hour <= 18:
-                    hourly_residuals[hour].append(delta)
-
-        # --- Build results ---
-        def _solve_normal(a, n, min_samples=10):
-            """Solve normal equations for implied coefficient.
-
-            Attempts a 3x3 solve (S, E, W).  When the west dimension has
-            no variance (sum_ww ≈ 0, typical for legacy logs without
-            solar_vector_w), falls back to the 2x2 (S, E) system so that
-            diagnose_solar remains useful immediately after upgrading.
-
-            Args:
-                a: dict with keys ss, ee, ww, se, sw, ew, sI, eI, wI.
-                n: number of qualifying samples.
-            """
-            if n < min_samples:
-                return None
-            ss, ee, ww = a["ss"], a["ee"], a["ww"]
-            se, sw, ew = a["se"], a["sw"], a["ew"]
-            sI, eI, wI = a["sI"], a["eI"], a["wI"]
-            # 3x3 determinant via cofactor expansion
-            det = (
-                ss * (ee * ww - ew * ew)
-                - se * (se * ww - ew * sw)
-                + sw * (se * ew - ee * sw)
-            )
-            if abs(det) > 1e-6:
-                # Full 3D solution
-                det_s = (
-                    sI * (ee * ww - ew * ew)
-                    - se * (eI * ww - ew * wI)
-                    + sw * (eI * ew - ee * wI)
-                )
-                det_e = (
-                    ss * (eI * ww - ew * wI)
-                    - sI * (se * ww - ew * sw)
-                    + sw * (se * wI - eI * sw)
-                )
-                det_w = (
-                    ss * (ee * wI - ew * eI)
-                    - se * (se * wI - eI * sw)
-                    + sI * (se * ew - ee * sw)
-                )
-                return {
-                    "s": round(det_s / det, 4),
-                    "e": round(det_e / det, 4),
-                    "w": round(det_w / det, 4),
-                }
-            # Fallback: 2D solve (S, E) when W dimension has no variance
-            # (legacy logs or insufficient afternoon data)
-            det_2d = ss * ee - se * se
-            if abs(det_2d) > 1e-6:
-                return {
-                    "s": round((ee * sI - se * eI) / det_2d, 4),
-                    "e": round((ss * eI - se * sI) / det_2d, 4),
-                    "w": 0.0,
-                }
-            return None
-
-        per_unit = {}
-        for entity_id, acc in unit_accum.items():
-            current = self.solar.calculate_unit_coefficient(entity_id, "10")
-
-            implied_30d = _solve_normal(acc, acc["n"])
-
-            # Physical-space implied (undo screen transmittance)
-            implied_physical = None
-            if implied_30d is not None:
-                # We can't perfectly recover avg transmittance from the log,
-                # but screen_closed + screen_open counts give us a proxy.
-                # Use the formula: physical = effective / transmittance.
-                # For simplicity, use current correction_percent from coordinator.
-                current_correction = self.solar_correction_percent
-                transmittance = _SC._screen_transmittance(current_correction)
-                if transmittance > 0.1:
-                    implied_physical = {
-                        "s": round(implied_30d["s"] / transmittance, 4),
-                        "e": round(implied_30d["e"] / transmittance, 4),
-                        "w": round(implied_30d["w"] / transmittance, 4),
-                    }
-
-            # Stability windows
-            stability = []
-            for w in acc["windows"]:
-                coeff = _solve_normal(w, w["n"], min_samples=5)
-                stability.append({"coefficient": coeff, "qualifying_hours": w["n"]})
-
-            # Flags
-            flags = []
-            if acc["qualifying"] > 0 and acc["saturated"] / acc["qualifying"] > 0.3:
-                flags.append("high_saturation")
-            # Coefficient stability: check if S component varies >2x between windows
-            s_values = [w["coefficient"]["s"] for w in stability if w["coefficient"] is not None and abs(w["coefficient"]["s"]) > 0.01]
-            if len(s_values) >= 2 and max(abs(v) for v in s_values) > 2 * min(abs(v) for v in s_values):
-                flags.append("coefficient_unstable")
-            # Under-prediction
-            mean_delta = acc["sum_delta"] / acc["delta_n"] if acc["delta_n"] > 0 else 0.0
-            if mean_delta < -0.1:
-                flags.append("under_predicting_solar")
-            elif mean_delta > 0.1:
-                flags.append("over_predicting_solar")
-
-            # Dominant component
-            cs = abs(current.get("s", 0.0))
-            ce = abs(current.get("e", 0.0))
-            cw = abs(current.get("w", 0.0))
-            total_c = cs + ce + cw
-            dominant = "balanced"
-            if total_c > 0.01:
-                if cs / total_c > 0.9:
-                    dominant = "south"
-                elif ce / total_c > 0.9:
-                    dominant = "east"
-                elif cw / total_c > 0.9:
-                    dominant = "west"
-
-            per_unit[entity_id] = {
-                "current_coefficient": {k: round(v, 4) for k, v in current.items()},
-                "implied_coefficient_30d": implied_30d,
-                "implied_coefficient_physical": implied_physical,
-                "stability_windows": stability,
-                "mean_delta_kwh": round(mean_delta, 4),
-                "saturation_pct": round(100 * acc["saturated"] / acc["qualifying"], 1) if acc["qualifying"] > 0 else 0.0,
-                "dominant_component": dominant,
-                "qualifying_hours": acc["n"],
-                "temporal_bias": {
-                    "morning_mean_delta": round(acc["morning_delta"] / acc["morning_n"], 4) if acc["morning_n"] > 0 else None,
-                    "afternoon_mean_delta": round(acc["afternoon_delta"] / acc["afternoon_n"], 4) if acc["afternoon_n"] > 0 else None,
-                },
-                "flags": flags,
-            }
-
-        # Global metrics
-        global_flags = []
-
-        # Battery health
-        battery_health = {}
-        if battery_residuals:
-            mean_residual = sum(battery_residuals) / len(battery_residuals)
-            battery_health = {
-                "mean_residual_kwh": round(mean_residual, 4),
-                "qualifying_post_sunset_hours": len(battery_residuals),
-                "decay_rate": self.solar_battery_decay,
-                # Negative residual = actual < expected = battery under-credits
-                # post-sunset = decays too fast. Positive = opposite.
-                "assessment": "too_slow" if mean_residual > 0.05 else ("too_fast" if mean_residual < -0.05 else "ok"),
-            }
-            if battery_health["assessment"] != "ok":
-                global_flags.append(f"battery_decay_{battery_health['assessment']}")
-
-        # Battery decay calibration: sweep decay rates to find optimal
-        calibration = {}
-        candidates = [round(0.50 + i * 0.05, 2) for i in range(10)]  # 0.50 to 0.95
-        if day_sequences:
-            best_decay = self.solar_battery_decay
-            best_abs_residual = float("inf")
-            sweep_results = {}
-            for candidate in candidates:
-                total_residual = 0.0
-                n_post_sunset = 0
-                for _day_key, hours in day_sequences.items():
-                    hours_sorted = sorted(hours, key=lambda x: x[0])
-                    sim_battery = 0.0
-                    for h, raw_solar, actual, expected in hours_sorted:
-                        sim_battery = sim_battery * candidate + raw_solar * (1 - candidate)
-                        # Post-sunset: solar_factor ~ 0 but battery > 0
-                        if raw_solar < 0.01 and sim_battery > 0.05 and expected > 0.05:
-                            # expected already includes current battery effect.
-                            # Residual from this candidate = what the candidate battery
-                            # would credit minus what the current battery credited.
-                            # Simpler: just track if actual-expected improves.
-                            total_residual += actual - expected
-                            n_post_sunset += 1
-                if n_post_sunset >= 5:
-                    mean_res = total_residual / n_post_sunset
-                    sweep_results[str(candidate)] = round(mean_res, 4)
-                    if abs(mean_res) < best_abs_residual:
-                        best_abs_residual = abs(mean_res)
-                        best_decay = candidate
-            calibration = {
-                "current_decay": self.solar_battery_decay,
-                "recommended_decay": best_decay,
-                "sweep_results": sweep_results,
-                "post_sunset_hours_evaluated": max(
-                    (sum(1 for h, raw, a, e in hrs if raw < 0.01)
-                     for hrs in day_sequences.values()), default=0
-                ),
-            }
-            if apply_battery_decay and best_decay != self.solar_battery_decay:
-                old_decay = self.solar_battery_decay
-                self.solar_battery_decay = best_decay
-                # Persist to entry.data
-                new_data = {**self.entry.data, "solar_battery_decay": best_decay}
-                self.hass.config_entries.async_update_entry(self.entry, data=new_data)
-                calibration["applied"] = True
-                _LOGGER.info(
-                    "Solar battery decay calibrated: %.2f → %.2f (applied)",
-                    old_decay, best_decay,
-                )
-
-        # Screen impact
-        screen_impact = {}
-        if screen_closed_errors and screen_open_errors:
-            mean_closed = sum(screen_closed_errors) / len(screen_closed_errors)
-            mean_open = sum(screen_open_errors) / len(screen_open_errors)
-            screen_impact = {
-                "mean_error_screens_closed": round(mean_closed, 4),
-                "mean_error_screens_open": round(mean_open, 4),
-                "qualifying_hours_closed": len(screen_closed_errors),
-                "qualifying_hours_open": len(screen_open_errors),
-            }
-            if abs(mean_closed - mean_open) > 0.1:
-                global_flags.append("screen_drift_detected")
-
-        # Temporal bias (global)
-        all_morning = [acc["morning_delta"] / acc["morning_n"] for acc in unit_accum.values() if acc["morning_n"] > 5]
-        all_afternoon = [acc["afternoon_delta"] / acc["afternoon_n"] for acc in unit_accum.values() if acc["afternoon_n"] > 5]
-
-        # Hour-of-day curve
-        hour_curve = {}
-        for h in range(6, 19):
-            vals = hourly_residuals[h]
-            if vals:
-                hour_curve[str(h)] = round(sum(vals) / len(vals), 4)
-
-        return {
-            "global": {
-                "qualifying_hours": total_qualifying,
-                "excluded": excluded,
-                "battery_decay_health": battery_health,
-                "battery_calibration": calibration,
-                "screen_impact": screen_impact,
-                "temporal_bias": {
-                    "morning_mean_delta": round(sum(all_morning) / len(all_morning), 4) if all_morning else None,
-                    "afternoon_mean_delta": round(sum(all_afternoon) / len(all_afternoon), 4) if all_afternoon else None,
-                },
-                "hour_of_day_residual": hour_curve,
-                "flags": global_flags,
-            },
-            "per_unit": per_unit,
-        }
+        """Delegates to :class:`diagnostics.DiagnosticsEngine`."""
+        return self._diagnostics.diagnose_solar(days_back, apply_battery_decay)
 
     def _get_float_state(self, entity_id: str) -> float | None:
         """Helper to get float state from an entity."""
@@ -2558,6 +2017,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 await self._process_daily_data(self._last_day_processed)
             self._last_day_processed = current_time.date()
 
+        # --- Track C pre-midnight snapshot (#855 follow-up) ---
+        # Three attempts per evening so the midnight sync has a usable
+        # fallback when the live MPC call fails.  See _track_c_snapshot
+        # docstring on __init__ for rationale.
+        if self.track_c_enabled and self.daily_learning_mode:
+            await self._maybe_snapshot_track_c(current_time)
+
         # --- Forecast Update ---
         # Now that rollovers are handled, update the forecast.
         # This ensures the new day's snapshot is created with complete inertia data.
@@ -2595,8 +2061,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if self.wind_gust_source == SOURCE_SENSOR:
              if self.wind_gust_sensor:
                  wind_gust = self._get_speed_in_ms(self.wind_gust_sensor)
-                 if wind_gust is None:
-                     # Gusts are often intermittent, maybe debug level?
+                 if wind_gust is None and self.hass.is_running:
+                     # Gusts are often intermittent, debug level.  is_running
+                     # guard suppresses the spurious startup log before
+                     # entities are available (CLAUDE.md Startup warnings).
                      _LOGGER.debug(f"Wind Gust Sensor '{self.wind_gust_sensor}' is unavailable.")
         else:
              wind_gust = self._get_weather_attribute("wind_gust_speed")
@@ -3096,6 +2564,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         correction_percent: float = 0.0,
         potential_solar_factor: float = 0.0,
         solar_normalization_delta: float = 0.0,
+        is_solar_dominant: bool = False,
+        solar_dominant_entities: tuple[str, ...] = (),
     ) -> "HourlyObservation":
         """Build an immutable HourlyObservation from current coordinator state.
 
@@ -3163,28 +2633,32 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             potential_solar_factor=potential_solar_factor,
             was_cooldown_active=was_cooldown_active,
             solar_normalization_delta=solar_normalization_delta,
+            is_solar_dominant=is_solar_dominant,
+            solar_dominant_entities=solar_dominant_entities,
+            battery_filtered_potential=(
+                self._potential_battery_s,
+                self._potential_battery_e,
+                self._potential_battery_w,
+            ),
         )
 
     @property
     def model(self) -> "ModelState":
-        """Cached ModelState holding live references to learned model data.
+        """ModelState view holding live references to learned model data.
 
-        Since ModelState stores references (not copies), reading
-        ``self.model.correlation_data`` is equivalent to reading
-        ``self._correlation_data`` — but makes the dependency explicit
-        and eliminates private-field access from external modules.
+        Returns a fresh ModelState each call.  The instance holds
+        references (not copies) to the coordinator's canonical dicts,
+        so reading ``self.model.correlation_data`` is equivalent to
+        reading ``self._correlation_data`` — but makes the dependency
+        explicit and eliminates private-field access from external
+        modules.
 
-        The instance is created lazily and reused.  If the underlying
-        dicts are replaced (e.g. by storage load), call
-        ``_invalidate_model_cache()`` to force re-creation.
+        No caching.  If a coordinator field is reassigned (e.g. during
+        storage load) the next ``.model`` access picks up the new
+        reference, so the old aliasing footgun that required
+        in-place mutation of the underlying dicts is gone.
         """
-        if self._model_cache is None:
-            self._model_cache = self.get_model_state()
-        return self._model_cache
-
-    def _invalidate_model_cache(self) -> None:
-        """Force re-creation of the cached ModelState on next access."""
-        self._model_cache = None
+        return self.get_model_state()
 
     def get_model_state(self) -> "ModelState":
         """Return a snapshot of the current learned model state.
@@ -3209,6 +2683,35 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             daily_history=self._daily_history,
             hourly_log=self._hourly_log,
         )
+
+    # ------------------------------------------------------------------
+    # Public accessors for runtime state consumed by manager modules.
+    # Managers (StatisticsManager, ForecastManager) read these instead of
+    # reaching into ``coordinator._X`` — keeping the manager/coordinator
+    # boundary explicit.  Model-state fields are exposed via ``model``
+    # (ModelState) above; these accessors cover non-model runtime state
+    # (collector accumulators, daily aggregates, aux cooldown flags).
+    # ------------------------------------------------------------------
+
+    @property
+    def collector(self) -> ObservationCollector:
+        """ObservationCollector holding the current hour's accumulators."""
+        return self._collector
+
+    @property
+    def daily_individual(self) -> dict:
+        """Per-sensor running daily kWh totals."""
+        return self._daily_individual
+
+    @property
+    def aux_cooldown_active(self) -> bool:
+        """True while the aux-heating cooldown window is active."""
+        return self._aux_cooldown_active
+
+    @property
+    def aux_affected_set(self) -> set:
+        """Set of entity IDs flagged as aux-affected (derived from config)."""
+        return self._aux_affected_set
 
     async def _process_hourly_data(self, current_time: datetime):
         """Process the accumulated data for the past hour.
@@ -3463,9 +2966,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Use the authoritative calculation from statistics which correctly applies saturation
         # (Solar cannot reduce consumption below zero or below base - aux)
         solar_impact = 0.0
+        solar_wasted = 0.0
         solar_normalization_delta = 0.0
         if self.solar_enabled:
             solar_impact = res_analysis["breakdown"]["solar_reduction_kwh"]
+            solar_wasted = res_analysis["breakdown"].get("solar_wasted_kwh", 0.0)
             # Saturation-aware solar delta for global model normalization (#801).
             # Heating solar was subtracted from demand; cooling solar was added.
             # To normalize to dark-sky: add heating solar back, subtract cooling solar.
@@ -3487,6 +2992,35 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 self._solar_battery_state * self.solar_battery_decay
                 + solar_impact * (1 - self.solar_battery_decay)
             )
+            # Per-direction potential battery (#865).  Reconstruct the
+            # hour's potential vector from the effective ``avg_solar_vector``
+            # and ``actual_correction`` via the canonical per-direction
+            # transmittance, then feed into per-direction EMAs.  Same
+            # decay as the scalar battery for physical consistency.
+            #
+            # Guarded: test mocks may return a non-iterable from the
+            # transmittance helper.  On any unpacking error we simply skip
+            # this hour's battery update — the battery decays toward zero
+            # over a few hours rather than corrupting the EMA on bad input.
+            try:
+                screen_cfg = getattr(self, "screen_config", None)
+                pot_s, pot_e, pot_w = self.solar.reconstruct_potential_vector(
+                    avg_solar_vector, actual_correction, screen_cfg
+                )
+                decay = self.solar_battery_decay
+                self._potential_battery_s = (
+                    self._potential_battery_s * decay + pot_s * (1 - decay)
+                )
+                self._potential_battery_e = (
+                    self._potential_battery_e * decay + pot_e * (1 - decay)
+                )
+                self._potential_battery_w = (
+                    self._potential_battery_w * decay + pot_w * (1 - decay)
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                # Mock-friendly fallback.  Real screen_transmittance_vector
+                # cannot raise — it returns a fixed-length tuple of floats.
+                pass
         effective_solar_impact = self._solar_battery_state
 
         # Update Last Hour Data in Coordinator
@@ -3528,6 +3062,49 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 for mode in self._unit_modes.values()
             )
 
+            # Solar shutdown detection (#838).
+            # Identifies VP units whose thermostat cut the compressor because
+            # sun-heated rooms exceeded setpoint.  Such hours produce
+            # actual_impact = base - 0 = base in the NLMS target, inflating
+            # the solar coefficient and feeding contaminated values into the
+            # base model via solar_normalization_delta.
+            from .solar import SolarCalculator as _SC
+            from .observation import detect_solar_shutdown_entities
+            _potential_vector = _SC.reconstruct_potential_vector(
+                avg_solar_vector, actual_correction, self.screen_config
+            )
+            solar_dominant_entities = detect_solar_shutdown_entities(
+                solar_enabled=self.solar_enabled,
+                is_aux_dominant=is_aux_dominant,
+                potential_vector=_potential_vector,
+                energy_sensors=self.energy_sensors,
+                unit_modes=self._unit_modes,
+                unit_actual_kwh=self._hourly_delta_per_unit,
+                unit_expected_base_kwh=self._hourly_expected_base_per_unit,
+                unit_min_base=self._per_unit_min_base_thresholds or None,
+            )
+            is_solar_dominant = bool(solar_dominant_entities)
+
+            # Correct normalization delta: exclude shutdown-flagged units whose
+            # saturated solar contribution was included in solar_heating_applied
+            # before detection ran.  Without this, the global base model learns
+            # from an inflated delta during shutdown hours.
+            if solar_dominant_entities and self.solar_enabled:
+                for _sd_eid in solar_dominant_entities:
+                    _sd_mode = self._unit_modes.get(_sd_eid, MODE_HEATING)
+                    _sd_coeff = self.solar.calculate_unit_coefficient(_sd_eid, temp_key)
+                    _sd_solar = self.solar.calculate_unit_solar_impact(
+                        _potential_vector, _sd_coeff
+                    )
+                    _sd_base = self._hourly_expected_base_per_unit.get(_sd_eid, 0.0)
+                    _sd_applied, _, _ = self.solar.calculate_saturation(
+                        _sd_base, _sd_solar, _sd_mode
+                    )
+                    if _sd_mode in (MODE_HEATING, MODE_GUEST_HEATING):
+                        solar_normalization_delta -= _sd_applied
+                    elif _sd_mode in (MODE_COOLING, MODE_GUEST_COOLING):
+                        solar_normalization_delta += _sd_applied
+
             # --- Build immutable observation snapshot (Issue #775) ---
             obs = self._build_hourly_observation(
                 current_time,
@@ -3560,6 +3137,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 correction_percent=round(actual_correction, 1),
                 potential_solar_factor=round(potential_factor_avg, 3),
                 solar_normalization_delta=solar_normalization_delta,
+                is_solar_dominant=is_solar_dominant,
+                solar_dominant_entities=solar_dominant_entities,
             )
 
             # Delegate Learning to LearningManager (#775 Phase 3)
@@ -3585,6 +3164,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 aux_affected_entities=self.aux_affected_entities,
                 has_guest_activity=has_guest_activity,
                 per_unit_learning_enabled=should_learn_per_unit,
+                screen_config=self.screen_config,
+                unit_min_base=self._per_unit_min_base_thresholds or None,
             )
 
             learning_result = self.learning.process_learning(
@@ -3669,6 +3250,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "solar_vector_w": round(avg_solar_vector[2], 3),
                 "solar_impact_kwh": round(effective_solar_impact, 3),
                 "solar_impact_raw_kwh": round(solar_impact, 3),
+                "solar_wasted_kwh": round(solar_wasted, 3),
                 "primary_entity": self.weather_entity,
                 "secondary_entity": self.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY),
                 "crossover_day": self.entry.data.get(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY),
@@ -3685,6 +3267,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "correction_percent": round(actual_correction, 1),
                 "potential_solar_factor": round(potential_factor_avg, 3),
                 "solar_normalization_delta": round(solar_normalization_delta, 5),
+                "solar_regime": "shutdown" if is_solar_dominant else "normal",
+                "solar_dominant_entities": list(solar_dominant_entities),
+                # Balance point active when this entry was logged (#856).  BP is
+                # user-configurable via the reconfigure flow; recording it per
+                # entry lets diagnostics detect BP transitions in the analysis
+                # window and flag the U-coefficient as mixed-BP when the stored
+                # tdd values were computed under different BPs.
+                "bp_at_log_time": self.balance_point,
                 # Only filter out MODE_HEATING (the true default) to reduce log clutter
                 # Cooling, off, and guest modes MUST be logged for correct historical reconstruction
                 "unit_modes": {
@@ -3693,18 +3283,18 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     if mode != MODE_HEATING
                 },
             }
-            # Guard against duplicate entries (e.g., crash-at-boundary + restart scenario)
+            # Guard against duplicate entries (e.g., crash-at-boundary + restart scenario).
+            # Live appends are monotonic in timestamp, so comparing the tail is enough — O(1)
+            # instead of scanning ~8760 entries every hour-boundary.  CSV import re-sorts the
+            # log by timestamp (storage.py), which preserves the tail-is-latest invariant
+            # because any new real-time entry is at least an hour after every imported entry.
             entry_ts = log_entry["timestamp"]
-            if any(e.get("timestamp") == entry_ts for e in self._hourly_log):
+            if self._hourly_log and self._hourly_log[-1].get("timestamp") == entry_ts:
                 _LOGGER.warning(f"Duplicate hourly entry detected for {entry_ts}, skipping append.")
             else:
                 self._hourly_log.append(log_entry)
 
             # Retention Policy (#820): configurable via hourly_log_retention_days.
-            # Use in-place deletion to preserve the list identity.
-            # Creating a new list (self._hourly_log = self._hourly_log[-N:])
-            # would sever the reference held by the cached ModelState,
-            # causing model.hourly_log to return stale data.
             max_entries = self._hourly_log_max_entries
             if len(self._hourly_log) > max_entries:
                 del self._hourly_log[:-max_entries]
@@ -3922,17 +3512,12 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         return updated_count
 
-    async def _run_track_c_midnight_sync(
-        self, day_logs: list[dict], date_key: str
-    ) -> tuple[float, list] | None:
-        """Fetch MPC thermal data and run the ThermodynamicEngine Midnight Sync.
+    async def _fetch_mpc_buffer_and_cop(self) -> tuple[list, dict | None] | None:
+        """Fetch MPC hourly buffer and COP params.  Shared by live midnight
+        sync and pre-midnight snapshot polling.
 
-        Returns (total_synthetic_el, distribution) where:
-          - total_synthetic_el: sum of synthetic_kwh_el across all 24 hours —
-            the weather-smeared electrical equivalent used as q_adjusted in learning.
-          - distribution: the full list of HourlyDistribution dicts for storage
-            (enables future per-hour visualisation without recomputing).
-        Returns None if the sync cannot proceed (MPC unavailable, empty buffer, etc.).
+        Returns (mpc_records, cop_params) on success, or None on any failure
+        (service missing, empty buffer, malformed response).  Never raises.
         """
         from homeassistant.exceptions import ServiceNotFound, HomeAssistantError
 
@@ -3949,27 +3534,23 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 return_response=True,
             )
         except ServiceNotFound:
-            _LOGGER.warning("Track C: heatpump_mpc.get_sh_hourly service not found — falling back to Track B.")
+            _LOGGER.debug("Track C fetch: heatpump_mpc.get_sh_hourly service not found.")
             return None
         except HomeAssistantError as err:
-            _LOGGER.warning("Track C: MPC service call failed (%s) — falling back to Track B.", err)
+            _LOGGER.debug("Track C fetch: MPC service call failed (%s).", err)
             return None
 
-        # Service returns {"buffer": [...]} per heatpump_mpc/__init__.py.
-        # Guard against alternative wrapping keys for forward-compatibility.
         if isinstance(response, dict):
             mpc_records = response.get("buffer", response.get("data", response.get("hourly", [])))
         elif isinstance(response, list):
             mpc_records = response
         else:
-            _LOGGER.warning("Track C: Unexpected MPC response format (%s) — falling back to Track B.", type(response))
+            _LOGGER.debug("Track C fetch: Unexpected MPC response format (%s).", type(response))
             return None
 
         if not mpc_records:
-            _LOGGER.warning("Track C: MPC returned empty hourly buffer for %s — falling back to Track B.", date_key)
             return None
 
-        # --- Fetch COP model parameters for per-hour conversion ---
         cop_params = None
         try:
             cop_response = await self.hass.services.async_call(
@@ -3982,14 +3563,107 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             if isinstance(cop_response, dict) and "eta_carnot" in cop_response:
                 cop_params = cop_response
                 self._last_cop_params = cop_params  # Cache for Track B COP smearing (#793)
-                _LOGGER.debug(
-                    "Track C: COP params received — η=%.3f, f_defrost=%.2f, LWT=%.1f",
-                    cop_params["eta_carnot"], cop_params.get("f_defrost", 0.85), cop_params.get("lwt", 35.0),
+        except (ServiceNotFound, HomeAssistantError):
+            pass
+
+        return mpc_records, cop_params
+
+    async def _maybe_snapshot_track_c(self, current_time) -> None:
+        """Take a Track C MPC snapshot if we've entered a trigger slot.
+
+        Trigger slots: 22:00 hour, 23:00-23:54 hour, 23:55+ minute.  Each
+        slot snapshots at most once per day — subsequent ticks in the same
+        slot skip.  A snapshot overwrites any earlier one: the latest is
+        always the freshest.  If the live call fails, the previous
+        snapshot (if any) is preserved.
+        """
+        today_key = current_time.date().isoformat()
+        hour = current_time.hour
+        minute = current_time.minute
+
+        slot_key: str | None = None
+        if hour == 22:
+            slot_key = f"{today_key}:2200"
+        elif hour == 23 and minute < 55:
+            slot_key = f"{today_key}:2300"
+        elif hour == 23 and minute >= 55:
+            slot_key = f"{today_key}:2355"
+
+        if slot_key is None or self._track_c_last_snapshot_slot == slot_key:
+            return
+
+        fetched = await self._fetch_mpc_buffer_and_cop()
+        self._track_c_last_snapshot_slot = slot_key
+        if fetched is None:
+            _LOGGER.debug(
+                "Track C snapshot at %s failed — previous snapshot (if any) preserved.",
+                current_time.strftime("%H:%M"),
+            )
+            return
+
+        mpc_records, cop_params = fetched
+        self._track_c_snapshot = {
+            "date": today_key,
+            "captured_at": current_time.isoformat(),
+            "slot": slot_key.split(":")[-1],
+            "mpc_records": mpc_records,
+            "cop_params": cop_params,
+        }
+        _LOGGER.info(
+            "Track C snapshot captured at %s (%d records) — fallback ready for midnight sync.",
+            current_time.strftime("%H:%M"), len(mpc_records),
+        )
+
+    async def _run_track_c_midnight_sync(
+        self, day_logs: list[dict], date_key: str
+    ) -> tuple[float, list, str] | None:
+        """Fetch MPC thermal data and run the ThermodynamicEngine Midnight Sync.
+
+        Returns (total_synthetic_el, distribution, source) where:
+          - total_synthetic_el: sum of synthetic_kwh_el across all 24 hours —
+            the weather-smeared electrical equivalent used as q_adjusted in learning.
+          - distribution: the full list of HourlyDistribution dicts for storage
+            (enables future per-hour visualisation without recomputing).
+          - source: "live" or "snapshot_<HHMM>" — identifies the data origin
+            for daily_history tagging and diagnostics.
+        Returns None if the sync cannot proceed (live call failed AND no
+        matching snapshot available).  Triggers Option B skip at the caller.
+        """
+        mpc_records = None
+        cop_params = None
+        source = "live"
+
+        fetched = await self._fetch_mpc_buffer_and_cop()
+        if fetched is not None:
+            mpc_records, cop_params = fetched
+
+        if mpc_records is None and self._track_c_snapshot is not None:
+            snap = self._track_c_snapshot
+            if snap.get("date") == date_key:
+                mpc_records = snap["mpc_records"]
+                cop_params = snap["cop_params"]
+                source = f"snapshot_{snap['slot']}"
+                _LOGGER.info(
+                    "Track C: live MPC unavailable for %s — using snapshot captured at %s.",
+                    date_key, snap["captured_at"],
                 )
-            else:
-                _LOGGER.info("Track C: get_cop_params returned unexpected format — using daily avg COP fallback.")
-        except (ServiceNotFound, HomeAssistantError) as err:
-            _LOGGER.info("Track C: get_cop_params unavailable (%s) — using daily avg COP fallback.", err)
+
+        if mpc_records is None:
+            _LOGGER.warning(
+                "Track C: no live MPC response and no usable snapshot for %s — "
+                "skipping learning (Option B).",
+                date_key,
+            )
+            return None
+
+        if cop_params is not None:
+            _LOGGER.debug(
+                "Track C: COP params in use — η=%.3f, f_defrost=%.2f, LWT=%.1f (source=%s)",
+                cop_params["eta_carnot"], cop_params.get("f_defrost", 0.85),
+                cop_params.get("lwt", 35.0), source,
+            )
+        else:
+            _LOGGER.info("Track C: no COP params — using daily avg COP fallback (source=%s).", source)
 
         # --- Filter MPC records to the target day ---
         # The MPC buffer holds up to 48 hours of rolling data.  We must select
@@ -4093,16 +3767,24 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         engine = ThermodynamicEngine(balance_point=self.balance_point)
         try:
             distribution = engine.calculate_synthetic_baseline(mpc_records, weather_data, cop_params=cop_params)
-        except Exception as err:
+        except (TypeError, KeyError, ValueError) as err:
             _LOGGER.error("Track C: ThermodynamicEngine failed (%s) — falling back to Track B.", err)
             return None
 
         total_synthetic_el = sum(h["synthetic_kwh_el"] for h in distribution)
         _LOGGER.info(
-            "Track C Midnight Sync %s: total_synthetic_el=%.3f kWh from %d MPC records.",
-            date_key, total_synthetic_el, len(mpc_records),
+            "Track C Midnight Sync %s: total_synthetic_el=%.3f kWh from %d MPC records (source=%s).",
+            date_key, total_synthetic_el, len(mpc_records), source,
         )
-        return total_synthetic_el, distribution
+
+        # Clear the snapshot after successful consumption so it doesn't leak
+        # into later days.  Any earlier snapshot from today is still eligible
+        # — the day boundary itself is what invalidates yesterday's snapshot
+        # via the ``date`` equality check above.
+        if source.startswith("snapshot_"):
+            self._track_c_snapshot = None
+
+        return total_synthetic_el, distribution, source
 
     def _apply_strategies_to_global_model(
         self,
@@ -4154,6 +3836,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         # If not cached, fetch directly from MPC.
         if cop_params is None and self.mpc_entry_id:
+            from homeassistant.exceptions import HomeAssistantError
             try:
                 service_data = {"entry_id": self.mpc_entry_id}
                 cop_response = await self.hass.services.async_call(
@@ -4163,7 +3846,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 if isinstance(cop_response, dict) and "eta_carnot" in cop_response:
                     cop_params = cop_response
                     self._last_cop_params = cop_params
-            except Exception as err:
+            except (TypeError, KeyError, AttributeError, HomeAssistantError) as err:
+                # HomeAssistantError covers ServiceNotFound when the MPC
+                # integration is uninstalled or not yet loaded (#878).
                 _LOGGER.debug(f"Track B COP smearing: could not fetch COP params ({err})")
 
         if cop_params is None:
@@ -4230,7 +3915,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             distribution = engine.calculate_synthetic_baseline(
                 synthetic_mpc_data, weather_data, cop_params=cop_params,
             )
-        except Exception as err:
+        except (TypeError, KeyError, ValueError) as err:
             _LOGGER.warning(f"Track B COP smearing failed ({err}), falling back to flat.")
             return None
 
@@ -4345,11 +4030,20 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 excluded_mode_kwh, daily_stats["kwh"],
             )
 
+        # #855 Option B: flag Track C installs whose MPC did not produce a
+        # distribution this day.  When set, bucket learning AND U-coefficient
+        # update are both skipped to avoid writing Track-B-semantic values
+        # (raw electrical minus thermal-mass correction) into buckets that
+        # normally hold MPC-synthetic thermal-per-hour values.  The U-coeff
+        # is skipped for the same reason: mixing MPC-thermal q_adjusted with
+        # electrical-only q_adjusted in the same EMA gives a meaningless value.
+        track_c_outage_skip = False
+
         if self.track_c_enabled and self.daily_learning_mode and day_logs:
             # Track C: replace electrical baseline with thermodynamic synthetic baseline.
             track_c_result = await self._run_track_c_midnight_sync(day_logs, key)
             if track_c_result is not None:
-                track_c_kwh, track_c_distribution = track_c_result
+                track_c_kwh, track_c_distribution, track_c_source = track_c_result
 
                 # Compute q_adjusted from strategy contributions for U-coefficient.
                 # Only include non-MPC sensors that are in a learning-eligible mode (#789).
@@ -4369,20 +4063,39 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 self._daily_history[key]["track_c_kwh_mpc_only"] = round(track_c_kwh, 3)
                 self._daily_history[key]["track_c_kwh_non_mpc"] = round(non_mpc_daily_kwh, 3)
                 self._daily_history[key]["track_c_distribution"] = track_c_distribution
+                # S1 (#855 follow-up): explicit track identity per day.  "C_live"
+                # or "C_<snapshot_HHMM>".  Lets diagnose_model, retrain and
+                # future BP-aware consumers see the attribution source without
+                # inferring it from which fields happen to be present.
+                self._daily_history[key]["track_used"] = (
+                    "C_live" if track_c_source == "live" else f"C_{track_c_source}"
+                )
             else:
-                _LOGGER.warning("Track C unavailable for %s — applying Track B correction.", key)
-                if self.thermal_mass_kwh_per_degree > 0.0 and current_indoor_temp is not None and self._last_midnight_indoor_temp is not None:
-                    delta_t_indoor = current_indoor_temp - self._last_midnight_indoor_temp
-                    base_kwh = daily_stats["kwh"] - excluded_mode_kwh
-                    q_adjusted = base_kwh - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
-                    _LOGGER.debug(f"Track B fallback: Adjusted kWh from {base_kwh:.2f} to {q_adjusted:.2f} (ΔT={delta_t_indoor:.2f}°C)")
+                # #855 Option B: skip learning entirely on MPC outage.
+                _LOGGER.warning(
+                    "Track C unavailable for %s — skipping learning "
+                    "(no bucket update, no U-coefficient update). "
+                    "Mixing MPC-synthetic and raw-electrical q_adjusted "
+                    "in the same model is a category error; waiting for "
+                    "MPC recovery is the safer path.",
+                    key,
+                )
+                self._track_c_outage_count_session += 1
+                track_c_outage_skip = True
+                self._daily_history[key]["track_used"] = "skipped_mpc_outage"
         elif self.thermal_mass_kwh_per_degree > 0.0 and current_indoor_temp is not None and self._last_midnight_indoor_temp is not None:
             delta_t_indoor = current_indoor_temp - self._last_midnight_indoor_temp
             base_kwh = daily_stats["kwh"] - excluded_mode_kwh
             q_adjusted = base_kwh - (self.thermal_mass_kwh_per_degree * delta_t_indoor)
             _LOGGER.debug(f"Daily Learning: Adjusted kWh from {base_kwh:.2f} to {q_adjusted:.2f} based on indoor delta T {delta_t_indoor:.2f}°C")
 
-        if self.daily_learning_mode and self.learning_enabled and daily_stats["tdd"] >= 0.5 and q_adjusted > 0:
+        if (
+            self.daily_learning_mode
+            and self.learning_enabled
+            and daily_stats["tdd"] >= 0.5
+            and q_adjusted > 0
+            and not track_c_outage_skip  # #855 Option B
+        ):
             if len(day_logs) >= 22:
                 # U-coefficient: always updated daily regardless of track.
                 observed_u = q_adjusted / daily_stats["tdd"]
@@ -4405,6 +4118,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     )
                     if cop_smeared:
                         _LOGGER.info(f"Track B COP-smeared: {cop_smeared} bucket updates from 24 hours.")
+                        self._daily_history[key]["track_used"] = "B_cop"
                     else:
                         # Flat fallback: single q_adjusted/24 to one bucket.
                         # Apply accumulated solar normalization delta (#792).
@@ -4426,10 +4140,25 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                             new_pred = current_pred + self.learning_rate * (q_hourly_avg - current_pred)
                             self._correlation_data[flat_temp_key][flat_wind_bucket] = round(new_pred, 5)
                             _LOGGER.info(f"Track B Learning (EMA): T={flat_temp_key} W={flat_wind_bucket} -> {new_pred:.3f} kWh (was {current_pred:.3f}, actual avg {q_hourly_avg:.3f})")
+                        # S1: tag day as Track B flat-daily attribution.
+                        # Pure Track B installs (track_c_enabled=False) land
+                        # here via the thermal-mass-correction elif branch;
+                        # track_c_enabled installs never reach here because
+                        # track_c_outage_skip guards the parent block.
+                        self._daily_history[key].setdefault("track_used", "B_flat")
             else:
                 _LOGGER.info(f"Daily Learning skipped: Incomplete day ({len(day_logs)}/24 hours)")
 
         self.data["learned_u_coefficient"] = self._learned_u_coefficient
+
+        # S1 (#855 follow-up): ensure every daily_history entry has an
+        # explicit track_used tag so diagnose_model and future BP-aware
+        # consumers can see composition without inferring from field
+        # presence.  Non-daily-learning installs (plain Track A) land here
+        # with no track_used set — mark them as "A".  All daily-mode
+        # branches set their own tag above.
+        if not self.daily_learning_mode:
+            self._daily_history[key].setdefault("track_used", "A")
 
         if current_indoor_temp is not None:
             self._last_midnight_indoor_temp = current_indoor_temp

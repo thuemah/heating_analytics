@@ -66,27 +66,45 @@ DEFAULT_SOLAR_COEFF_COOLING = 0.40
 
 # Solar thermal battery: exponential decay factor applied per hour.
 # Models how solar energy absorbed by building mass is released over time.
-# 0.75 → half-life ~2.4 h; good middle ground between light (furniture)
-# and heavy (concrete floor) thermal mass.  Per-installation calibration
+# 0.80 → half-life ~3.1 h; appropriate for typical Norwegian construction
+# with concrete floor slabs.  Per-installation calibration
 # available via diagnose_solar with apply_battery_decay: true.
-SOLAR_BATTERY_DECAY = 0.75
+SOLAR_BATTERY_DECAY = 0.80
 
-# Minimum solar transmittance when screens are fully closed.
-# Models two physical realities:
-#   1. Screen G-value (SHGC): fabric lets through ~10-15 % of solar irradiance.
-#   2. Unmonitored windows: windows without screens always contribute baseline gain.
-# Net effect: even at correction_percent = 0, the building still receives ~20 %
-# of the potential solar gain.  Without this floor the effective solar vector
-# collapses to zero, solar-coefficient learning is suppressed, and the base
-# thermal model absorbs the residual solar variance as a systematic bias.
-DEFAULT_SOLAR_MIN_TRANSMITTANCE = 0.20
+# Composite legacy floor for screen transmittance.  Used for facades configured
+# WITHOUT explicit per-direction screen presence (CONF_SCREEN_SOUTH/EAST/WEST):
+# represents the typical Nordic building where ~70-90 % of windows have screens
+# and 10-30 % do not (north walls, utility rooms, skylights).  Raised from 0.20
+# to 0.30 in v1.3.3 based on Nordic-residential analysis (issue #826):
+# unscreened-window penalty dominates the floor and the previous 0.20 fit only
+# fully-screened bespoke installations.
+DEFAULT_SOLAR_MIN_TRANSMITTANCE = 0.30
+
+# Per-direction floor for facades that ARE configured as screened
+# (CONF_SCREEN_SOUTH/EAST/WEST = True).  Represents pure screen-fabric × glass
+# transmittance: zip screen G-value ~0.06 combined with low-E triple glazing
+# g-value ~0.5 yields ~0.08 effective.  Source: manufacturer datasheets
+# referenced in issue #826 research.  Tunable in patch releases as summer
+# diagnose_solar data accumulates.
+SCREEN_DIRECT_TRANSMITTANCE = 0.08
 
 CONF_WIND_UNIT = "wind_unit"
 CONF_ENABLE_LIFETIME_TRACKING = "enable_lifetime_tracking"
 CONF_SOLAR_ENABLED = "solar_enabled"
 CONF_SOLAR_AZIMUTH = "solar_azimuth"
 CONF_SOLAR_CORRECTION = "solar_correction"
-# Removed: CONF_AC_CAPABLE_DEVICES - replaced by CONF_HAS_AC_UNITS global checkbox
+# Per-direction screen presence flags (#826).  True = facade has external
+# motorised screens that respond to the global solar_correction slider; the
+# direction's transmittance falls to SCREEN_DIRECT_TRANSMITTANCE when fully
+# closed.  False = facade has no screens; transmittance is fixed at 1.0
+# regardless of slider position.  Default True for all three on upgrade so the
+# composite behaviour stays similar to pre-1.3.3 (single global floor).
+CONF_SCREEN_SOUTH = "screen_south"
+CONF_SCREEN_EAST = "screen_east"
+CONF_SCREEN_WEST = "screen_west"
+DEFAULT_SCREEN_SOUTH = True
+DEFAULT_SCREEN_EAST = True
+DEFAULT_SCREEN_WEST = True
 
 DEFAULT_SOLAR_AZIMUTH = 180
 
@@ -105,9 +123,78 @@ COLD_START_SOLAR_DAMPING = 0.75     # Dampen cold-start solar estimates; base mo
 NLMS_STEP_SIZE = 0.10               # NLMS mu for solar coefficient learning (converges in ~10 qualifying hours)
 NLMS_REGULARIZATION = 0.05          # NLMS epsilon: prevents noise-chasing at low solar power, shrinks east component
 SOLAR_DEAD_ZONE_THRESHOLD = 15      # Consecutive zero-impact sunny hours before forcing coefficient reset
+# Solar shutdown detection (#838): identifies VP units whose thermostat cut
+# the compressor because sun-heated rooms exceeded setpoint.  Such hours
+# inflate the NLMS coefficient (actual_impact = base - 0 = base) and
+# contaminate the base model via solar_normalization_delta.  Detection uses
+# only data available at the call site (no historical tracking).
+SOLAR_SHUTDOWN_ACTUAL_FLOOR = 0.03   # kWh — below this, unit is effectively off
+SOLAR_SHUTDOWN_RATIO = 0.15          # actual/expected below this = shutdown
+# Fallback default for shutdown-detection base gate.  Individual units may
+# override this via ``_per_unit_min_base_thresholds`` populated by
+# ``_calibrate_per_unit_min_base_thresholds`` (#871).  The per-unit path
+# lets small loads (termostat, varmekabel) and low-min-modulation heat
+# pumps (Panasonic 3 kW, Toshiba at mild temps) participate in learning
+# below this global floor when their own noise floor warrants it.
+SOLAR_SHUTDOWN_MIN_BASE = 0.15       # kWh — fallback; per-unit overrides preferred
+SOLAR_SHUTDOWN_MIN_MAGNITUDE = 0.3   # potential vector magnitude — must be sunny
+# Minimum per-unit base demand for solar NLMS learning.  Below this, the
+# actual_impact = base - actual residual is dominated by VP cycling noise,
+# not solar signal.  Separate from SOLAR_SHUTDOWN_MIN_BASE (which gates
+# shutdown detection) because the two serve different purposes even though
+# the values happen to be the same default today.
+# Fallback default; per-unit overrides populated from dark-hour p10 (#871)
+# take precedence.
+SOLAR_LEARNING_MIN_BASE = 0.15       # kWh — fallback; per-unit overrides preferred
+
+# Per-unit min-base auto-calibration.  Computes a per-sensor
+# noise floor from dark-hour (solar_factor < 0.05) actual consumption
+# and uses it as the NLMS + inequality + shutdown-detection gate,
+# replacing the global 0.15 fallback when sufficient data exists.
+PER_UNIT_MIN_BASE_FLOOR = 0.03              # Absolute floor on calibrated threshold
+# Absolute ceiling sized for residential heat pumps up to ~10-12 kW nameplate
+# running continuously at minimum modulation (~800-1000 W) in cold weather.
+# Larger than this suggests a non-VP load scoped onto the sensor or an
+# always-on circuit — the ratio-guard below is the primary filter for that
+# class; this ceiling is a safety net.
+PER_UNIT_MIN_BASE_CEILING = 1.5
+PER_UNIT_MIN_BASE_MIN_SAMPLES = 20          # Min dark-hour samples for p10 to be trusted
+PER_UNIT_MIN_BASE_MIN_HOURS_OF_LOG = 14 * 24  # 14 days × 24h before calibration runs
+PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE = 0.5  # Max ±50 % change per recalibration
+PER_UNIT_MIN_BASE_DARK_SOLAR_FACTOR = 0.05  # solar_factor below = dark hour
+# Ratio-guard: reject when p10 is too close to the median.  A legitimate
+# noise floor sits far below typical consumption (off-periods in the tail,
+# active modulation in the mass).  When p10/median approaches 1.0 the
+# sensor is measuring an always-on load — electric boiler mislabeled as
+# heat-pump heating, sensor scoped to a shared circuit, etc. — and the
+# p10 is not a noise floor at all.
+PER_UNIT_MIN_BASE_MAX_P10_MEDIAN_RATIO = 0.9
 LEARNING_BUFFER_THRESHOLD = 4
 TARGET_TDD_WINDOW = 0.5  # Minimum TDD accumulation for seamless rolling window efficiency
 MIN_EXTRAPOLATION_DELTA_T = 0.5  # Minimum Delta T (Degrees) required to trust extrapolation source
+
+# SNR-weighted base-model learning (#866).
+# When True, base-bucket EMA uses signal-to-noise weighting instead of
+# solar_normalization_delta compensation.  Target becomes raw actual;
+# step size is scaled by snr_weight(solar_factor, shutdown_state).
+# Dark hours retain full rate; sunny hours contribute proportional to
+# their signal quality.
+SNR_WEIGHT_FLOOR = 0.1  # Minimum weight for sunny hours (avoids bucket starvation)
+SNR_WEIGHT_K = 3.0      # Slope: w = max(FLOOR, 1 − K × solar_factor)
+
+# Inequality learning for solar shutdown hours.
+# Hours flagged as shutdown (by detect_solar_shutdown_entities) feed a
+# parallel one-sided learner.  The learner enforces
+# ``coeff · battery_filtered_potential ≥ INEQUALITY_MARGIN × base``
+# via projected gradient with step ``INEQUALITY_STEP_SIZE``, distributing
+# the deficit across non-zero components of the battery-filtered potential
+# vector.  Non-negativity and ``SOLAR_COEFF_CAP`` clamps are preserved.
+# Rationale: a shutdown hour carries physical information (solar gain was
+# at least enough to cover base demand) that the equality-only NLMS path
+# would otherwise discard.  On low-demand units the discard would create
+# a permanent ceiling on west-coefficient convergence.
+INEQUALITY_STEP_SIZE = 0.05   # Half of NLMS_STEP_SIZE — conservative for new mechanism
+INEQUALITY_MARGIN = 0.9       # Constraint: coeff·potential ≥ MARGIN × base (10% buffer)
 
 # Cloud Coverage Default (when weather entity has unknown state)
 DEFAULT_CLOUD_COVERAGE = 50.0
@@ -157,7 +244,7 @@ DEFAULT_UNCERTAINTY_P50 = 1.0
 DEFAULT_UNCERTAINTY_P95 = 2.0
 
 # Storage
-STORAGE_VERSION = 2  # Incremented for Solar Correction support
+STORAGE_VERSION = 3  # v3: versioned migration chain (see storage.py:_migrate_pre_v3)
 STORAGE_KEY = f"{DOMAIN}.storage"
 
 # Attributes
@@ -342,8 +429,6 @@ MODES_EXCLUDED_FROM_GLOBAL_LEARNING = frozenset({
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
 })
-
-CONF_HAS_AC_UNITS = "has_ac_units"
 CONF_HOURLY_LOG_RETENTION_DAYS = "hourly_log_retention_days"
 DEFAULT_HOURLY_LOG_RETENTION_DAYS = 90
 HOURLY_LOG_RETENTION_OPTIONS = [90, 180, 365]
