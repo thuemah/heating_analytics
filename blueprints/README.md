@@ -57,21 +57,29 @@ Synchronizes climate entity states (heat/cool/off) to Heating Analytics mode sel
       use_guest_prefix: true
 ```
 
-**State mapping:**
+**State mapping (v2):**
 
-| Climate State | Standard Mode | Guest Mode        |
-|---------------|---------------|-------------------|
-| `heat`        | `heating`     | `guest_heating`   |
-| `cool`        | `cooling`     | `guest_cooling`   |
-| `off`         | `off`         | `off`             |
-| `unavailable` | `off`         | `off`             |
-| `unknown`     | `off`         | `off`             |
+| Climate State          | Standard Mode | Guest Mode        |
+|------------------------|---------------|-------------------|
+| `heat`                 | `heating`     | `guest_heating`   |
+| `auto`, `heat_cool`    | `heating`     | `guest_heating`   |
+| `cool`                 | `cooling`     | `guest_cooling`   |
+| `off`                  | *preserve*    | `off`             |
+| `dry`, `fan_only`      | *preserve*    | *preserve*        |
+| `unavailable`, `unknown` | *no trigger* | *no trigger*    |
+
+*preserve* = the mode helper is left at its current value.  Standard
+units treat off as transient (modulation, automation pause) and don't
+auto-disable tracking; users who want explicit off must set the select
+manually via the UI.  See `MIGRATION.md` for the rationale and upgrade
+notes if you're coming from v1.
 
 **Features:**
-- ✅ Handles Norwegian localization issues automatically (default fallback)
+- ✅ Handles Norwegian localization issues automatically (no templates that fail on localized states)
 - ✅ Queued mode prevents race conditions
-- ✅ Gracefully handles unavailable/unknown states
-- ✅ No template conditions that can fail on localized states
+- ✅ Asymmetric off-handling: guest off → off, standard off → preserve
+- ✅ Active states like `auto` and `heat_cool` correctly route to heating
+- ✅ Inert states (`dry`, `fan_only`) leave the mode helper alone
 
 ## Custom Logic
 

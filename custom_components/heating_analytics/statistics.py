@@ -39,6 +39,7 @@ from .const import (
     ATTR_SOLAR_FACTOR,
     ENERGY_GUARD_THRESHOLD,
     TARGET_TDD_WINDOW,
+    COOLING_WIND_BUCKET,
     MIN_EXTRAPOLATION_DELTA_T,
     MODE_HEATING,
     MODE_COOLING,
@@ -82,6 +83,7 @@ class StatisticsManager:
         override_solar_vector: tuple[float, float, float] | None = None,
         detailed: bool = True,
         known_aux_impact_kwh: float | None = None,
+        carryover_state_override: float | None = None,
     ) -> dict:
         """Calculate total power and breakdown using Hybrid "Global Stabilizer" logic.
 
@@ -203,9 +205,22 @@ class StatisticsManager:
                 aux_affected_set = set(self.coordinator.aux_affected_entities)
 
         for entity_id in self.coordinator.energy_sensors:
+            # Resolve effective mode up-front so per-unit bucket lookups
+            # (base + aux) can route cooling-mode samples to the dedicated
+            # "cooling" wind-bucket (#885).  Heating samples continue to
+            # use the hour's actual wind bucket.  The mode value is reused
+            # below for the cooling-vs-heating solar-gain split.
+            if unit_modes and entity_id in unit_modes:
+                unit_mode = unit_modes[entity_id]
+            else:
+                unit_mode = self.coordinator.get_unit_mode(entity_id)
+            effective_wind_bucket = (
+                COOLING_WIND_BUCKET if unit_mode == MODE_COOLING else wind_bucket
+            )
+
             # Base Prediction
             unit_data = correlation_per_unit.get(entity_id, {})
-            base_kwh = self._get_prediction_from_model(unit_data, temp_key, wind_bucket, temp, self.coordinator.balance_point)
+            base_kwh = self._get_prediction_from_model(unit_data, temp_key, effective_wind_bucket, temp, self.coordinator.balance_point)
             unit_sum_base += base_kwh
 
             # Aux Reduction (Raw)
@@ -220,26 +235,36 @@ class StatisticsManager:
 
                 if is_affected:
                     unit_aux_data = aux_coeffs_per_unit.get(entity_id, {})
-                    aux_reduction = self._get_prediction_from_model(unit_aux_data, temp_key, wind_bucket, temp, self.coordinator.balance_point)
+                    aux_reduction = self._get_prediction_from_model(unit_aux_data, temp_key, effective_wind_bucket, temp, self.coordinator.balance_point)
                     sum_affected_aux += aux_reduction
 
             # Solar Reduction
             unit_solar_reduction = 0.0
             if self.coordinator.solar_enabled:
-                 unit_coeff = self.coordinator.solar.calculate_unit_coefficient(entity_id, temp_key)
+                 unit_coeff = self.coordinator.solar.calculate_unit_coefficient(
+                     entity_id, temp_key, unit_mode
+                 )
+                 # Per-entity screen routing: a unit whose room has no
+                 # screens reconstructs potential against transmittance=1.0
+                 # (effective_solar_vector is its physical potential).  This
+                 # mirrors the learn-side routing in
+                 # learning._process_per_unit_learning so prediction and
+                 # learning stay consistent for the same entity.
+                 _scr_fn = getattr(self.coordinator, "screen_config_for_entity", None)
+                 entity_scr_cfg = _scr_fn(entity_id) if _scr_fn else screen_cfg
+                 if entity_scr_cfg == screen_cfg:
+                     entity_pot_vec = potential_solar_vector
+                 else:
+                     entity_pot_vec = SolarCalculator.reconstruct_potential_vector(
+                         effective_solar_vector, screen_pct, entity_scr_cfg
+                     )
                  unit_solar_reduction = self.coordinator.solar.calculate_unit_solar_impact(
-                     potential_solar_vector, unit_coeff
+                     entity_pot_vec, unit_coeff
                  )
 
-            # Determine Mode
-            mode = MODE_HEATING
-            if unit_modes and entity_id in unit_modes:
-                mode = unit_modes[entity_id]
-            else:
-                mode = self.coordinator.get_unit_mode(entity_id)
-
+            # Mode already resolved above (unit_mode) and reused here.
             if self.coordinator.solar_enabled:
-                if mode == MODE_COOLING:
+                if unit_mode == MODE_COOLING:
                     cooling_solar_gain_sum += unit_solar_reduction
                 else:
                     heating_solar_reduction_sum += unit_solar_reduction
@@ -248,7 +273,7 @@ class StatisticsManager:
                 "base": base_kwh,
                 "raw_aux": aux_reduction,
                 "solar": unit_solar_reduction,
-                "mode": mode,
+                "mode": unit_mode,
                 "affected": is_affected
             }
 
@@ -264,8 +289,31 @@ class StatisticsManager:
         # Re-calculate global solar effect using the APPLIED (saturated) values to ensure consistency
         sum_applied_heating = 0.0
         sum_applied_cooling = 0.0
+        # Heating-only wasted (#896).  Cooling-mode saturation returns
+        # wasted=0 today (see solar.calculate_saturation), so summing
+        # only on the heating branch is structurally equivalent to the
+        # total wasted aggregate; exposing it as its own field makes
+        # the contract explicit at downstream call sites (battery EMA
+        # in hourly_processor, feedback-sweep replay in diagnose_solar)
+        # and insulates them from any future change that lets cooling
+        # produce non-zero wasted.
+        sum_wasted_heating = 0.0
         heating_unit_sum_net = 0.0
         cooling_unit_sum_net = 0.0
+        # Strictly-heating-mode net for carryover release (#896 follow-up).
+        # ``heating_unit_sum_net`` accumulates in the non-cooling
+        # branch which also catches DHW (no explicit case in
+        # ``solar.calculate_saturation`` → falls through to "unknown
+        # mode" with ``final_net = net_demand``).  Using
+        # ``heating_unit_sum_net`` as the release cap would let an
+        # all-DHW install pull release out of global net while the
+        # per-unit distribution loop (gated to MODE_HEATING /
+        # MODE_GUEST_HEATING) skips every unit — global net drops but
+        # ``unit_breakdown`` sum doesn't, breaking the
+        # ``unspecified_kwh`` accounting invariant.  This accumulator
+        # is built only from heating-regime units, matching the
+        # release distribution loop's filter exactly.
+        heating_only_unit_sum_net = 0.0
 
         for entity_id, data in raw_unit_data.items():
             # Use raw learned aux reduction (No Scaling)
@@ -311,6 +359,13 @@ class StatisticsManager:
             else:
                 sum_applied_heating += solar_applied
                 heating_unit_sum_net += net_final
+                # Heating-only wasted (#896).  Gate on heating modes
+                # explicitly, not the else branch — OFF/DHW also fall
+                # through to else and their wasted is structurally 0,
+                # but a stricter gate keeps the contract robust.
+                if data["mode"] in (MODE_HEATING, MODE_GUEST_HEATING):
+                    sum_wasted_heating += solar_wasted
+                    heating_only_unit_sum_net += net_final
 
             unit_sum_net += net_final
             unit_sum_aux_final += applied_aux
@@ -333,6 +388,99 @@ class StatisticsManager:
         global_net_after_aux = max(0.0, global_base - global_aux_reduction)
         global_net = max(0.0, global_net_after_aux + global_solar_effect)
 
+        # 4b. Solar carry-over reservoir release (#896 follow-up).
+        #
+        # ``_solar_carryover_state`` is the parallel-to-battery scalar
+        # charged ONLY from ``k × solar_heating_wasted`` in the hour-
+        # boundary processor.  Here we subtract its release from the
+        # heating-mode demand prediction — closing the loop the original
+        # #896 implementation deliberately left open (battery state was
+        # charged but never read by prediction).
+        #
+        # Strict heating-mode gate.  Both the release cap AND the
+        # distribution-share denominator use ``heating_only_unit_sum_net``
+        # (built only from MODE_HEATING / MODE_GUEST_HEATING units),
+        # NOT the looser ``heating_unit_sum_net`` which accumulates in
+        # the non-cooling branch (also catches DHW, whose
+        # ``calculate_saturation`` falls through to "unknown mode" with
+        # ``final_net = net_demand``).  Using the looser accumulator
+        # would let an all-DHW install pull release out of global net
+        # while the per-unit distribution loop (filtered to heating
+        # regimes) skips every unit — global net drops but
+        # ``unit_breakdown`` sum doesn't, breaking the
+        # ``unspecified_kwh`` accounting invariant.
+        #
+        # Option (a) "blind decay": release_available is computed as the
+        # canonical EMA per-hour discharge ``state × (1 − decay)``; the
+        # state itself decays naturally on the next hour boundary via
+        # the EMA in hourly_processor.  Energy that has nowhere to go
+        # (when heating_only_unit_sum_net is below release_available) is
+        # lost to the clamp.  Estimated cost on a typical Norwegian
+        # install: ~1-2 kWh/year of 15-25,000 kWh — well below noise.
+        # See PR discussion for the option (a) vs (b) trade-off.
+        #
+        # Distribution: ``release_applied`` is distributed across the
+        # heating-mode units in ``unit_breakdown`` proportionally to
+        # each unit's pre-release ``net_kwh``, keeping the per-unit
+        # breakdown self-consistent with the post-release global net
+        # (``unspecified_kwh`` stays clean).
+        # ``carryover_state_override`` lets forecast call sites pass a
+        # forward-decayed state value (``state_now × decay^N`` for the
+        # N-th forecast hour) without mutating the live state.  When
+        # ``None``, use the live coordinator state — correct for hour-
+        # boundary calls and any current-time prediction.  Forecast
+        # callers that don't pass an override over-credit the release
+        # by ~2 % over a 24h horizon (every forecast hour reads the
+        # same live state); the ``decay^N`` factor at the call site
+        # drops that bias to <0.3 %.
+        if carryover_state_override is not None:
+            state_to_use = carryover_state_override
+        else:
+            _state_attr = getattr(self.coordinator, "_solar_carryover_state", 0.0)
+            # Guard against MagicMock test fixtures whose attribute
+            # access returns a MagicMock instance — coerce to 0.0 when
+            # the value isn't a real number.
+            state_to_use = _state_attr if isinstance(_state_attr, (int, float)) else 0.0
+        carryover_release_applied = 0.0
+        if state_to_use > 0.0 and heating_only_unit_sum_net > 0.0:
+            release_available = (
+                state_to_use * (1 - self.coordinator.solar_battery_decay)
+            )
+            carryover_release_applied = min(release_available, heating_only_unit_sum_net)
+
+        if carryover_release_applied > 0.0:
+            global_net = max(0.0, global_net - carryover_release_applied)
+            # Distribute across heating-mode units in unit_breakdown
+            # (only populated when ``detailed=True``).  Proportional
+            # share so larger consumers absorb more of the carry-over.
+            # Share denominator must match the release-cap accumulator
+            # (``heating_only_unit_sum_net``) so distribution sums to
+            # exactly ``carryover_release_applied``.
+            if detailed:
+                for entity_id, ud in unit_breakdown.items():
+                    udata = raw_unit_data.get(entity_id)
+                    if udata is None:
+                        continue
+                    if udata["mode"] not in (MODE_HEATING, MODE_GUEST_HEATING):
+                        continue
+                    unit_net = ud.get("net_kwh", 0.0)
+                    if unit_net <= 0:
+                        continue
+                    share = unit_net / heating_only_unit_sum_net
+                    unit_release = carryover_release_applied * share
+                    ud["net_kwh"] = round(max(0.0, unit_net - unit_release), 3)
+            # Keep accumulators consistent with the per-unit post-release
+            # values.  ``heating_unit_sum_net`` (returned as
+            # ``heating_total_kwh``) drops by the same amount since
+            # heating-only is a subset.
+            heating_unit_sum_net = max(
+                0.0, heating_unit_sum_net - carryover_release_applied
+            )
+            heating_only_unit_sum_net = max(
+                0.0, heating_only_unit_sum_net - carryover_release_applied
+            )
+            unit_sum_net = max(0.0, unit_sum_net - carryover_release_applied)
+
         # 5. Calculate Deviation (Unspecified)
         unspecified_kwh = global_net - unit_sum_net
 
@@ -347,8 +495,10 @@ class StatisticsManager:
                 "aux_reduction_kwh": round(unit_sum_aux_final, 3),
                 "solar_reduction_kwh": round(unit_sum_solar_final, 3),
                 "solar_wasted_kwh": round(unit_sum_solar_wasted, 3),
+                "solar_heating_wasted_kwh": round(sum_wasted_heating, 3),
                 "solar_heating_applied_kwh": round(sum_applied_heating, 3),
                 "solar_cooling_applied_kwh": round(sum_applied_cooling, 3),
+                "carryover_release_kwh": round(carryover_release_applied, 3),
                 "unassigned_aux_savings": round(unassigned_aux_savings, 3),
                 "orphaned_aux_savings": round(orphaned_aux_savings, 3),
                 "unspecified_kwh": round(unspecified_kwh, 3)
@@ -364,9 +514,17 @@ class StatisticsManager:
         2. Normal (Most robust baseline)
         3. High Wind (If normal missing)
         4. Extreme Wind (Last resort)
+
+        Per #885: "cooling" is a distinct wind-bucket dedicated to
+        cooling-mode per-unit samples.  If the cooling bucket is missing
+        at this temp, we return None rather than falling back to heating
+        wind buckets — heating data would be physically wrong as a
+        cooling prediction (e.g. heating ≈ 0 kWh at 25 °C).
         """
         if requested_bucket in bucket_data:
             return requested_bucket
+        if requested_bucket == COOLING_WIND_BUCKET:
+            return None
         if "normal" in bucket_data:
             return "normal"
         if "high_wind" in bucket_data:
@@ -434,8 +592,12 @@ class StatisticsManager:
                 pass
 
             # 3. Wind Fallback (Same Temp)
-            # Check if we have data for the requested temp but different wind
-            if temp_key in data_map:
+            # Check if we have data for the requested temp but different wind.
+            # Per #885: "cooling" is a distinct per-unit wind-bucket and must
+            # NOT fall back to heating wind buckets — doing so would reroute
+            # cooling prediction to heating data (physically wrong at cooling
+            # temperatures; e.g. heating ≈ 0 kWh at 25 °C while cooling ≠ 0).
+            if temp_key in data_map and wind_bucket != COOLING_WIND_BUCKET:
                 bucket_data = data_map[temp_key]
                 if wind_bucket == "extreme_wind":
                     if "high_wind" in bucket_data: return bucket_data["high_wind"]
@@ -1665,7 +1827,17 @@ class StatisticsManager:
                 eff_wind_legacy = log.get("effective_wind", 0.0)
                 wind_bucket = self.coordinator._get_wind_bucket(eff_wind_legacy)
 
-            count = self.coordinator._get_unit_observation_count(entity_id, temp_key, wind_bucket)
+            # Pass the unit's mode AT THE TIME this entry was logged so the
+            # count is read from the bucket the sample was written to, not
+            # the bucket the unit's *current* mode would route to (the
+            # mode-switching regression the current-mode override would
+            # silently introduce).  Legacy logs without ``unit_modes`` fall
+            # back to MODE_HEATING → read the stored wind_bucket directly,
+            # matching pre-#885 write semantics.
+            log_mode = log.get("unit_modes", {}).get(entity_id, MODE_HEATING)
+            count = self.coordinator._get_unit_observation_count(
+                entity_id, temp_key, wind_bucket, mode=log_mode
+            )
             obs_count_sum += count
             hours_counted += 1
 
@@ -1714,20 +1886,29 @@ class StatisticsManager:
     ) -> float:
         """Calculate fallback projection if intra-hour accumulation is missing."""
         unit_data = self.coordinator.model.correlation_data_per_unit.get(entity_id, {})
+        unit_mode_fb = self.coordinator.get_unit_mode(entity_id)
+        # Per #885: route cooling-mode units to the dedicated bucket.
+        if unit_mode_fb == MODE_COOLING:
+            wind_bucket = COOLING_WIND_BUCKET
         unit_base_curr = self._get_prediction_from_model(unit_data, temp_key, wind_bucket, current_temp, self.coordinator.balance_point)
 
         if self.coordinator.solar_enabled:
              curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
-             unit_coeff = self.coordinator.solar.calculate_unit_coefficient(entity_id, temp_key)
+             unit_coeff = self.coordinator.solar.calculate_unit_coefficient(
+                 entity_id, temp_key, unit_mode_fb
+             )
              eff_solar_vector = (
                  self.coordinator.data.get("solar_vector_s", 0.0),
                  self.coordinator.data.get("solar_vector_e", 0.0),
                  self.coordinator.data.get("solar_vector_w", 0.0),
              )
              # Reconstruct potential vector per direction (#826); coeff
-             # already absorbs avg per-direction transmittance.
+             # already absorbs avg per-direction transmittance.  Per-entity
+             # screen routing: unscreened units reconstruct against
+             # transmittance=1.0 (see learning._process_per_unit_learning).
              scr_pct = self.coordinator.solar_correction_percent
-             scr_cfg = getattr(self.coordinator, "screen_config", None)
+             _scr_fn = getattr(self.coordinator, "screen_config_for_entity", None)
+             scr_cfg = _scr_fn(entity_id) if _scr_fn else getattr(self.coordinator, "screen_config", None)
              pot_vec = SolarCalculator.reconstruct_potential_vector(
                  eff_solar_vector, scr_pct, scr_cfg
              )

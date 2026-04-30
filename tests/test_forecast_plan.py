@@ -31,7 +31,7 @@ async def test_get_plan_for_hour_sources():
     def mock_process(item, *args, **kwargs):
         temp = item["temperature"]
         # Dummy prediction logic: kwh = temp * 2
-        return (temp * 2.0, 0.0, temp, temp, 0.0, 0.0, {}, 0.0)
+        return (temp * 2.0, 0.0, temp, temp, 0.0, 0.0, {}, 0.0, 0.0)
 
     manager._process_forecast_item = MagicMock(side_effect=mock_process)
 

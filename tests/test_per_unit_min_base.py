@@ -18,9 +18,7 @@ from homeassistant.util import dt as dt_util
 
 from tests.helpers import CoordinatorModelMixin
 
-from custom_components.heating_analytics.coordinator import (
-    HeatingDataCoordinator,
-)
+from custom_components.heating_analytics.diagnostics import DiagnosticsEngine
 from custom_components.heating_analytics.const import (
     MODE_HEATING,
     MODE_OFF,
@@ -39,8 +37,10 @@ from custom_components.heating_analytics.observation import (
 )
 
 
-# Bound-method trampoline so we can call the coordinator method on a mock.
-_calibrate = HeatingDataCoordinator._calibrate_per_unit_min_base_thresholds
+# Trampoline so we can call the calibration method on a mock.
+# Post-#877 the implementation lives on DiagnosticsEngine.
+def _calibrate(coord, **kwargs):
+    return DiagnosticsEngine(coord).calibrate_per_unit_min_base_thresholds(**kwargs)
 
 
 class MockCoord(CoordinatorModelMixin):

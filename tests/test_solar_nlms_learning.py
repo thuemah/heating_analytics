@@ -20,6 +20,11 @@ from custom_components.heating_analytics.const import (
 )
 
 
+def _regime_for(unit_mode: str) -> str:
+    """Mode→regime mapping for v4 stratified coefficient access (#868)."""
+    return "cooling" if unit_mode == MODE_COOLING else "heating"
+
+
 def _run_nlms_learning(
     manager: LearningManager,
     entity_id: str,
@@ -35,7 +40,9 @@ def _run_nlms_learning(
 
     Generates actual_unit values from true coefficients and runs learning.
     Returns list of (step, coeff_s, coeff_e) for convergence analysis.
+    Reads from the v4 mode regime corresponding to ``unit_mode``.
     """
+    regime = _regime_for(unit_mode)
     history = []
     for solar_s, solar_e, solar_w in solar_vectors:
         true_impact = true_coeff_s * solar_s + true_coeff_e * solar_e
@@ -57,9 +64,11 @@ def _run_nlms_learning(
             balance_point=15.0,
             unit_mode=unit_mode,
         )
-        coeff = solar_coefficients.get(entity_id)
-        if coeff is not None:
-            history.append((len(history), coeff["s"], coeff["e"]))
+        entity_entry = solar_coefficients.get(entity_id)
+        if entity_entry is not None:
+            coeff = entity_entry.get(regime)
+            if coeff is not None:
+                history.append((len(history), coeff["s"], coeff["e"]))
     return history
 
 
@@ -78,8 +87,9 @@ class TestNLMSConvergence:
             manager, "unit_south", 1.5, 0.1, vectors, coeffs, buffers,
         )
 
-        # After 20 samples (4 buffered + 16 NLMS), should be close
-        final = coeffs["unit_south"]
+        # After 20 samples (4 buffered + 16 NLMS), should be close.
+        # Heating-regime read per #868.
+        final = coeffs["unit_south"]["heating"]
         assert abs(final["s"] - 1.5) < 0.3, f"S coeff {final['s']} not near 1.5"
         assert abs(final["e"] - 0.1) < 0.3, f"E coeff {final['e']} not near 0.1"
 
@@ -100,7 +110,7 @@ class TestNLMSConvergence:
             manager, "unit_se", 1.0, 0.8, vectors, coeffs, buffers,
         )
 
-        final = coeffs["unit_se"]
+        final = coeffs["unit_se"]["heating"]
         assert abs(final["s"] - 1.0) < 0.4, f"S coeff {final['s']} not near 1.0"
         assert abs(final["e"] - 0.8) < 0.4, f"E coeff {final['e']} not near 0.8"
 
@@ -116,8 +126,11 @@ class TestNLMSConvergence:
             unit_mode=MODE_COOLING, base_kwh=3.0,
         )
 
-        final = coeffs["unit_cool"]
+        # Cooling-mode learning routes to the cooling regime per #868.
+        final = coeffs["unit_cool"]["cooling"]
         assert abs(final["s"] - 0.8) < 0.3, f"S coeff {final['s']} not near 0.8"
+        # Heating regime untouched.
+        assert coeffs["unit_cool"]["heating"] == {"s": 0.0, "e": 0.0, "w": 0.0}
 
 
 class TestNLMSGainIndependence:
@@ -146,8 +159,8 @@ class TestNLMSGainIndependence:
             vectors_high, coeffs_high, buffers_high,
         )
 
-        final_low = coeffs_low["unit_low"]
-        final_high = coeffs_high["unit_high"]
+        final_low = coeffs_low["unit_low"]["heating"]
+        final_high = coeffs_high["unit_high"]["heating"]
 
         # Both should converge to similar accuracy
         error_low = abs(final_low["s"] - true_s) + abs(final_low["e"] - true_e)
@@ -176,7 +189,7 @@ class TestNLMSRegularization:
             manager, "unit_pure_s", 1.0, 0.0, vectors, coeffs, buffers,
         )
 
-        final = coeffs["unit_pure_s"]
+        final = coeffs["unit_pure_s"]["heating"]
         assert abs(final["e"]) < 0.1, (
             f"East coeff {final['e']} should be ~0 with pure south sun"
         )
@@ -203,9 +216,15 @@ class TestColdStartToNLMSTransition:
                 0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
             )
 
-        # Should still be buffering
-        assert "unit_trans" not in coeffs
-        assert len(buffers.get("unit_trans", [])) == LEARNING_BUFFER_THRESHOLD - 1
+        # Should still be buffering — neither regime has a written coefficient
+        # yet.  The buffer holds samples in the heating regime.
+        assert "unit_trans" not in coeffs or all(
+            sum(coeffs["unit_trans"][r].values()) == 0
+            for r in ("heating", "cooling")
+            if r in coeffs.get("unit_trans", {})
+        )
+        buf_heating = buffers.get("unit_trans", {}).get("heating", [])
+        assert len(buf_heating) == LEARNING_BUFFER_THRESHOLD - 1
 
         # Phase 2: One more sample triggers jump-start
         solar_s, solar_e = 0.6, 0.15
@@ -216,11 +235,11 @@ class TestColdStartToNLMSTransition:
             0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
         )
 
-        # Now coefficients should exist (jump-started)
+        # Now coefficients should exist (jump-started) in the heating regime.
         assert "unit_trans" in coeffs
-        jumpstart_s = coeffs["unit_trans"]["s"]
-        # Buffer should be cleared
-        assert len(buffers.get("unit_trans", [])) == 0
+        jumpstart_s = coeffs["unit_trans"]["heating"]["s"]
+        # Buffer for the heating regime should be cleared after solve.
+        assert len(buffers.get("unit_trans", {}).get("heating", [])) == 0
 
         # Phase 3: NLMS refinement (10 more samples)
         vectors = [(0.5, 0.12, 0.0)] * 5 + [(0.6, 0.08, 0.0)] * 5
@@ -232,7 +251,7 @@ class TestColdStartToNLMSTransition:
                 0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
             )
 
-        final = coeffs["unit_trans"]
+        final = coeffs["unit_trans"]["heating"]
         # NLMS should have refined beyond jump-start
         error_final = abs(final["s"] - true_s)
         # Jump-start is damped by COLD_START_SOLAR_DAMPING, so NLMS should improve
@@ -242,8 +261,9 @@ class TestColdStartToNLMSTransition:
 
     def test_zero_vector_skipped(self):
         """Samples with zero solar vector are ignored (no division by zero)."""
+        from tests.helpers import stratified_coeff
         manager = LearningManager()
-        coeffs = {"unit_z": {"s": 1.0, "e": 0.0, "w": 0.0}}
+        coeffs = {"unit_z": stratified_coeff(s=1.0)}
         buffers = {}
 
         # Zero vector should be silently skipped
@@ -253,15 +273,16 @@ class TestColdStartToNLMSTransition:
         )
 
         # Coefficient unchanged
-        assert coeffs["unit_z"]["s"] == 1.0
-        assert coeffs["unit_z"]["e"] == 0.0
+        assert coeffs["unit_z"]["heating"]["s"] == 1.0
+        assert coeffs["unit_z"]["heating"]["e"] == 0.0
 
     def test_off_mode_skipped(self):
         """Units in OFF mode are not updated."""
         from custom_components.heating_analytics.const import MODE_OFF
+        from tests.helpers import stratified_coeff
 
         manager = LearningManager()
-        coeffs = {"unit_off": {"s": 1.0, "e": 0.0, "w": 0.0}}
+        coeffs = {"unit_off": stratified_coeff(s=1.0)}
         buffers = {}
 
         manager._learn_unit_solar_coefficient(
@@ -269,7 +290,7 @@ class TestColdStartToNLMSTransition:
             0.01, coeffs, buffers, 5.0, 15.0, MODE_OFF,
         )
 
-        assert coeffs["unit_off"]["s"] == 1.0
+        assert coeffs["unit_off"]["heating"]["s"] == 1.0
 
 
 class TestDeadZoneDetection:
@@ -277,10 +298,13 @@ class TestDeadZoneDetection:
 
     def test_dead_zone_resets_coefficient_after_threshold(self):
         """After SOLAR_DEAD_ZONE_THRESHOLD consecutive zero-impact hours,
-        the coefficient is deleted so cold-start can re-learn.
+        the heating regime coefficient is reset so cold-start can re-learn.
+        Cooling regime is preserved per #868 (per-(entity, regime) dead-zone
+        tracking).
         """
+        from tests.helpers import stratified_coeff
         manager = LearningManager()
-        coeffs = {"unit_stuck": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        coeffs = {"unit_stuck": stratified_coeff(s=0.1, cooling_s=0.5)}
         buffers = {}
 
         # Simulate dead zone: base=0.03, actual=0.18, sun shining
@@ -299,13 +323,15 @@ class TestDeadZoneDetection:
                 unit_mode=MODE_HEATING,
             )
 
-        # Coefficient should have been deleted (reset to cold-start)
-        assert "unit_stuck" not in coeffs
+        # Heating regime reset to zero; cooling regime preserved.
+        assert coeffs["unit_stuck"]["heating"] == {"s": 0.0, "e": 0.0, "w": 0.0}
+        assert coeffs["unit_stuck"]["cooling"]["s"] == 0.5
 
     def test_dead_zone_counter_resets_on_positive_impact(self):
         """A single hour with positive actual_impact resets the counter."""
+        from tests.helpers import stratified_coeff
         manager = LearningManager()
-        coeffs = {"unit_recover": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        coeffs = {"unit_recover": stratified_coeff(s=0.1)}
         buffers = {}
 
         # Accumulate near-threshold dead zone hours
@@ -333,9 +359,11 @@ class TestDeadZoneDetection:
             unit_mode=MODE_HEATING,
         )
 
-        # Counter should be reset — coefficient still exists
+        # Counter should be reset — coefficient still exists in heating regime.
         assert "unit_recover" in coeffs
-        assert manager._dead_zone_counts.get("unit_recover", 0) == 0
+        assert coeffs["unit_recover"]["heating"]["s"] != 0.0
+        # Dead-zone counter is keyed by (entity, regime) — both should be clear.
+        assert manager._dead_zone_counts.get(("unit_recover", "heating"), 0) == 0
 
     def test_dead_zone_not_triggered_for_cold_start(self):
         """Units without existing coefficients (cold-start) don't trigger
@@ -362,12 +390,13 @@ class TestDeadZoneDetection:
         # Should NOT have created a coefficient (all-zero buffers discarded)
         assert "unit_new" not in coeffs
         # Dead zone counter should not have incremented (no current_coeff)
-        assert manager._dead_zone_counts.get("unit_new", 0) == 0
+        assert manager._dead_zone_counts.get(("unit_new", "heating"), 0) == 0
 
     def test_dead_zone_not_triggered_without_sun(self):
         """Zero vector magnitude doesn't count toward dead zone."""
+        from tests.helpers import stratified_coeff
         manager = LearningManager()
-        coeffs = {"unit_dark": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        coeffs = {"unit_dark": stratified_coeff(s=0.1)}
         buffers = {}
 
         for _ in range(SOLAR_DEAD_ZONE_THRESHOLD + 5):
@@ -384,12 +413,14 @@ class TestDeadZoneDetection:
 
         # Coefficient should NOT have been reset (no sun = early return)
         assert "unit_dark" in coeffs
+        assert coeffs["unit_dark"]["heating"]["s"] == 0.1
 
     def test_dead_zone_reset_clears_stale_buffer(self):
-        """Dead zone reset should also clear any stale solar buffer."""
+        """Dead zone reset should also clear the regime's stale buffer."""
+        from tests.helpers import stratified_coeff
         manager = LearningManager()
-        coeffs = {"unit_buf": {"s": 0.1, "e": 0.0, "w": 0.0}}
-        buffers = {"unit_buf": [(0.3, 0.1, 0.2, 0.05)]}  # Stale sample
+        coeffs = {"unit_buf": stratified_coeff(s=0.1)}
+        buffers = {"unit_buf": {"heating": [(0.3, 0.1, 0.2, 0.05)], "cooling": []}}
 
         for _ in range(SOLAR_DEAD_ZONE_THRESHOLD):
             manager._learn_unit_solar_coefficient(
@@ -403,8 +434,10 @@ class TestDeadZoneDetection:
                 unit_mode=MODE_HEATING,
             )
 
-        assert "unit_buf" not in coeffs
-        assert "unit_buf" not in buffers  # Buffer also cleared
+        # Heating regime reset to zero, cooling regime preserved.
+        assert coeffs["unit_buf"]["heating"] == {"s": 0.0, "e": 0.0, "w": 0.0}
+        # Heating regime buffer cleared.
+        assert buffers["unit_buf"]["heating"] == []
 
     def test_cold_start_discards_all_zero_impact_buffer(self):
         """Cold-start with all-zero impact samples discards buffer instead
@@ -427,20 +460,23 @@ class TestDeadZoneDetection:
                 unit_mode=MODE_HEATING,
             )
 
-        # Should NOT have created a coefficient (buffer was discarded)
+        # Should NOT have created a coefficient (buffer was discarded).
+        # In v4 the buffer entry exists as a dict-of-regimes with empty lists.
         assert "unit_reentry" not in coeffs
-        # Buffer should be empty (cleared after discard)
-        assert len(buffers.get("unit_reentry", [])) == 0
+        # Buffer for the heating regime should be empty (cleared after discard).
+        buf_h = buffers.get("unit_reentry", {}).get("heating", [])
+        assert len(buf_h) == 0
 
     def test_post_reset_recovery_with_improving_base(self):
         """After dead zone reset, once base model recovers enough to produce
         positive actual_impact, cold-start completes successfully.
         """
+        from tests.helpers import stratified_coeff
         manager = LearningManager()
-        coeffs = {"unit_recov": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        coeffs = {"unit_recov": stratified_coeff(s=0.1)}
         buffers = {}
 
-        # Phase 1: Trigger dead zone reset
+        # Phase 1: Trigger dead zone reset (heating regime).
         for _ in range(SOLAR_DEAD_ZONE_THRESHOLD):
             manager._learn_unit_solar_coefficient(
                 "unit_recov", "10",
@@ -452,7 +488,7 @@ class TestDeadZoneDetection:
                 avg_temp=12.0, balance_point=15.0,
                 unit_mode=MODE_HEATING,
             )
-        assert "unit_recov" not in coeffs
+        assert coeffs["unit_recov"]["heating"] == {"s": 0.0, "e": 0.0, "w": 0.0}
 
         # Phase 2: Base model has recovered (expected > actual now)
         for _ in range(LEARNING_BUFFER_THRESHOLD):
@@ -467,8 +503,6 @@ class TestDeadZoneDetection:
                 unit_mode=MODE_HEATING,
             )
 
-        # Cold-start should have completed with real signal
-        assert "unit_recov" in coeffs
-        # Coefficient should be non-trivial (not all zeros)
-        coeff = coeffs["unit_recov"]
+        # Cold-start should have completed with real signal.
+        coeff = coeffs["unit_recov"]["heating"]
         assert coeff["s"] > 0.0 or coeff["e"] > 0.0 or coeff["w"] > 0.0

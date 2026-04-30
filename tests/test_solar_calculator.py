@@ -123,34 +123,54 @@ def test_calculate_unit_solar_impact(calculator, coordinator):
 
 
 def test_calculate_unit_coefficient(calculator, coordinator):
-    # 1. Global Default Fallback (Heating)
-    # Target 10, BP 15 -> Heating
-    coeff = calculator.calculate_unit_coefficient("unit_1", "10")
+    # Mode-stratified per #868: mode is a required parameter; the
+    # heating regime returns ``DEFAULT_SOLAR_COEFF_HEATING`` and cooling
+    # returns ``DEFAULT_SOLAR_COEFF_COOLING`` when no learned value
+    # exists for that regime.
+
+    # 1. Heating mode → heating default
+    coeff = calculator.calculate_unit_coefficient("unit_1", "10", "heating")
     assert coeff['s'] == DEFAULT_SOLAR_COEFF_HEATING
 
-    # 2. Global Default Fallback (Cooling)
-    # Target 20, BP 15 -> Cooling
-    coeff_cooling = calculator.calculate_unit_coefficient("unit_1", "20")
+    # 2. Cooling mode → cooling default
+    coeff_cooling = calculator.calculate_unit_coefficient("unit_1", "20", "cooling")
     assert coeff_cooling['s'] == DEFAULT_SOLAR_COEFF_COOLING
 
-    # 3. Learned Coefficient (Global per Unit, Not Temp-Stratified)
-    # Setting a learned coefficient for the unit returns it for any temp key.
-    coordinator._solar_coefficients_per_unit["unit_1"] = {"s": 0.08, "e": 0.0, "w": 0.0}
-    assert calculator.calculate_unit_coefficient("unit_1", "10")["s"] == 0.08
+    # 3. Learned heating coefficient returned for heating mode lookup.
+    coordinator._solar_coefficients_per_unit["unit_1"] = {
+        "heating": {"s": 0.08, "e": 0.0, "w": 0.0},
+        "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+    }
+    assert calculator.calculate_unit_coefficient("unit_1", "10", "heating")["s"] == 0.08
 
-    # 4. Same global coefficient returned for all temp keys regardless of mode.
-    assert calculator.calculate_unit_coefficient("unit_1", "12")["s"] == 0.08
-    assert calculator.calculate_unit_coefficient("unit_1", "20")["s"] == 0.08
+    # 4. Cooling mode lookup with empty cooling regime → default fallback.
+    assert (
+        calculator.calculate_unit_coefficient("unit_1", "20", "cooling")["s"]
+        == DEFAULT_SOLAR_COEFF_COOLING
+    )
 
-    # 5. Remove learned coefficient -> falls back to mode-appropriate default.
+    # 5. Learn cooling separately — heating unaffected.
+    coordinator._solar_coefficients_per_unit["unit_1"]["cooling"] = {
+        "s": 0.04, "e": 0.0, "w": 0.0
+    }
+    assert calculator.calculate_unit_coefficient("unit_1", "20", "cooling")["s"] == 0.04
+    assert calculator.calculate_unit_coefficient("unit_1", "10", "heating")["s"] == 0.08
+
+    # 6. Remove learned entry → both regimes fall back to mode-appropriate default.
     del coordinator._solar_coefficients_per_unit["unit_1"]
-    coeff_cooling = calculator.calculate_unit_coefficient("unit_1", "20")
-    assert coeff_cooling['s'] == DEFAULT_SOLAR_COEFF_COOLING
+    assert (
+        calculator.calculate_unit_coefficient("unit_1", "20", "cooling")["s"]
+        == DEFAULT_SOLAR_COEFF_COOLING
+    )
+    assert (
+        calculator.calculate_unit_coefficient("unit_1", "10", "heating")["s"]
+        == DEFAULT_SOLAR_COEFF_HEATING
+    )
 
 def test_calculate_unit_coefficient_non_numeric(calculator, coordinator):
-    # Mock coordinator get_unit_mode
-    coordinator.get_unit_mode = MagicMock(return_value="cooling")
-    coeff = calculator.calculate_unit_coefficient("unit_1", "invalid")
+    # ``temp_key`` is reserved for future temp-stratified extensions but
+    # currently unused — only ``mode`` drives regime selection.
+    coeff = calculator.calculate_unit_coefficient("unit_1", "invalid", "cooling")
     assert coeff['s'] == DEFAULT_SOLAR_COEFF_COOLING
 
 def test_apply_correction(calculator, coordinator):

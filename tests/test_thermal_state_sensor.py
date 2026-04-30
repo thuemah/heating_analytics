@@ -3,7 +3,12 @@ import pytest
 from unittest.mock import MagicMock, patch
 from datetime import datetime
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
-from custom_components.heating_analytics.const import DEFAULT_INERTIA_WEIGHTS
+
+# Test fixture only — production runtime uses an exponential kernel
+# generated from CONF_THERMAL_INERTIA via generate_exponential_kernel.
+# These 4 weights are an arbitrary mock value that satisfies the
+# weighted-average shape expected by _calculate_weighted_inertia.
+_INERTIA_WEIGHTS_FIXTURE = (0.20, 0.30, 0.30, 0.20)
 
 @pytest.fixture
 def coordinator(hass):
@@ -20,7 +25,7 @@ async def test_thermal_state_calculation_logic():
 
     # 1. Basic Weighted Average
     inertia_list = [10.0, 10.0, 10.0, 10.0]
-    weights = DEFAULT_INERTIA_WEIGHTS # (0.20, 0.30, 0.30, 0.20)
+    weights = _INERTIA_WEIGHTS_FIXTURE # (0.20, 0.30, 0.30, 0.20)
     weighted_sum = sum(t * w for t, w in zip(inertia_list, weights))
     assert weighted_sum == 10.0
 
@@ -53,7 +58,7 @@ async def test_thermal_state_short_history():
     inertia_list = [5.0, 10.0] # Only 2 samples
 
     # Weights used: last 2 -> [0.30, 0.20]
-    w = DEFAULT_INERTIA_WEIGHTS[-2:]
+    w = _INERTIA_WEIGHTS_FIXTURE[-2:]
     total_w = sum(w) # 0.50
     val = sum(t * weight for t, weight in zip(inertia_list, w)) / total_w
 

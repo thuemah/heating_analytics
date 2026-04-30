@@ -88,7 +88,7 @@ class TestLiveMidnightSyncOutage:
         """Track C enabled + MPC fails → no bucket, no U, counter += 1."""
         base_coord.track_c_enabled = True
         base_coord.mpc_managed_sensor = "sensor.vp_stue"
-        base_coord._run_track_c_midnight_sync = AsyncMock(return_value=None)  # outage
+        base_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(return_value=None)  # outage
         base_coord._hourly_log = _full_day_logs("2026-04-20")
         base_coord._accumulated_energy_today = 12.0
         base_coord.data[ATTR_TDD] = 5.0
@@ -107,7 +107,7 @@ class TestLiveMidnightSyncOutage:
         """Counter accumulates across multiple sync calls."""
         base_coord.track_c_enabled = True
         base_coord.mpc_managed_sensor = "sensor.vp_stue"
-        base_coord._run_track_c_midnight_sync = AsyncMock(return_value=None)
+        base_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(return_value=None)
 
         base_coord._hourly_log = _full_day_logs("2026-04-20")
         base_coord._accumulated_energy_today = 12.0
@@ -128,8 +128,8 @@ class TestLiveMidnightSyncOutage:
         base_coord.mpc_managed_sensor = "sensor.vp_stue"
         # Pretend Track C returns (kwh, distribution, source).
         dist = [{"synthetic_kwh_el": 0.5} for _ in range(24)]
-        base_coord._run_track_c_midnight_sync = AsyncMock(return_value=(12.0, dist, "live"))
-        base_coord._apply_strategies_to_global_model = MagicMock(return_value=3)
+        base_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(return_value=(12.0, dist, "live"))
+        base_coord._daily_processor.apply_strategies_to_global_model = MagicMock(return_value=3)
         base_coord._hourly_log = _full_day_logs("2026-04-20")
         base_coord._accumulated_energy_today = 12.0
         base_coord.data[ATTR_TDD] = 5.0
@@ -182,10 +182,10 @@ def _retrain_coord(hourly_log, *, track_c_enabled: bool, daily_history: dict | N
     coord.learning = LearningManager()
     coord.solar = SolarCalculator(coord)
     coord._replay_per_unit_models = MagicMock()
-    coord._apply_strategies_to_global_model = MagicMock(return_value=1)
+    coord._daily_processor.apply_strategies_to_global_model = MagicMock(return_value=1)
     coord._compute_excluded_mode_energy = MagicMock(return_value=0.0)
     coord._get_wind_bucket = MagicMock(return_value="normal")
-    coord._try_track_b_cop_smearing = AsyncMock(return_value=0)
+    coord._daily_processor.try_track_b_cop_smearing = AsyncMock(return_value=0)
     coord._unit_strategies = build_strategies(
         energy_sensors=["sensor.vp_stue", "sensor.panel"],
         track_c_enabled=track_c_enabled,

@@ -99,7 +99,11 @@ class TestPreScreenLearningRobustness:
                 unit_mode=MODE_HEATING,
             )
 
-        return coeffs.get("unit_screen", {"s": 0.0, "e": 0.0, "w": 0.0})
+        # Mode-stratified per #868 — return the heating regime view.
+        entity = coeffs.get("unit_screen")
+        if isinstance(entity, dict) and "heating" in entity:
+            return entity["heating"]
+        return {"s": 0.0, "e": 0.0, "w": 0.0}
 
     def test_learning_converges_with_screens_closed(self):
         """Learning still converges when screens are nearly closed (10%).
@@ -135,7 +139,7 @@ class TestPreScreenLearningRobustness:
             _solar_coefficients_per_unit = {}
 
         calc = SolarCalculator(MockCoord())
-        predicted = calc.calculate_unit_solar_impact(test_potential, coeff, 1.0)
+        predicted = calc.calculate_unit_solar_impact(test_potential, coeff)
         true_impact = true_s * test_potential[0] + true_e * test_potential[1]
 
         assert abs(predicted - true_impact) < 0.1, (
@@ -169,9 +173,10 @@ class TestPreScreenLearningRobustness:
                 0.01, coeffs, buffers, 5.0, 15.0, MODE_HEATING,
             )
 
-        # Should have converged (not diverged or oscillated)
+        # Should have converged (not diverged or oscillated).
+        # Heating-regime read per #868.
         assert "unit_vary" in coeffs
-        final = coeffs["unit_vary"]
+        final = coeffs["unit_vary"]["heating"]
         assert 0.0 < final["s"] < SOLAR_COEFF_CAP, f"S={final['s']} out of range"
         assert abs(final["e"]) < SOLAR_COEFF_CAP, f"E={final['e']} out of range"
 
@@ -197,11 +202,20 @@ class TestTransmittanceReconstruction:
         assert 1.0 / t < 6.0, f"Amplification factor {1/t:.1f} too large"
 
 
-class TestPredictionPathUsesTransmittance:
-    """The prediction path should apply screen_transmittance separately."""
+class TestPredictionPathIsTransmittanceFree:
+    """The prediction path must NOT apply screen_transmittance separately.
 
-    def test_calculate_unit_solar_impact_with_transmittance(self):
-        """Impact = (coeff . potential_vector) × transmittance."""
+    CLAUDE.md invariant #1: ``coeff × potential`` with no extra transmittance
+    factor — the coefficient absorbs ``avg_transmittance`` via the NLMS
+    learning target.  A separate transmittance factor at prediction would
+    yield ``phys × trans² × potential`` (the trans² bug that motivated #809
+    and the current design).
+    """
+
+    def test_calculate_unit_solar_impact_is_dot_product_only(self):
+        """Impact == coeff . potential_vector, regardless of any external
+        screen state — the function signature accepts only (vector, coeff).
+        """
         from tests.helpers import CoordinatorModelMixin
 
         class MockCoord(CoordinatorModelMixin):
@@ -214,16 +228,6 @@ class TestPredictionPathUsesTransmittance:
         coeff = {"s": 1.5, "e": 0.3, "w": 0.0}
         potential_vector = (0.6, 0.2, 0.0)
 
-        # Full transmittance
-        impact_full = calc.calculate_unit_solar_impact(potential_vector, coeff, 1.0)
-        expected_full = 1.5 * 0.6 + 0.3 * 0.2
-        assert impact_full == pytest.approx(expected_full)
-
-        # Half transmittance
-        impact_half = calc.calculate_unit_solar_impact(potential_vector, coeff, 0.5)
-        assert impact_half == pytest.approx(expected_full * 0.5)
-
-        # Floor transmittance
-        t_floor = SolarCalculator._screen_transmittance(0.0)
-        impact_floor = calc.calculate_unit_solar_impact(potential_vector, coeff, t_floor)
-        assert impact_floor == pytest.approx(expected_full * t_floor)
+        impact = calc.calculate_unit_solar_impact(potential_vector, coeff)
+        expected = 1.5 * 0.6 + 0.3 * 0.2
+        assert impact == pytest.approx(expected)

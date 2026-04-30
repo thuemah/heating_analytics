@@ -4,6 +4,35 @@ blueprint:
     Synchronizes climate entity states (heat/cool/off) to a Heating Analytics
     mode select helper. Supports both standard and guest mode tracking.
 
+    State mapping (v2):
+
+      heat, heat_cool, auto    →  heating  (active heating intent)
+      cool                     →  cooling  (active cooling intent)
+      off:
+        - guest mode           →  off      (guest left, no demand)
+        - standard mode        →  preserve (do nothing — see below)
+      dry, fan_only            →  preserve (small load, neither heat nor cool)
+      unavailable, unknown     →  preserve (no trigger fires)
+
+    The asymmetric off-handling is deliberate.  For guest units (e.g.
+    a guest-room heat pump), climate=off cleanly maps to mode=off:
+    the unit is genuinely idle when no guests are present.  For
+    standard units (the main heating system), climate=off may be
+    transient — automation pause, brief modulation, short user
+    intervention — and flipping the mode helper to off cancels
+    Heating Analytics learning for the period.  MODE_OFF is reserved
+    for units the user explicitly disabled (matches the rationale
+    in the heat_pump_mode_sync.yaml blueprint).  Users who DO want
+    standard climate=off to stop tracking can manually set the
+    select to off via the UI.
+
+    Behaviour change from v1 (1.3.4 and earlier):
+      - climate=off on standard units no longer silently sets mode=off.
+      - heat_cool and auto now route to heating instead of off.
+      - dry and fan_only now preserve (they were silently set to off).
+
+    See blueprints/MIGRATION.md for the upgrade guide.
+
   domain: automation
 
   source_url: https://github.com/thuemah/heating_analytics/blob/main/blueprints/climate_sync.yaml
@@ -26,8 +55,11 @@ blueprint:
     use_guest_prefix:
       name: Use Guest Mode Prefix
       description: >
-        Enable to prefix heating/cooling states with 'guest_' for tracking
-        consumption separately from main heating system
+        Enable for guest-room units. Heating/cooling states get prefixed
+        with 'guest_' so consumption is bucketed separately, and climate=off
+        sets the mode helper to off (guest left).  Disable for the main
+        heating system; off-states then preserve the current mode helper
+        rather than auto-disabling tracking on transient off-states.
       default: false
       selector:
         boolean:
@@ -48,7 +80,7 @@ trigger:
       - "dry"
       - "fan_only"
 #      - "unavailable" # beholder da sin siste status
-#      - "unknown"     # beholder da sin siste status 
+#      - "unknown"     # beholder da sin siste status
 
 variables:
   # Load the boolean input into a variable for robust access in templates
@@ -59,9 +91,11 @@ variables:
 
 action:
   - choose:
-      # Heat mode
+      # Active heating intent: explicit heat, plus auto / heat_cool where
+      # the climate device decides between heat/cool but heating is the
+      # dominant intent for installations using this integration.
       - conditions:
-          - "{{ hvac_state == 'heat' }}"
+          - "{{ hvac_state in ['heat', 'auto', 'heat_cool'] }}"
         sequence:
           - service: select.select_option
             target:
@@ -69,7 +103,7 @@ action:
             data:
               option: "{{ prefix ~ 'heating' }}"
 
-      # Cool mode
+      # Active cooling intent.
       - conditions:
           - "{{ hvac_state == 'cool' }}"
         sequence:
@@ -79,10 +113,23 @@ action:
             data:
               option: "{{ prefix ~ 'cooling' }}"
 
-    # Default: off (also handles unavailable/unknown gracefully)
-    default:
-      - service: select.select_option
-        target:
-          entity_id: !input mode_helper
-        data:
-          option: "off"
+      # Climate=off — guest-mode-only branch.  Standard units fall
+      # through to the no-op default to preserve their current mode
+      # helper state (see blueprint description).
+      - conditions:
+          - "{{ hvac_state == 'off' and _use_guest_prefix }}"
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input mode_helper
+            data:
+              option: "off"
+
+    # Default: do nothing.  Covers:
+    #   - dry / fan_only (small load, neither heating nor cooling — let
+    #     the per-unit base bucket absorb whatever consumption appears).
+    #   - climate=off on standard units (preserve — MODE_OFF is for
+    #     deliberate user disable, not transient automation/modulation).
+    # The mode helper is unchanged; live learning continues against the
+    # most recently set mode.
+    default: []

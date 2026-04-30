@@ -5,7 +5,11 @@ from unittest.mock import MagicMock, patch
 
 from custom_components.heating_analytics.forecast import ForecastManager
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
-from custom_components.heating_analytics.const import DEFAULT_INERTIA_WEIGHTS
+
+# Test fixture only — production runtime uses an exponential kernel from
+# CONF_THERMAL_INERTIA via generate_exponential_kernel.  These 4 weights
+# are an arbitrary mock value satisfying the weighted-average shape.
+_INERTIA_WEIGHTS_FIXTURE = (0.20, 0.30, 0.30, 0.20)
 
 @pytest.fixture
 def mock_coordinator():
@@ -14,7 +18,7 @@ def mock_coordinator():
     coordinator.hass = MagicMock()
     coordinator.hass.config.time_zone = "UTC"
     coordinator.weather_entity = "weather.test"
-    coordinator.inertia_weights = DEFAULT_INERTIA_WEIGHTS
+    coordinator.inertia_weights = _INERTIA_WEIGHTS_FIXTURE
     coordinator.entry = MagicMock()
     coordinator.entry.data = {}
     coordinator.data = {}

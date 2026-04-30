@@ -61,7 +61,10 @@ class TestOverrideSolarVectorPriority:
         the vector should be used and the factor ignored."""
         coord = _MockCoord()
         coord.energy_sensors = ["unit_a"]
-        coord._solar_coefficients_per_unit = {"unit_a": {"s": 1.0, "e": 0.0, "w": 0.0}}
+        coord._solar_coefficients_per_unit = {"unit_a": {
+            "heating": {"s": 1.0, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}
         coord._correlation_data_per_unit = {"unit_a": {"10": {"normal": 1.0}}}
         coord._observation_counts = {"unit_a": {"10": {"normal": 10}}}
         stats = StatisticsManager(coord)
@@ -94,7 +97,10 @@ class TestOverrideSolarVectorPriority:
         """When override_solar_vector is None, factor is used."""
         coord = _MockCoord()
         coord.energy_sensors = ["unit_a"]
-        coord._solar_coefficients_per_unit = {"unit_a": {"s": 1.0, "e": 0.0, "w": 0.0}}
+        coord._solar_coefficients_per_unit = {"unit_a": {
+            "heating": {"s": 1.0, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}
         coord._correlation_data_per_unit = {"unit_a": {"10": {"normal": 1.0}}}
         coord._observation_counts = {"unit_a": {"10": {"normal": 10}}}
         stats = StatisticsManager(coord)
@@ -126,8 +132,11 @@ class TestForecastUsesWestCoefficient:
         elev, azim, cloud = 30.0, 240.0, 0.0
         solar_vector = coord.solar.calculate_solar_vector(elev, azim, cloud)
 
-        # With west coefficient
-        coord._solar_coefficients_per_unit = {"unit_west": {"s": 0.3, "e": 0.0, "w": 0.5}}
+        # With west coefficient (mode-stratified per #868).
+        coord._solar_coefficients_per_unit = {"unit_west": {
+            "heating": {"s": 0.3, "e": 0.0, "w": 0.5},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}
         res_with_w = stats.calculate_total_power(
             temp=10.0, effective_wind=0.0, solar_impact=0.0,
             is_aux_active=False,
@@ -135,7 +144,10 @@ class TestForecastUsesWestCoefficient:
         )
 
         # Without west coefficient
-        coord._solar_coefficients_per_unit = {"unit_west": {"s": 0.3, "e": 0.0, "w": 0.0}}
+        coord._solar_coefficients_per_unit = {"unit_west": {
+            "heating": {"s": 0.3, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}
         coord._model_cache = None  # Invalidate cache
         res_without_w = stats.calculate_total_power(
             temp=10.0, effective_wind=0.0, solar_impact=0.0,
@@ -159,6 +171,13 @@ class _HassConfig:
     latitude = 59.9  # Oslo, Norway
     longitude = 10.75
     time_zone = "Europe/Oslo"
+    # Real ``HassConfig`` instances always carry ``elevation``.  Pre-#878
+    # the broad ``except Exception`` in ``solar.get_approx_sun_pos``
+    # swallowed any AttributeError silently; after #878 narrowed the
+    # except to ``(TypeError, ValueError)`` an AttributeError here
+    # propagates and the test fails.  Provide the attribute explicitly
+    # to mirror the production HA contract.
+    elevation = 0
 
 
 class _MockCoordWithHass(CoordinatorModelMixin):

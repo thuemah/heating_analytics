@@ -30,6 +30,21 @@ from .observation import DirectMeter, WeightedSmear
 _LOGGER = logging.getLogger(__name__)
 
 
+def _screen_affected_set_or_none(coordinator) -> frozenset[str] | None:
+    """Return coordinator._screen_affected_set if it is a real set/frozenset.
+
+    Guards against MagicMock-based test coordinators where ``getattr`` would
+    return a MagicMock (truthy, `__contains__` returns False) and silently
+    route every entity down the "unscreened" branch inside
+    :meth:`learning.replay_solar_nlms` — masking inequality-path regressions
+    in tests that don't explicitly set the attribute.
+    """
+    value = getattr(coordinator, "_screen_affected_set", None)
+    if isinstance(value, (frozenset, set)):
+        return value
+    return None
+
+
 class RetrainEngine:
     """Hosts the retrain_from_history service implementation."""
 
@@ -298,6 +313,7 @@ class RetrainEngine:
                 unit_strategies=self.coordinator._unit_strategies,
                 daily_history=self.coordinator._daily_history,
                 unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
+                screen_affected_entities=_screen_affected_set_or_none(self.coordinator),
                 return_diagnostics=True,
             )
             solar_replay_updates = solar_replay_diagnostics.get("updates", 0)
@@ -490,6 +506,7 @@ class RetrainEngine:
                 unit_strategies=self.coordinator._unit_strategies,
                 daily_history=self.coordinator._daily_history,
                 unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
+                screen_affected_entities=_screen_affected_set_or_none(self.coordinator),
                 return_diagnostics=True,
             )
             solar_replay_updates = solar_replay_diagnostics.get("updates", 0)

@@ -298,7 +298,8 @@ class TestEndToEndSolarPipeline:
                 unit_mode=MODE_HEATING,
             )
 
-        coeff = coord._solar_coefficients_per_unit["unit_a"]
+        # Mode-stratified per #868 — heating regime read.
+        coeff = coord._solar_coefficients_per_unit["unit_a"]["heating"]
         # Coefficient should converge to true × transmittance
         expected_s = true_s * trans
         expected_e = true_e * trans
@@ -366,26 +367,19 @@ class TestEndToEndSolarPipeline:
         coord = _MockCoordinator(solar_coefficients={"unit_a": coeff})
         calc = SolarCalculator(coord)
 
-        # Prediction: coeff × potential × 1.0 (default transmittance)
+        # Prediction: coeff × potential
         impact = calc.calculate_unit_solar_impact((pot_s, 0.0, 0.0), coeff)
         expected = 1.0 * 0.5  # coeff_s × pot_s, no transmittance factor
         assert impact == pytest.approx(expected), (
             f"Impact {impact} != {expected} — extra transmittance factor detected"
         )
 
-        # If we INCORRECTLY passed screen_transmittance, we'd get trans²:
+        # Result is invariant to screen state across the slider range —
+        # prediction reads coeff × potential directly (no trans factor).
         for pct in [25, 50, 75]:
-            trans = SolarCalculator._screen_transmittance(pct)
-            impact_correct = calc.calculate_unit_solar_impact((pot_s, 0.0, 0.0), coeff)
-            impact_wrong = calc.calculate_unit_solar_impact(
-                (pot_s, 0.0, 0.0), coeff, screen_transmittance=trans
-            )
-            # Correct: 0.5 (independent of screen). Wrong: 0.5 × trans.
-            assert impact_correct == pytest.approx(0.5)
-            assert impact_wrong == pytest.approx(0.5 * trans)
-            assert impact_correct != pytest.approx(impact_wrong), (
-                "Correct and wrong paths should differ when trans < 1"
-            )
+            _ = pct  # screen pct no longer feeds impact; retained for coverage
+            impact_at_pct = calc.calculate_unit_solar_impact((pot_s, 0.0, 0.0), coeff)
+            assert impact_at_pct == pytest.approx(0.5)
 
     def test_full_pipeline_with_screen_ramp(self):
         """Complete pipeline: accumulate 30 samples with screen ramp 20→80%,
@@ -427,8 +421,9 @@ class TestEndToEndSolarPipeline:
                 unit_mode=MODE_HEATING,
             )
 
-        # Phase 2: Verify coefficient converged
-        learned = coord._solar_coefficients_per_unit["unit_ramp"]
+        # Phase 2: Verify coefficient converged.
+        # Mode-stratified per #868 — heating regime read.
+        learned = coord._solar_coefficients_per_unit["unit_ramp"]["heating"]
         avg_correction = sum(
             20.0 + (i / (n_samples - 1)) * 60.0 for i in range(n_samples)
         ) / n_samples

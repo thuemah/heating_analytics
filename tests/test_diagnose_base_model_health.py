@@ -166,24 +166,138 @@ class TestBaseModelHealthFiltering:
         bucket = result["base_model_health"]["buckets"]["10"]["normal"]
         assert bucket["verdict"] == "unverifiable"
 
-    def test_excluded_mode_hours_filtered(self):
-        """DHW / guest / off mode contamination excludes the hour."""
+    def test_off_unit_does_not_block_hour(self):
+        """OFF unit contributes 0 kWh — hour is INCLUDED with no subtraction.
+
+        Permanently-off auxiliary VPs (kjøkken, kjeller, etc.) must not
+        cause base_model_health to flag every bucket as unverifiable.
+        Mirrors the production scenario where every hour in the log has
+        at least one OFF unit.  Subtraction is a no-op for OFF (kwh = 0)
+        so the dark-hour mean equals the heating units' actual kWh.
+        """
         stored = {"10": {"normal": 0.40}}
-        # 15 hours with DHW mode contamination — should NOT count toward dark-hour mean
         log = [
-            _base_entry(f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
-                        temp_key="10", wind_bucket="normal",
-                        actual_kwh=0.25, solar_factor=0.0,
-                        unit_modes={"sensor.heater1": "heating",
-                                    "sensor.heater2": "dhw"})
+            {
+                "timestamp": f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
+                "temp_key": "10",
+                "wind_bucket": "normal",
+                "actual_kwh": 0.25,
+                "solar_factor": 0.0,
+                "auxiliary_active": False,
+                "unit_modes": {
+                    "sensor.heater1": "heating",
+                    "sensor.heater_off": "off",
+                },
+                # OFF unit has 0 in breakdown — physically correct, off ⇒ 0 kWh
+                "unit_breakdown": {"sensor.heater1": 0.25, "sensor.heater_off": 0.0},
+                "expected_kwh": 0.25,
+            }
             for i in range(15)
         ]
         coord = _make_coord(stored, log)
         result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
 
         bucket = result["base_model_health"]["buckets"]["10"]["normal"]
-        assert bucket["verdict"] == "unverifiable"
-        assert bucket["n_dark_hours"] == 0
+        # Hour included; full actual used (OFF subtraction is no-op)
+        assert bucket["n_dark_hours"] == 15
+        assert bucket["actual_dark_mean_kwh"] == pytest.approx(0.25)
+        # Stored 0.40 vs mean 0.25 → 60% inflated
+        assert bucket["verdict"] == "inflated"
+
+    def test_dhw_unit_kwh_subtracted_from_dark_mean(self):
+        """DHW unit's non-zero kWh is subtracted; residual compared to bucket.
+
+        Mirrors retrain.py:401-408 — a DHW unit that contributes 0.10 kWh
+        on top of 0.30 kWh heating should yield a dark-hour reference of
+        0.30 (heating only), not 0.40 (heating + DHW contamination).
+        """
+        stored = {"10": {"normal": 0.30}}
+        log = [
+            {
+                "timestamp": f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
+                "temp_key": "10",
+                "wind_bucket": "normal",
+                "actual_kwh": 0.40,  # 0.30 heating + 0.10 DHW
+                "solar_factor": 0.0,
+                "auxiliary_active": False,
+                "unit_modes": {
+                    "sensor.heater1": "heating",
+                    "sensor.dhw": "dhw",
+                },
+                "unit_breakdown": {"sensor.heater1": 0.30, "sensor.dhw": 0.10},
+                "expected_kwh": 0.40,
+            }
+            for i in range(15)
+        ]
+        coord = _make_coord(stored, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+
+        bucket = result["base_model_health"]["buckets"]["10"]["normal"]
+        assert bucket["n_dark_hours"] == 15
+        # 0.40 raw - 0.10 DHW = 0.30 → matches stored bucket exactly
+        assert bucket["actual_dark_mean_kwh"] == pytest.approx(0.30)
+        assert bucket["verdict"] == "ok"
+
+    def test_guest_heating_unit_kwh_subtracted(self):
+        """GUEST_HEATING is in MODES_EXCLUDED_FROM_GLOBAL_LEARNING — same path."""
+        stored = {"10": {"normal": 0.25}}
+        log = [
+            {
+                "timestamp": f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
+                "temp_key": "10",
+                "wind_bucket": "normal",
+                "actual_kwh": 0.40,
+                "solar_factor": 0.0,
+                "auxiliary_active": False,
+                "unit_modes": {
+                    "sensor.heater1": "heating",
+                    "sensor.guest": "guest_heating",
+                },
+                "unit_breakdown": {"sensor.heater1": 0.25, "sensor.guest": 0.15},
+                "expected_kwh": 0.40,
+            }
+            for i in range(15)
+        ]
+        coord = _make_coord(stored, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+
+        bucket = result["base_model_health"]["buckets"]["10"]["normal"]
+        # 0.40 - 0.15 (guest) = 0.25 → matches stored
+        assert bucket["actual_dark_mean_kwh"] == pytest.approx(0.25)
+        assert bucket["verdict"] == "ok"
+
+    def test_mixed_excluded_modes_subtracted_together(self):
+        """OFF (0 kWh) + DHW (non-zero) together — only DHW kWh subtracted."""
+        stored = {"10": {"normal": 0.30}}
+        log = [
+            {
+                "timestamp": f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
+                "temp_key": "10",
+                "wind_bucket": "normal",
+                "actual_kwh": 0.42,
+                "solar_factor": 0.0,
+                "auxiliary_active": False,
+                "unit_modes": {
+                    "sensor.heater1": "heating",
+                    "sensor.heater_off": "off",
+                    "sensor.dhw": "dhw",
+                },
+                "unit_breakdown": {
+                    "sensor.heater1": 0.30,
+                    "sensor.heater_off": 0.0,
+                    "sensor.dhw": 0.12,
+                },
+                "expected_kwh": 0.42,
+            }
+            for i in range(15)
+        ]
+        coord = _make_coord(stored, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+
+        bucket = result["base_model_health"]["buckets"]["10"]["normal"]
+        # 0.42 - 0 (off) - 0.12 (dhw) = 0.30
+        assert bucket["actual_dark_mean_kwh"] == pytest.approx(0.30)
+        assert bucket["verdict"] == "ok"
 
 
 class TestBaseModelHealthMultipleBuckets:
@@ -238,6 +352,207 @@ class TestBaseModelHealthConfig:
         assert cfg["dark_solar_factor_threshold"] == 0.05
         assert cfg["min_dark_hours_for_verdict"] == 10
         assert cfg["bucket_deviation_threshold_pct"] == 15.0
+
+
+class TestDiagnoseModelSummary:
+    """Top-of-response summary block aggregates section headlines + verdict."""
+
+    def test_summary_present_and_first_key(self):
+        coord = _make_coord({"10": {"normal": 0.30}}, [])
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        assert "summary" in result
+        # Summary must render first so callers can read a one-screen verdict
+        assert next(iter(result.keys())) == "summary"
+
+    def test_summary_ok_verdict_when_clean(self):
+        """Stored matches dark-hour reality, no inversions, no solar bias."""
+        stored = {"10": {"normal": 0.30}}
+        log = _dark_hours("10", "normal", actual_kwh=0.30, n=15)
+        coord = _make_coord(stored, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        s = result["summary"]
+        assert s["verdict"] == "ok"
+        assert s["base_model"]["ok"] == 1
+        assert s["base_model"]["unverifiable"] == 0
+        assert s["monotonicity"]["inversion_count"] == 0
+
+    def test_summary_issues_found_on_inflated_bucket(self):
+        stored = {"10": {"normal": 0.40}}
+        log = _dark_hours("10", "normal", actual_kwh=0.25, n=15)
+        coord = _make_coord(stored, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        s = result["summary"]
+        assert s["verdict"] == "issues_found"
+        assert s["base_model"]["inflated"] == 1
+        assert s["base_model"]["ok"] == 0
+
+    def test_summary_unverifiable_when_majority_unverifiable(self):
+        """>50 % unverifiable → verdict = model_unverifiable."""
+        # 3 buckets total; 2 have no qualifying dark hours → unverifiable
+        stored = {
+            "5":  {"normal": 0.50},
+            "10": {"normal": 0.30},
+            "15": {"normal": 0.10},
+        }
+        log = _dark_hours("10", "normal", actual_kwh=0.30, n=15)
+        coord = _make_coord(stored, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        s = result["summary"]
+        assert s["verdict"] == "model_unverifiable"
+        assert s["base_model"]["unverifiable"] == 2
+        assert s["base_model"]["verifiable"] == 1
+
+    def test_summary_inversion_noise_floor(self):
+        """Sub-noise inversion (delta ≤ 0.05 kWh) does NOT drive verdict.
+
+        Inversion direction: kwh_cold < kwh_warm (colder temp recorded LESS
+        consumption than warmer temp — physically wrong).  Mirrors the
+        production output where 19 °C = 0.040 and 18 °C = 0.038.
+        """
+        stored = {
+            "19": {"normal": 0.040},  # warmer
+            "18": {"normal": 0.038},  # colder, but LESS → inversion delta 0.002
+        }
+        # Provide 15 dark hours per bucket so they're verifiable + ok
+        log = (
+            _dark_hours("19", "normal", actual_kwh=0.040, n=15, start="2026-04-01")
+            + _dark_hours("18", "normal", actual_kwh=0.038, n=15, start="2026-04-15")
+        )
+        coord = _make_coord(stored, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        s = result["summary"]
+        # Inversion counted but does not flip verdict
+        assert s["monotonicity"]["inversion_count"] == 1
+        assert s["monotonicity"]["inversion_count_above_noise"] == 0
+        assert s["verdict"] == "ok"
+
+    def test_summary_inversion_above_noise_drives_verdict(self):
+        """Inversion > noise floor flips verdict to issues_found."""
+        # 9 °C: 0.20 (warmer), 8 °C: 0.10 (colder, less) → inversion delta 0.10 > 0.05
+        # Both buckets verifiable + ok individually (dark mean matches stored)
+        stored = {"9": {"normal": 0.20}, "8": {"normal": 0.10}}
+        log = (
+            _dark_hours("9", "normal", actual_kwh=0.20, n=15, start="2026-04-01")
+            + _dark_hours("8", "normal", actual_kwh=0.10, n=15, start="2026-04-15")
+        )
+        coord = _make_coord(stored, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        s = result["summary"]
+        assert s["monotonicity"]["inversion_count"] == 1
+        assert s["monotonicity"]["inversion_count_above_noise"] == 1
+        assert s["monotonicity"]["max_delta_kwh"] == pytest.approx(0.10)
+        assert s["verdict"] == "issues_found"
+
+    def test_summary_data_window_reflects_inputs(self):
+        coord = _make_coord({"10": {"normal": 0.30}}, _dark_hours("10", "normal", 0.30, n=12))
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=14)
+        s = result["summary"]
+        assert s["data_window"]["days"] == 14
+        assert s["data_window"]["hours_analyzed"] == 12
+
+
+class TestSolarCorrelationExcludedKwhSubtraction:
+    """solar_correlation must subtract excluded-mode (DHW / OFF / guest) kWh
+    from ``actual`` before computing the residual against ``expected``.
+
+    Without subtraction, DHW or guest hours that overlap with solar hours
+    bias the correlation positive (residual is inflated by non-heating
+    energy that ``expected`` does not account for).  Mirrors the same fix
+    applied to base_model_health.
+    """
+
+    @staticmethod
+    def _solar_hour(ts, *, actual, expected, solar_factor=0.5,
+                    unit_modes=None, unit_breakdown=None):
+        return {
+            "timestamp": ts,
+            "actual_kwh": actual,
+            "expected_kwh": expected,
+            "solar_factor": solar_factor,
+            "unit_modes": unit_modes or {},
+            "unit_breakdown": unit_breakdown or {"sensor.heater1": actual},
+            # Defaults that make this entry pass the dark-hour filter
+            # (irrelevant for correlation, kept for fixture consistency)
+            "auxiliary_active": False,
+            "temp_key": "10",
+            "wind_bucket": "normal",
+        }
+
+    def test_off_unit_does_not_affect_correlation(self):
+        """OFF contributes 0 kWh — subtraction is a no-op."""
+        # 30 sunny hours, all clean (no DHW/guest), heater1 + heater_off (OFF, 0 kWh)
+        log = [
+            self._solar_hour(
+                f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
+                actual=0.30, expected=0.30, solar_factor=0.4,
+                unit_modes={"sensor.heater1": "heating", "sensor.heater_off": "off"},
+                unit_breakdown={"sensor.heater1": 0.30, "sensor.heater_off": 0.0},
+            )
+            for i in range(30)
+        ]
+        coord = _make_coord({}, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        sc = result["solar_correlation"]
+        # avg residual is 0 (actual == expected after no-op subtraction)
+        assert sc["qualifying_hours"] == 30
+        assert sc["avg_error_kwh"] == pytest.approx(0.0, abs=0.001)
+
+    def test_dhw_overlap_with_sun_subtracted(self):
+        """A unit in DHW with non-zero kWh has its contribution removed."""
+        # 30 sunny hours; heating contributes 0.20, DHW contributes 0.10 on top.
+        # Without subtraction: residual = (0.20 + 0.10) - 0.20 = +0.10 → spurious
+        # positive correlation.  With subtraction: residual = 0.20 - 0.20 = 0.
+        log = [
+            self._solar_hour(
+                f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
+                actual=0.30, expected=0.20, solar_factor=0.5,
+                unit_modes={"sensor.heater1": "heating", "sensor.dhw": "dhw"},
+                unit_breakdown={"sensor.heater1": 0.20, "sensor.dhw": 0.10},
+            )
+            for i in range(30)
+        ]
+        coord = _make_coord({}, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        sc = result["solar_correlation"]
+        # avg residual ≈ 0 after DHW subtraction
+        assert sc["qualifying_hours"] == 30
+        assert sc["avg_error_kwh"] == pytest.approx(0.0, abs=0.001)
+
+    def test_guest_heating_kwh_subtracted(self):
+        """GUEST_HEATING is in MODES_EXCLUDED_FROM_GLOBAL_LEARNING — same path."""
+        log = [
+            self._solar_hour(
+                f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
+                actual=0.40, expected=0.25, solar_factor=0.5,
+                unit_modes={"sensor.heater1": "heating", "sensor.guest": "guest_heating"},
+                unit_breakdown={"sensor.heater1": 0.25, "sensor.guest": 0.15},
+            )
+            for i in range(30)
+        ]
+        coord = _make_coord({}, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        sc = result["solar_correlation"]
+        # 0.40 raw - 0.15 guest = 0.25 → residual 0
+        assert sc["avg_error_kwh"] == pytest.approx(0.0, abs=0.001)
+
+    def test_excluded_subtraction_clamped_at_zero(self):
+        """If ``excluded_kwh > actual`` (corrupt log), adjusted_actual clamps to 0."""
+        # Logged actual 0.10 but breakdown sums to 0.30 (broken state) — clamp protects
+        # the correlation from going negative due to data corruption.
+        log = [
+            self._solar_hour(
+                f"2026-04-{(i // 24) + 10:02d}T{i % 24:02d}:00:00",
+                actual=0.10, expected=0.10, solar_factor=0.5,
+                unit_modes={"sensor.dhw": "dhw"},
+                unit_breakdown={"sensor.dhw": 0.30},
+            )
+            for i in range(30)
+        ]
+        coord = _make_coord({}, log)
+        result = DiagnosticsEngine(coord).diagnose_model(days_back=30)
+        sc = result["solar_correlation"]
+        # adjusted_actual = max(0, 0.10 - 0.30) = 0; residual = 0 - 0.10 = -0.10
+        assert sc["avg_error_kwh"] == pytest.approx(-0.10, abs=0.001)
 
 
 # -----------------------------------------------------------------------------

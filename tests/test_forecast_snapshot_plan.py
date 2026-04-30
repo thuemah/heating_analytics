@@ -5,7 +5,11 @@ from unittest.mock import MagicMock, patch
 
 from custom_components.heating_analytics.forecast import ForecastManager
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
-from custom_components.heating_analytics.const import DEFAULT_INERTIA_WEIGHTS
+
+# Test fixture only — production runtime uses an exponential kernel from
+# CONF_THERMAL_INERTIA via generate_exponential_kernel.  These 4 weights
+# are an arbitrary mock value satisfying the weighted-average shape.
+_INERTIA_WEIGHTS_FIXTURE = (0.20, 0.30, 0.30, 0.20)
 
 @pytest.fixture
 def mock_coordinator():
@@ -25,7 +29,7 @@ def mock_coordinator():
     coordinator.get_unit_mode = MagicMock(return_value="normal")
     coordinator._hourly_log = [] # No history
     coordinator.auxiliary_heating_active = False # Default state
-    coordinator.inertia_weights = DEFAULT_INERTIA_WEIGHTS
+    coordinator.inertia_weights = _INERTIA_WEIGHTS_FIXTURE
 
     return coordinator
 
@@ -54,9 +58,9 @@ def test_snapshot_generation_includes_hourly_plan(mock_now, mock_start_of_day, m
     def process_side_effect(item, *args, **kwargs):
         temp = float(item["temperature"])
         if temp == 10.0:
-            return (1.5, 0.0, 5.0, 10.0, 0.0, 0.0, {}, 0.0)
+            return (1.5, 0.0, 5.0, 10.0, 0.0, 0.0, {}, 0.0, 0.0)
         else:
-            return (2.0, 0.0, 4.0, 9.0, 0.0, 0.0, {}, 0.0)
+            return (2.0, 0.0, 4.0, 9.0, 0.0, 0.0, {}, 0.0, 0.0)
 
     with patch.object(fm, '_process_forecast_item', side_effect=process_side_effect) as mock_process:
         snapshot = fm._capture_daily_forecast_snapshot()

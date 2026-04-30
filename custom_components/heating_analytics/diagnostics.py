@@ -7,6 +7,7 @@ on the coordinator so the external API is unchanged.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date as _date, datetime, timedelta
 
 from homeassistant.util import dt as dt_util
@@ -41,6 +42,12 @@ class DiagnosticsEngine:
         from .const import MODES_EXCLUDED_FROM_GLOBAL_LEARNING
 
         result: dict = {}
+        # Pre-insert summary so it renders first in the response — populated
+        # at the bottom of this method once all sections are computed.
+        # Mutating an existing key preserves its insertion-order position
+        # (Python 3.7+ dict semantics), so the final assignment does not
+        # move it.
+        result["summary"] = {}
 
         # --- 1. Monotonicity check per wind bucket ---
         monotonicity: dict[str, dict] = {}
@@ -167,8 +174,25 @@ class DiagnosticsEngine:
             solar_f = entry.get("solar_factor")
             actual = entry.get("actual_kwh")
             expected = entry.get("expected_kwh")
-            if solar_f is not None and actual is not None and expected is not None and solar_f > 0.01:
-                solar_errors.append((solar_f, actual - expected))
+            if solar_f is None or actual is None or expected is None or solar_f <= 0.01:
+                continue
+            # Subtract excluded-mode (DHW / OFF / guest) energy from actual
+            # before computing the residual — mirrors the base_model_health
+            # fix.  Without this, DHW or guest hours that overlap with solar
+            # hours bias the correlation positive: ``expected`` is a heating-
+            # only prediction (excluded modes are not in the learning loop)
+            # but ``actual`` is the raw meter sum that includes DHW / guest
+            # contributions.  OFF contributes 0 kWh so the subtraction is a
+            # no-op for OFF — which is correct (OFF is a stable state, not
+            # contamination).
+            unit_modes = entry.get("unit_modes", {}) or {}
+            unit_breakdown = entry.get("unit_breakdown", {}) or {}
+            excluded_kwh = sum(
+                kwh for sid, kwh in unit_breakdown.items()
+                if unit_modes.get(sid, MODE_HEATING) in MODES_EXCLUDED_FROM_GLOBAL_LEARNING
+            )
+            adjusted_actual = max(0.0, actual - excluded_kwh)
+            solar_errors.append((solar_f, adjusted_actual - expected))
 
         solar_diag: dict = {"qualifying_hours": len(solar_errors)}
 
@@ -311,17 +335,27 @@ class DiagnosticsEngine:
                 continue
             if entry.get("auxiliary_active", False):
                 continue
-            # Exclude hours where any unit was in an excluded mode — the
-            # stored bucket represents all-heating energy, mixing in DHW or
-            # guest hours would bias the empirical mean.
-            unit_modes = entry.get("unit_modes", {}) or {}
-            if any(m in MODES_EXCLUDED_FROM_GLOBAL_LEARNING for m in unit_modes.values()):
-                continue
             temp_key = entry.get("temp_key")
             wind_bucket = entry.get("wind_bucket")
             if temp_key is None or wind_bucket is None or entry.get("actual_kwh") is None:
                 continue
             ref_kwh, used_track_c = _reference_dark_kwh(entry)
+            # Subtract excluded-mode (DHW / OFF / guest) energy rather than
+            # dropping the whole hour — mirrors retrain.py:401-408.  An OFF
+            # unit contributes 0 kWh so the subtraction is a no-op for it
+            # (which is correct: a permanently-off auxiliary VP is a stable
+            # state, not contamination).  For DHW / guest the unit's actual
+            # contribution is removed so the residual matches the
+            # heating-only semantic of the stored bucket.  Track-C's
+            # synthetic + non_mpc_kwh path inherits the same correction:
+            # any non-MPC unit in an excluded mode has its kWh subtracted.
+            unit_modes = entry.get("unit_modes", {}) or {}
+            unit_breakdown = entry.get("unit_breakdown", {}) or {}
+            excluded_kwh = sum(
+                kwh for sid, kwh in unit_breakdown.items()
+                if unit_modes.get(sid, MODE_HEATING) in MODES_EXCLUDED_FROM_GLOBAL_LEARNING
+            )
+            ref_kwh = max(0.0, ref_kwh - excluded_kwh)
             slot = dark_accum.setdefault(
                 (temp_key, wind_bucket), {"values": [], "track_c_count": 0}
             )
@@ -456,7 +490,123 @@ class DiagnosticsEngine:
         # the install is seeing frequent MPC unavailability.
         result["track_c_outage_session_count"] = self.coordinator._track_c_outage_count_session
 
+        # --- 0. Summary (top-of-response, populated last) ---
+        # Aggregates the headline numbers from each section so callers can
+        # read a one-screen verdict before drilling into per-bucket detail.
+        # The summary's "verdict" reflects model health only — it ignores
+        # mode_contamination (informational) and bucket_population (the
+        # underlying bucket counts surface elsewhere).  Noise floor for
+        # monotonicity inversions is 0.05 kWh — sub-noise inversions near
+        # the balance point (where stored kWh ≈ 0) are excluded from the
+        # verdict driver but still counted in ``inversion_count``.
+        MONOTONICITY_NOISE_FLOOR_KWH = 0.05
+        SOLAR_CORRELATION_NEUTRAL_BAND = 0.15
+
+        total_inv = 0
+        total_inv_above_noise = 0
+        max_delta = 0.0
+        for wb_diag in monotonicity.values():
+            for inv in wb_diag.get("inversions", []):
+                total_inv += 1
+                d = float(inv.get("delta", 0.0))
+                if d > max_delta:
+                    max_delta = d
+                if d > MONOTONICITY_NOISE_FLOOR_KWH:
+                    total_inv_above_noise += 1
+
+        base_summary = result["base_model_health"]["summary"]
+        total_buckets = (
+            base_summary["inflated_count"]
+            + base_summary["deflated_count"]
+            + base_summary["unverifiable_count"]
+            + sum(
+                1
+                for buckets in base_health.values()
+                for entry_out in buckets.values()
+                if entry_out.get("verdict") == "ok"
+            )
+        )
+        ok_count = total_buckets - (
+            base_summary["inflated_count"]
+            + base_summary["deflated_count"]
+            + base_summary["unverifiable_count"]
+        )
+        verifiable_count = total_buckets - base_summary["unverifiable_count"]
+
+        solar_corr = solar_diag.get("correlation_solar_vs_error")
+        solar_qual_hours = solar_diag.get("qualifying_hours", 0)
+
+        if total_buckets > 0 and base_summary["unverifiable_count"] / total_buckets > 0.5:
+            verdict = "model_unverifiable"
+        elif (
+            total_inv_above_noise > 0
+            or base_summary["inflated_count"] > 0
+            or base_summary["deflated_count"] > 0
+            or (solar_corr is not None and abs(solar_corr) > SOLAR_CORRELATION_NEUTRAL_BAND)
+        ):
+            verdict = "issues_found"
+        else:
+            verdict = "ok"
+
+        result["summary"] = {
+            "verdict": verdict,
+            "data_window": {
+                "days": days_back,
+                "hours_analyzed": result["mode_contamination"]["total_hours_analyzed"],
+            },
+            "monotonicity": {
+                "inversion_count": total_inv,
+                "inversion_count_above_noise": total_inv_above_noise,
+                "max_delta_kwh": round(max_delta, 4),
+                "noise_floor_kwh": MONOTONICITY_NOISE_FLOOR_KWH,
+            },
+            "base_model": {
+                "total_buckets": total_buckets,
+                "verifiable": verifiable_count,
+                "ok": ok_count,
+                "inflated": base_summary["inflated_count"],
+                "deflated": base_summary["deflated_count"],
+                "unverifiable": base_summary["unverifiable_count"],
+            },
+            "mode_contamination": {
+                "contaminated_days": result["mode_contamination"]["contaminated_days"],
+                "total_excluded_kwh": result["mode_contamination"]["total_excluded_kwh"],
+            },
+            "solar": {
+                "qualifying_hours": solar_qual_hours,
+                "correlation": solar_corr,
+                "interpretation": solar_diag.get("interpretation"),
+            },
+        }
+
         return result
+
+    def _format_last_batch_fit(self, entity_id: str) -> dict | None:
+        """Format the most recent batch-fit-solar summary for diagnose_solar (#884).
+
+        Returns ``None`` when the unit has never been included in any
+        batch-fit run.  Persisted across HA restarts via the standard
+        save path (``last_batch_fit_per_unit`` in storage).  When the
+        most recent run was a top-level skip for this entity (e.g.
+        ``weighted_smear_excluded``), the entry includes a ``skip_reason``
+        field with empty ``regimes`` — distinguishing "skipped, here's why"
+        from "never run".  Successful fits expose timestamp + per-(regime)
+        sample count, residual RMSE, before/after coefficients, damping
+        applied, and any per-regime skip reason.
+        """
+        last_per_unit = getattr(self.coordinator, "_last_batch_fit_per_unit", None)
+        if not isinstance(last_per_unit, dict):
+            return None
+        entry = last_per_unit.get(entity_id)
+        if not isinstance(entry, dict):
+            return None
+        out: dict = {
+            "timestamp": entry.get("timestamp"),
+            "regimes": entry.get("regimes") or {},
+        }
+        if "skip_reason" in entry:
+            out["skip_reason"] = entry["skip_reason"]
+        return out
 
 
     def diagnose_solar(self, days_back: int = 30, apply_battery_decay: bool = False) -> dict:
@@ -563,6 +713,17 @@ class DiagnosticsEngine:
         # Hour-of-day residual curve (hours 6-18)
         hourly_residuals: dict[int, list[float]] = {h: [] for h in range(6, 19)}
 
+        # Battery thermal-feedback sweep (#896): chronological tuples for
+        # replay of the EMA under candidate k values.  Data shape mirrors the
+        # production EMA input plus enough metadata to stratify residuals by
+        # (hour-of-day × temp-regime × screen-position).  Population happens
+        # outside the per-entity inner loop (one tuple per hour, not one per
+        # entity), so it lives directly in the entry-level pass below.
+        # Each tuple:
+        #   (solar_impact_raw, solar_wasted, actual, expected,
+        #    has_heating_unit, hour_bucket, temp_bucket, screen_bucket)
+        sweep_tuples: list[tuple] = []
+
         # --- Single pass ---
         for entry in self.coordinator._hourly_log:
             ts = entry.get("timestamp", "")
@@ -604,13 +765,126 @@ class DiagnosticsEngine:
                 if expected_total > 0.05:
                     battery_residuals.append(actual_total - expected_total)
 
-            # Collect day sequences for battery decay calibration sweep
+            # Collect day sequences for joint (decay, k) calibration sweep.
+            # Per-hour wasted is needed alongside raw_solar so the carryover
+            # battery EMA can be replayed under each k candidate without
+            # re-iterating the hourly_log.  Read the same wasted field the
+            # k-only sweep uses (preferring the heating-gated field, falling
+            # back to the legacy aggregate).
             day_key = ts[:10]
             actual_total = entry.get("actual_kwh", 0.0)
             expected_total = entry.get("expected_kwh", 0.0)
+            day_wasted = entry.get(
+                "solar_heating_wasted_kwh",
+                entry.get("solar_wasted_kwh", 0.0),
+            )
             if day_key not in day_sequences:
                 day_sequences[day_key] = []
-            day_sequences[day_key].append((hour, solar_impact_raw, actual_total, expected_total))
+            day_sequences[day_key].append(
+                (hour, solar_impact_raw, day_wasted, actual_total, expected_total)
+            )
+
+            # Battery thermal-feedback sweep (#896).  Build chronological
+            # tuples matching the production EMA input shape; stratification
+            # happens at residual-bucketing time post-loop.
+            #
+            # Wasted source: prefer ``solar_heating_wasted_kwh`` (heating-
+            # gated at write time, #896) and fall back to the total
+            # ``solar_wasted_kwh`` for legacy entries written before that
+            # field existed.  Today's saturation logic returns wasted=0 for
+            # cooling/OFF/DHW, so the legacy aggregate is structurally
+            # heating-only — but we prefer the explicit field when present.
+            #
+            # Heating-active gate mirrors the live EMA gate: the unit_modes
+            # log entry only stores non-heating modes (heating is the default
+            # to reduce log clutter, see HourlyProcessor.process), so missing
+            # entity → MODE_HEATING.  ``has_heating_unit`` is True when at
+            # least one configured energy sensor was in heating-regime that
+            # hour — an absent unit_modes block (legacy or pre-#838 log)
+            # falls back to True since heating is the default.
+            sweep_solar_wasted = entry.get(
+                "solar_heating_wasted_kwh",
+                entry.get("solar_wasted_kwh", 0.0),
+            )
+            if sweep_solar_wasted > 0.0:
+                # Cooling/OFF/DHW saturation returns wasted=0; positive wasted
+                # is a structural witness of at least one heating unit having
+                # contributed to the aggregate.  Avoids depending on the
+                # filtered unit_modes log (which can omit explicit-heating).
+                has_heating_unit = True
+            elif unit_modes:
+                stored_heating = any(
+                    m in (MODE_HEATING, MODE_GUEST_HEATING)
+                    for m in unit_modes.values()
+                )
+                stored_non_default = bool(unit_modes)
+                # If the stored map omits some sensors entirely, those
+                # sensors were in MODE_HEATING (the default-omitted regime).
+                missing_count = sum(
+                    1 for sid in self.coordinator.energy_sensors if sid not in unit_modes
+                )
+                has_heating_unit = stored_heating or missing_count > 0
+                # If no sensors are configured, treat as no heating active.
+                if not self.coordinator.energy_sensors and not stored_non_default:
+                    has_heating_unit = False
+            else:
+                has_heating_unit = bool(self.coordinator.energy_sensors)
+
+            # Hour-of-day bucket: morning captures the issue's reported
+            # symptom (transition-regime over-prediction at ~7-10 °C, mid
+            # morning).  Night included for completeness — the EMA carries
+            # state across midnight and post-sunset error is the diagnostic
+            # signal.
+            if 6 <= hour < 11:
+                hour_bucket = "morning"
+            elif 11 <= hour < 15:
+                hour_bucket = "midday"
+            elif 15 <= hour < 22:
+                hour_bucket = "afternoon"
+            else:
+                hour_bucket = "night"
+
+            # Temp regime: 4 buckets including a ``transition`` zone
+            # (BP-2 ≤ T ≤ BP+2).  Issue #896's headline symptom — sunny
+            # mornings at 7-10 °C with BP=15 — actually lies inside
+            # ``heating_mild`` ([7, 13)) for typical Norwegian BP=15,
+            # but for higher-BP installs (older buildings, BP≈17-18) the
+            # symptom hours can drift up into the BP±2 window.  Keeping
+            # ``transition`` as its own bucket ensures that cell is
+            # always visible in ``per_cell_at_optimum``; collapsing it
+            # into None (the previous behaviour) hid the headline
+            # symptom from the user-facing diagnostic for high-BP
+            # installs.  The other diagnose_solar.temperature_stratified
+            # block still drops transition for its own purpose
+            # (mode-flip noise on the COP-blindness check); the sweep
+            # has different needs and stratifies independently.
+            if temp_entry is not None:
+                bp = self.coordinator.balance_point
+                if temp_entry < bp - 8.0:
+                    temp_bucket = "heating_deep"
+                elif temp_entry < bp - 2.0:
+                    temp_bucket = "heating_mild"
+                elif temp_entry <= bp + 2.0:
+                    temp_bucket = "transition"
+                else:
+                    temp_bucket = "cooling"
+            else:
+                temp_bucket = None
+
+            # Screen-position bucket: matches per-unit screen_stratified.
+            if correction is None:
+                screen_bucket = "open"
+            elif correction >= 80.0:
+                screen_bucket = "open"
+            elif correction >= 40.0:
+                screen_bucket = "mid"
+            else:
+                screen_bucket = "closed"
+
+            sweep_tuples.append((
+                solar_impact_raw, sweep_solar_wasted, actual_total, expected_total,
+                has_heating_unit, hour_bucket, temp_bucket, screen_bucket,
+            ))
 
             # Days-ago for window assignment
             try:
@@ -671,9 +945,11 @@ class DiagnosticsEngine:
                 diag_potential = _SC.reconstruct_potential_vector(
                     effective,
                     correction if correction is not None else 100.0,
-                    self.coordinator.screen_config,
+                    self.coordinator.screen_config_for_entity(entity_id),
                 )
-                unit_coeff = self.coordinator.solar.calculate_unit_coefficient(entity_id, entry.get("temp_key", "10"))
+                unit_coeff = self.coordinator.solar.calculate_unit_coefficient(
+                    entity_id, entry.get("temp_key", "10"), mode
+                )
                 modeled_solar = self.coordinator.solar.calculate_unit_solar_impact(diag_potential, unit_coeff)
                 delta = modeled_solar - implied_solar
 
@@ -904,7 +1180,32 @@ class DiagnosticsEngine:
 
         per_unit = {}
         for entity_id, acc in unit_accum.items():
-            current = self.coordinator.solar.calculate_unit_coefficient(entity_id, "10")
+            # #868: report both regimes separately.  ``current_coefficient``
+            # remains the prediction-time view (heating regime + default
+            # fallback) for backwards compatibility with consumers that
+            # haven't migrated.  The split-aware fields and
+            # ``coefficient_split_delta_pct`` read raw storage instead —
+            # an unlearned regime must show ``{0,0,0}``, not a default
+            # decomposition.  Otherwise the validation criterion ("split
+            # delta > N means the split captures real physics") is
+            # muddled by every heating-only install reporting a small
+            # divergence purely from the cooling default.
+            current = self.coordinator.solar.calculate_unit_coefficient(
+                entity_id, "10", MODE_HEATING
+            )
+            stored_entry = (
+                self.coordinator.model.solar_coefficients_per_unit.get(
+                    entity_id, {}
+                )
+            )
+            if not isinstance(stored_entry, dict):
+                stored_entry = {}
+            current_heating = stored_entry.get("heating") or {
+                "s": 0.0, "e": 0.0, "w": 0.0
+            }
+            current_cooling = stored_entry.get("cooling") or {
+                "s": 0.0, "e": 0.0, "w": 0.0
+            }
 
             implied_30d = _solve_normal(acc, acc["n"])
 
@@ -918,7 +1219,7 @@ class DiagnosticsEngine:
                 # by an irrelevant factor.
                 current_correction = self.coordinator.solar_correction_percent
                 t_s, t_e, t_w = _SC._screen_transmittance_vector(
-                    current_correction, self.coordinator.screen_config
+                    current_correction, self.coordinator.screen_config_for_entity(entity_id)
                 )
                 implied_physical = {
                     "s": round(implied_30d["s"] / t_s, 4) if t_s > 0.01 else implied_30d["s"],
@@ -994,11 +1295,15 @@ class DiagnosticsEngine:
             screen_stratified = {}
             for bkey, b in acc["correction_buckets"].items():
                 if b["n"] > 0:
+                    # Trimmed (#896 follow-up): only ``n`` and
+                    # ``mean_delta_kwh`` are actionable.  ``mean_modeled_kwh``
+                    # and ``mean_implied_kwh`` are reconstructable from the
+                    # current coefficient + log breakdown if needed and
+                    # added ~3× the bytes per bucket on every diagnose
+                    # response.
                     screen_stratified[bkey] = {
                         "n": b["n"],
                         "mean_delta_kwh": round(b["delta_sum"] / b["n"], 4),
-                        "mean_modeled_kwh": round(b["modeled_sum"] / b["n"], 4),
-                        "mean_implied_kwh": round(b["implied_sum"] / b["n"], 4),
                     }
                 else:
                     screen_stratified[bkey] = {"n": 0}
@@ -1042,7 +1347,7 @@ class DiagnosticsEngine:
             tuples = acc["sensitivity_tuples"]
             if len(tuples) >= 20:
                 candidates = [0.05, 0.08, 0.12, 0.15, 0.20, 0.25]
-                cfg = self.coordinator.screen_config
+                cfg = self.coordinator.screen_config_for_entity(entity_id)
                 results = []
                 # Correction-variance gate: if slider barely changes, the
                 # sweep is uninformative — all candidates will yield similar
@@ -1108,13 +1413,35 @@ class DiagnosticsEngine:
                     })
                 if results:
                     best = min(results, key=lambda r: r["residual_rmse_kwh"])
+                    # Trim (#896 follow-up): if every candidate produces
+                    # essentially the same coefficient and RMSE, the sweep
+                    # is uninformative — emit only the ``best`` row plus a
+                    # ``verdict`` flag.  Saves 6 nearly-identical rows per
+                    # entity on installs with low solar signal (small
+                    # non-VP loads where implied coefficient is near zero
+                    # so the candidate floor cannot move the fit).  Tests
+                    # that need the full ``candidates`` list use a known-
+                    # transmittance generative log where the sweep is
+                    # genuinely informative.
+                    rmses = [r["residual_rmse_kwh"] for r in results]
+                    rmse_uniform = (max(rmses) - min(rmses)) < 0.01
+                    first = results[0]["implied_coefficient"]
+                    coeff_uniform = all(
+                        abs(r["implied_coefficient"]["s"] - first["s"]) < 1e-3
+                        and abs(r["implied_coefficient"]["e"] - first["e"]) < 1e-3
+                        and abs(r["implied_coefficient"]["w"] - first["w"]) < 1e-3
+                        for r in results
+                    )
                     sensitivity = {
                         "n_hours": len(tuples),
                         "correction_range_pct": round(corr_var, 1),
                         "informative": corr_var >= 40.0,  # ≥40 pct points of slider variance
-                        "candidates": results,
                         "best": best,
                     }
+                    if rmse_uniform and coeff_uniform:
+                        sensitivity["verdict"] = "uniform_across_candidates"
+                    else:
+                        sensitivity["candidates"] = results
                     if (
                         sensitivity["informative"]
                         and abs(best["screen_direct_transmittance"] - 0.08) > 0.04
@@ -1125,34 +1452,118 @@ class DiagnosticsEngine:
             # produce if retrained from zero over the same window.  Absence
             # means the unit did not qualify for any update (no shutdown
             # hours, or base below SOLAR_SHUTDOWN_MIN_BASE everywhere).
-            implied_inequality_coeff = shadow_coeffs.get(entity_id)
-            if implied_inequality_coeff is not None:
-                implied_inequality_coeff = {
-                    k: round(v, 4) for k, v in implied_inequality_coeff.items()
-                }
+            # Mode-stratified per #868 — replay writes per-regime; inequality
+            # is heating-only by #865 design, so we report the heating regime
+            # of the shadow output.  ``None`` means no inequality update fired.
+            shadow_entry = shadow_coeffs.get(entity_id)
+            implied_inequality_coeff = None
+            if isinstance(shadow_entry, dict):
+                heating_shadow = shadow_entry.get("heating")
+                if isinstance(heating_shadow, dict) and any(
+                    heating_shadow.get(k) for k in ("s", "e", "w")
+                ):
+                    implied_inequality_coeff = {
+                        k: round(v, 4) for k, v in heating_shadow.items()
+                    }
 
-            per_unit[entity_id] = {
-                "current_coefficient": {k: round(v, 4) for k, v in current.items()},
-                "implied_coefficient_30d": implied_30d,
-                "implied_coefficient_30d_no_shutdown": implied_no_shutdown,
-                "implied_coefficient_inequality": implied_inequality_coeff,
-                "implied_coefficient_physical": implied_physical,
-                "stability_windows": stability,
-                "mean_delta_kwh": round(mean_delta, 4),
-                "saturation_pct": round(100 * acc["saturated"] / acc["qualifying"], 1) if acc["qualifying"] > 0 else 0.0,
-                "shutdown_hours_30d": acc["shutdown_hours"],
-                "shutdown_pct_of_qualifying": shutdown_pct,
-                "dominant_component": dominant,
-                "qualifying_hours": acc["n"],
-                "temperature_stratified": temperature_stratified,
-                "screen_stratified": screen_stratified,
-                "transmittance_sensitivity": sensitivity,
-                "temporal_bias": {
-                    "morning_mean_delta": round(acc["morning_delta"] / acc["morning_n"], 4) if acc["morning_n"] > 0 else None,
-                    "afternoon_mean_delta": round(acc["afternoon_delta"] / acc["afternoon_n"], 4) if acc["afternoon_n"] > 0 else None,
-                },
-                "flags": flags,
-            }
+            # Mode-stratified split (#868): scalar percentage divergence
+            # between the heating and cooling regimes, averaged over the
+            # three directions.  Stable across regime swaps because we
+            # take absolute differences and normalise by the symmetric
+            # mean.  ``None`` when both regimes are zero (cooling never
+            # learned on a heating-only install — the seeded copy from
+            # migration drifts away as cooling-mode hours arrive).
+            h_dir = current_heating
+            c_dir = current_cooling
+            denom = sum(
+                abs(h_dir.get(k, 0.0)) + abs(c_dir.get(k, 0.0))
+                for k in ("s", "e", "w")
+            )
+            if denom > 0.001:
+                split_delta_pct = (
+                    100.0
+                    * sum(
+                        abs(h_dir.get(k, 0.0) - c_dir.get(k, 0.0))
+                        for k in ("s", "e", "w")
+                    )
+                    / denom
+                )
+                coefficient_split_delta = round(split_delta_pct, 1)
+            else:
+                coefficient_split_delta = None
+
+            # Inactive-unit collapse (#896 follow-up).  Sensors with no
+            # learned coefficient, no saturation, no shutdown signal, and
+            # no flags carry no actionable information in the verbose
+            # blocks (transmittance_sensitivity is structurally uniform
+            # because the implied coefficient is ~0 so candidate floors
+            # cannot move the fit; screen_stratified and stability_windows
+            # are noise around zero; temporal_bias adds nothing the global
+            # block doesn't already report).  Emit a minimal record so the
+            # entity stays addressable via ``per_unit[entity_id]`` for any
+            # consumer that walks the dict, but drop the verbose tail that
+            # was bloating diagnose_solar output by ~70 % on installs with
+            # many small non-VP energy sensors.  Backward-compatible: every
+            # field that existing tests assert on for zero-coeff fixtures
+            # (current_coefficient_*, coefficient_split_delta_pct,
+            # implied_coefficient_30d, qualifying_hours, mean_delta_kwh,
+            # flags) is preserved.
+            heating_zero = all(abs(v) < 1e-6 for v in current_heating.values())
+            cooling_zero = all(abs(v) < 1e-6 for v in current_cooling.values())
+            is_inactive = (
+                heating_zero
+                and cooling_zero
+                and acc["saturated"] == 0
+                and acc["shutdown_hours"] == 0
+                and not flags
+            )
+            if is_inactive:
+                per_unit[entity_id] = {
+                    "inactive": True,
+                    "current_coefficient": {k: round(v, 4) for k, v in current.items()},
+                    "current_coefficient_heating": {
+                        k: round(v, 4) for k, v in current_heating.items()
+                    },
+                    "current_coefficient_cooling": {
+                        k: round(v, 4) for k, v in current_cooling.items()
+                    },
+                    "coefficient_split_delta_pct": coefficient_split_delta,
+                    "implied_coefficient_30d": implied_30d,
+                    "qualifying_hours": acc["n"],
+                    "mean_delta_kwh": round(mean_delta, 4),
+                    "flags": flags,
+                }
+            else:
+                per_unit[entity_id] = {
+                    "current_coefficient": {k: round(v, 4) for k, v in current.items()},
+                    "current_coefficient_heating": {
+                        k: round(v, 4) for k, v in current_heating.items()
+                    },
+                    "current_coefficient_cooling": {
+                        k: round(v, 4) for k, v in current_cooling.items()
+                    },
+                    "coefficient_split_delta_pct": coefficient_split_delta,
+                    "implied_coefficient_30d": implied_30d,
+                    "implied_coefficient_30d_no_shutdown": implied_no_shutdown,
+                    "implied_coefficient_inequality": implied_inequality_coeff,
+                    "implied_coefficient_physical": implied_physical,
+                    "stability_windows": stability,
+                    "mean_delta_kwh": round(mean_delta, 4),
+                    "saturation_pct": round(100 * acc["saturated"] / acc["qualifying"], 1) if acc["qualifying"] > 0 else 0.0,
+                    "shutdown_hours_30d": acc["shutdown_hours"],
+                    "shutdown_pct_of_qualifying": shutdown_pct,
+                    "dominant_component": dominant,
+                    "qualifying_hours": acc["n"],
+                    "temperature_stratified": temperature_stratified,
+                    "screen_stratified": screen_stratified,
+                    "transmittance_sensitivity": sensitivity,
+                    "temporal_bias": {
+                        "morning_mean_delta": round(acc["morning_delta"] / acc["morning_n"], 4) if acc["morning_n"] > 0 else None,
+                        "afternoon_mean_delta": round(acc["afternoon_delta"] / acc["afternoon_n"], 4) if acc["afternoon_n"] > 0 else None,
+                    },
+                    "last_batch_fit": self._format_last_batch_fit(entity_id),
+                    "flags": flags,
+                }
 
         # Global metrics
         global_flags = []
@@ -1172,55 +1583,494 @@ class DiagnosticsEngine:
             if battery_health["assessment"] != "ok":
                 global_flags.append(f"battery_decay_{battery_health['assessment']}")
 
-        # Battery decay calibration: sweep decay rates to find optimal
-        calibration = {}
-        candidates = [round(0.50 + i * 0.05, 2) for i in range(10)]  # 0.50 to 0.95
+        # Joint (decay, k) battery calibration with counterfactual residuals.
+        #
+        # Replaces the prior 1-D decay sweep, which had three statistical
+        # defects (#902 statistics review):
+        #
+        #   1. The estimator was biased toward the live decay: ``actual −
+        #      expected`` is the residual against the LIVE model, not a
+        #      counterfactual residual under the candidate decay.  Hours
+        #      where the live model already credited enough battery were
+        #      filtered out before the candidate saw them, biasing the
+        #      recommendation toward status quo.
+        #   2. Mean-residual minimisation is the wrong loss — a candidate
+        #      that systematically over-credits some hours and under-credits
+        #      others equally can score zero mean while tracking the data
+        #      poorly.  Use RMSE.
+        #   3. ``decay`` and ``k`` are jointly unidentified from post-sunset
+        #      residuals.  Sequential calibration converges to order-
+        #      dependent local optima — both must be swept jointly.
+        #
+        # Method: for each (decay_alt, k_alt) candidate, replay BOTH batteries
+        # (main solar EMA + carryover EMA) starting from 0 over each day's
+        # hours, AND replay the live (decay, k) the same way.  The difference
+        # in release between the two replays is the counterfactual delta;
+        # adding it to the live residual yields the residual the system
+        # would have produced under the candidate.  Score by RMSE on
+        # post-sunset hours.
+        #
+        # Post-sunset definition: per day, the ``POST_SUNSET_REPLAY_HOURS``
+        # hours immediately after the last hour with raw_solar > 0.  Uses
+        # the raw signal (``solar_impact_raw_kwh``) — the post-coefficient
+        # × raw-vector value, which is 0 by construction when the sun is
+        # below the horizon — NOT the post-battery ``solar_factor`` which
+        # carries battery residue across midnight.  Restricting to the
+        # window where the battery is observably charged improves SNR
+        # (pre-dawn hours have battery ≈ 0 and tell us nothing about
+        # decay).
+        #
+        # Initial-state caveat: from-0 daily replay underestimates the
+        # live system's actual battery state on the morning of each day
+        # by an exponentially decaying residual from yesterday's evening.
+        # After ~3 half-lives (~9 h at decay 0.80) the bias is < 12 %.
+        # POST_SUNSET_REPLAY_HOURS = 6 captures the 1-2 half-life window
+        # where signal-to-noise is highest; the from-0 approximation is
+        # acceptable here because the post-sunset evening is far past the
+        # morning when the bias was largest.
+        DECAY_GRID = [round(0.50 + 0.05 * i, 2) for i in range(10)]   # 0.50..0.95
+        K_GRID = [round(0.1 * i, 1) for i in range(11)]               # 0.0..1.0
+        POST_SUNSET_REPLAY_HOURS = 6
+        MIN_POST_SUNSET_HOURS_FOR_RECOMMENDATION = 5
+
+        calibration: dict = {}
         if day_sequences:
-            best_decay = self.coordinator.solar_battery_decay
-            best_abs_residual = float("inf")
-            sweep_results = {}
-            for candidate in candidates:
-                total_residual = 0.0
-                n_post_sunset = 0
-                for _day_key, hours in day_sequences.items():
+            decay_live = self.coordinator.solar_battery_decay
+            k_live = self.coordinator.battery_thermal_feedback_k
+
+            # Build per-day post-sunset hour set: the N hours immediately
+            # after the last hour with raw_solar > 0.01.  Days with no
+            # qualifying sunny hour (e.g. fully overcast) contribute nothing.
+            post_sunset_set_by_day: dict[str, set[int]] = {}
+            # Build per-day morning hour set: from the first hour with
+            # raw_solar > 0.01 through the hour where raw_solar peaks
+            # (inclusive on both ends).  This is the rising-sun phase
+            # where charge-side dynamics differ between models — instant-
+            # respons would credit fast, EMA accumulates slowly.  Plateau
+            # hours past the peak are deliberately excluded: both models
+            # converge to steady state there, so they carry no
+            # discriminating information about decay vs instant credit.
+            #
+            # The two windows together separate the two physical regimes
+            # the battery model captures: post-sunset = pure decay tail
+            # (current model fits this); morning = charge ramp (the
+            # asymmetric-charge gap from #896's deferred scope).  The
+            # tail/morning RMSE disagreement at any single (decay, k) is
+            # the diagnostic that confirms whether asymmetric handling is
+            # needed (large gap → yes) or not (small gap → no, single-
+            # decay model is sufficient).
+            morning_set_by_day: dict[str, set[int]] = {}
+            for day_key, hours in day_sequences.items():
+                last_sunny_h = -1
+                first_sunny_h = -1
+                peak_solar = 0.0
+                peak_hour = -1
+                for h, raw, _wasted, _act, _exp in hours:
+                    if raw > 0.01:
+                        if first_sunny_h < 0:
+                            first_sunny_h = h
+                        if h > last_sunny_h:
+                            last_sunny_h = h
+                        if raw > peak_solar:
+                            peak_solar = raw
+                            peak_hour = h
+                if last_sunny_h >= 0:
+                    post_sunset_set_by_day[day_key] = {
+                        last_sunny_h + i for i in range(1, POST_SUNSET_REPLAY_HOURS + 1)
+                    }
+                if first_sunny_h >= 0 and peak_hour >= first_sunny_h:
+                    morning_set_by_day[day_key] = set(
+                        range(first_sunny_h, peak_hour + 1)
+                    )
+
+            def _replay_score(
+                decay_alt: float,
+                k_alt: float,
+                window_by_day: dict[str, set[int]],
+            ) -> tuple[float, int]:
+                """Counterfactual replay scored over ``window_by_day``.
+
+                Returns (rmse, n_hours_evaluated).  Window-agnostic — the
+                replay recurrence and counterfactual residual formula are
+                the same regardless of which hours feed into the SSE.
+                """
+                sse = 0.0
+                n = 0
+                for day_key, hours in day_sequences.items():
+                    window = window_by_day.get(day_key)
+                    if not window:
+                        continue
                     hours_sorted = sorted(hours, key=lambda x: x[0])
-                    sim_battery = 0.0
-                    for h, raw_solar, actual, expected in hours_sorted:
-                        sim_battery = sim_battery * candidate + raw_solar * (1 - candidate)
-                        # Post-sunset: solar_factor ~ 0 but battery > 0
-                        if raw_solar < 0.01 and sim_battery > 0.05 and expected > 0.05:
-                            # expected already includes current battery effect.
-                            # Residual from this candidate = what the candidate battery
-                            # would credit minus what the current battery credited.
-                            # Simpler: just track if actual-expected improves.
-                            total_residual += actual - expected
-                            n_post_sunset += 1
-                if n_post_sunset >= 5:
-                    mean_res = total_residual / n_post_sunset
-                    sweep_results[str(candidate)] = round(mean_res, 4)
-                    if abs(mean_res) < best_abs_residual:
-                        best_abs_residual = abs(mean_res)
-                        best_decay = candidate
+                    main_alt = main_live = 0.0
+                    carry_alt = carry_live = 0.0
+                    for h, raw, wasted, actual, expected in hours_sorted:
+                        # Live replay
+                        main_live = main_live * decay_live + raw * (1 - decay_live)
+                        live_carry_in = (
+                            k_live * wasted if k_live > 0.0 else 0.0
+                        )
+                        carry_live = (
+                            carry_live * decay_live + live_carry_in * (1 - decay_live)
+                        )
+                        live_release = (
+                            main_live + k_live * carry_live * (1 - decay_live)
+                        )
+                        # Alt replay
+                        main_alt = main_alt * decay_alt + raw * (1 - decay_alt)
+                        alt_carry_in = k_alt * wasted if k_alt > 0.0 else 0.0
+                        carry_alt = (
+                            carry_alt * decay_alt + alt_carry_in * (1 - decay_alt)
+                        )
+                        alt_release = (
+                            main_alt + k_alt * carry_alt * (1 - decay_alt)
+                        )
+                        if h in window:
+                            # Counterfactual derivation:
+                            #   base[t]      = expected[t] + live_release[t]
+                            #   expected_alt = base[t] − alt_release[t]
+                            #               = expected + (live_release − alt_release)
+                            #   residual_alt = actual − expected_alt
+                            #               = (actual − expected) + (alt_release − live_release)
+                            # Minimised at alt = truth where alt_release matches the
+                            # release that produced ``actual``.
+                            residual_alt = (actual - expected) + (alt_release - live_release)
+                            sse += residual_alt * residual_alt
+                            n += 1
+                rmse = (sse / n) ** 0.5 if n > 0 else float("inf")
+                return rmse, n
+
+            # Post-sunset surface — the original tail-decay scoring.
+            # Recommendation is driven by this surface (the live battery
+            # model is parameterised for tail behaviour; morning is read-
+            # only diagnostic until asymmetric-charge support lands).
+            surface: dict[str, float] = {}
+            best = (decay_live, k_live)
+            best_rmse = float("inf")
+            n_post_sunset = 0
+            for d_alt in DECAY_GRID:
+                for k_alt in K_GRID:
+                    rmse, n_post_sunset = _replay_score(
+                        d_alt, k_alt, post_sunset_set_by_day
+                    )
+                    if n_post_sunset < MIN_POST_SUNSET_HOURS_FOR_RECOMMENDATION:
+                        continue
+                    surface[f"{d_alt},{k_alt}"] = round(rmse, 4)
+                    if rmse < best_rmse - 1e-6:
+                        best_rmse = rmse
+                        best = (d_alt, k_alt)
+
+            # Morning surface — read-only diagnostic.  Same grid + same
+            # counterfactual, but scored over the rising-sun window per
+            # day.  Reveals whether any (decay, k) candidate would also
+            # fit charge-side behaviour, or whether tail-best and morning-
+            # best diverge (= asymmetric-charge gap).
+            morning_surface: dict[str, float] = {}
+            morning_best = (decay_live, k_live)
+            morning_best_rmse = float("inf")
+            n_morning = 0
+            for d_alt in DECAY_GRID:
+                for k_alt in K_GRID:
+                    rmse, n_morning = _replay_score(
+                        d_alt, k_alt, morning_set_by_day
+                    )
+                    if n_morning < MIN_POST_SUNSET_HOURS_FOR_RECOMMENDATION:
+                        continue
+                    morning_surface[f"{d_alt},{k_alt}"] = round(rmse, 4)
+                    if rmse < morning_best_rmse - 1e-6:
+                        morning_best_rmse = rmse
+                        morning_best = (d_alt, k_alt)
+
+            # Live config's own RMSE on the same post-sunset hours, computed
+            # via the same replay path so the comparison is apples-to-apples.
+            # When the live (decay_live, k_live) sits inside the swept grids,
+            # this equals surface[f"{decay_live},{k_live}"]; computing it
+            # explicitly handles the case where live values fall between
+            # grid points (e.g. decay 0.82).
+            live_rmse, _ = _replay_score(
+                decay_live, k_live, post_sunset_set_by_day
+            )
+            morning_live_rmse, _ = _replay_score(
+                decay_live, k_live, morning_set_by_day
+            )
+
+            # Tail/morning disagreement at the post-sunset-recommended
+            # candidate.  If small (≲ 0.05 kWh) the post-sunset
+            # recommendation also fits morning — single-decay model is
+            # sufficient.  If large (≳ 0.10 kWh) post-sunset and morning
+            # want different decay + k — asymmetric handling is what's
+            # left to fix.  Computed as |best_post_sunset_rmse −
+            # rmse_at_morning(post_sunset_best)|: how much worse the
+            # tail-optimised candidate is on morning RMSE compared to
+            # what's achievable on morning.
+            morning_at_tail_best = (
+                morning_surface.get(f"{best[0]},{best[1]}")
+                if best_rmse != float("inf") else None
+            )
+            tail_morning_disagreement = (
+                round(morning_at_tail_best - morning_best_rmse, 4)
+                if (
+                    morning_at_tail_best is not None
+                    and morning_best_rmse != float("inf")
+                )
+                else None
+            )
+
             calibration = {
-                "current_decay": self.coordinator.solar_battery_decay,
-                "recommended_decay": best_decay,
-                "sweep_results": sweep_results,
-                "post_sunset_hours_evaluated": max(
-                    (sum(1 for h, raw, a, e in hrs if raw < 0.01)
-                     for hrs in day_sequences.values()), default=0
+                "current_decay": decay_live,
+                "current_k": k_live,
+                "current_rmse_kwh": round(live_rmse, 4) if live_rmse != float("inf") else None,
+                "recommended_decay": best[0],
+                "recommended_k": best[1],
+                "recommended_rmse_kwh": round(best_rmse, 4) if best_rmse != float("inf") else None,
+                "rmse_improvement_kwh": (
+                    round(live_rmse - best_rmse, 4)
+                    if (live_rmse != float("inf") and best_rmse != float("inf"))
+                    else None
                 ),
+                "rmse_surface": surface,
+                "post_sunset_hours_evaluated": n_post_sunset,
+                "post_sunset_replay_hours_per_day": POST_SUNSET_REPLAY_HOURS,
+                # Morning-window diagnostic block (read-only — does NOT
+                # drive recommendation).  Surfaces the asymmetric-charge
+                # gap from #896's deferred scope.
+                "morning_current_rmse_kwh": (
+                    round(morning_live_rmse, 4)
+                    if morning_live_rmse != float("inf") else None
+                ),
+                "morning_recommended_decay": morning_best[0],
+                "morning_recommended_k": morning_best[1],
+                "morning_recommended_rmse_kwh": (
+                    round(morning_best_rmse, 4)
+                    if morning_best_rmse != float("inf") else None
+                ),
+                "morning_rmse_surface": morning_surface,
+                "morning_hours_evaluated": n_morning,
+                "tail_morning_disagreement_kwh": tail_morning_disagreement,
+                "method": "joint_decay_k_counterfactual_replay",
+                "loss": "rmse_post_sunset",
             }
-            if apply_battery_decay and best_decay != self.coordinator.solar_battery_decay:
-                old_decay = self.coordinator.solar_battery_decay
-                self.coordinator.solar_battery_decay = best_decay
-                # Persist to entry.data
-                new_data = {**self.coordinator.entry.data, "solar_battery_decay": best_decay}
-                self.coordinator.hass.config_entries.async_update_entry(self.coordinator.entry, data=new_data)
+            if apply_battery_decay and (
+                best[0] != decay_live or best[1] != k_live
+            ) and best_rmse != float("inf"):
+                old_decay, old_k = decay_live, k_live
+                self.coordinator.solar_battery_decay = best[0]
+                self.coordinator.battery_thermal_feedback_k = best[1]
+                # Persist BOTH to entry.data
+                new_data = {
+                    **self.coordinator.entry.data,
+                    "solar_battery_decay": best[0],
+                    "battery_thermal_feedback_k": best[1],
+                }
+                self.coordinator.hass.config_entries.async_update_entry(
+                    self.coordinator.entry, data=new_data
+                )
                 calibration["applied"] = True
                 _LOGGER.info(
-                    "Solar battery decay calibrated: %.2f → %.2f (applied)",
-                    old_decay, best_decay,
+                    "Joint battery calibration applied: decay %.2f → %.2f, k %.2f → %.2f",
+                    old_decay, best[0], old_k, best[1],
                 )
+
+        # Carry-over reservoir feedback sweep (#896 follow-up).  Replays
+        # the carryover-state EMA over the window for each k candidate
+        # and reports per-cell residual delta vs the live (k=0) baseline.
+        #
+        # As of split-state implementation, this sweep models the LIVE
+        # wiring: ``_solar_carryover_state`` is charged by ``k × wasted``
+        # and its release ``state × (1 − decay)`` subtracts from
+        # heating-mode demand prediction in ``calculate_total_power``.
+        # The previous "hypothetical 1:1 wiring" disclaimer is removed —
+        # the wiring exists.
+        #
+        # Counterfactual residual derivation:
+        #
+        #   residual_live[t] = actual[t] − expected_live[t]   (logged)
+        #   residual_alt[t]  = residual_live[t] + Δrelease[t]
+        #
+        # where Δrelease[t] = (B_kα[t] − B_k0[t]) × (1 − decay).  Both
+        # replays start from B=0 over the analysis window; the EMA's
+        # initial-condition term is identical between replays and
+        # cancels in the difference.  Coefficients are held at their
+        # currently-learned values (frozen-coefficient mode); real
+        # adoption of k > 0 will see ~2-6 % NLMS coefficient drift over
+        # 2-3 weeks of qualifying hours, which this replay does not
+        # model.  Use ``empirical_optimum_k`` as a calibration hint;
+        # validate against actual prediction RMSE after enabling
+        # k > 0 for 2-4 sunny weeks.
+        battery_feedback_sweep: dict = {}
+        if sweep_tuples:
+            decay_for_sweep = self.coordinator.solar_battery_decay
+            k_candidates = [round(0.1 * i, 1) for i in range(11)]  # 0.0..1.0
+
+            # Replay battery for each k.  trajectories[k] is a list of
+            # battery states aligned 1:1 with sweep_tuples.
+            trajectories: dict[float, list[float]] = {}
+            for k_cand in k_candidates:
+                B = 0.0
+                trace: list[float] = []
+                for (impact_raw, wasted, _act, _exp, heating_active,
+                     _hb, _tb, _sb) in sweep_tuples:
+                    feedback = (k_cand * wasted) if (k_cand > 0.0 and heating_active) else 0.0
+                    B = B * decay_for_sweep + (impact_raw + feedback) * (1 - decay_for_sweep)
+                    trace.append(B)
+                trajectories[k_cand] = trace
+
+            baseline_trace = trajectories[0.0]
+
+            # Per-cell residuals.  Cells dropped when they lack a temp
+            # bucket (transition zone) — kept in global aggregate via the
+            # ``global`` cell key so the user still sees an overall RMSE.
+            per_k_results: dict[str, dict] = {}
+            for k_cand in k_candidates:
+                k_trace = trajectories[k_cand]
+                cell_residuals: dict[tuple, list[float]] = {}
+                global_residuals: list[float] = []
+                for idx, (
+                    _impact_raw, _wasted, actual, expected,
+                    _heating, hour_bucket, temp_bucket, screen_bucket,
+                ) in enumerate(sweep_tuples):
+                    # Convert state-trajectory delta to release-delta:
+                    # release[t] = state[t] × (1 − decay) is what
+                    # ``calculate_total_power`` subtracts from heating
+                    # demand under the live wiring (split-state, post-#896
+                    # follow-up).  Multiplying the state delta by
+                    # ``(1 − decay)`` projects the sweep from "what state
+                    # would be" to "what release would be subtracted from
+                    # prediction" — which matches the live model's
+                    # observable effect on prediction error.
+                    delta_release = (k_trace[idx] - baseline_trace[idx]) * (1 - decay_for_sweep)
+                    residual_live = actual - expected
+                    residual_alt = residual_live + delta_release
+                    global_residuals.append(residual_alt)
+                    if temp_bucket is None:
+                        continue
+                    cell_key = (hour_bucket, temp_bucket, screen_bucket)
+                    cell_residuals.setdefault(cell_key, []).append(residual_alt)
+
+                cells = {}
+                for (hb, tb, sb), residuals in cell_residuals.items():
+                    n = len(residuals)
+                    sse = sum(r * r for r in residuals)
+                    rmse = (sse / n) ** 0.5 if n > 0 else 0.0
+                    mean = sum(residuals) / n if n > 0 else 0.0
+                    cells[f"{hb}__{tb}__{sb}"] = {
+                        "n": n,
+                        "rmse_kwh": round(rmse, 4),
+                        "mean_residual_kwh": round(mean, 4),
+                    }
+                global_n = len(global_residuals)
+                global_sse = sum(r * r for r in global_residuals)
+                global_rmse = (global_sse / global_n) ** 0.5 if global_n > 0 else 0.0
+                per_k_results[str(k_cand)] = {
+                    "global": {
+                        "n": global_n,
+                        "rmse_kwh": round(global_rmse, 4),
+                    },
+                    "cells": cells,
+                }
+
+            # Empirical optimum: lowest global RMSE.  Tie-break in favour
+            # of smaller k (more conservative — closer to the disabled
+            # default).  Reported as a recommendation, not auto-applied.
+            best_k = 0.0
+            best_global_rmse = per_k_results["0.0"]["global"]["rmse_kwh"]
+            for k_cand in k_candidates:
+                cand_rmse = per_k_results[str(k_cand)]["global"]["rmse_kwh"]
+                if cand_rmse < best_global_rmse - 1e-6:
+                    best_global_rmse = cand_rmse
+                    best_k = k_cand
+
+            # Per-cell delta-RMSE table relative to k=0.  Lets the user
+            # see which (hour × temp × screen) combinations actually
+            # benefit at the recommended k, vs which ones the global
+            # optimum is averaging over.  Cells with n < 5 are emitted
+            # but flagged so the reader does not over-interpret thin
+            # data — particularly relevant at 10-day windows where many
+            # cells carry only 1-3 hours.
+            #
+            # Sweep collapse (#896 follow-up).  When ``best_k == 0.0``
+            # every per_cell_at_optimum row would be identical to the
+            # baseline (delta_rmse = 0 everywhere), and every non-baseline
+            # ``sweep[k]["cells"]`` table is informational fluff with no
+            # actionable signal.  Emit only the baseline cells in
+            # ``sweep["0.0"]`` and a single ``per_k_global_rmse`` summary
+            # for the other candidates.  When ``best_k > 0`` the full
+            # detail is preserved on baseline + optimum k; intermediate k
+            # values still drop ``cells`` because they are not the
+            # recommended target.
+            if best_k == 0.0:
+                per_cell_at_optimum = None
+                for k_str, k_data in per_k_results.items():
+                    if k_str != "0.0":
+                        k_data.pop("cells", None)
+            else:
+                per_cell_at_optimum = {}
+                baseline_cells = per_k_results["0.0"]["cells"]
+                optimum_cells = per_k_results[str(best_k)]["cells"]
+                all_cell_keys = set(baseline_cells) | set(optimum_cells)
+                for cell_key in sorted(all_cell_keys):
+                    base_cell = baseline_cells.get(cell_key, {"n": 0, "rmse_kwh": 0.0})
+                    opt_cell = optimum_cells.get(cell_key, {"n": 0, "rmse_kwh": 0.0})
+                    delta_rmse = opt_cell["rmse_kwh"] - base_cell["rmse_kwh"]
+                    per_cell_at_optimum[cell_key] = {
+                        "n": base_cell["n"],
+                        "baseline_rmse_kwh": base_cell["rmse_kwh"],
+                        "optimum_rmse_kwh": opt_cell["rmse_kwh"],
+                        "delta_rmse_kwh": round(delta_rmse, 4),
+                        "thin_sample": base_cell["n"] < 5,
+                    }
+                # Drop cells from intermediate k values; only baseline
+                # and optimum are actionable for the user.
+                for k_str, k_data in per_k_results.items():
+                    if k_str != "0.0" and k_str != str(best_k):
+                        k_data.pop("cells", None)
+
+            battery_feedback_sweep = {
+                "current_k": self.coordinator.battery_thermal_feedback_k,
+                "decay_used": decay_for_sweep,
+                "n_hours_in_window": len(sweep_tuples),
+                "n_hours_with_heating_active": sum(
+                    1 for t in sweep_tuples if t[4]
+                ),
+                "n_hours_with_heating_wasted": sum(
+                    1 for t in sweep_tuples if t[1] > 0.0 and t[4]
+                ),
+                "k_candidates": k_candidates,
+                "sweep": per_k_results,
+                "empirical_optimum_k": best_k,
+                "global_rmse_at_optimum_kwh": round(best_global_rmse, 4),
+                "global_rmse_at_baseline_kwh": round(
+                    per_k_results["0.0"]["global"]["rmse_kwh"], 4
+                ),
+                "rmse_improvement_kwh": round(
+                    per_k_results["0.0"]["global"]["rmse_kwh"] - best_global_rmse, 4
+                ),
+                "per_cell_at_optimum": per_cell_at_optimum,
+                # Methodology — read this before interpreting numbers.
+                "method": "carryover_release_replay",
+                "interpretation": "calibration_hint",
+                "notes": (
+                    "This sweep models the live wiring (split-state "
+                    "implementation): _solar_carryover_state is charged "
+                    "by k × wasted, and its release × (1 - decay) "
+                    "subtracts from heating-mode demand prediction. "
+                    "Each k candidate's hypothetical RMSE is computed "
+                    "by replaying the carryover EMA over the window and "
+                    "adding the release-delta vs k=0 baseline to the "
+                    "logged residual.  Coefficients are held at their "
+                    "currently-learned values (frozen-coefficient mode) "
+                    "— real adoption of k > 0 will trigger ~2-6 % NLMS "
+                    "coefficient drift over 2-3 weeks, which this "
+                    "replay does not model.  Use empirical_optimum_k "
+                    "as a calibration hint, then validate against "
+                    "actual prediction RMSE after running with k > 0 "
+                    "for 2-4 sunny weeks.  Transition-zone hours "
+                    "(BP±2 °C) are included in both `global` aggregates "
+                    "and the per-cell table under "
+                    "temp_bucket=\"transition\"; expect that cell to "
+                    "carry the strongest signal for the headline "
+                    "symptom on high-BP installs."
+                ),
+            }
 
         # Screen impact
         screen_impact = {}
@@ -1302,13 +2152,96 @@ class DiagnosticsEngine:
                 "calibrated_value": calibrated,
             }
 
+        # Top-level summary digest (#896 follow-up).  Human-readable
+        # at-a-glance overview that lets the user decide whether to read
+        # the verbose blocks below.  Computed strictly from already-built
+        # blocks — no new arithmetic, just pivots and counts.  Verdict
+        # logic is conservative: ``no_action_needed`` only when EVERY
+        # signal source agrees nothing is actionable; otherwise
+        # ``review_recommended`` and the user reads ``units_with_flags``,
+        # ``global_flags``, and the battery sub-blocks for specifics.
+        active_count = sum(
+            1 for u in per_unit.values() if not u.get("inactive", False)
+        )
+        inactive_count = sum(
+            1 for u in per_unit.values() if u.get("inactive", False)
+        )
+        units_with_flags = [
+            {"entity_id": eid, "flags": u["flags"]}
+            for eid, u in per_unit.items()
+            if u.get("flags")
+        ]
+        # Battery feedback verdict.
+        if battery_feedback_sweep:
+            opt_k = battery_feedback_sweep.get("empirical_optimum_k", 0.0)
+            improvement = battery_feedback_sweep.get("rmse_improvement_kwh", 0.0)
+            if opt_k == 0.0:
+                bf_verdict = "no_improvement_available"
+            else:
+                bf_verdict = f"consider_k_{opt_k}"
+            battery_feedback_summary = {
+                "current_k": battery_feedback_sweep.get("current_k", 0.0),
+                "optimum_k": opt_k,
+                "rmse_improvement_kwh": improvement,
+                "verdict": bf_verdict,
+            }
+        else:
+            battery_feedback_summary = {
+                "current_k": self.coordinator.battery_thermal_feedback_k,
+                "verdict": "no_data",
+            }
+        # Battery decay verdict pivots on assessment from battery_health
+        # and the calibration block; "ok" means no recommendation pending.
+        if calibration:
+            decay_verdict = (
+                "ok"
+                if calibration.get("recommended_decay") == calibration.get("current_decay")
+                else f"consider_decay_{calibration.get('recommended_decay')}"
+            )
+            battery_decay_summary = {
+                "current_decay": calibration.get("current_decay"),
+                "recommended_decay": calibration.get("recommended_decay"),
+                "verdict": decay_verdict,
+            }
+        elif battery_health:
+            battery_decay_summary = {
+                "current_decay": battery_health.get("decay_rate"),
+                "verdict": battery_health.get("assessment", "no_data"),
+            }
+        else:
+            battery_decay_summary = {
+                "current_decay": self.coordinator.solar_battery_decay,
+                "verdict": "no_data",
+            }
+        # Top-level verdict: only ``no_action_needed`` when every signal
+        # source is clean.  Otherwise the user should look at one of the
+        # detail blocks the summary points at.
+        any_action = (
+            bool(global_flags)
+            or bool(units_with_flags)
+            or battery_feedback_summary["verdict"].startswith("consider_")
+            or battery_decay_summary["verdict"].startswith("consider_")
+            or battery_decay_summary["verdict"] in ("too_fast", "too_slow")
+        )
+        summary = {
+            "verdict": "review_recommended" if any_action else "no_action_needed",
+            "global_flags": global_flags,
+            "active_solar_units": active_count,
+            "inactive_units": inactive_count,
+            "units_with_flags": units_with_flags,
+            "battery_feedback": battery_feedback_summary,
+            "battery_decay": battery_decay_summary,
+        }
+
         return {
+            "summary": summary,
             "context": context,
             "global": {
                 "qualifying_hours": total_qualifying,
                 "excluded": excluded,
                 "battery_decay_health": battery_health,
                 "battery_calibration": calibration,
+                "battery_feedback_sweep": battery_feedback_sweep,
                 "screen_impact": screen_impact,
                 "temporal_bias": {
                     "morning_mean_delta": round(sum(all_morning) / len(all_morning), 4) if all_morning else None,
@@ -1333,4 +2266,200 @@ class DiagnosticsEngine:
             "per_unit": per_unit,
             "per_unit_thresholds": per_unit_thresholds,
         }
+
+    def calibrate_per_unit_min_base_thresholds(
+        self,
+        *,
+        sample_days: int = 30,
+        require_min_hours_of_log: int | None = None,
+    ) -> dict:
+        """Compute per-unit min-base noise floor from dark-hour actuals (#871).
+
+        Replaces the global 0.15 kWh gate with a per-sensor p10 of
+        dark-hour (``solar_factor < PER_UNIT_MIN_BASE_DARK_SOLAR_FACTOR``)
+        metered consumption.  Dark-hour filtering isolates the non-solar
+        base-demand distribution; p10 captures the operating-noise floor
+        without being skewed by the tail of idle samples.
+
+        Safety guards (in order):
+            1. Requires ≥ ``PER_UNIT_MIN_BASE_MIN_HOURS_OF_LOG`` hours of
+               log data overall (14 × 24 by default).  Fresh installs
+               skip calibration and continue on the global fallback.
+            2. Requires ≥ ``PER_UNIT_MIN_BASE_MIN_SAMPLES`` dark-hour
+               samples per unit.  Under-sampled units keep their prior
+               value (or skip entirely if never calibrated).
+            3. Rejects when ``p10 / median(dark_samples)`` exceeds
+               ``PER_UNIT_MIN_BASE_MAX_P10_MEDIAN_RATIO``.  A legitimate
+               noise floor sits far below typical consumption; a ratio
+               near 1.0 indicates an always-on load (electric boiler
+               mislabeled as heat-pump heating, sensor scoped to a
+               shared circuit) where p10 is not a noise floor at all.
+               Primary physics-grounded filter.
+            4. Clamps p10 from below to ``PER_UNIT_MIN_BASE_FLOOR``;
+               absolute ceiling ``PER_UNIT_MIN_BASE_CEILING`` acts as
+               a safety net behind the ratio-guard.
+            5. Limits rate-of-change to
+               ``PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE`` per run (±50 %
+               vs previous value).  Protects against a single anomalous
+               week flipping the threshold.
+
+        Only heating-mode samples contribute.  Aux-active hours and guest
+        modes are excluded — matches the live learning exclusion set.
+
+        Returns a diagnostic dict usable by the ``calibrate_unit_thresholds``
+        service and the startup log; ``self.coordinator._per_unit_min_base_thresholds``
+        is updated in-place.
+        """
+        from datetime import timedelta
+        from homeassistant.util import dt as dt_util
+        from .const import (
+            MODE_HEATING,
+            PER_UNIT_MIN_BASE_CEILING,
+            PER_UNIT_MIN_BASE_DARK_SOLAR_FACTOR,
+            PER_UNIT_MIN_BASE_FLOOR,
+            PER_UNIT_MIN_BASE_MAX_P10_MEDIAN_RATIO,
+            PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE,
+            PER_UNIT_MIN_BASE_MIN_HOURS_OF_LOG,
+            PER_UNIT_MIN_BASE_MIN_SAMPLES,
+        )
+
+        min_hours = (
+            PER_UNIT_MIN_BASE_MIN_HOURS_OF_LOG
+            if require_min_hours_of_log is None
+            else require_min_hours_of_log
+        )
+        total_hours = len(self.coordinator._hourly_log)
+        result = {
+            "total_log_hours": total_hours,
+            "required_log_hours": min_hours,
+            "sample_days": sample_days,
+            "status": "ok",
+            "units": {},
+            "updated": {},
+            "rejected": {},
+            "skipped": {},
+        }
+        if total_hours < min_hours:
+            result["status"] = "insufficient_log_data"
+            return result
+
+        cutoff_iso = (dt_util.now() - timedelta(days=sample_days)).date().isoformat()
+
+        # Collect dark-hour actuals per unit.
+        samples: dict[str, list[float]] = {sid: [] for sid in self.coordinator.energy_sensors}
+        for entry in self.coordinator._hourly_log:
+            ts = entry.get("timestamp", "")
+            if ts[:10] < cutoff_iso:
+                continue
+            if entry.get("auxiliary_active", False):
+                continue
+            solar_factor = entry.get("solar_factor") or 0.0
+            if solar_factor >= PER_UNIT_MIN_BASE_DARK_SOLAR_FACTOR:
+                continue
+            unit_modes = entry.get("unit_modes", {}) or {}
+            unit_breakdown = entry.get("unit_breakdown", {}) or {}
+            for sid in self.coordinator.energy_sensors:
+                mode = unit_modes.get(sid, MODE_HEATING)
+                if mode != MODE_HEATING:
+                    continue
+                if sid not in unit_breakdown:
+                    continue
+                actual = unit_breakdown.get(sid, 0.0)
+                if actual is None or actual < 0.0:
+                    continue
+                samples[sid].append(float(actual))
+
+        def _p10(values: list[float]) -> float:
+            if not values:
+                return 0.0
+            s = sorted(values)
+            # Nearest-rank p10, 1-indexed: idx = ceil(0.10 × n) - 1 in 0-indexed.
+            # math.ceil is required (not round): round underestimates the
+            # rank for n ∈ {21..25} — and Python's banker's rounding flips
+            # n=25 to 2 rather than 3 — which would bias calibrated
+            # thresholds downward and let noisy low-base hours through
+            # the NLMS gate.
+            idx = max(0, math.ceil(0.10 * len(s)) - 1)
+            return s[idx]
+
+        for sid in self.coordinator.energy_sensors:
+            dark = samples.get(sid, [])
+            n = len(dark)
+            prior = self.coordinator._per_unit_min_base_thresholds.get(sid)
+            unit_report = {
+                "dark_samples": n,
+                "prior": prior,
+                "p10_actual": None,
+                "effective": prior,
+                "method": "prior" if prior is not None else "fallback",
+            }
+            if n < PER_UNIT_MIN_BASE_MIN_SAMPLES:
+                unit_report["status"] = "skipped_low_samples"
+                result["skipped"][sid] = unit_report
+                result["units"][sid] = unit_report
+                continue
+
+            p10 = _p10(dark)
+            unit_report["p10_actual"] = round(p10, 5)
+
+            # Ratio-guard (primary filter): a legitimate noise floor
+            # sits far below typical consumption.  A sorted-dark-sample
+            # distribution where p10 approaches the median means the
+            # sensor is measuring an always-on load rather than a
+            # modulating heat pump — no noise floor exists to calibrate.
+            sorted_dark = sorted(dark)
+            median = sorted_dark[len(sorted_dark) // 2]
+            unit_report["median_actual"] = round(median, 5)
+            if median > 0.0 and p10 > PER_UNIT_MIN_BASE_MAX_P10_MEDIAN_RATIO * median:
+                unit_report["status"] = "rejected_constant_load"
+                unit_report["p10_over_median"] = round(p10 / median, 3)
+                _LOGGER.warning(
+                    "Per-unit min-base calibration rejected for %s: "
+                    "p10=%.3f kWh is %.0f%% of median=%.3f — distribution "
+                    "suggests an always-on load, not a modulating heat pump. "
+                    "Keeping %s.",
+                    sid, p10, 100.0 * p10 / median, median,
+                    f"prior {prior:.3f}" if prior else "global fallback",
+                )
+                result["rejected"][sid] = unit_report
+                result["units"][sid] = unit_report
+                continue
+
+            # Absolute ceiling (safety net behind the ratio-guard).
+            if p10 > PER_UNIT_MIN_BASE_CEILING:
+                unit_report["status"] = "rejected_above_ceiling"
+                _LOGGER.warning(
+                    "Per-unit min-base calibration rejected for %s: p10=%.3f kWh "
+                    "exceeds ceiling %.3f — keeping %s.",
+                    sid, p10, PER_UNIT_MIN_BASE_CEILING,
+                    f"prior {prior:.3f}" if prior else "global fallback",
+                )
+                result["rejected"][sid] = unit_report
+                result["units"][sid] = unit_report
+                continue
+
+            candidate = max(PER_UNIT_MIN_BASE_FLOOR, p10)
+
+            # Rate-of-change clamp vs prior value.
+            if prior is not None and prior > 0.0:
+                lo = prior * (1.0 - PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE)
+                hi = prior * (1.0 + PER_UNIT_MIN_BASE_MAX_RATE_OF_CHANGE)
+                clamped = min(hi, max(lo, candidate))
+                if clamped != candidate:
+                    unit_report["rate_clamped_from"] = round(candidate, 5)
+                candidate = max(PER_UNIT_MIN_BASE_FLOOR, clamped)
+
+            new_value = round(candidate, 5)
+            self.coordinator._per_unit_min_base_thresholds[sid] = new_value
+            unit_report["effective"] = new_value
+            unit_report["method"] = "auto"
+            unit_report["status"] = "updated"
+            result["updated"][sid] = unit_report
+            result["units"][sid] = unit_report
+
+        _LOGGER.info(
+            "Per-unit min-base calibration complete: updated=%d, rejected=%d, skipped=%d",
+            len(result["updated"]), len(result["rejected"]), len(result["skipped"]),
+        )
+        return result
 

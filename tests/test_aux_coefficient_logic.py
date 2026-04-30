@@ -4,6 +4,10 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from datetime import datetime
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 from custom_components.heating_analytics.const import ENERGY_GUARD_THRESHOLD, MODE_HEATING
+from custom_components.heating_analytics.learning import LearningManager
+from custom_components.heating_analytics.solar import SolarCalculator
+from custom_components.heating_analytics.observation import build_strategies
+from custom_components.heating_analytics.retrain import RetrainEngine
 
 @pytest.mark.asyncio
 async def test_aux_coefficient_persistence(hass):
@@ -340,3 +344,104 @@ async def test_per_unit_aux_prediction(hass):
 
         # Global Totals - Unit Sum Aux = 1.5
         assert res["breakdown"]["aux_reduction_kwh"] == 1.5
+
+
+# =============================================================================
+# Aux delta preserved in Track A retrain under SNR.
+# learn_from_historical_import's aux branch uses the per-hour
+# solar_normalization_delta to compensate aux_target on sunny aux hours.
+# Under SNR, the base path ignores delta (uses snr_weight) but the aux
+# path must still receive the stored delta — otherwise solar reduction
+# gets attributed as aux reduction and inflates the aux coefficient.
+# =============================================================================
+
+def _track_a_aux_coord(hourly_log):
+    """Track A retrain coord with one aux-active sunny hour."""
+    coord = MagicMock()
+    coord._hourly_log = hourly_log
+    coord.daily_learning_mode = False
+    coord.learning_rate = 1.0
+    coord.balance_point = 15.0
+    coord.energy_sensors = ["sensor.heater"]
+    coord.aux_affected_entities = ["sensor.heater"]
+    coord.screen_config = (True, True, True)
+    coord._correlation_data = {"-5": {"normal": 4.0}}
+    coord._correlation_data_per_unit = {"sensor.heater": {"-5": {"normal": 4.0}}}
+    coord._aux_coefficients = {}
+    coord._aux_coefficients_per_unit = {}
+    coord._learning_buffer_global = {}
+    coord._learning_buffer_per_unit = {}
+    coord._learning_buffer_aux_per_unit = {}
+    coord._solar_coefficients_per_unit = {}
+    coord._learning_buffer_solar_per_unit = {}
+    coord._observation_counts = {}
+    coord._learned_u_coefficient = None
+    coord._daily_history = {}
+    coord.storage.async_save_data = AsyncMock()
+    coord._get_predicted_kwh = MagicMock(return_value=4.0)  # base prediction at -5°C
+    coord.learning = LearningManager()
+    coord.solar = SolarCalculator(coord)
+    coord._unit_strategies = build_strategies(
+        energy_sensors=["sensor.heater"],
+        track_c_enabled=False,
+        mpc_managed_sensor=None,
+    )
+    coord._replay_per_unit_models = MagicMock(
+        side_effect=lambda entries: HeatingDataCoordinator._replay_per_unit_models(
+            coord, entries
+        )
+    )
+    return coord
+
+
+class TestAuxDeltaPreservedInRetrain:
+
+    @pytest.mark.asyncio
+    async def test_sunny_aux_hour_uses_stored_delta_for_aux(self):
+        """Aux-active hour at -5°C with sun: stored delta should compensate
+        actual so aux_implied = base − (actual + delta), not base − actual.
+
+        Pre-fix: delta=0 forced under SNR retrain → aux inflated by ~delta.
+        Post-fix: stored delta passed through, base unaffected (SNR branch
+        ignores delta), aux gets correct compensation.
+        """
+        # Build entries: many heating hours + ONE aux-sunny hour at -5°C
+        # base bucket pre-seeded at 4.0 kWh (matches expected behaviour)
+        # actual on aux hour = 1.0 kWh (aux reduced demand)
+        # solar delta stored on log = 0.5 kWh (sun displaced 0.5 kWh)
+        # If retrain uses stored delta:
+        #   aux_target = 1.0 + 0.5 = 1.5
+        #   implied_aux = 4.0 - 1.5 = 2.5
+        # If retrain uses delta=0 (the bug):
+        #   aux_target = 1.0
+        #   implied_aux = 4.0 - 1.0 = 3.0  ← inflated by 0.5
+        entries = [{
+            "timestamp": "2026-01-15T12:00:00",
+            "temp": -5.0,
+            "temp_key": "-5",
+            "wind_bucket": "normal",
+            "actual_kwh": 1.0,
+            "auxiliary_active": True,
+            "solar_factor": 0.4,
+            "solar_vector_s": 0.4,
+            "solar_vector_e": 0.0,
+            "solar_vector_w": 0.0,
+            "correction_percent": 100.0,
+            "unit_modes": {"sensor.heater": MODE_HEATING},
+            "unit_breakdown": {"sensor.heater": 1.0},
+            "solar_dominant_entities": [],
+            "solar_normalization_delta": 0.5,
+            "learning_status": "logged",
+        }]
+        coord = _track_a_aux_coord(entries)
+        await RetrainEngine(coord).retrain_from_history(reset_first=False)
+
+        # Aux coefficient at -5°C, normal wind
+        aux_at_temp = coord._aux_coefficients.get("-5", {}).get("normal", 0.0)
+        # Expected with delta-compensation: implied_aux = 4.0 - (1.0 + 0.5) = 2.5
+        # Expected without (bug): implied_aux = 4.0 - 1.0 = 3.0
+        # learning_rate=1.0, no prior aux coeff at this bucket → seed = implied_aux
+        assert aux_at_temp == pytest.approx(2.5, abs=0.05), (
+            f"aux coefficient should be 2.5 with delta-compensation; got {aux_at_temp} "
+            f"(would be 3.0 if delta were not applied)"
+        )

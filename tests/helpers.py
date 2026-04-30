@@ -1,6 +1,26 @@
 """Shared test helpers for coordinator mocking (#775)."""
 
 
+def stratified_coeff(s: float = 0.0, e: float = 0.0, w: float = 0.0,
+                     *, cooling_s: float | None = None,
+                     cooling_e: float | None = None,
+                     cooling_w: float | None = None) -> dict:
+    """Build a v4-shape mode-stratified solar coefficient dict (#868).
+
+    Default: heating regime takes ``(s, e, w)``; cooling regime is zeros.
+    Pass ``cooling_*`` to set cooling regime values explicitly.  Useful in
+    tests that need to construct a known coefficient state.
+    """
+    return {
+        "heating": {"s": s, "e": e, "w": w},
+        "cooling": {
+            "s": cooling_s if cooling_s is not None else 0.0,
+            "e": cooling_e if cooling_e is not None else 0.0,
+            "w": cooling_w if cooling_w is not None else 0.0,
+        },
+    }
+
+
 class ModelProxy:
     """Lightweight proxy for the coordinator.model property in tests.
 

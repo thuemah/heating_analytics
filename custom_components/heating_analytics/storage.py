@@ -48,6 +48,23 @@ def _sanitize_solar_coeff(value: dict) -> dict:
     }
 
 
+def _sanitize_stratified(value: dict) -> dict:
+    """Sanitize a v4-shape mode-stratified solar coefficient entry.
+
+    Returns ``{"heating": {s,e,w}, "cooling": {s,e,w}}`` with both regimes
+    always present.  Missing regimes default to zero.  Each regime's inner
+    dict is clamped via :func:`_sanitize_solar_coeff`.
+    """
+    if not isinstance(value, dict):
+        value = {}
+    heating = value.get("heating") if isinstance(value.get("heating"), dict) else {}
+    cooling = value.get("cooling") if isinstance(value.get("cooling"), dict) else {}
+    return {
+        "heating": _sanitize_solar_coeff(heating),
+        "cooling": _sanitize_solar_coeff(cooling),
+    }
+
+
 def _migrate_pre_v3(
     data: dict,
     *,
@@ -204,6 +221,77 @@ def _migrate_pre_v3(
     return data
 
 
+def _migrate_v3_to_v4(data: dict) -> dict:
+    """v3 -> v4: split per-unit solar coefficients by mode regime.
+
+    Pre-v4 shape: ``solar_coefficients_per_unit[entity] = {s, e, w}`` —
+    one coefficient per unit, used identically in heating and cooling.
+    Cooling-active installations therefore had their cooling-mode hours
+    pulling the coefficient toward ``phys × E[1/COP_cooling]`` while
+    heating hours pulled it toward ``phys × E[1/COP_heating]``; on a
+    heating-dominated install the cooling prediction is systematically
+    off by the COP ratio (typically 1.3-1.8x).
+
+    Post-v4 shape: ``solar_coefficients_per_unit[entity] = {
+        "heating": {s, e, w}, "cooling": {s, e, w}
+    }``.  Each regime absorbs its own ``E[1/COP]``.
+
+    Migration semantics (per #868 consolidated plan, "seed cooling from
+    heating"): existing flat ``{s, e, w}`` is copied to BOTH regimes so
+    manually-seeded values (e.g. Toshiba 0.40, Mitsubishi 0.30) survive
+    across the migration.  Cooling drifts toward its real value once
+    cooling-mode hours arrive; heating-only installations leave the
+    cooling seed inert.
+
+    Cold-start buffer: ``learning_buffer_solar_per_unit[entity]`` was a
+    flat ``list[(s,e,w,impact)]``.  Post-v4: ``{entity: {regime: list}}``.
+    Migrated samples are routed to ``"heating"`` (Nordic-install bias —
+    overwhelmingly heating samples).  Buffer is flushed on the next
+    cold-start solve regardless, so any minority cooling sample is
+    self-correcting within ~4 cold-start hours per regime.
+
+    Idempotent: already-stratified entries (with ``"heating"`` or
+    ``"cooling"`` keys) pass through ``_sanitize_stratified`` and are
+    returned unchanged in shape.
+    """
+    coeffs = data.get("solar_coefficients_per_unit")
+    if isinstance(coeffs, dict):
+        migrated_coeffs: dict = {}
+        for entity_id, value in coeffs.items():
+            if not isinstance(value, dict):
+                continue
+            if "heating" in value or "cooling" in value:
+                # Already stratified — sanitize and pass through.
+                migrated_coeffs[entity_id] = _sanitize_stratified(value)
+                continue
+            # Pre-v4 flat shape — seed both regimes from the same value.
+            seed = _sanitize_solar_coeff(value)
+            migrated_coeffs[entity_id] = {
+                "heating": dict(seed),
+                "cooling": dict(seed),
+            }
+        data["solar_coefficients_per_unit"] = migrated_coeffs
+
+    buffer = data.get("learning_buffer_solar_per_unit")
+    if isinstance(buffer, dict):
+        migrated_buffer: dict = {}
+        for entity_id, value in buffer.items():
+            if isinstance(value, list):
+                # Pre-v4 flat list — route to heating regime.
+                migrated_buffer[entity_id] = {"heating": list(value), "cooling": []}
+            elif isinstance(value, dict):
+                # Already stratified — keep, ensuring both regimes present.
+                heating = value.get("heating") if isinstance(value.get("heating"), list) else []
+                cooling = value.get("cooling") if isinstance(value.get("cooling"), list) else []
+                migrated_buffer[entity_id] = {
+                    "heating": list(heating),
+                    "cooling": list(cooling),
+                }
+        data["learning_buffer_solar_per_unit"] = migrated_buffer
+
+    return data
+
+
 class StorageManager:
     """Manages data persistence (JSON, CSV)."""
 
@@ -255,6 +343,13 @@ class StorageManager:
                 solar_azimuth=getattr(self.coordinator, "solar_azimuth", 0.0),
                 solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", 0.80),
             )
+
+        if old_major_version < 4:
+            _LOGGER.info(
+                "Heating Analytics: migrating storage v%d -> v4 (mode-stratified solar coefficients)",
+                old_major_version,
+            )
+            old_data = _migrate_v3_to_v4(old_data)
 
         return old_data
 
@@ -352,19 +447,32 @@ class StorageManager:
                 self.coordinator._aux_coefficients_per_unit = loaded_aux_coefficients_per_unit
                 self._cleanup_removed_sensors(self.coordinator._aux_coefficients_per_unit)
 
-            # Load unit solar coefficients — canonical v3 shape is
-            # {entity_id: {"s": float, "e": float, "w": float}}.  Legacy
-            # temp-stratified and scalar forms are flattened by the v3 migration.
+            # Load unit solar coefficients — canonical v4 shape is
+            # {entity_id: {"heating": {s,e,w}, "cooling": {s,e,w}}}.
+            # Legacy flat {s,e,w} shape is wrapped by the v3->v4 migration.
             loaded_solar_coefficients_per_unit = data.get("solar_coefficients_per_unit", {})
             if isinstance(loaded_solar_coefficients_per_unit, dict):
                 self.coordinator._solar_coefficients_per_unit = {
-                    entity_id: _sanitize_solar_coeff(value)
+                    entity_id: _sanitize_stratified(value)
                     for entity_id, value in loaded_solar_coefficients_per_unit.items()
                     if isinstance(value, dict)
                 }
                 self._cleanup_removed_sensors(self.coordinator._solar_coefficients_per_unit)
             else:
                 self.coordinator._solar_coefficients_per_unit = {}
+
+            # Load last batch-fit-solar summaries (observability-only).
+            # Optional top-level key — pre-existing installs without the
+            # field load with an empty dict; no migration needed.
+            loaded_last_batch_fit = data.get("last_batch_fit_per_unit", {})
+            if isinstance(loaded_last_batch_fit, dict):
+                self.coordinator._last_batch_fit_per_unit = {
+                    eid: v for eid, v in loaded_last_batch_fit.items()
+                    if isinstance(v, dict)
+                }
+                self._cleanup_removed_sensors(self.coordinator._last_batch_fit_per_unit)
+            else:
+                self.coordinator._last_batch_fit_per_unit = {}
 
             # Load unit modes
             loaded_unit_modes = data.get("unit_modes", {})
@@ -390,16 +498,22 @@ class StorageManager:
             else:
                 self.coordinator._learning_buffer_aux_per_unit = {}
 
-            # Load learning buffer solar per unit — canonical v3 shape is
-            # {entity_id: [(s, e, w, impact), ...]}.  Legacy 3-tuple and
-            # temp-stratified dict forms are flattened by the v3 migration.
+            # Load learning buffer solar per unit — canonical v4 shape is
+            # {entity_id: {"heating": [(s,e,w,impact), ...], "cooling": [...]}}.
+            # Legacy flat list is wrapped by the v3->v4 migration.
             loaded_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
             if isinstance(loaded_buffer_solar, dict):
-                self.coordinator._learning_buffer_solar_per_unit = {
-                    entity_id: [tuple(s) if isinstance(s, list) else s for s in value]
-                    for entity_id, value in loaded_buffer_solar.items()
-                    if isinstance(value, list)
-                }
+                self.coordinator._learning_buffer_solar_per_unit = {}
+                for entity_id, value in loaded_buffer_solar.items():
+                    if not isinstance(value, dict):
+                        continue
+                    self.coordinator._learning_buffer_solar_per_unit[entity_id] = {
+                        regime: [
+                            tuple(s) if isinstance(s, list) else s for s in samples
+                        ]
+                        for regime, samples in value.items()
+                        if isinstance(samples, list) and regime in ("heating", "cooling")
+                    }
                 self._cleanup_removed_sensors(self.coordinator._learning_buffer_solar_per_unit)
             else:
                 self.coordinator._learning_buffer_solar_per_unit = {}
@@ -610,6 +724,12 @@ class StorageManager:
             self.coordinator.data["learned_u_coefficient"] = self.coordinator._learned_u_coefficient
             self.coordinator._last_midnight_indoor_temp = data.get("last_midnight_indoor_temp")
             self.coordinator._solar_battery_state = data.get("solar_battery_state", 0.0)
+            # Solar carry-over reservoir (#896 follow-up).  Default 0.0
+            # on missing — pre-feature storage has no concept of this
+            # state; it warms up to steady-state within a few sunny
+            # hours once ``battery_thermal_feedback_k > 0`` is enabled.
+            # No migration needed; the field is purely additive.
+            self.coordinator._solar_carryover_state = data.get("solar_carryover_state", 0.0)
             # Per-direction potential battery (#865).  Default 0.0 on
             # missing — the EMA repopulates within a few sunny hours
             # post-upgrade.  No migration needed; pre-1.3.3 storage has
@@ -882,6 +1002,7 @@ class StorageManager:
                     "learned_u_coefficient": self.coordinator._learned_u_coefficient,
                     "last_midnight_indoor_temp": self.coordinator._last_midnight_indoor_temp,
                     "solar_battery_state": self.coordinator._solar_battery_state,
+                    "solar_carryover_state": self.coordinator._solar_carryover_state,
                     "potential_battery_s": self.coordinator._potential_battery_s,
                     "potential_battery_e": self.coordinator._potential_battery_e,
                     "potential_battery_w": self.coordinator._potential_battery_w,
@@ -920,6 +1041,7 @@ class StorageManager:
                     "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
                     "unit_modes": self.coordinator._unit_modes,
                     "solar_optimizer_data": self.coordinator.solar_optimizer.get_data(),
+                    "last_batch_fit_per_unit": self.coordinator._last_batch_fit_per_unit,
                 }
                 await self._store.async_save(data)
                 self._last_save_time = now
@@ -941,6 +1063,9 @@ class StorageManager:
         # Clear unit solar data
         self.coordinator._solar_coefficients_per_unit.clear()
         self.coordinator._learning_buffer_solar_per_unit.clear()
+        # Clear last-batch-fit observability dict — stale once coefficients
+        # are reset (the recorded "before/after" no longer matches state).
+        self.coordinator._last_batch_fit_per_unit.clear()
         # Clear daily learning U-coefficient
         self.coordinator._learned_u_coefficient = None
         await self.async_save_data(force=True)
@@ -995,7 +1120,9 @@ class StorageManager:
             "solar_coefficients_per_unit": self.coordinator._solar_coefficients_per_unit,
             "learning_buffer_solar_per_unit": self.coordinator._learning_buffer_solar_per_unit,
             "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
+            "last_batch_fit_per_unit": self.coordinator._last_batch_fit_per_unit,
             "solar_battery_state": self.coordinator._solar_battery_state,
+            "solar_carryover_state": self.coordinator._solar_carryover_state,
             "potential_battery_s": self.coordinator._potential_battery_s,
             "potential_battery_e": self.coordinator._potential_battery_e,
             "potential_battery_w": self.coordinator._potential_battery_w,
@@ -1042,6 +1169,7 @@ class StorageManager:
                 solar_azimuth=getattr(self.coordinator, "solar_azimuth", 0.0),
                 solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", 0.80),
             )
+            data = _migrate_v3_to_v4(data)
 
             # Apply Data
             self.coordinator._correlation_data.clear()
@@ -1088,6 +1216,8 @@ class StorageManager:
             self.coordinator.data["learned_u_coefficient"] = self.coordinator._learned_u_coefficient
             self.coordinator._last_midnight_indoor_temp = data.get("last_midnight_indoor_temp")
             self.coordinator._solar_battery_state = data.get("solar_battery_state", 0.0)
+            # Solar carry-over reservoir (#896 follow-up) — see async_load_data.
+            self.coordinator._solar_carryover_state = data.get("solar_carryover_state", 0.0)
             # Per-direction potential battery (#865) — see async_load_data.
             self.coordinator._potential_battery_s = data.get("potential_battery_s", 0.0)
             self.coordinator._potential_battery_e = data.get("potential_battery_e", 0.0)
@@ -1127,19 +1257,31 @@ class StorageManager:
             self.coordinator._learning_buffer_aux_per_unit = data.get("learning_buffer_aux_per_unit", {})
 
             # Restore Unit Solar Data (clamp components >= 0).  Shape is
-            # already canonical v3 after the migration above.
+            # already canonical v4 (mode-stratified) after the migration above.
             raw_solar = data.get("solar_coefficients_per_unit", {})
             self.coordinator._solar_coefficients_per_unit = {
-                eid: _sanitize_solar_coeff(v)
+                eid: _sanitize_stratified(v)
                 for eid, v in raw_solar.items()
                 if isinstance(v, dict)
             }
+            # Restore last batch-fit summaries (observability-only, optional).
+            raw_last_batch_fit = data.get("last_batch_fit_per_unit", {})
+            self.coordinator._last_batch_fit_per_unit = {
+                eid: v for eid, v in raw_last_batch_fit.items()
+                if isinstance(v, dict)
+            } if isinstance(raw_last_batch_fit, dict) else {}
             raw_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
-            self.coordinator._learning_buffer_solar_per_unit = {
-                eid: [tuple(s) if isinstance(s, list) else s for s in buf]
-                for eid, buf in raw_buffer_solar.items()
-                if isinstance(buf, list)
-            }
+            self.coordinator._learning_buffer_solar_per_unit = {}
+            for eid, buf in raw_buffer_solar.items():
+                if not isinstance(buf, dict):
+                    continue
+                self.coordinator._learning_buffer_solar_per_unit[eid] = {
+                    regime: [
+                        tuple(s) if isinstance(s, list) else s for s in samples
+                    ]
+                    for regime, samples in buf.items()
+                    if isinstance(samples, list) and regime in ("heating", "cooling")
+                }
 
             # Restore Unit Modes
             self.coordinator._unit_modes = data.get("unit_modes", {})

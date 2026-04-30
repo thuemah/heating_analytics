@@ -48,7 +48,7 @@ class TestSnapshotPolling:
         """Entering the 22:00 hour triggers a snapshot fetch."""
         records = [{"datetime": "2026-04-20T12:00:00", "q_th": 1.0}]
         cop = {"eta_carnot": 0.45}
-        track_c_coord._fetch_mpc_buffer_and_cop = AsyncMock(return_value=(records, cop))
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = AsyncMock(return_value=(records, cop))
 
         await track_c_coord._maybe_snapshot_track_c(datetime(2026, 4, 20, 22, 0))
 
@@ -63,7 +63,7 @@ class TestSnapshotPolling:
         first = ([{"datetime": "2026-04-20T12:00:00"}], {"eta_carnot": 0.40})
         second = ([{"datetime": "2026-04-20T23:00:00"}], {"eta_carnot": 0.45})
         fetch = AsyncMock(side_effect=[first, second])
-        track_c_coord._fetch_mpc_buffer_and_cop = fetch
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = fetch
 
         await track_c_coord._maybe_snapshot_track_c(datetime(2026, 4, 20, 22, 0))
         await track_c_coord._maybe_snapshot_track_c(datetime(2026, 4, 20, 23, 55))
@@ -75,7 +75,7 @@ class TestSnapshotPolling:
     async def test_snapshot_slot_deduped_within_same_slot(self, track_c_coord):
         """Multiple ticks within the same slot only fetch once."""
         fetch = AsyncMock(return_value=([{"datetime": "x"}], None))
-        track_c_coord._fetch_mpc_buffer_and_cop = fetch
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = fetch
 
         await track_c_coord._maybe_snapshot_track_c(datetime(2026, 4, 20, 22, 0))
         await track_c_coord._maybe_snapshot_track_c(datetime(2026, 4, 20, 22, 30))
@@ -87,7 +87,7 @@ class TestSnapshotPolling:
     async def test_snapshot_failure_preserves_previous(self, track_c_coord):
         """If a later snapshot fails, the earlier one is still available."""
         good = ([{"datetime": "2026-04-20T12:00:00"}], None)
-        track_c_coord._fetch_mpc_buffer_and_cop = AsyncMock(
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = AsyncMock(
             side_effect=[good, None]
         )
 
@@ -103,7 +103,7 @@ class TestSnapshotPolling:
     async def test_no_snapshot_outside_trigger_hours(self, track_c_coord):
         """Ticks outside 22:00/23:00/23:55 slots do nothing."""
         fetch = AsyncMock(return_value=([{"x": 1}], None))
-        track_c_coord._fetch_mpc_buffer_and_cop = fetch
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = fetch
 
         for h in (0, 6, 12, 18, 21):
             await track_c_coord._maybe_snapshot_track_c(datetime(2026, 4, 20, h, 0))
@@ -144,7 +144,7 @@ class TestMidnightSyncFallback:
             {"datetime": f"2026-04-20T{h:02d}:00:00+00:00", "q_th": 0.5}
             for h in range(24)
         ]
-        track_c_coord._fetch_mpc_buffer_and_cop = AsyncMock(
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = AsyncMock(
             return_value=(records, None)
         )
 
@@ -154,10 +154,10 @@ class TestMidnightSyncFallback:
         mock_engine = MagicMock()
         mock_engine.calculate_synthetic_baseline = MagicMock(return_value=fake_dist)
         mock_engine_cls.return_value = mock_engine
-        # Patch the coordinator's imported symbol — it imports at module
+        # Patch daily_processor's imported symbol — it imports at module
         # load time, so patching the source module has no effect.
         monkeypatch.setattr(
-            "custom_components.heating_analytics.coordinator.ThermodynamicEngine",
+            "custom_components.heating_analytics.daily_processor.ThermodynamicEngine",
             mock_engine_cls,
         )
 
@@ -185,17 +185,17 @@ class TestMidnightSyncFallback:
             "cop_params": None,
         }
         # Live call fails.
-        track_c_coord._fetch_mpc_buffer_and_cop = AsyncMock(return_value=None)
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = AsyncMock(return_value=None)
 
         fake_dist = [{"synthetic_kwh_el": 0.5} for _ in range(24)]
         mock_engine_cls = MagicMock()
         mock_engine = MagicMock()
         mock_engine.calculate_synthetic_baseline = MagicMock(return_value=fake_dist)
         mock_engine_cls.return_value = mock_engine
-        # Patch the coordinator's imported symbol — it imports at module
+        # Patch daily_processor's imported symbol — it imports at module
         # load time, so patching the source module has no effect.
         monkeypatch.setattr(
-            "custom_components.heating_analytics.coordinator.ThermodynamicEngine",
+            "custom_components.heating_analytics.daily_processor.ThermodynamicEngine",
             mock_engine_cls,
         )
 
@@ -218,7 +218,7 @@ class TestMidnightSyncFallback:
             "mpc_records": [{"datetime": "2026-04-19T12:00:00+00:00"}],
             "cop_params": None,
         }
-        track_c_coord._fetch_mpc_buffer_and_cop = AsyncMock(return_value=None)
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = AsyncMock(return_value=None)
 
         day_logs = [_day_log(h) for h in range(24)]
         result = await track_c_coord._run_track_c_midnight_sync(day_logs, "2026-04-20")
@@ -231,7 +231,7 @@ class TestMidnightSyncFallback:
     @pytest.mark.asyncio
     async def test_no_live_no_snapshot_triggers_option_b(self, track_c_coord):
         """No live and no snapshot → None → caller applies Option B skip."""
-        track_c_coord._fetch_mpc_buffer_and_cop = AsyncMock(return_value=None)
+        track_c_coord._daily_processor.fetch_mpc_buffer_and_cop = AsyncMock(return_value=None)
         track_c_coord._track_c_snapshot = None
 
         day_logs = [_day_log(h) for h in range(24)]
@@ -254,10 +254,10 @@ class TestTrackUsedTagging:
     async def test_track_c_live_tagged_c_live(self, track_c_coord):
         """Successful live Track C → track_used='C_live'."""
         dist = [{"synthetic_kwh_el": 0.5} for _ in range(24)]
-        track_c_coord._run_track_c_midnight_sync = AsyncMock(
+        track_c_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(
             return_value=(12.0, dist, "live")
         )
-        track_c_coord._apply_strategies_to_global_model = MagicMock(return_value=3)
+        track_c_coord._daily_processor.apply_strategies_to_global_model = MagicMock(return_value=3)
         from custom_components.heating_analytics.observation import build_strategies
         track_c_coord._unit_strategies = build_strategies(
             energy_sensors=["sensor.vp_stue"],
@@ -276,10 +276,10 @@ class TestTrackUsedTagging:
     async def test_track_c_snapshot_tagged_c_snapshot(self, track_c_coord):
         """Snapshot-sourced Track C → track_used='C_snapshot_2355'."""
         dist = [{"synthetic_kwh_el": 0.5} for _ in range(24)]
-        track_c_coord._run_track_c_midnight_sync = AsyncMock(
+        track_c_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(
             return_value=(12.0, dist, "snapshot_2355")
         )
-        track_c_coord._apply_strategies_to_global_model = MagicMock(return_value=3)
+        track_c_coord._daily_processor.apply_strategies_to_global_model = MagicMock(return_value=3)
         from custom_components.heating_analytics.observation import build_strategies
         track_c_coord._unit_strategies = build_strategies(
             energy_sensors=["sensor.vp_stue"],
@@ -297,7 +297,7 @@ class TestTrackUsedTagging:
     @pytest.mark.asyncio
     async def test_track_c_outage_tagged_skipped(self, track_c_coord):
         """MPC outage with no snapshot → track_used='skipped_mpc_outage'."""
-        track_c_coord._run_track_c_midnight_sync = AsyncMock(return_value=None)
+        track_c_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(return_value=None)
         track_c_coord._hourly_log = _full_day_logs()
         track_c_coord._accumulated_energy_today = 12.0
         track_c_coord.data[ATTR_TDD] = 5.0
@@ -323,7 +323,7 @@ class TestTrackUsedTagging:
         coord.daily_learning_mode = True
         coord.learning_enabled = True
         coord.track_c_enabled = False
-        coord._try_track_b_cop_smearing = AsyncMock(return_value=0)  # no cop-smear
+        coord._daily_processor.try_track_b_cop_smearing = AsyncMock(return_value=0)  # no cop-smear
         coord._hourly_log = _full_day_logs()
         coord._accumulated_energy_today = 12.0
         coord.data[ATTR_TDD] = 5.0
@@ -346,7 +346,7 @@ class TestTrackUsedTagging:
         coord.daily_learning_mode = True
         coord.learning_enabled = True
         coord.track_c_enabled = False
-        coord._try_track_b_cop_smearing = AsyncMock(return_value=5)  # 5 updates
+        coord._daily_processor.try_track_b_cop_smearing = AsyncMock(return_value=5)  # 5 updates
         coord._hourly_log = _full_day_logs()
         coord._accumulated_energy_today = 12.0
         coord.data[ATTR_TDD] = 5.0

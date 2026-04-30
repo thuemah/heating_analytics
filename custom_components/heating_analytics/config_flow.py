@@ -53,6 +53,7 @@ from .const import (
     CONF_SCREEN_SOUTH,
     CONF_SCREEN_EAST,
     CONF_SCREEN_WEST,
+    CONF_SCREEN_AFFECTED_ENTITIES,
     DEFAULT_SCREEN_SOUTH,
     DEFAULT_SCREEN_EAST,
     DEFAULT_SCREEN_WEST,
@@ -235,9 +236,16 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Ensure thermal mass is always present (Track B field may not have been shown)
         data.setdefault(CONF_THERMAL_MASS, DEFAULT_THERMAL_MASS)
 
-        # Default aux_affected_entities to all energy sensors when left empty
-        if not data.get(CONF_AUX_AFFECTED_ENTITIES):
+        # Sentinel-based defaults: distinguish "user never saw the field"
+        # (key absent → fill with all energy sensors) from "user deselected
+        # all" (key present with empty list → preserve, means zero entities
+        # are affected).  Truthiness-based `not data.get(...)` would
+        # clobber a legitimate empty selection for e.g. a building with
+        # zero external screens or no aux-affected units.
+        if CONF_AUX_AFFECTED_ENTITIES not in data:
             data[CONF_AUX_AFFECTED_ENTITIES] = data.get("energy_sensors", [])
+        if CONF_SCREEN_AFFECTED_ENTITIES not in data:
+            data[CONF_SCREEN_AFFECTED_ENTITIES] = data.get("energy_sensors", [])
 
         return data
 
@@ -313,6 +321,17 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Optional(CONF_SCREEN_SOUTH, default=g(CONF_SCREEN_SOUTH, DEFAULT_SCREEN_SOUTH)): selector.BooleanSelector(),
             vol.Optional(CONF_SCREEN_EAST, default=g(CONF_SCREEN_EAST, DEFAULT_SCREEN_EAST)): selector.BooleanSelector(),
             vol.Optional(CONF_SCREEN_WEST, default=g(CONF_SCREEN_WEST, DEFAULT_SCREEN_WEST)): selector.BooleanSelector(),
+            # Which energy sensors' solar coefficients learn/predict against the
+            # screen_config above.  Default: all sensors (preserves prior
+            # behaviour).  Uncheck a sensor if its zone has no screens — its
+            # coefficients then learn against pure transmittance=1.0 rather
+            # than absorbing an avg_transmittance it never physically sees.
+            vol.Optional(
+                CONF_SCREEN_AFFECTED_ENTITIES,
+                default=g(CONF_SCREEN_AFFECTED_ENTITIES, self._flow_data.get("energy_sensors", [])),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
+            ),
             # Derive dedicated-wind default from whether a wind sensor is already configured
             vol.Optional(_CONF_DEDICATED_WIND, default=bool(g("wind_speed_sensor"))): selector.BooleanSelector(),
         }

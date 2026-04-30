@@ -145,3 +145,63 @@ def test_cooldown_excludes_aux_learning(learning_manager, base_context):
 
     # Affected unit locked
     assert correlation_data["sensor.affected"]["5"]["normal"] == 10.0
+
+
+# =============================================================================
+# learn_from_historical_import — solar normalization delta passthrough.
+# Live Track A learning writes ``actual + solar_impact`` (dark-equivalent)
+# into the base bucket EMA. learn_from_historical_import must apply the
+# same normalization; otherwise retrain converges toward a different
+# surface than live learning. Both the base path and the aux path read
+# the normalized actual.
+# =============================================================================
+
+class TestLearnFromHistoricalImportSolarNormalization:
+    """learn_from_historical_import applies solar_normalization_delta."""
+
+    def _call(self, *, actual_kwh, solar_delta, current_bucket=0.0):
+        lm = LearningManager()
+        corr = {"10": {"normal": current_bucket}} if current_bucket else {}
+        aux = {}
+        lm.learn_from_historical_import(
+            temp_key="10",
+            wind_bucket="normal",
+            actual_kwh=actual_kwh,
+            is_aux_active=False,
+            correlation_data=corr,
+            aux_coefficients=aux,
+            learning_rate=0.5,  # high rate so one call moves the value visibly
+            get_predicted_kwh_fn=lambda *_a, **_k: 0.0,
+            actual_temp=10.0,
+            solar_normalization_delta=solar_delta,
+        )
+        return corr["10"]["normal"]
+
+    def test_delta_zero_preserves_pre_fix_behaviour(self):
+        """delta=0 → bucket written equals raw actual (first-observation path)."""
+        v = self._call(actual_kwh=0.3, solar_delta=0.0)
+        assert v == pytest.approx(0.3)
+
+    def test_aux_branch_also_uses_normalized_value(self):
+        """is_aux_active=True path computes implied_aux_reduction from
+        base_prediction - normalized_actual, so the delta must apply here too.
+        """
+        lm = LearningManager()
+        corr = {}
+        aux = {}
+        lm.learn_from_historical_import(
+            temp_key="10",
+            wind_bucket="normal",
+            actual_kwh=0.5,          # raw
+            is_aux_active=True,
+            correlation_data=corr,
+            aux_coefficients=aux,
+            learning_rate=1.0,       # take the target directly (pre-existing code
+                                     # uses implied_aux_reduction directly on first write)
+            get_predicted_kwh_fn=lambda *_a, **_k: 1.5,  # base_prediction
+            actual_temp=10.0,
+            solar_normalization_delta=0.3,
+        )
+        # normalized_actual = 0.5 + 0.3 = 0.8
+        # implied_aux_reduction = 1.5 - 0.8 = 0.7
+        assert aux["10"]["normal"] == pytest.approx(0.7)

@@ -117,6 +117,7 @@ from .const import (
 
     # Mode constants
     MODE_OFF,
+    MODE_COOLING,
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
 
@@ -360,7 +361,8 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
                         if f_dt and dt_util.as_local(f_dt).date() == now.date():
                             # Pass mutable sim_inertia: it will be updated by _process_forecast_item
                             # This fixes the "Borderline Technical Error" (Inertia Reset)
-                            pred, _, _, _, _, _, _, _ = forecast_mgr._process_forecast_item(
+                            # 9-tuple return as of #899 trajectory threading.
+                            pred, _, _, _, _, _, _, _, _ = forecast_mgr._process_forecast_item(
                                 item, sim_inertia, weather_wind_unit, current_cloud, ignore_aux=False
                             )
                             if pred > max_hour_kwh:
@@ -1542,12 +1544,35 @@ class HeatingDeviceDailySensor(HeatingAnalyticsBaseSensor):
         # Exposes per-unit solar state so users can inspect what each unit
         # has learned from sun observations.  Values come from live in-memory
         # state (no 30-day log iteration) so the attribute update is O(1).
-        # ``isinstance(..., dict)`` guard: when running under a mocked
-        # coordinator in unit tests, ``solar_coefficients_per_unit.get(...)``
-        # returns a MagicMock which would fail the arithmetic below.
-        solar_coeff = self.coordinator.model.solar_coefficients_per_unit.get(
+        # Mode-stratified per #868: the displayed coefficient reflects the
+        # unit's CURRENT mode (heating or cooling).  When the unit transitions
+        # mode, the displayed regime follows naturally on the next update.
+        unit_mode = self.coordinator.get_unit_mode(self.source_entity_id)
+        # Only expose coefficient attributes when an actual learned value
+        # exists for this regime — defaults from
+        # ``calculate_unit_coefficient`` are not user-visible state.
+        # Regime selector matches ``solar.calculate_unit_coefficient`` and
+        # ``learning._solar_coeff_regime``: GUEST_COOLING routes to the
+        # cooling regime, GUEST_HEATING / OFF / DHW / unknown to heating.
+        # An earlier ``unit_mode == "cooling"`` shortcut here misrouted
+        # guest_cooling units to the heating regime, surfacing wrong
+        # coefficients + dead-zone state in device-daily attributes.
+        learned_entry = self.coordinator.model.solar_coefficients_per_unit.get(
             self.source_entity_id
         )
+        regime_key = (
+            "cooling"
+            if unit_mode in (MODE_COOLING, MODE_GUEST_COOLING)
+            else "heating"
+        )
+        learned_regime = None
+        if isinstance(learned_entry, dict):
+            candidate = learned_entry.get(regime_key)
+            if isinstance(candidate, dict) and any(
+                candidate.get(k) for k in ("s", "e", "w")
+            ):
+                learned_regime = candidate
+        solar_coeff = learned_regime
         if isinstance(solar_coeff, dict):
             attrs["solar_coefficient_s"] = round(solar_coeff.get("s", 0.0), 4)
             attrs["solar_coefficient_e"] = round(solar_coeff.get("e", 0.0), 4)
@@ -1563,7 +1588,7 @@ class HeatingDeviceDailySensor(HeatingAnalyticsBaseSensor):
             sv_e = self.coordinator.data.get("solar_vector_e", 0.0)
             sv_w = self.coordinator.data.get("solar_vector_w", 0.0)
             impact = self.coordinator.solar.calculate_unit_solar_impact(
-                (sv_s, sv_e, sv_w), solar_coeff, screen_transmittance=1.0
+                (sv_s, sv_e, sv_w), solar_coeff
             )
             if isinstance(impact, (int, float)):
                 attrs["solar_impact_current_kwh"] = round(impact, 3)
@@ -1581,19 +1606,44 @@ class HeatingDeviceDailySensor(HeatingAnalyticsBaseSensor):
                         attrs["solar_impact_saturation_pct"] = 0.0
 
         # Learning state: single string that summarises cold-start vs
-        # NLMS-converged vs dead-zone-warning.  Avoids exposing raw
-        # counters; surfaces the three states the user actually needs
-        # to act on.
-        buffer = self.coordinator._learning_buffer_solar_per_unit.get(
-            self.source_entity_id, []
+        # NLMS-converged vs dead-zone-warning.  Mode-stratified per #868 —
+        # the displayed state reflects the unit's CURRENT mode regime
+        # (heating or cooling).  Buffer and dead-zone counters are keyed
+        # per (entity, regime).  Regime selector matches the coefficient
+        # lookup above so GUEST_COOLING surfaces cooling-regime state.
+        regime_for_status = (
+            "cooling"
+            if unit_mode in (MODE_COOLING, MODE_GUEST_COOLING)
+            else "heating"
         )
+        buf_entry = self.coordinator._learning_buffer_solar_per_unit.get(
+            self.source_entity_id
+        )
+        if isinstance(buf_entry, dict):
+            buffer = buf_entry.get(regime_for_status, [])
+        else:
+            buffer = []
         dead_zone_count = self.coordinator.learning._dead_zone_counts.get(
-            self.source_entity_id, 0
+            (self.source_entity_id, regime_for_status), 0
         )
         if not isinstance(dead_zone_count, int):
             # Mocked coordinator in tests returns MagicMock; treat as 0.
             dead_zone_count = 0
-        coeff_present = isinstance(solar_coeff, dict) and solar_coeff
+        # Coefficient "present" iff the active regime has any non-zero entry.
+        # ``solar_coeff`` was resolved via calculate_unit_coefficient above —
+        # which returns the regime's dict when learned, or the default.
+        # Treat default-only (no learned coefficient saved) as cold-start by
+        # checking the raw coordinator state.
+        regime_entry = self.coordinator.model.solar_coefficients_per_unit.get(
+            self.source_entity_id, {}
+        )
+        if isinstance(regime_entry, dict) and isinstance(
+            regime_entry.get(regime_for_status), dict
+        ):
+            stored = regime_entry[regime_for_status]
+            coeff_present = any(stored.get(k) for k in ("s", "e", "w"))
+        else:
+            coeff_present = False
         buffer_len = len(buffer) if isinstance(buffer, (list, tuple)) else 0
 
         if not coeff_present and buffer_len == 0:

@@ -217,7 +217,12 @@ def _build_per_unit_kwargs(**overrides):
         is_aux_active=False,
         aux_coefficients_per_unit={},
         learning_buffer_aux_per_unit={},
-        solar_coefficients_per_unit={"vp_stue": {"s": 1.0, "e": 0.3, "w": 0.0}},
+        solar_coefficients_per_unit={
+            "vp_stue": {
+                "heating": {"s": 1.0, "e": 0.3, "w": 0.0},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            }
+        },
         learning_buffer_solar_per_unit={},
         balance_point=17.0,
         unit_modes={"vp_stue": MODE_HEATING},
@@ -230,10 +235,18 @@ def _build_per_unit_kwargs(**overrides):
     )
     defaults.update(overrides)
     # Solar calculator must return the coefficient + impact we can control.
-    solar_coeffs = defaults["solar_coefficients_per_unit"].get("vp_stue", {"s": 0, "e": 0, "w": 0})
-
-    def _fake_unit_coeff(entity_id, temp_key):
-        return defaults["solar_coefficients_per_unit"].get(entity_id, {"s": 0, "e": 0, "w": 0})
+    # ``solar_coefficients_per_unit`` is now mode-stratified (#868); the mock
+    # picks the regime corresponding to the unit's mode.
+    def _fake_unit_coeff(entity_id, temp_key, mode):
+        entry = defaults["solar_coefficients_per_unit"].get(
+            entity_id, {"heating": {"s": 0, "e": 0, "w": 0},
+                        "cooling": {"s": 0, "e": 0, "w": 0}}
+        )
+        if isinstance(entry, dict) and ("heating" in entry or "cooling" in entry):
+            regime = "cooling" if mode == MODE_COOLING else "heating"
+            return entry.get(regime, {"s": 0, "e": 0, "w": 0})
+        # Legacy flat shape — return as-is for tests not yet migrated.
+        return entry
 
     def _fake_impact(vec, coeff, *args, **kwargs):
         return coeff.get("s", 0) * vec[0] + coeff.get("e", 0) * vec[1] + coeff.get("w", 0) * vec[2]
@@ -257,7 +270,12 @@ class TestSolarShutdownSkip:
         lm = LearningManager()
         kwargs = _build_per_unit_kwargs(
             solar_dominant_entities=("vp_stue",),
-            solar_coefficients_per_unit={"vp_stue": {"s": 1.0, "e": 0.3, "w": 0.0}},
+            solar_coefficients_per_unit={
+            "vp_stue": {
+                "heating": {"s": 1.0, "e": 0.3, "w": 0.0},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            }
+        },
         )
         before = dict(kwargs["solar_coefficients_per_unit"]["vp_stue"])
         lm._process_per_unit_learning(**kwargs)
@@ -273,7 +291,12 @@ class TestSolarShutdownSkip:
         lm = LearningManager()
         kwargs = _build_per_unit_kwargs(
             solar_dominant_entities=("other_unit",),  # flag for a DIFFERENT unit
-            solar_coefficients_per_unit={"vp_stue": {"s": 1.0, "e": 0.3, "w": 0.0}},
+            solar_coefficients_per_unit={
+            "vp_stue": {
+                "heating": {"s": 1.0, "e": 0.3, "w": 0.0},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            }
+        },
         )
         before = dict(kwargs["solar_coefficients_per_unit"]["vp_stue"])
         lm._process_per_unit_learning(**kwargs)
@@ -305,7 +328,12 @@ class TestHeadroomWeightedEMA:
         Returns (correlation_after).
         """
         lm = LearningManager()
-        solar_coeffs = {"vp_stue": {"s": solar_coeff_s, "e": 0.0, "w": 0.0}}
+        solar_coeffs = {
+            "vp_stue": {
+                "heating": {"s": solar_coeff_s, "e": 0.0, "w": 0.0},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            }
+        }
         kwargs = _build_per_unit_kwargs(
             solar_coefficients_per_unit=solar_coeffs,
             correlation_data_per_unit={"vp_stue": {"10": {"normal": correlation_before}}},
@@ -335,7 +363,12 @@ class TestHeadroomWeightedEMA:
     def test_zero_solar_preserves_full_rate(self):
         """Dark hours (no solar) → headroom = 1 → rate unchanged."""
         lm = LearningManager()
-        solar_coeffs = {"vp_stue": {"s": 0.0, "e": 0.0, "w": 0.0}}
+        solar_coeffs = {
+            "vp_stue": {
+                "heating": {"s": 0.0, "e": 0.0, "w": 0.0},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            }
+        }
         kwargs = _build_per_unit_kwargs(
             solar_coefficients_per_unit=solar_coeffs,
             correlation_data_per_unit={"vp_stue": {"10": {"normal": 2.0}}},
@@ -401,19 +434,31 @@ class TestFeedbackLoopBroken:
         )
         assert shutdown == ("vp_stue",)
 
-        coeff_before = {"s": 1.0, "e": 0.3, "w": 0.0}
+        coeff_before = {
+            "heating": {"s": 1.0, "e": 0.3, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }
         corr_before = 1.2
+        # Pre-deep-copy so we can compare regime contents post-call.
+        coeff_before_snapshot = {
+            r: dict(v) for r, v in coeff_before.items()
+        }
         kwargs = _build_per_unit_kwargs(
             solar_dominant_entities=shutdown,
-            solar_coefficients_per_unit={"vp_stue": dict(coeff_before)},
+            solar_coefficients_per_unit={"vp_stue": coeff_before},
             correlation_data_per_unit={"vp_stue": {"10": {"normal": corr_before}}},
             hourly_delta_per_unit={"vp_stue": 0.0},
             hourly_expected_base_per_unit={"vp_stue": 1.2},
             avg_solar_vector=(0.6, 0.2, 0.0),
         )
         lm._process_per_unit_learning(**kwargs)
-        # Invariant 1: coefficient locked.
-        assert kwargs["solar_coefficients_per_unit"]["vp_stue"] == coeff_before
+        # Invariant 1: heating-regime coefficient locked when shutdown gates NLMS.
+        # Inequality may lift the coefficient when constraint is violated; this
+        # test runs with battery=0 (no inequality signal) so coeff is unchanged.
+        assert (
+            kwargs["solar_coefficients_per_unit"]["vp_stue"]
+            == coeff_before_snapshot
+        )
         # Invariant 2: base cannot have drifted upward on a shutdown hour.
         # unit_normalized = 0 + coeff·potential = 0.66 ≤ base, so EMA target
         # is below base → movement is downward (gradually self-correcting

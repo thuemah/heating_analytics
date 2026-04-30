@@ -22,6 +22,7 @@ import pytest
 from custom_components.heating_analytics.learning import (
     LearningManager,
     compute_snr_weight,
+    count_active_learnable_units,
 )
 from custom_components.heating_analytics.solar import SolarCalculator
 from custom_components.heating_analytics.observation import build_strategies
@@ -29,6 +30,9 @@ from custom_components.heating_analytics.const import (
     SNR_WEIGHT_FLOOR,
     SNR_WEIGHT_K,
     MODE_HEATING,
+    MODE_COOLING,
+    MODE_OFF,
+    SOLAR_LEARNING_MIN_BASE,
 )
 from custom_components.heating_analytics.retrain import RetrainEngine
 
@@ -362,3 +366,120 @@ class TestTrackBRetrainUnderSnr:
         # new = 1.0 + (lr=1.0 × 0.1) × (0.3 - 1.0) = 1.0 - 0.07 = 0.93
         bucket = coord._correlation_data["10"]["normal"]
         assert bucket == pytest.approx(1.0 - 1.0 * SNR_WEIGHT_FLOOR * 0.7, abs=0.02)
+
+
+# =============================================================================
+# count_active_learnable_units helper — SNR shutdown scaling uses count of
+# *active* learnable units. On installs with mixed sensor sizes (large VPs +
+# small loads), len(energy_sensors) inflates the denominator so clean_fraction
+# stays positive even when all signal-bearing VPs have shut down. The helper
+# excludes OFF/cooling and below-min-base sensors so SNR weight goes to zero
+# when all heating units in shutdown.
+# =============================================================================
+
+class TestCountActiveLearnableUnits:
+
+    def test_empty_expected_base_falls_back_to_total(self):
+        """Cold-start before any base data: helper returns full count."""
+        n = count_active_learnable_units(
+            energy_sensors=["a", "b", "c"],
+            unit_modes={},
+            expected_base_per_unit={},
+        )
+        assert n == 3
+
+    def test_only_heating_with_sufficient_base_counted(self):
+        """OFF/cooling + below-threshold base are excluded."""
+        n = count_active_learnable_units(
+            energy_sensors=["vp_big", "vp_small", "off_unit", "cooling_unit"],
+            unit_modes={
+                "vp_big": MODE_HEATING,
+                "vp_small": MODE_HEATING,
+                "off_unit": MODE_OFF,
+                "cooling_unit": MODE_COOLING,
+            },
+            expected_base_per_unit={
+                "vp_big": 1.5,
+                "vp_small": 0.05,  # below SOLAR_LEARNING_MIN_BASE (0.15)
+                "off_unit": 2.0,   # would qualify by base, but mode excludes
+                "cooling_unit": 1.0,
+            },
+        )
+        # Only vp_big qualifies: heating mode + base ≥ 0.15
+        assert n == 1
+
+    def test_zero_active_falls_back_to_total(self):
+        """Defensive: never zero out the SNR denominator if data is sparse."""
+        n = count_active_learnable_units(
+            energy_sensors=["off1", "off2"],
+            unit_modes={"off1": MODE_OFF, "off2": MODE_OFF},
+            expected_base_per_unit={"off1": 0.0, "off2": 0.0},
+        )
+        assert n == 2  # falls back to len()
+
+    def test_threshold_inclusive_at_min_base(self):
+        """Boundary: base == SOLAR_LEARNING_MIN_BASE counts as active."""
+        n = count_active_learnable_units(
+            energy_sensors=["a"],
+            unit_modes={"a": MODE_HEATING},
+            expected_base_per_unit={"a": SOLAR_LEARNING_MIN_BASE},
+        )
+        assert n == 1
+
+
+class TestSnrWeightFreezesOnActiveShutdown:
+
+    def test_all_active_units_shutdown_zeros_weight(self):
+        """User scenario: 9 sensors total but only 2 are signal-bearing VPs.
+        Both VPs shut down → weight should be 0, not (9-2)/9 = 0.78."""
+        active = count_active_learnable_units(
+            energy_sensors=[
+                "toshiba", "mitsubishi",   # the VPs (active learnable)
+                "termostat", "vaskerom", "gjaeringskjeller",
+                "socket_garasje", "bad_varmekabel",
+                "vinkjeller", "socket_yaser",  # small loads
+            ],
+            unit_modes={sid: MODE_HEATING for sid in [
+                "toshiba", "mitsubishi", "termostat", "vaskerom",
+                "gjaeringskjeller", "socket_garasje", "bad_varmekabel",
+                "vinkjeller", "socket_yaser",
+            ]},
+            # Only the VPs have meaningful base; small loads cycle near zero
+            expected_base_per_unit={
+                "toshiba": 1.5, "mitsubishi": 1.2,
+                "termostat": 0.05, "vaskerom": 0.03,
+                "gjaeringskjeller": 0.04, "socket_garasje": 0.02,
+                "bad_varmekabel": 0.06, "vinkjeller": 0.01,
+                "socket_yaser": 0.01,
+            },
+        )
+        # Both VPs qualify (base ≥ 0.15); small loads don't.
+        assert active == 2
+
+        # Both VPs in shutdown → fraction_clean = 0 → weight = 0
+        w = compute_snr_weight(
+            solar_factor=0.5,
+            solar_dominant_entities=["toshiba", "mitsubishi"],
+            total_units=active,
+        )
+        assert w == 0.0
+
+    def test_pre_fix_behavior_under_len_was_lenient(self):
+        """Documents the bug being fixed: with len() the weight stays
+        non-zero even when both signal-bearers are shut down."""
+        # 9 sensors, 2 shut down → clean_fraction = 7/9 ≈ 0.78
+        # solar_factor = 0.5 → base weight = max(0.1, 1 - 1.5) = 0.1 (floor)
+        # → final weight = 0.1 × 0.78 ≈ 0.078 (not 0)
+        w_buggy = compute_snr_weight(
+            solar_factor=0.5,
+            solar_dominant_entities=["toshiba", "mitsubishi"],
+            total_units=9,
+        )
+        assert w_buggy > 0.0
+        # Post-fix (active=2): w = 0
+        w_fixed = compute_snr_weight(
+            solar_factor=0.5,
+            solar_dominant_entities=["toshiba", "mitsubishi"],
+            total_units=2,
+        )
+        assert w_fixed == 0.0

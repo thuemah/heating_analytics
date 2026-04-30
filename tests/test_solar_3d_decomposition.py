@@ -170,7 +170,8 @@ class TestWestCoefficientConvergence:
             )
 
         assert "unit_west" in coeffs
-        final = coeffs["unit_west"]
+        # Heating-regime read per #868.
+        final = coeffs["unit_west"]["heating"]
         assert final["w"] > 0.3, f"West coeff {final['w']} should be significant"
         assert abs(final["w"] - true_w) < 0.4, (
             f"West coeff {final['w']} not converging toward {true_w}"
@@ -212,7 +213,7 @@ class TestColdStart3x3Solver:
             )
 
         assert "unit_3x3" in coeffs, "Cold start should have triggered with 4 samples"
-        final = coeffs["unit_3x3"]
+        final = coeffs["unit_3x3"]["heating"]
         # All three coefficients should be positive (not clamped to 0)
         assert final["s"] > 0.05, f"S coeff {final['s']} should be positive"
         assert final["e"] > 0.05, f"E coeff {final['e']} should be positive"
@@ -237,7 +238,7 @@ class TestColdStart3x3Solver:
             )
 
         assert "unit_collinear" in coeffs, "Collinear fallback should still produce coefficients"
-        final = coeffs["unit_collinear"]
+        final = coeffs["unit_collinear"]["heating"]
         # S and W should be positive (projected along dominant direction)
         assert final["s"] >= 0.0
         assert final["w"] >= 0.0

@@ -43,6 +43,8 @@ SERVICE_DIAGNOSE_MODEL = "diagnose_model"
 SERVICE_DIAGNOSE_SOLAR = "diagnose_solar"
 SERVICE_RESET_SOLAR_LEARNING = "reset_solar_learning"
 SERVICE_RETRAIN_FROM_HISTORY = "retrain_from_history"
+SERVICE_BATCH_FIT_SOLAR = "batch_fit_solar"
+SERVICE_APPLY_IMPLIED_COEFFICIENT = "apply_implied_coefficient"
 SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=90)),
@@ -123,6 +125,42 @@ SERVICE_SCHEMA_RETRAIN = vol.Schema({
     vol.Optional("days_back"): vol.All(vol.Coerce(int), vol.Range(min=1, max=730)),
     vol.Optional("reset_first", default=False): cv.boolean,
     vol.Optional("experimental_cop_smear", default=False): cv.boolean,  # #793 hidden flag
+})
+
+SERVICE_SCHEMA_BATCH_FIT_SOLAR = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("unit_entity_id"): cv.entity_id,
+    vol.Optional("days_back", default=30): vol.All(
+        vol.Coerce(int), vol.Range(min=1, max=730)
+    ),
+    vol.Optional("dry_run", default=False): cv.boolean,
+})
+
+SERVICE_SCHEMA_APPLY_IMPLIED_COEFFICIENT = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Required("unit_entity_id"): cv.entity_id,
+    # Guest modes are rejected at the schema layer: guest hours are
+    # filtered out of ``_collect_batch_fit_samples`` (mode != target_mode),
+    # so picking guest_heating / guest_cooling would always return
+    # ``no_data``.  The coordinator method still accepts them as
+    # synonyms for the underlying regime — they're routed via
+    # _solar_coeff_regime — but the service-level dropdown should not
+    # advertise an option that's functionally inert.
+    vol.Optional("mode", default="heating"): vol.In(("heating", "cooling")),
+    # ``min: 7`` is deliberate: stability windows split samples
+    # chronologically into 3 chunks; with ``days_back < 7`` all three
+    # chunks fall within the same solar phase (e.g. one sunny
+    # afternoon), and the per-direction stability check would pass
+    # within-afternoon noise instead of catching real temporal drift.
+    # 7 gives ~3 chunks of 2-day spans — the minimum useful temporal
+    # resolution for the guard.  Users wanting smaller windows must
+    # set the coefficient manually via reset_solar_learning + custom
+    # state.
+    vol.Optional("days_back", default=30): vol.All(
+        vol.Coerce(int), vol.Range(min=7, max=730)
+    ),
+    vol.Optional("dry_run", default=False): cv.boolean,
+    vol.Optional("force", default=False): cv.boolean,
 })
 
 SERVICE_SCHEMA_COMPARE_PERIODS = vol.Schema({
@@ -339,6 +377,97 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         SERVICE_RETRAIN_FROM_HISTORY,
         handle_retrain_from_history,
         schema=SERVICE_SCHEMA_RETRAIN,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    # Register Batch-Fit Solar Service (#884)
+    async def handle_batch_fit_solar(call: ServiceCall) -> dict:
+        """Handle the batch-fit-solar service call.
+
+        On-demand periodic batch least-squares fit per (entity, mode)
+        regime over the modulating-regime hourly log.  Bridges the
+        mild-weather catch-22 where NLMS / inequality both produce zero
+        signal because expected base demand is near zero (e.g. west sun
+        peaks at the warmest part of the day).
+
+        ``days_back`` defaults to 30 at the service boundary (a fresh
+        fit shortly after a release should not absorb pre-upgrade data).
+        ``dry_run`` defaults to False; when True the service returns the
+        would-be coefficients without writing them.
+        """
+        entity_id = call.data.get("entity_id")
+        unit_entity_id = call.data.get("unit_entity_id")
+        # voluptuous defaults guarantee these keys exist post-schema.
+        days_back = call.data.get("days_back", 30)
+        dry_run = call.data.get("dry_run", False)
+        coord = _get_target_coordinator(hass, entity_id)
+        scope = f"unit {unit_entity_id}" if unit_entity_id else "all units"
+        suffix = f" (last {days_back}d{', dry-run' if dry_run else ''})"
+        _LOGGER.info(
+            f"Service called: batch_fit_solar for {scope}{suffix} "
+            f"(coordinator={coord.entry.entry_id})"
+        )
+        return await coord.async_batch_fit_solar(
+            entity_id=unit_entity_id,
+            days_back=days_back,
+            dry_run=dry_run,
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_BATCH_FIT_SOLAR,
+        handle_batch_fit_solar,
+        schema=SERVICE_SCHEMA_BATCH_FIT_SOLAR,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    # Register Apply Implied Coefficient Service (#884 follow-up)
+    async def handle_apply_implied_coefficient(call: ServiceCall) -> dict:
+        """Handle the apply-implied-coefficient service call.
+
+        Writes ``diagnose_solar``'s implied LS-fit into the live
+        coefficient for one (unit, mode regime), with per-direction
+        stability guards.  ``dry_run=true`` shows what would be
+        applied without writing.  ``force=true`` overrides the
+        per-direction stability guard (use after manually verifying
+        the implied is trustworthy on a noisy install).  ``days_back``
+        defaults to 30 — fitting only on recent data avoids
+        contamination from pre-retrain or pre-upgrade entries.
+        """
+        entity_id = call.data.get("entity_id")
+        unit_entity_id = call.data["unit_entity_id"]  # Required
+        mode = call.data.get("mode", "heating")
+        days_back = call.data.get("days_back", 30)
+        dry_run = call.data.get("dry_run", False)
+        force = call.data.get("force", False)
+        coord = _get_target_coordinator(hass, entity_id)
+        # Conditional ``last Nd`` mirrors the coordinator-side log line
+        # — currently the schema default forces a non-None value here,
+        # but the conditional keeps the log readable if the schema
+        # default is ever changed to None.
+        suffix = (
+            f" [{mode}]"
+            f"{f', last {days_back}d' if days_back is not None else ''}"
+            f"{', dry-run' if dry_run else ''}"
+            f"{', forced' if force else ''}"
+        )
+        _LOGGER.info(
+            f"Service called: apply_implied_coefficient for {unit_entity_id}{suffix} "
+            f"(coordinator={coord.entry.entry_id})"
+        )
+        return await coord.async_apply_implied_coefficient(
+            entity_id=unit_entity_id,
+            mode=mode,
+            dry_run=dry_run,
+            force=force,
+            days_back=days_back,
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_APPLY_IMPLIED_COEFFICIENT,
+        handle_apply_implied_coefficient,
+        schema=SERVICE_SCHEMA_APPLY_IMPLIED_COEFFICIENT,
         supports_response=SupportsResponse.ONLY,
     )
 

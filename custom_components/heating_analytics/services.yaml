@@ -274,6 +274,148 @@ reset_solar_learning:
           max: 730
           mode: box
 
+batch_fit_solar:
+  name: Batch-Fit Solar Coefficients
+  description: >-
+    Run a periodic batch least-squares fit on per-unit solar coefficients
+    over the modulating-regime hourly log.  Bridges the mild-weather
+    catch-22 where online learning (NLMS + inequality) produces zero net
+    signal because expected base demand is near zero — typically west-
+    facing rooms whose solar peak coincides with the daily temperature
+    maximum.  Each (unit, mode) regime is fit independently; saturated
+    and shutdown samples are excluded.  Result is damped against the
+    existing coefficient (factor 0.3) so a single noisy batch cannot
+    overshoot.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor (optional)
+      description: Restrict the batch fit to a single energy sensor. Leave empty to fit all units in the instance.
+      selector:
+        entity:
+          domain: sensor
+    days_back:
+      name: Days of History
+      description: >-
+        Restrict the fit to the last N days of the hourly log.  Default 30.
+        Recommended after a major release: a 14- or 30-day window fits
+        against representative post-upgrade data instead of being pulled
+        toward old model behaviour by pre-upgrade entries.  Increase only
+        if you specifically want to absorb older data (e.g. cross-seasonal).
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 730
+          mode: box
+    dry_run:
+      name: Dry Run (preview only)
+      description: >-
+        When enabled, run every gate and the LS solve but do NOT write the
+        coefficients back.  The response carries the would-be result per
+        (unit, regime) so you can preview before committing.  Useful for
+        sanity-checking an unfamiliar window before letting the fit drift
+        live state.
+      default: false
+      selector:
+        boolean:
+
+apply_implied_coefficient:
+  name: Apply Implied Solar Coefficient
+  description: >-
+    Write diagnose_solar's implied LS-fit into the live solar coefficient
+    for one (unit, mode) regime.  Useful when an installation cannot
+    produce a usable coefficient via the online learners — typically
+    Track C / MPC-managed sensors which have no coherent dark-equivalent
+    baseline, so NLMS / inequality / batch_fit_solar all skip them and
+    they're stuck on default coefficients.
+
+    Per-direction stability guard: each direction (S, E, W) is evaluated
+    across the diagnose stability windows.  A direction with sign-flip
+    or a max/min spread above the threshold is skipped (current value
+    preserved); only stable directions are written.  ``force: true``
+    overrides the per-direction guard — use only after manually verifying
+    the implied is trustworthy.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor
+      description: The energy sensor whose coefficient you want to apply. Required.
+      selector:
+        entity:
+          domain: sensor
+    mode:
+      name: Mode Regime
+      description: >-
+        Which regime to write to: ``heating`` (default) or ``cooling``.
+        Guest modes are excluded — guest hours are filtered out at the
+        sample collector, so applying to guest_heating / guest_cooling
+        would always return no_data.  OFF and DHW have no learnable
+        solar regime and are also excluded.
+      default: heating
+      selector:
+        select:
+          options:
+            - heating
+            - cooling
+    days_back:
+      name: Days of History
+      description: >-
+        Restrict the implied LS fit to the last N days of the hourly
+        log.  Default 30, minimum 7.  Recommended after a retrain or
+        upgrade — a 14- or 30-day window fits against representative
+        current-state data instead of being pulled by older entries
+        that reflect a previous model state.  Compare ``days_back: 7``
+        vs ``days_back: 30`` (with ``dry_run: true`` both times) to
+        spot-check whether recent data agrees with the longer window;
+        large divergence indicates older data is dragging the fit and
+        the recent window should be trusted.
+
+        The 7-day floor is deliberate: stability windows split samples
+        chronologically into 3 chunks, and ``days_back < 7`` would
+        place all chunks within a single solar phase (e.g. one sunny
+        afternoon), letting within-phase noise pass as "stable".
+        Users who want a tighter window must set the coefficient
+        manually.
+      default: 30
+      selector:
+        number:
+          min: 7
+          max: 730
+          mode: box
+    dry_run:
+      name: Dry Run (preview only)
+      description: >-
+        When enabled, run the analysis pass and return what *would* be
+        applied per direction without actually writing.  Inspect the
+        ``stability`` block in the response to see why directions were
+        skipped.  Useful for sanity-checking before committing.
+      default: false
+      selector:
+        boolean:
+    force:
+      name: Force (override per-direction stability guard)
+      description: >-
+        When enabled, write every direction's implied value even when
+        the stability guard would normally skip it.  Use only when you
+        have manually verified the implied is the right answer for a
+        noisy direction (e.g. you know the house has no west-facing
+        windows so the noisy west signal can be safely set to zero or
+        whatever the implied says).
+      default: false
+      selector:
+        boolean:
+
 exit_cooldown:
   name: Exit Auxiliary Cooldown
   description: Manually force the system to exit the auxiliary cooldown/decay state. Use this if you want to resume normal model learning immediately after an auxiliary event, bypassing the thermal settling period.

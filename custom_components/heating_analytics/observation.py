@@ -136,6 +136,12 @@ class LearningConfig:
     # direction independently in :meth:`SolarCalculator._screen_transmittance_vector`.
     screen_config: tuple[bool, bool, bool] | None = None
 
+    # Per-entity scope for the screen_config above.  Set of entity_ids whose
+    # solar coefficients learn against the installation-level screen_config;
+    # others get ``(False, False, False)`` (transmittance=1.0) at learn time.
+    # None = legacy behaviour (all entities affected, as before).
+    screen_affected_entities: frozenset[str] | None = None
+
     # Per-unit min-base thresholds (#871).  Maps entity_id → calibrated
     # noise floor (kWh) used to gate NLMS, inequality, and shutdown
     # detection per unit.  None or empty → all gate sites fall back to
@@ -262,7 +268,9 @@ class ModelState:
     aux_coefficients_per_unit: dict  # {entity_id: {temp_key: {wind_bucket: kw_reduction}}}
 
     # --- Solar coefficients ---
-    solar_coefficients_per_unit: dict  # {entity_id: {temp_key: coeff}}
+    # Mode-stratified per #868:
+    # ``{entity_id: {"heating": {s, e, w}, "cooling": {s, e, w}}}``.
+    solar_coefficients_per_unit: dict
 
     # --- Daily learning ---
     learned_u_coefficient: float | None

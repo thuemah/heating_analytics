@@ -82,19 +82,28 @@ def test_aux_impact_neighbor_logic(mock_coordinator):
     assert mock_coordinator._get_aux_impact_kw("10", "normal", actual_temp=10.0) == 2.0
 
 def test_solar_coefficient_neighbor_logic(mock_coordinator):
-    """Test global solar coefficient lookup (not temp-stratified since ad5f41f)."""
+    """Test mode-stratified solar coefficient lookup (#868)."""
     mock_coordinator._solar_coefficients_per_unit = {
-        "unit_1": {"s": 0.6, "e": 0.0, "w": 0.0}
+        "unit_1": {
+            "heating": {"s": 0.6, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }
     }
 
-    # Global coefficient returned for any temp key.
-    assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "10")["s"] == 0.6
-    assert mock_coordinator.solar.calculate_unit_coefficient("unit_1", "9")["s"] == 0.6
+    # Heating regime returns the learned value regardless of temp_key.
+    assert mock_coordinator.solar.calculate_unit_coefficient(
+        "unit_1", "10", "heating"
+    )["s"] == 0.6
+    assert mock_coordinator.solar.calculate_unit_coefficient(
+        "unit_1", "9", "heating"
+    )["s"] == 0.6
 
     # No learned data for unit_2 -> falls back to mode-appropriate default.
-    # Temp "12" == balance_point (12.0) -> MODE_COOLING -> DEFAULT_SOLAR_COEFF_COOLING = 0.40.
+    # Cooling mode -> DEFAULT_SOLAR_COEFF_COOLING = 0.40.
     mock_coordinator.solar_azimuth = 180
-    assert mock_coordinator.solar.calculate_unit_coefficient("unit_2", "12")["s"] == 0.40
+    assert mock_coordinator.solar.calculate_unit_coefficient(
+        "unit_2", "12", "cooling"
+    )["s"] == 0.40
 
 def test_per_unit_neighbor_logic(mock_coordinator):
     """Test neighbor lookup for per-unit predictions."""

@@ -28,6 +28,17 @@ from .base import HeatingAnalyticsBaseSensor
 _LOGGER = logging.getLogger(__name__)
 
 
+# Session-level dedup for "missing historical data" warnings.  ``extra_state_attributes``
+# is recomputed on every coordinator update (~1/min), but the underlying condition
+# (no reference-temperature data for last-year's same period) is stable until new
+# history accumulates — so the warning is deterministic noise at per-minute
+# cadence.  Dedup at module level: one log per unique missing period per HA
+# restart.  Cleared on restart by design — user gets a reminder after each boot
+# that comparison data is still missing.
+_WARNED_WEEKS: set[int] = set()
+_WARNED_MONTHS: set[str] = set()
+
+
 def weighted_avg(val1, w1, val2, w2):
     """Calculate weighted average of two values."""
     if val1 is None and val2 is None:
@@ -556,9 +567,12 @@ class HeatingModelComparisonWeekSensor(HeatingModelComparisonBaseSensor):
             # Fallback to existing logic (keep current implementation as backup)
             weekly_summary = self._generate_fallback_summary(curr, last)
 
-        # Warning for missing data (as per PR feedback)
-        if w_stats["ref_temp"] is None:
-             _LOGGER.warning(f"Missing historical data for week {week_num}, comparison may be inaccurate.")
+        # Warning for missing data (as per PR feedback).  Session-deduped:
+        # the condition is deterministic per restart, repeating every
+        # coordinator tick adds no information.
+        if w_stats["ref_temp"] is None and week_num not in _WARNED_WEEKS:
+            _WARNED_WEEKS.add(week_num)
+            _LOGGER.warning(f"Missing historical data for week {week_num}, comparison may be inaccurate.")
 
         # Calculate hybrid projection totals for comparison
         # Current: Actual (past) + Budget (today) + Forecast (future)
@@ -687,8 +701,10 @@ class HeatingModelComparisonMonthSensor(HeatingModelComparisonBaseSensor):
             _LOGGER.warning(f"Failed to generate monthly explanation: {e}")
             monthly_summary = self._generate_fallback_summary(curr, last)
 
-        if w_stats["ref_temp"] is None:
-             _LOGGER.warning(f"Missing historical data for month comparison, summary may be inaccurate.")
+        _month_key = f"{year}-{month:02d}"
+        if w_stats["ref_temp"] is None and _month_key not in _WARNED_MONTHS:
+            _WARNED_MONTHS.add(_month_key)
+            _LOGGER.warning(f"Missing historical data for month comparison, summary may be inaccurate.")
 
         # Calculate hybrid projection totals for comparison
         # Current: Actual (past) + Budget (today) + Forecast (future)

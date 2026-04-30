@@ -31,18 +31,6 @@ DEFAULT_CONTRADICTION_SOLAR_KWH = 1.5  # kWh
 DEFAULT_SOLAR_SIGNIFICANT_KWH = 2.0  # Daily kWh delta
 DEFAULT_SOLAR_MODERATE_KWH = 0.5     # Daily kWh delta
 
-# Default Inertia Profile: "Thermal Mass Balanced"
-# Logic: (H-3, H-2, H-1, Current) -> Sums to 1.0
-#
-# Weights breakdown:
-# 20% (Current): Immediate outdoor conditions.
-# 80% (History): Dominant factor — retained heat in walls/floors (Thermal Mass).
-#
-# Symmetric arc profile: the middle hours (H-2, H-1) carry most weight,
-# reflecting that a well-insulated house's heating demand correlates most
-# with the 1-3 hour temperature trend, not the instantaneous reading.
-DEFAULT_INERTIA_WEIGHTS = (0.20, 0.30, 0.30, 0.20)
-
 # Thermal Inertia Configuration (User Selectable)
 CONF_THERMAL_INERTIA = "thermal_inertia"
 THERMAL_INERTIA_FAST = "fast"
@@ -70,6 +58,21 @@ DEFAULT_SOLAR_COEFF_COOLING = 0.40
 # with concrete floor slabs.  Per-installation calibration
 # available via diagnose_solar with apply_battery_decay: true.
 SOLAR_BATTERY_DECAY = 0.80
+
+# Saturation-wasted thermal-feedback coefficient (#896).  Fraction of
+# saturation-wasted solar (heating mode only) fed back into the solar
+# thermal battery EMA on top of the applied solar.  When 0.0 (default),
+# behaviour is bit-identical to the pre-#896 model.  When > 0.0, the
+# EMA input becomes ``solar_impact + k × solar_wasted``, accounting for
+# the portion of solar potential that exceeded VP demand and was clipped
+# but still physically entered the building thermal mass.  Heating mode
+# only — cooling-mode wasted is structurally zero (saturation returns
+# wasted=0 for cooling) and gated additionally at the call site.
+# Per-installation tuning via Advanced Options; expected useful range
+# 0.3-0.5 for high-saturation installs based on issue research.  Field
+# validation in progress.
+CONF_BATTERY_THERMAL_FEEDBACK_K = "battery_thermal_feedback_k"
+DEFAULT_BATTERY_THERMAL_FEEDBACK_K = 0.0
 
 # Composite legacy floor for screen transmittance.  Used for facades configured
 # WITHOUT explicit per-direction screen presence (CONF_SCREEN_SOUTH/EAST/WEST):
@@ -106,6 +109,18 @@ DEFAULT_SCREEN_SOUTH = True
 DEFAULT_SCREEN_EAST = True
 DEFAULT_SCREEN_WEST = True
 
+# Per-entity scope for the screen config.  List of energy_sensor entity_ids
+# whose solar coefficients learn and predict against the installation-level
+# `screen_config` + `solar_correction_percent`.  Entities NOT in the list
+# effectively get `screen_config=(False, False, False)` — their coefficients
+# learn and predict against pure transmittance=1.0 regardless of the
+# slider.  Purpose: a unit in a room with no screens (e.g. a second-floor
+# heat pump serving a west-facing room without motorised screens) should
+# not absorb an avg transmittance it never physically experiences.  Default
+# on upgrade / fresh install: all energy sensors included (preserves
+# pre-#xxx behaviour).
+CONF_SCREEN_AFFECTED_ENTITIES = "screen_affected_entities"
+
 DEFAULT_SOLAR_AZIMUTH = 180
 
 WIND_UNIT_MS = "m/s"
@@ -121,7 +136,7 @@ PER_UNIT_LEARNING_RATE_CAP = 0.03   # 3% max EMA rate for base/aux per-unit lear
 SOLAR_COEFF_CAP = 5.0               # Max solar coefficient (kW per full sun)
 COLD_START_SOLAR_DAMPING = 0.75     # Dampen cold-start solar estimates; base model noise inflates early samples
 NLMS_STEP_SIZE = 0.10               # NLMS mu for solar coefficient learning (converges in ~10 qualifying hours)
-NLMS_REGULARIZATION = 0.05          # NLMS epsilon: prevents noise-chasing at low solar power, shrinks east component
+NLMS_REGULARIZATION = 0.05          # NLMS epsilon: step-size denominator floor (mu / (||s||^2 + eps)).  Attenuates updates when input power is weak; does NOT shrink the coefficient toward zero.
 SOLAR_DEAD_ZONE_THRESHOLD = 15      # Consecutive zero-impact sunny hours before forcing coefficient reset
 # Solar shutdown detection (#838): identifies VP units whose thermostat cut
 # the compressor because sun-heated rooms exceeded setpoint.  Such hours
@@ -196,6 +211,33 @@ SNR_WEIGHT_K = 3.0      # Slope: w = max(FLOOR, 1 − K × solar_factor)
 INEQUALITY_STEP_SIZE = 0.05   # Half of NLMS_STEP_SIZE — conservative for new mechanism
 INEQUALITY_MARGIN = 0.9       # Constraint: coeff·potential ≥ MARGIN × base (10% buffer)
 
+# Batch-fit solar coefficients (#884).  A periodic offline least-squares
+# fit over the modulating-regime hourly log, intended to escape the
+# mild-weather catch-22 where NLMS and inequality both produce zero
+# signal because expected base demand is near zero (e.g. west sun
+# peaks during the warmest part of the day).  Joint 3×3 normal
+# equations + Cramer's rule (same machinery as cold-start) over N
+# samples extracts the coefficient even when each sample's individual
+# SNR is too low for online learning.  Per (entity, mode) — heating
+# and cooling regimes are fit independently.  Conservative defaults
+# chosen ahead of field validation; revise after one season of data.
+BATCH_FIT_MIN_SAMPLES = 30           # Below this, skip — too noisy to fit
+BATCH_FIT_DAMPING = 0.3              # new = α × batch + (1 - α) × current
+BATCH_FIT_SATURATION_RATIO = 0.95    # Drop samples where impact ≥ ratio × base
+
+# Apply-implied-coefficient guard parameters (#884 follow-up).  The
+# diagnose_solar implied-LS fit is precise but can be noisy on
+# data-sparse installations, especially for directions where solar
+# rarely arrives (e.g. west on a south-facing house).  The apply
+# service evaluates per-direction stability across the diagnose
+# stability_windows: a sign-flip OR > MAX_SPREAD ratio between
+# windows means that component is noise-dominated and gets skipped
+# (current value preserved); stable components are written.  The
+# ``force`` service flag overrides per-component skipping.
+APPLY_IMPLIED_MAX_SPREAD = 3.0          # max(|w|) / min(|w|) > this → unstable
+APPLY_IMPLIED_NEAR_ZERO = 0.05          # all |w| below this → stable (effectively zero)
+APPLY_IMPLIED_MIN_QUALIFYING_HOURS = 30 # at least this many qualifying hours required
+
 # Cloud Coverage Default (when weather entity has unknown state)
 DEFAULT_CLOUD_COVERAGE = 50.0
 
@@ -244,7 +286,7 @@ DEFAULT_UNCERTAINTY_P50 = 1.0
 DEFAULT_UNCERTAINTY_P95 = 2.0
 
 # Storage
-STORAGE_VERSION = 3  # v3: versioned migration chain (see storage.py:_migrate_pre_v3)
+STORAGE_VERSION = 4  # v4: mode-stratified solar coefficients (see storage.py:_migrate_v3_to_v4)
 STORAGE_KEY = f"{DOMAIN}.storage"
 
 # Attributes
@@ -429,6 +471,16 @@ MODES_EXCLUDED_FROM_GLOBAL_LEARNING = frozenset({
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
 })
+
+# Canonical wind-bucket key for per-unit cooling-mode samples.  All
+# cooling-mode per-unit learning writes land here regardless of actual
+# wind, and per-unit cooling-mode prediction reads from here.  Never
+# produced by coordinator._get_wind_bucket() (which only returns
+# "normal" / "high_wind" / "extreme_wind" for heating), so the heating
+# and cooling sample spaces stay cleanly separated inside the same
+# [entity][temp_key][wind_bucket] structure.
+COOLING_WIND_BUCKET = "cooling"
+
 CONF_HOURLY_LOG_RETENTION_DAYS = "hourly_log_retention_days"
 DEFAULT_HOURLY_LOG_RETENTION_DAYS = 90
 HOURLY_LOG_RETENTION_OPTIONS = [90, 180, 365]

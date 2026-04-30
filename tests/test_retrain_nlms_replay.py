@@ -27,7 +27,7 @@ from unittest.mock import MagicMock, AsyncMock
 import pytest
 
 from custom_components.heating_analytics.learning import LearningManager
-from custom_components.heating_analytics.observation import DirectMeter, WeightedSmear
+from custom_components.heating_analytics.observation import DirectMeter, WeightedSmear, build_strategies
 from custom_components.heating_analytics.solar import SolarCalculator
 from custom_components.heating_analytics.const import (
     SOLAR_LEARNING_MIN_BASE,
@@ -66,7 +66,10 @@ class TestOnTheFlyDelta:
             "solar_vector_w": 0.0,
             "unit_modes": {},  # matches real log shape for all-heating hour
         }
-        coeffs = {"sensor.heater1": {"s": 1.0, "e": 0.0, "w": 0.0}}
+        coeffs = {"sensor.heater1": {
+            "heating": {"s": 1.0, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}
         delta = lm.compute_on_the_fly_solar_delta(
             entry,
             solar_calculator=self._solar_calc(),
@@ -89,7 +92,10 @@ class TestOnTheFlyDelta:
             "solar_vector_w": 0.0,
             "unit_modes": {},  # all-heating hour
         }
-        coeffs = {"sensor.heater1": {"s": 0.8, "e": 0.0, "w": 0.0}}
+        coeffs = {"sensor.heater1": {
+            "heating": {"s": 0.8, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}
         delta = lm.compute_on_the_fly_solar_delta(
             entry,
             solar_calculator=self._solar_calc(),
@@ -110,7 +116,11 @@ class TestOnTheFlyDelta:
             "solar_vector_w": 0.0,
             "unit_modes": {"sensor.heater1": MODE_COOLING},
         }
-        coeffs = {"sensor.heater1": {"s": 1.0, "e": 0.0, "w": 0.0}}
+        # Cooling regime carries the test coefficient (#868: per-mode lookup).
+        coeffs = {"sensor.heater1": {
+            "heating": {"s": 0.0, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 1.0, "e": 0.0, "w": 0.0},
+        }}
         delta = lm.compute_on_the_fly_solar_delta(
             entry,
             solar_calculator=self._solar_calc(),
@@ -131,7 +141,10 @@ class TestOnTheFlyDelta:
             "solar_vector_w": 0.0,
             "unit_modes": {"sensor.heater1": MODE_DHW},
         }
-        coeffs = {"sensor.heater1": {"s": 1.0}}
+        coeffs = {"sensor.heater1": {
+            "heating": {"s": 1.0, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}
         delta = lm.compute_on_the_fly_solar_delta(
             entry,
             solar_calculator=self._solar_calc(),
@@ -151,7 +164,10 @@ class TestOnTheFlyDelta:
             "solar_vector_w": 0.0,
             "unit_modes": {},  # both heating (log omits heating)
         }
-        coeffs = {"sensor.heater1": {"s": 1.0}}  # heater2 missing
+        coeffs = {"sensor.heater1": {
+            "heating": {"s": 1.0, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}  # heater2 missing
         delta = lm.compute_on_the_fly_solar_delta(
             entry,
             solar_calculator=self._solar_calc(),
@@ -172,7 +188,10 @@ class TestOnTheFlyDelta:
             "solar_vector_w": 0.0,
             "unit_modes": {},
         }
-        coeffs = {"sensor.heater1": {"s": 5.0, "e": 5.0, "w": 5.0}}
+        coeffs = {"sensor.heater1": {
+            "heating": {"s": 5.0, "e": 5.0, "w": 5.0},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }}
         delta = lm.compute_on_the_fly_solar_delta(
             entry,
             solar_calculator=self._solar_calc(),
@@ -242,7 +261,8 @@ class TestReplaySolarNLMS:
         )
         assert updates >= 10
         assert "sensor.heater1" in solar_coeffs
-        learned_s = solar_coeffs["sensor.heater1"].get("s", 0.0)
+        # Mode-stratified per #868 — heating regime read.
+        learned_s = solar_coeffs["sensor.heater1"]["heating"].get("s", 0.0)
         # NLMS with 20 hours should land within ~30% of truth (buffered
         # cold-start damps the initial 4-sample LS by 0.75 and then NLMS
         # closes the gap; exact convergence depends on sample spread)
@@ -703,3 +723,342 @@ class TestReplaySolarNLMSWeightedSmearSkip:
         assert direct_sid in solar_coeffs
         assert mpc_sid not in solar_coeffs
         assert diag["unit_skipped_weighted_smear"] == 20
+
+
+# =============================================================================
+# Battery decay on aux-skipped / poisoned hours in replay_solar_nlms.
+# Live coordinator decays the per-direction potential battery every hour
+# regardless of aux state. The replay path must do the same: potential
+# reconstruction + battery EMA happen FIRST, before any entry-level skip
+# filter, otherwise long aux/poisoned/dark stretches leave stale battery
+# state and inflate the next qualifying shutdown hour's inequality update.
+# =============================================================================
+
+def _shutdown_env():
+    coord = MagicMock()
+    coord.screen_config = (True, True, True)
+    coord.energy_sensors = ["sensor.vp"]
+    coord.aux_affected_entities = []
+    coord._unit_strategies = build_strategies(
+        energy_sensors=["sensor.vp"],
+        track_c_enabled=False,
+        mpc_managed_sensor=None,
+    )
+    return coord
+
+
+def _shutdown_entry(ts, *, aux=False, solar_w=0.0, actual=0.5, dominant=()):
+    return {
+        "timestamp": ts,
+        "hour": int(ts[11:13]),
+        "temp": 10.0,
+        "temp_key": "10",
+        "wind_bucket": "normal",
+        "actual_kwh": actual,
+        "auxiliary_active": aux,
+        "solar_factor": solar_w,
+        "solar_vector_s": 0.0,
+        "solar_vector_e": 0.0,
+        "solar_vector_w": solar_w,
+        "correction_percent": 100.0,
+        "unit_modes": {},
+        "unit_breakdown": {"sensor.vp": actual},
+        "solar_dominant_entities": list(dominant),
+        "solar_normalization_delta": 0.0,
+        "learning_status": "logged",
+    }
+
+
+class TestBatteryDecayOnAuxSkippedHours:
+
+    def test_aux_stretch_decays_battery_to_near_zero(self):
+        """Long aux stretch with no sun: battery should decay every hour
+        even though aux-skip continues before the inequality check.
+
+        Test design: charge battery via shutdown-flagged + below-MIN_BASE
+        entries (skip NLMS via shutdown flag, skip inequality via base<0.15)
+        so neither learning path runs and we ONLY observe battery state.
+        """
+        coord = _shutdown_env()
+        calc = SolarCalculator(coord)
+        lm = LearningManager()
+
+        # Per-unit base BELOW SOLAR_SHUTDOWN_MIN_BASE (0.15) — inequality skips
+        correlation_data_per_unit = {"sensor.vp": {"10": {"normal": 0.05}}}
+
+        # Build entries:
+        # Phase 1: 6 sunny shutdown-flagged entries (charge battery, no learning)
+        entries = []
+        for h in range(6, 12):
+            e = _shutdown_entry(f"2026-05-01T{h:02d}:00:00", solar_w=0.8, dominant=["sensor.vp"])
+            entries.append(e)
+        # Phase 2: 12 hours aux-only, no sun (decay battery)
+        for h in range(12, 24):
+            entries.append(_shutdown_entry(f"2026-05-01T{h:02d}:00:00", aux=True, solar_w=0.0))
+
+        # First run with base=0.05: validates Phase 1+2 don't produce learning
+        solar_coeffs_no_learning: dict = {}
+        diag1 = lm.replay_solar_nlms(
+            entries,
+            solar_calculator=calc,
+            screen_config=coord.screen_config,
+            correlation_data_per_unit=correlation_data_per_unit,
+            solar_coefficients_per_unit=solar_coeffs_no_learning,
+            learning_buffer_solar_per_unit={},
+            energy_sensors=coord.energy_sensors,
+            learning_rate=1.0,
+            balance_point=15.0,
+            aux_affected_entities=coord.aux_affected_entities,
+            unit_strategies=coord._unit_strategies,
+            daily_history={},
+            return_diagnostics=True,
+        )
+        # Sanity: 12 aux hours skipped, no learning happened on shutdown-flagged entries
+        assert diag1["entry_skipped_aux"] == 12
+        # Sunny shutdown entries: NLMS skipped (shutdown), inequality skipped (base<MIN_BASE)
+        assert diag1["inequality_updates"] == 0
+        # No coeffs written
+        assert "sensor.vp" not in solar_coeffs_no_learning
+
+        # Now construct a fresh replay where the LAST entry has a base
+        # bucket of 1.0 (above MIN_BASE), so inequality fires and the
+        # coeff reflects the battery state at that moment.
+        correlation_with_base = {"sensor.vp": {"10": {"normal": 1.0}}}
+        # Add a final qualifying shutdown entry
+        final_entry = _shutdown_entry(
+            "2026-05-02T06:00:00",
+            actual=0.0,
+            solar_w=0.5,
+            dominant=["sensor.vp"],
+        )
+        entries_final = entries + [final_entry]
+
+        solar_coeffs: dict = {}
+        lm.replay_solar_nlms(
+            entries_final,
+            solar_calculator=calc,
+            screen_config=coord.screen_config,
+            correlation_data_per_unit=correlation_with_base,
+            solar_coefficients_per_unit=solar_coeffs,
+            learning_buffer_solar_per_unit={},
+            energy_sensors=coord.energy_sensors,
+            learning_rate=1.0,
+            balance_point=15.0,
+            aux_affected_entities=coord.aux_affected_entities,
+            unit_strategies=coord._unit_strategies,
+            daily_history={},
+            return_diagnostics=True,
+        )
+
+        # Battery-decay verification via behaviour:
+        # If decay happens on aux hours, then by the time we hit the final
+        # shutdown entry the battery is small and inequality is bounded.
+        # If it didn't decay, the stored battery from Phase 1 would still
+        # be present, producing a much larger inequality update.
+        # Mode-stratified per #868 — inequality writes the heating regime.
+        entity_entry = solar_coeffs.get("sensor.vp")
+        assert entity_entry is not None
+        coeff = entity_entry["heating"]
+
+        # Compute expected battery_w trajectory:
+        #   Phase 1 (6 hrs, pot_w=0.8): converges toward 0.8;
+        #     after 6 hrs at decay=0.80: 0.8 × (1 − 0.80^6) ≈ 0.59
+        #   Phase 2 (12 hrs, pot_w=0): decays by 0.80^12 ≈ 0.069
+        #     → battery_w ≈ 0.59 × 0.069 ≈ 0.041
+        #   Final entry (pot_w=0.5): adds 0.5 × 0.20 = 0.10
+        #     → battery_w ≈ 0.041 × 0.80 + 0.10 ≈ 0.133
+        #
+        # Without the fix, Phase 2 wouldn't decay; battery_w ≈ 0.59
+        # going into the final entry → battery_w ≈ 0.59 × 0.80 + 0.10 = 0.572
+        #
+        # Buggy: stale battery_w ≈ 0.5+ across all firings → coeff_w would
+        # compound past 1.0. Fixed: battery decays during aux → bounded growth.
+        assert coeff["w"] < 1.0, f"coeff_w should stay bounded; got {coeff['w']}"
+
+    def test_battery_decay_structural_via_source(self):
+        """Structural test: confirm potential reconstruction + battery
+        update precede ALL entry-skip filters in replay_solar_nlms.
+
+        This is a source-level invariant test — the live battery-decay
+        behavioural test conflates with NLMS / inequality firing on
+        intermediate sunny entries because the local battery state can't
+        be observed directly without firing other paths. Source-level
+        check guarantees the fix can't regress without explicit code change.
+        """
+        import inspect
+        src = inspect.getsource(LearningManager.replay_solar_nlms)
+        # Find the for-loop body.
+        loop_idx = src.find("for entry in entries:")
+        body = src[loop_idx:]
+
+        # Locate key markers in the body
+        battery_idx = body.find("battery_s = battery_s * battery_decay")
+        aux_skip_idx = body.find('entry.get("auxiliary_active"')
+        poisoned_idx = body.find('"learning_status"')
+        magnitude_idx = body.find("magnitude <= 0.1")
+
+        # All four markers must be present
+        assert battery_idx > 0, "battery EMA update missing from replay loop"
+        assert aux_skip_idx > 0, "aux skip missing from replay loop"
+        assert poisoned_idx > 0, "poisoned skip missing from replay loop"
+        assert magnitude_idx > 0, "magnitude gate missing from replay loop"
+
+        # Battery update must precede every entry-level skip filter,
+        # so a long aux/poisoned/dark stretch decays the battery rather
+        # than leaving stale state for the next qualifying shutdown hour.
+        assert battery_idx < aux_skip_idx, (
+            "battery update must precede aux skip — otherwise aux stretches "
+            "leave stale battery state"
+        )
+        assert battery_idx < poisoned_idx, (
+            "battery update must precede poisoned skip"
+        )
+        assert battery_idx < magnitude_idx, (
+            "battery update must precede magnitude gate "
+            "(otherwise dark hours don't decay)"
+        )
+
+
+# =============================================================================
+# Track A retrain end-to-end: solar normalization + per-unit replay.
+# Two integration concerns:
+#   1. retrain_from_history Track A passes solar_normalization_delta through
+#      to learn_from_historical_import (legacy entries without the field
+#      stay backward-compatible).
+#   2. retrain_from_history Track A calls _replay_per_unit_models after the
+#      per-hour loop, so per-unit tables stay in sync with global. Without
+#      this, isolate_sensor subtraction breaks silently after reset_first.
+# =============================================================================
+
+def _track_a_coord_with_log(hourly_log):
+    """Build a coord mock suitable for calling retrain_from_history as unbound."""
+    coord = MagicMock()
+    coord._hourly_log = hourly_log
+    coord.daily_learning_mode = False
+    coord.learning_rate = 1.0  # first-observation branch writes target directly
+    coord.balance_point = 15.0
+    coord.energy_sensors = ["sensor.heater1", "sensor.heater2"]
+    coord.aux_affected_entities = []
+    coord.screen_config = (True, True, True)
+    coord._correlation_data = {}
+    coord._correlation_data_per_unit = {}
+    coord._aux_coefficients = {}
+    coord._aux_coefficients_per_unit = {}
+    coord._learning_buffer_global = {}
+    coord._learning_buffer_per_unit = {}
+    coord._learning_buffer_aux_per_unit = {}
+    coord._solar_coefficients_per_unit = {}
+    coord._learning_buffer_solar_per_unit = {}
+    coord._observation_counts = {}
+    coord._learned_u_coefficient = None
+    coord.storage.async_save_data = AsyncMock()
+    coord._get_predicted_kwh = MagicMock(return_value=0.0)
+    coord.learning = LearningManager()
+    # Use a real SolarCalculator so the NLMS-replay path (which calls
+    # _screen_transmittance_vector) works end-to-end.
+    coord.solar = SolarCalculator(coord)
+
+    # Track per-unit replay calls so tests can assert it ran
+    replay_calls = []
+    def _replay(entries):
+        replay_calls.append(entries)
+        # Write per-unit values so tests can verify side effect
+        for entry in entries:
+            tk = entry.get("temp_key")
+            wb = entry.get("wind_bucket")
+            if tk is None or wb is None:
+                continue
+            for sid, kwh in (entry.get("unit_breakdown") or {}).items():
+                if kwh <= 0:
+                    continue
+                coord._correlation_data_per_unit.setdefault(sid, {}).setdefault(tk, {})[wb] = kwh
+
+    coord._replay_per_unit_models = MagicMock(side_effect=_replay)
+    coord._replay_calls = replay_calls
+    return coord
+
+
+def _track_a_entry(ts, *, actual=0.5, solar_delta=0.0, aux=False, status=None,
+                   unit_breakdown=None, temp=10.0):
+    e = {
+        "timestamp": ts,
+        "actual_kwh": actual,
+        "temp": temp,
+        # Real hourly_log entries include a pre-bucketed temp_key from the
+        # live coordinator; per-unit replay reads it directly.
+        "temp_key": str(int(round(temp))),
+        "wind_bucket": "normal",
+        "auxiliary_active": aux,
+        "solar_normalization_delta": solar_delta,
+        "unit_breakdown": unit_breakdown or {},
+    }
+    if status is not None:
+        e["learning_status"] = status
+    return e
+
+
+class TestTrackARetrainSolarNormalization:
+    """retrain_from_history Track A passes solar delta to learn_from_historical_import."""
+
+    @pytest.mark.asyncio
+    async def test_missing_solar_delta_field_treated_as_zero(self):
+        """Legacy log entries without solar_normalization_delta stay backward compat."""
+        entry = _track_a_entry("2026-04-10T12:00:00", actual=0.35)
+        entry.pop("solar_normalization_delta", None)  # legacy log
+        coord = _track_a_coord_with_log([entry])
+        await RetrainEngine(coord).retrain_from_history()
+
+        assert coord._correlation_data["10"]["normal"] == pytest.approx(0.35)
+
+
+class TestTrackARetrainPerUnitReplay:
+    """retrain_from_history Track A calls _replay_per_unit_models."""
+
+    @pytest.mark.asyncio
+    async def test_per_unit_replay_called_with_processed_entries(self):
+        entries = [
+            _track_a_entry("2026-04-10T12:00:00", actual=0.3,
+                           unit_breakdown={"sensor.heater1": 0.2, "sensor.heater2": 0.1}),
+            _track_a_entry("2026-04-10T13:00:00", actual=0.4,
+                           unit_breakdown={"sensor.heater1": 0.25, "sensor.heater2": 0.15}),
+        ]
+        coord = _track_a_coord_with_log(entries)
+        await RetrainEngine(coord).retrain_from_history()
+
+        # Replay was called once with both entries
+        assert coord._replay_per_unit_models.call_count == 1
+        replayed = coord._replay_calls[0]
+        assert len(replayed) == 2
+        # Per-unit side effect is visible
+        assert coord._correlation_data_per_unit["sensor.heater1"]["10"]["normal"] == pytest.approx(0.25)
+        assert coord._correlation_data_per_unit["sensor.heater2"]["10"]["normal"] == pytest.approx(0.15)
+
+    @pytest.mark.asyncio
+    async def test_per_unit_replay_skipped_when_no_processed_entries(self):
+        """All entries poisoned → no replay call (avoids empty work)."""
+        coord = _track_a_coord_with_log([
+            _track_a_entry("2026-04-10T12:00:00", status="skipped_bad_data"),
+        ])
+        await RetrainEngine(coord).retrain_from_history()
+
+        assert coord._replay_per_unit_models.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_per_unit_replay_excludes_poisoned_hours(self):
+        """Poisoned entries are excluded from replay input."""
+        entries = [
+            _track_a_entry("2026-04-10T12:00:00", actual=0.3,
+                           unit_breakdown={"sensor.heater1": 0.3}),
+            _track_a_entry("2026-04-10T13:00:00", status="skipped_bad_data",
+                           unit_breakdown={"sensor.heater1": 999.0}),  # poison value
+            _track_a_entry("2026-04-10T14:00:00", actual=0.4,
+                           unit_breakdown={"sensor.heater1": 0.4}),
+        ]
+        coord = _track_a_coord_with_log(entries)
+        await RetrainEngine(coord).retrain_from_history()
+
+        replayed = coord._replay_calls[0]
+        # Poisoned entry NOT in replay input
+        assert len(replayed) == 2
+        kwhs = [e["unit_breakdown"]["sensor.heater1"] for e in replayed]
+        assert 999.0 not in kwhs

@@ -5,7 +5,11 @@ import logging
 from typing import Callable
 
 from .const import (
+    BATCH_FIT_DAMPING,
+    BATCH_FIT_MIN_SAMPLES,
+    BATCH_FIT_SATURATION_RATIO,
     COLD_START_SOLAR_DAMPING,
+    COOLING_WIND_BUCKET,
     ENERGY_GUARD_THRESHOLD,
     INEQUALITY_MARGIN,
     INEQUALITY_STEP_SIZE,
@@ -35,6 +39,50 @@ from .solar import SolarCalculator
 _LOGGER = logging.getLogger(__name__)
 
 
+def _filter_log_by_days_back(
+    hourly_log: list[dict], days_back: int | None
+) -> list[dict]:
+    """Filter ``hourly_log`` to entries within the last ``days_back`` days.
+
+    ``days_back`` ``None`` or ``<= 0`` falls through to "no filtering"
+    (returns the input list reference unchanged) for backwards compat
+    with callers that pass missing-or-zero values.
+
+    Compares parsed ``datetime`` objects, NOT ISO strings.  Lex
+    comparison of ISO strings with different tz-offsets is not
+    chronologically equivalent: e.g. ``"2026-03-27T11:00:00+02:00"``
+    (= 09:00 UTC) lex-compares greater than
+    ``"2026-03-27T10:33:53+00:00"`` even though the first is
+    chronologically earlier.  Production log timestamps may carry
+    non-UTC offsets depending on how they were written; parsing both
+    sides removes the ambiguity.
+
+    Naive timestamps in the log (legacy entries without an offset)
+    are interpreted as UTC for comparison purposes.  Entries that
+    fail to parse are dropped silently — they would have been dropped
+    by the downstream sample collector anyway.
+    """
+    if days_back is None or days_back <= 0:
+        return hourly_log
+    from datetime import timedelta
+    from homeassistant.util import dt as dt_util
+
+    cutoff_dt = dt_util.utcnow() - timedelta(days=days_back)
+    filtered: list[dict] = []
+    for entry in hourly_log:
+        ts = entry.get("timestamp")
+        if not ts:
+            continue
+        parsed = dt_util.parse_datetime(ts)
+        if parsed is None:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt_util.UTC)
+        if parsed >= cutoff_dt:
+            filtered.append(entry)
+    return filtered
+
+
 def _pad_solar_vector(v: tuple) -> tuple[float, float, float]:
     """Ensure a solar vector is a 3-tuple (S, E, W).
 
@@ -43,6 +91,30 @@ def _pad_solar_vector(v: tuple) -> tuple[float, float, float]:
     if len(v) >= 3:
         return (v[0], v[1], v[2])
     return (v[0], v[1], 0.0)
+
+
+def _solar_coeff_regime(unit_mode: str) -> str | None:
+    """Map a unit operating mode to the solar coefficient regime key.
+
+    Returns ``"heating"`` for ``MODE_HEATING`` / ``MODE_GUEST_HEATING``,
+    ``"cooling"`` for ``MODE_COOLING`` / ``MODE_GUEST_COOLING``, and
+    ``None`` for modes that don't learn solar (``MODE_OFF``,
+    ``MODE_DHW``, unknown).
+
+    Used by all per-unit solar paths (NLMS, cold-start, inequality,
+    prediction) to route reads and writes to the correct
+    ``solar_coefficients_per_unit[entity][regime]`` slot.
+
+    Heating and cooling regimes converge to physically distinct
+    coefficients: ``phys_coeff × E[1/COP_mode]``.  Mixing modes into one
+    coefficient (pre-#868 behaviour) produced a weighted mean of the
+    two, biasing whichever mode dominated by the COP ratio.
+    """
+    if unit_mode in (MODE_HEATING, MODE_GUEST_HEATING):
+        return "heating"
+    if unit_mode in (MODE_COOLING, MODE_GUEST_COOLING):
+        return "cooling"
+    return None
 
 
 def _resolve_min_base(
@@ -79,9 +151,14 @@ def compute_snr_weight(
     """Signal-to-noise weight for base-model EMA (#866).
 
     Exogenous weight — a function of observed sun geometry and shutdown
-    flags only, never of a learned state.  This keeps the weighted EMA
-    unbiased (the weight is independent of the target) while down-weighting
-    hours where the target carries more noise than signal.
+    flags only, never of a learned state.  The weighted EMA converges to
+    ``E[w·Y] / E[w]``, NOT to ``E[Y]``: because ``w`` depends on
+    ``solar_factor`` and ``E[Y | solar_factor]`` is non-constant (sunny
+    hours have systematically lower electrical heating load), the
+    stationary point is *dark-equivalent* expected demand, not the
+    arithmetic mean of observed demand.  This is the desired semantic for
+    a base bucket consumed by `predict − solar_impact` downstream.  Do
+    not call this estimator "unbiased for E[Y]" — it isn't, by design.
 
     Shape:
         w = max(floor, 1 − k × solar_factor) × (n_clean / n_total)
@@ -401,7 +478,35 @@ class LearningManager:
                 # Aux-path above is unchanged — aux learning is a different
                 # physical mechanism and does not share the COP-ceiling /
                 # shutdown-contamination failure modes that motivated SNR.
-                if solar_enabled:
+
+                # BP-2 cold-cooling-regime shield (#885 follow-up): when
+                # every active learnable unit is in cooling mode AND the
+                # outdoor temp is below ``balance_point − 2``, the hour
+                # reflects seasonal-misconfig idle (AC left on through
+                # winter), not the installation's real heating-regime
+                # baseline.  Skip the global base update so transient
+                # misconfig periods do not contaminate cold-temp heating
+                # buckets with compressor-standby values.  Mixed-mode
+                # hours (any heating unit active) write normally — the
+                # U-curve shape of ``correlation_data`` absorbs those as
+                # legitimate building consumption.
+                active_modes = [
+                    m for m in unit_modes.values()
+                    if m not in MODES_EXCLUDED_FROM_GLOBAL_LEARNING
+                ]
+                is_cold_cooling_regime = (
+                    bool(active_modes)
+                    and all(m == MODE_COOLING for m in active_modes)
+                    and avg_temp < (balance_point - 2.0)
+                )
+
+                if is_cold_cooling_regime:
+                    _LOGGER.debug(
+                        "Global base: skipping cold-cooling-regime hour "
+                        "(T=%.1f, BP=%.1f, %d cooling unit(s))",
+                        avg_temp, balance_point, len(active_modes),
+                    )
+                elif solar_enabled:
                     base_target = total_energy_kwh
                     snr_w = compute_snr_weight(
                         solar_factor,
@@ -418,40 +523,41 @@ class LearningManager:
                     base_target = total_energy_kwh
                     base_effective_rate = learning_rate
 
-                if base_expected_kwh == 0.0:
-                    # Cold Start: Use Buffered Learning.
-                    # Shutdown hours (weight = 0) must NOT contaminate the
-                    # cold-start buffer with near-zero actuals.
-                    if temp_key not in learning_buffer_global:
-                        learning_buffer_global[temp_key] = {}
-                    if wind_bucket not in learning_buffer_global[temp_key]:
-                        learning_buffer_global[temp_key][wind_bucket] = []
+                if not is_cold_cooling_regime:
+                    if base_expected_kwh == 0.0:
+                        # Cold Start: Use Buffered Learning.
+                        # Shutdown hours (weight = 0) must NOT contaminate the
+                        # cold-start buffer with near-zero actuals.
+                        if temp_key not in learning_buffer_global:
+                            learning_buffer_global[temp_key] = {}
+                        if wind_bucket not in learning_buffer_global[temp_key]:
+                            learning_buffer_global[temp_key][wind_bucket] = []
 
-                    buffer_list = learning_buffer_global[temp_key][wind_bucket]
-                    if base_effective_rate > 0.0:
-                        buffer_list.append(base_target)
+                        buffer_list = learning_buffer_global[temp_key][wind_bucket]
+                        if base_effective_rate > 0.0:
+                            buffer_list.append(base_target)
 
-                    if len(buffer_list) >= LEARNING_BUFFER_THRESHOLD:
-                        avg_val = sum(buffer_list) / len(buffer_list)
-                        new_base_prediction = avg_val
-                        _LOGGER.info(f"Global Buffered Learning [Jump Start]: T={temp_key} W={wind_bucket} -> {new_base_prediction:.3f} kWh (Avg of {len(buffer_list)} samples)")
+                        if len(buffer_list) >= LEARNING_BUFFER_THRESHOLD:
+                            avg_val = sum(buffer_list) / len(buffer_list)
+                            new_base_prediction = avg_val
+                            _LOGGER.info(f"Global Buffered Learning [Jump Start]: T={temp_key} W={wind_bucket} -> {new_base_prediction:.3f} kWh (Avg of {len(buffer_list)} samples)")
+                            if temp_key not in correlation_data:
+                                correlation_data[temp_key] = {}
+                            correlation_data[temp_key][wind_bucket] = round(new_base_prediction, 5)
+                            buffer_list.clear()
+                        else:
+                            _LOGGER.debug(f"Global Buffered Learning [Collecting]: T={temp_key} W={wind_bucket} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({base_target:.3f} kWh)")
+                            # While buffering, keep prediction at 0 until jump start
+                            new_base_prediction = 0.0
+
+                    else:
+                        # EMA Update
+                        new_base_prediction = base_expected_kwh + base_effective_rate * (base_target - base_expected_kwh)
                         if temp_key not in correlation_data:
                             correlation_data[temp_key] = {}
                         correlation_data[temp_key][wind_bucket] = round(new_base_prediction, 5)
-                        buffer_list.clear()
-                    else:
-                        _LOGGER.debug(f"Global Buffered Learning [Collecting]: T={temp_key} W={wind_bucket} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({base_target:.3f} kWh)")
-                        # While buffering, keep prediction at 0 until jump start
-                        new_base_prediction = 0.0
 
-                else:
-                    # EMA Update
-                    new_base_prediction = base_expected_kwh + base_effective_rate * (base_target - base_expected_kwh)
-                    if temp_key not in correlation_data:
-                        correlation_data[temp_key] = {}
-                    correlation_data[temp_key][wind_bucket] = round(new_base_prediction, 5)
-
-                model_base_after = new_base_prediction
+                    model_base_after = new_base_prediction
 
         # Update Per-Unit Models (Both Normal and Aux modes)
         # We run this even in cooldown (for non-affected units)
@@ -474,6 +580,7 @@ class LearningManager:
                 correction_percent=correction_percent,
                 solar_dominant_entities=solar_dominant_entities,
                 screen_config=config.screen_config,
+                screen_affected_entities=config.screen_affected_entities,
                 unit_min_base=unit_min_base,
                 solar_factor=solar_factor,
                 battery_filtered_potential=battery_filtered_potential,
@@ -590,6 +697,7 @@ class LearningManager:
         correction_percent: float = 100.0,
         solar_dominant_entities: tuple[str, ...] = (),
         screen_config: tuple[bool, bool, bool] | None = None,
+        screen_affected_entities: frozenset[str] | None = None,
         solar_factor: float = 0.0,
         battery_filtered_potential: tuple[float, float, float] | None = None,
         unit_min_base: dict[str, float] | None = None,
@@ -600,6 +708,16 @@ class LearningManager:
             if unit_mode in (MODE_OFF, MODE_GUEST_HEATING, MODE_GUEST_COOLING):
                 # Skip learning for non-tracked/temporary modes
                 continue
+
+            # Mode-stratified per-unit buckets (#885): cooling-mode samples
+            # land in a dedicated "cooling" wind-bucket regardless of the
+            # actual hour's wind.  Heating-mode samples continue to use
+            # normal/high_wind/extreme_wind.  The two sample spaces coexist
+            # inside the same [entity][temp][wind] structure without
+            # collision because _get_wind_bucket() never produces "cooling".
+            effective_wind_bucket = (
+                COOLING_WIND_BUCKET if unit_mode == MODE_COOLING else wind_bucket
+            )
 
             # Check Cooldown Exclusion
             # If cooldown is active, we SKIP learning for units that were affected by Aux (thermal lag bias)
@@ -631,7 +749,7 @@ class LearningManager:
             if entity_id in hourly_expected_base_per_unit:
                 expected_unit_base = hourly_expected_base_per_unit[entity_id]
             else:
-                expected_unit_base = get_predicted_unit_base_fn(entity_id, temp_key, wind_bucket, avg_temp)
+                expected_unit_base = get_predicted_unit_base_fn(entity_id, temp_key, effective_wind_bucket, avg_temp)
             unit_mode = unit_modes.get(entity_id, MODE_HEATING)
 
             # Step 1: Learn Unit Solar (if enabled, sunny, and NOT aux)
@@ -645,8 +763,22 @@ class LearningManager:
             # (#809, per-direction since #826).  Coefficients learn against raw
             # irradiance so they encode window physics, not screen state.
             # Screen correction is applied at prediction time only.
+            # Per-entity scope: if the entity is NOT in screen_affected_entities,
+            # reconstruct with an all-False screen_config (transmittance=1.0).
+            # NLMS for an unscreened entity then converges to
+            # `coeff ≈ phys / install_avg_trans` — the coefficient is not "pure
+            # phys" but the install_trans factor cancels at prediction time
+            # (effective × (phys / install_trans) = phys × true_potential for
+            # the unscreened zone).  End-to-end prediction stays consistent;
+            # the purpose is to avoid confounding the coefficient with a
+            # screen state the unit doesn't physically experience.
+            entity_screen_config = (
+                screen_config
+                if screen_affected_entities is None or entity_id in screen_affected_entities
+                else (False, False, False)
+            )
             potential_s, potential_e, potential_w = SolarCalculator.reconstruct_potential_vector(
-                avg_solar_vector, correction_percent, screen_config
+                avg_solar_vector, correction_percent, entity_screen_config
             )
 
             # Vector magnitude check for "sunny enough" threshold
@@ -694,12 +826,26 @@ class LearningManager:
                 # two paths converge toward the same physical coefficient
                 # from opposite sides (NLMS from above, inequality from
                 # below).
+                #
+                # Scope restriction (#xxx per-entity screen): inequality
+                # is only applied to screen-affected entities.
+                # ``battery_filtered_potential`` is coordinator-level and
+                # reconstructed with the installation screen_config —
+                # using it for unscreened entities would yield an inflated
+                # battery that satisfies the constraint too easily (~20-60 %
+                # under-lift during screen-closed hours).  Unscreened
+                # entities already have correct NLMS signal per the live
+                # path, so skipping inequality here is behaviourally safe.
                 solar_enabled
                 and is_solar_shutdown
                 and not is_aux_active
                 and expected_unit_base >= shutdown_threshold
                 and unit_mode == MODE_HEATING  # cooling semantics inverted — out of scope
                 and battery_filtered_potential is not None
+                and (
+                    screen_affected_entities is None
+                    or entity_id in screen_affected_entities
+                )
             ):
                 self._update_unit_solar_inequality(
                     entity_id=entity_id,
@@ -721,7 +867,9 @@ class LearningManager:
             # below.  ``unit_solar_impact`` is retained for the headroom
             # calculation.
             if solar_enabled:
-                unit_coeff = solar_calculator.calculate_unit_coefficient(entity_id, temp_key)
+                unit_coeff = solar_calculator.calculate_unit_coefficient(
+                    entity_id, temp_key, unit_mode
+                )
                 unit_solar_impact = solar_calculator.calculate_unit_solar_impact(
                     (potential_s, potential_e, potential_w), unit_coeff
                 )
@@ -746,7 +894,7 @@ class LearningManager:
 
                     if is_affected:
                         self._learn_unit_aux_coefficient(
-                            entity_id, temp_key, wind_bucket,
+                            entity_id, temp_key, effective_wind_bucket,
                             expected_unit_base, unit_normalized,
                             learning_rate,  # Use global rate
                             aux_coefficients_per_unit, learning_buffer_aux_per_unit,
@@ -757,7 +905,7 @@ class LearningManager:
                         # Note: This does NOT require Global Base to update - Global is locked
                         # during aux (see process_learning). The models are independent.
                         self._learn_unit_model(
-                            entity_id, temp_key, wind_bucket,
+                            entity_id, temp_key, effective_wind_bucket,
                             expected_unit_base, unit_normalized,
                             learning_rate,
                             learning_buffer_per_unit, correlation_data_per_unit, observation_counts
@@ -801,29 +949,15 @@ class LearningManager:
                 )
                 rate_multiplier = headroom_multiplier * snr_w
 
-                # Cooling-at-cold guard (#869 follow-up to #862/#868).
-                # A unit left in cooling mode across a full season (the
-                # seasonal-automation pattern) produces idle-compressor
-                # consumption on cold nights that would contaminate the
-                # heating-dominated per-unit base bucket.  Skip the update
-                # for cooling units when the hour's outdoor temperature is
-                # below balance_point − 2.  Matches the transition-zone
-                # boundary in diagnose_solar.temperature_stratified.
-                # Only the per-unit base EMA is gated — global base
-                # learning is unaffected (the cooling-idle contamination
-                # is small there, <1 % seasonal bias) and per-unit solar
-                # NLMS is already gated on vector_magnitude.  Retrain
-                # paths are NOT guarded — they replay the log faithfully
-                # so historical data is preserved for mode-stratified
-                # future work (#869).
-                if (
-                    unit_mode == MODE_COOLING
-                    and avg_temp < (balance_point - 2.0)
-                ):
-                    continue
-
+                # Per #885: cooling-at-cold no longer needs a guard here.
+                # Mode-stratified per-unit buckets route cooling samples
+                # to a dedicated "cooling" wind-bucket (see
+                # effective_wind_bucket above), so cold-hour cooling
+                # standby populates cooling[temp]["cooling"] — which is
+                # semantically correct (those ARE cooling-mode
+                # observations) and cannot contaminate heating buckets.
                 self._learn_unit_model(
-                    entity_id, temp_key, wind_bucket,
+                    entity_id, temp_key, effective_wind_bucket,
                     expected_unit_base, unit_normalized,
                     learning_rate,
                     learning_buffer_per_unit, correlation_data_per_unit, observation_counts,
@@ -844,17 +978,25 @@ class LearningManager:
         balance_point: float,
         unit_mode: str,
     ):
-        """Update 3D solar coefficient vector (S, E, W) for a specific unit (Buffered or NLMS)."""
+        """Update 3D solar coefficient (S, E, W) for one (entity, mode) slot.
+
+        Mode-stratified per #868: heating-mode hours update
+        ``solar_coefficients_per_unit[entity]["heating"]``; cooling-mode
+        hours update ``["cooling"]``.  Each regime absorbs its own
+        ``E[1/COP]`` and converges to a physically distinct value.
+        OFF/DHW/unknown modes return early — no solar learning signal.
+        """
+        regime = _solar_coeff_regime(unit_mode)
+        if regime is None:
+            return
+
         actual_impact = 0.0
-        if unit_mode == MODE_HEATING:
+        if regime == "heating":
             # Heating: Sun reduces consumption
             actual_impact = expected_unit_base - actual_unit
-        elif unit_mode == MODE_COOLING:
+        else:  # regime == "cooling"
             # Cooling: Sun increases consumption
             actual_impact = actual_unit - expected_unit_base
-        else:
-            # OFF or unknown: Cannot learn solar coefficient
-            return
 
         # Clamping
         raw_impact = actual_impact
@@ -866,8 +1008,16 @@ class LearningManager:
         if vector_magnitude <= 0.01:
             return
 
-        # Get Current Coefficient Vector (global per unit — solar gain is temperature-independent)
-        current_coeff = solar_coefficients_per_unit.get(entity_id)
+        # Get current (regime-specific) coefficient — None means cold-start.
+        # The entity dict carries both regimes; we route to the active one.
+        entity_coeffs = solar_coefficients_per_unit.get(entity_id)
+        current_coeff = None
+        if isinstance(entity_coeffs, dict):
+            regime_coeff = entity_coeffs.get(regime)
+            if isinstance(regime_coeff, dict) and any(
+                regime_coeff.get(k) for k in ("s", "e", "w")
+            ):
+                current_coeff = regime_coeff
 
         # --- Dead Zone Detection ---
         # When the base model is too low (expected < actual during sun),
@@ -876,32 +1026,41 @@ class LearningManager:
         # is wrong, and the base model stays wrong because the coefficient
         # is wrong (no solar normalization).  After SOLAR_DEAD_ZONE_THRESHOLD
         # consecutive qualifying hours with zero impact, force a coefficient
-        # reset so cold-start can re-learn from fresh data.
+        # reset so cold-start can re-learn from fresh data.  Dead-zone
+        # counter is keyed by (entity, regime) so a stuck cooling coefficient
+        # resets without disturbing heating, and vice versa.
+        dead_key = (entity_id, regime)
         if actual_impact == 0.0 and raw_impact < 0.0 and current_coeff is not None:
-            count = self._dead_zone_counts.get(entity_id, 0) + 1
-            self._dead_zone_counts[entity_id] = count
+            count = self._dead_zone_counts.get(dead_key, 0) + 1
+            self._dead_zone_counts[dead_key] = count
             if count >= SOLAR_DEAD_ZONE_THRESHOLD:
-                del solar_coefficients_per_unit[entity_id]
-                # Clear stale buffer so cold-start begins fresh
-                learning_buffer_solar_per_unit.pop(entity_id, None)
-                self._dead_zone_counts[entity_id] = 0
+                # Reset only this regime — preserve the other one.
+                if isinstance(entity_coeffs, dict):
+                    entity_coeffs[regime] = {"s": 0.0, "e": 0.0, "w": 0.0}
+                # Clear regime buffer so cold-start begins fresh
+                buf_entry = learning_buffer_solar_per_unit.get(entity_id)
+                if isinstance(buf_entry, dict):
+                    buf_entry[regime] = []
+                self._dead_zone_counts[dead_key] = 0
                 _LOGGER.warning(
-                    "Solar dead zone detected: reset %s after %d consecutive "
-                    "zero-impact qualifying hours (base model too low to "
-                    "produce learnable signal)",
-                    entity_id, count,
+                    "Solar dead zone detected: reset %s [%s] after %d "
+                    "consecutive zero-impact qualifying hours (base model too "
+                    "low to produce learnable signal)",
+                    entity_id, regime, count,
                 )
             return
         else:
             # Any non-zero impact resets the counter
-            self._dead_zone_counts.pop(entity_id, None)
+            self._dead_zone_counts.pop(dead_key, None)
 
         # --- Buffered Learning Logic (Cold Start) ---
         if current_coeff is None:
-            if entity_id not in learning_buffer_solar_per_unit:
-                learning_buffer_solar_per_unit[entity_id] = []
-
-            buffer_list = learning_buffer_solar_per_unit[entity_id]
+            buf_entry = learning_buffer_solar_per_unit.setdefault(entity_id, {})
+            if not isinstance(buf_entry, dict):
+                # Defensive: legacy in-memory shape — rewrap to per-regime.
+                buf_entry = {"heating": [], "cooling": []}
+                learning_buffer_solar_per_unit[entity_id] = buf_entry
+            buffer_list = buf_entry.setdefault(regime, [])
             # Store tuple of (s, e, w, impact)
             buffer_list.append((solar_s, solar_e, solar_w, actual_impact))
 
@@ -971,7 +1130,7 @@ class LearningManager:
                         "e": new_coeff_e * COLD_START_SOLAR_DAMPING,
                         "w": new_coeff_w * COLD_START_SOLAR_DAMPING,
                     }
-                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start]: {entity_id} -> {new_coeff} (3D Least Squares, {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
+                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start]: {entity_id} [{regime}] -> {new_coeff} (3D Least Squares, {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
                 else:
                     # Collinear fallback: sun observed from a narrow angle range (e.g. winter).
                     # Project all observations onto the dominant direction and solve 1D LS,
@@ -1002,9 +1161,11 @@ class LearningManager:
                         "e": c_scalar * d_e * COLD_START_SOLAR_DAMPING,
                         "w": c_scalar * d_w * COLD_START_SOLAR_DAMPING,
                     }
-                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start 1D]: {entity_id} -> {new_coeff} (collinear fallback, dir=({d_s:.2f},{d_e:.2f},{d_w:.2f}), {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
+                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start 1D]: {entity_id} [{regime}] -> {new_coeff} (collinear fallback, dir=({d_s:.2f},{d_e:.2f},{d_w:.2f}), {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
 
-                self._update_unit_solar_coefficient(entity_id, new_coeff, solar_coefficients_per_unit)
+                self._update_unit_solar_coefficient(
+                    entity_id, new_coeff, solar_coefficients_per_unit, regime
+                )
                 buffer_list.clear()
             else:
                  _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({actual_impact:.3f} kW)")
@@ -1040,8 +1201,10 @@ class LearningManager:
 
             new_coeff = {"s": new_coeff_s, "e": new_coeff_e, "w": new_coeff_w}
 
-            _LOGGER.debug(f"Per-Unit Solar Learning [NLMS]: {entity_id} -> {new_coeff} (was {current_coeff})")
-            self._update_unit_solar_coefficient(entity_id, new_coeff, solar_coefficients_per_unit)
+            _LOGGER.debug(f"Per-Unit Solar Learning [NLMS]: {entity_id} [{regime}] -> {new_coeff} (was {current_coeff})")
+            self._update_unit_solar_coefficient(
+                entity_id, new_coeff, solar_coefficients_per_unit, regime
+            )
 
     def _learn_unit_model(
         self,
@@ -1215,17 +1378,42 @@ class LearningManager:
 
         aux_coefficients_per_unit[entity_id][temp_key][wind_bucket] = round(value, 3)
 
-    def _update_unit_solar_coefficient(self, entity_id, value: dict[str, float], solar_coefficients_per_unit):
-        """Update the solar coefficient data structure (global per unit, not temp-stratified).
+    def _update_unit_solar_coefficient(
+        self,
+        entity_id: str,
+        value: dict[str, float],
+        solar_coefficients_per_unit: dict,
+        regime: str,
+    ) -> None:
+        """Update the solar coefficient for one (entity, regime) slot.
 
-        All three components (south, east, west) are clamped to >= 0.
-        Each represents solar gain through windows facing one cardinal
-        direction — a window can only receive gain, never produce negative
-        gain.  This is a true physics invariant with the 3-component
-        decomposition (unlike the old 2D system where it was a modeling
-        decision).
+        ``regime`` is ``"heating"`` or ``"cooling"`` (#868).  The other
+        regime is preserved unchanged on every write.  Initial entry for
+        an entity creates both regimes as zero-vectors so subsequent
+        reads on the unwritten regime return a stable shape.
+
+        All three components (south, east, west) are clamped to >= 0
+        (invariant #4): each represents solar gain through windows
+        facing one cardinal direction, and a window can only receive
+        gain.  Heating and cooling regimes share this clamp but
+        converge to different absolute values (each absorbs its own
+        ``E[1/COP]``).
         """
-        solar_coefficients_per_unit[entity_id] = {
+        if regime not in ("heating", "cooling"):
+            raise ValueError(f"Invalid solar coefficient regime: {regime!r}")
+        entry = solar_coefficients_per_unit.get(entity_id)
+        if not isinstance(entry, dict):
+            entry = {
+                "heating": {"s": 0.0, "e": 0.0, "w": 0.0},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            }
+            solar_coefficients_per_unit[entity_id] = entry
+        else:
+            if "heating" not in entry or not isinstance(entry["heating"], dict):
+                entry["heating"] = {"s": 0.0, "e": 0.0, "w": 0.0}
+            if "cooling" not in entry or not isinstance(entry["cooling"], dict):
+                entry["cooling"] = {"s": 0.0, "e": 0.0, "w": 0.0}
+        entry[regime] = {
             "s": round(max(0.0, value.get("s", 0.0)), 5),
             "e": round(max(0.0, value.get("e", 0.0)), 5),
             "w": round(max(0.0, value.get("w", 0.0)), 5),
@@ -1296,10 +1484,18 @@ class LearningManager:
             # no direction to learn against.  Skip rather than update.
             return "zero_magnitude"
 
-        current = solar_coefficients_per_unit.get(entity_id) or {"s": 0.0, "e": 0.0, "w": 0.0}
-        coeff_s = float(current.get("s", 0.0))
-        coeff_e = float(current.get("e", 0.0))
-        coeff_w = float(current.get("w", 0.0))
+        # Inequality is heating-only by design (#865).  Cooling shutdown
+        # semantics invert the constraint and remain out of scope until a
+        # cooling-heavy install requests it.  Read and write the heating
+        # regime only — never touch cooling here.
+        entity_coeffs = solar_coefficients_per_unit.get(entity_id)
+        if isinstance(entity_coeffs, dict):
+            heating_coeff = entity_coeffs.get("heating") or {}
+        else:
+            heating_coeff = {}
+        coeff_s = float(heating_coeff.get("s", 0.0))
+        coeff_e = float(heating_coeff.get("e", 0.0))
+        coeff_w = float(heating_coeff.get("w", 0.0))
 
         predicted_impact = coeff_s * pot_s + coeff_e * pot_e + coeff_w * pot_w
         constraint_target = margin * expected_unit_base
@@ -1326,6 +1522,7 @@ class LearningManager:
             entity_id,
             {"s": new_s, "e": new_e, "w": new_w},
             solar_coefficients_per_unit,
+            "heating",
         )
         return "updated"
 
@@ -1633,33 +1830,43 @@ class LearningManager:
             if h_temp_key is None or h_wind_bucket is None:
                 continue
             breakdown = log_entry.get("unit_breakdown", {})
+            # Per #885: route cooling-mode samples to the dedicated
+            # "cooling" wind-bucket, mirroring live-write semantics in
+            # _process_per_unit_learning.  Without this, retrain from a
+            # log containing cooling hours would pollute heating buckets.
+            entry_unit_modes = log_entry.get("unit_modes", {}) or {}
             for strategy in direct_sensors:
                 sid = strategy.sensor_id
                 unit_kwh = breakdown.get(sid, 0.0)
                 if unit_kwh <= 0.0:
                     continue
+                effective_bucket = (
+                    COOLING_WIND_BUCKET
+                    if entry_unit_modes.get(sid) == MODE_COOLING
+                    else h_wind_bucket
+                )
                 if sid not in correlation_per_unit:
                     correlation_per_unit[sid] = {}
                 if h_temp_key not in correlation_per_unit[sid]:
                     correlation_per_unit[sid][h_temp_key] = {}
-                cur = correlation_per_unit[sid][h_temp_key].get(h_wind_bucket, 0.0)
+                cur = correlation_per_unit[sid][h_temp_key].get(effective_bucket, 0.0)
                 if cur == 0.0:
                     if sid not in buffer_per_unit:
                         buffer_per_unit[sid] = {}
                     if h_temp_key not in buffer_per_unit[sid]:
                         buffer_per_unit[sid][h_temp_key] = {}
-                    if h_wind_bucket not in buffer_per_unit[sid][h_temp_key]:
-                        buffer_per_unit[sid][h_temp_key][h_wind_bucket] = []
-                    buf = buffer_per_unit[sid][h_temp_key][h_wind_bucket]
+                    if effective_bucket not in buffer_per_unit[sid][h_temp_key]:
+                        buffer_per_unit[sid][h_temp_key][effective_bucket] = []
+                    buf = buffer_per_unit[sid][h_temp_key][effective_bucket]
                     buf.append(unit_kwh)
                     if len(buf) >= LEARNING_BUFFER_THRESHOLD:
-                        correlation_per_unit[sid][h_temp_key][h_wind_bucket] = round(
+                        correlation_per_unit[sid][h_temp_key][effective_bucket] = round(
                             sum(buf) / len(buf), 5
                         )
                         buf.clear()
                 else:
                     new_val = cur + learning_rate * (unit_kwh - cur)
-                    correlation_per_unit[sid][h_temp_key][h_wind_bucket] = round(new_val, 5)
+                    correlation_per_unit[sid][h_temp_key][effective_bucket] = round(new_val, 5)
 
     # -------------------------------------------------------------------------
     # Retrain-time helpers (NLMS replay + on-the-fly solar_normalization_delta)
@@ -1738,8 +1945,15 @@ class LearningManager:
         cooling_total = 0.0
         for entity_id in energy_sensors:
             mode = unit_modes.get(entity_id, MODE_HEATING)
-            coeff = solar_coefficients_per_unit.get(entity_id)
-            if not coeff:
+            regime = _solar_coeff_regime(mode)
+            if regime is None:
+                # OFF / DHW / unknown — no solar contribution
+                continue
+            entity_coeffs = solar_coefficients_per_unit.get(entity_id)
+            if not isinstance(entity_coeffs, dict):
+                continue
+            coeff = entity_coeffs.get(regime)
+            if not isinstance(coeff, dict):
                 continue
             impact = max(
                 0.0,
@@ -1747,11 +1961,10 @@ class LearningManager:
                 + coeff.get("e", 0.0) * pot_e
                 + coeff.get("w", 0.0) * pot_w,
             )
-            if mode == MODE_HEATING:
+            if mode in (MODE_HEATING, MODE_GUEST_HEATING):
                 heating_total += impact
-            elif mode == MODE_COOLING:
+            elif mode in (MODE_COOLING, MODE_GUEST_COOLING):
                 cooling_total += impact
-            # OFF / DHW / Guest modes contribute nothing
         return heating_total - cooling_total
 
     def replay_solar_nlms(
@@ -1771,6 +1984,7 @@ class LearningManager:
         daily_history: dict | None = None,
         return_diagnostics: bool = False,
         unit_min_base: dict[str, float] | None = None,
+        screen_affected_entities: frozenset[str] | None = None,
     ):
         """Re-run NLMS solar coefficient learning over historical entries.
 
@@ -1916,6 +2130,18 @@ class LearningManager:
                         diag["inequality_skipped_mode"] += 1
                         diag["unit_skipped_shutdown"] += 1
                         continue
+                    # Per-entity screen scope: inequality is only applied to
+                    # screen-affected entities.  Mirrors the live path —
+                    # unscreened entities already have correct NLMS signal
+                    # and the coordinator battery is reconstructed with the
+                    # installation screen_config (wrong for unscreened).
+                    if (
+                        screen_affected_entities is not None
+                        and entity_id not in screen_affected_entities
+                    ):
+                        diag["inequality_skipped_mode"] += 1
+                        diag["unit_skipped_shutdown"] += 1
+                        continue
                     # Resolve base via same per-unit path as NLMS branch
                     # below.  WeightedSmear sensors: same as NLMS — skip.
                     strategy_sd = strategies.get(entity_id)
@@ -1924,8 +2150,16 @@ class LearningManager:
                             "unit_skipped_weighted_smear", 0
                         ) + 1
                         continue
+                    # Inequality path is already gated to MODE_HEATING above,
+                    # so effective_bucket == wind_bucket here — defensive
+                    # override retained for parity with the NLMS branch.
+                    effective_bucket_sd = (
+                        COOLING_WIND_BUCKET
+                        if unit_modes.get(entity_id) == MODE_COOLING
+                        else wind_bucket
+                    )
                     unit_buckets_sd = correlation_data_per_unit.get(entity_id, {}).get(temp_key, {})
-                    expected_base_sd = unit_buckets_sd.get(wind_bucket, 0.0) if unit_buckets_sd else 0.0
+                    expected_base_sd = unit_buckets_sd.get(effective_bucket_sd, 0.0) if unit_buckets_sd else 0.0
                     shutdown_threshold_sd = _resolve_min_base(
                         entity_id, unit_min_base, SOLAR_SHUTDOWN_MIN_BASE
                     )
@@ -1982,8 +2216,17 @@ class LearningManager:
                         "unit_skipped_weighted_smear", 0
                     ) + 1
                     continue
+                # Per #885: cooling-mode entities read from the dedicated
+                # "cooling" wind-bucket; otherwise use the hour's actual
+                # wind bucket.  Mirrors live-read semantics in
+                # coordinator._get_predicted_kwh_per_unit.
+                effective_bucket = (
+                    COOLING_WIND_BUCKET
+                    if unit_mode == MODE_COOLING
+                    else wind_bucket
+                )
                 unit_buckets = correlation_data_per_unit.get(entity_id, {}).get(temp_key, {})
-                expected_unit_base = unit_buckets.get(wind_bucket, 0.0) if unit_buckets else 0.0
+                expected_unit_base = unit_buckets.get(effective_bucket, 0.0) if unit_buckets else 0.0
                 nlms_threshold = _resolve_min_base(
                     entity_id, unit_min_base, SOLAR_LEARNING_MIN_BASE
                 )
@@ -1991,12 +2234,27 @@ class LearningManager:
                     diag["unit_skipped_below_threshold"] += 1
                     continue
                 actual_unit = unit_breakdown.get(entity_id, 0.0)
+                # Per-entity screen routing: mirrors live learning.  Entities
+                # not in screen_affected_entities learn against the effective
+                # vector directly — no reconstruction needed because
+                # transmittance=1.0 per direction reduces to effective/1.0.
+                if (
+                    screen_affected_entities is None
+                    or entity_id in screen_affected_entities
+                ):
+                    entity_pot = (pot_s, pot_e, pot_w)
+                else:
+                    entity_pot = (
+                        entry.get("solar_vector_s", 0.0),
+                        entry.get("solar_vector_e", 0.0),
+                        entry.get("solar_vector_w", 0.0),
+                    )
                 self._learn_unit_solar_coefficient(
                     entity_id=entity_id,
                     temp_key=temp_key,
                     expected_unit_base=expected_unit_base,
                     actual_unit=actual_unit,
-                    avg_solar_vector=(pot_s, pot_e, pot_w),
+                    avg_solar_vector=entity_pot,
                     learning_rate=learning_rate,
                     solar_coefficients_per_unit=solar_coefficients_per_unit,
                     learning_buffer_solar_per_unit=learning_buffer_solar_per_unit,
@@ -2009,3 +2267,699 @@ class LearningManager:
             diag["updates"] = updates
             return diag
         return updates
+
+    def batch_fit_solar_coefficients(
+        self,
+        hourly_log: list[dict],
+        solar_coefficients_per_unit: dict,
+        energy_sensors: list[str],
+        coordinator,
+        *,
+        entity_id_filter: str | None = None,
+        unit_min_base: dict[str, float] | None = None,
+        screen_affected_entities: frozenset[str] | None = None,
+        days_back: int | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Periodic batch least-squares fit per (entity, mode) regime (#884).
+
+        Solves the joint 3×3 normal equations over the modulating-regime
+        hourly log to extract a coefficient that NLMS and inequality
+        cannot — specifically the mild-weather catch-22 where expected
+        base demand is near zero (e.g. west-facing rooms whose solar
+        peak coincides with the daily temperature maximum).  A
+        least-squares fit over N samples extracts the underlying
+        coefficient even when each individual sample carries tiny SNR
+        and net-zeroes in NLMS.
+
+        Per (entity, regime): heating-mode hours fit the heating regime
+        only; cooling-mode hours fit the cooling regime only.  Each
+        regime absorbs its own ``E[1/COP_mode]`` (#868 invariant).
+        Inequality-flagged shutdown hours and saturated samples are
+        dropped — they violate the linear-regression assumptions of
+        the fit.
+
+        ``days_back`` (default ``None`` = full log) restricts the input
+        window.  Without this, a fit on a fresh upgrade would absorb
+        pre-upgrade data and pull coefficients toward old model
+        behaviour (e.g. pre-1.3.3 transmittance constants); a 14- or
+        30-day window after a major release fits against representative
+        post-upgrade data.
+
+        ``dry_run`` (default ``False``) runs every gate and the LS
+        solve but does not write coefficients back to
+        ``solar_coefficients_per_unit``.  The diagnostic dict reports
+        ``coefficient_after`` so the user can preview the result; a
+        subsequent (non-dry-run) call applies the same fit.  Useful
+        for sanity-checking before letting the fit drift live state.
+
+        Sample filter (per (entity, regime)):
+        - ``unit_modes[entity_id]`` resolves to ``regime`` (heating
+          regime takes HEATING + GUEST_HEATING; cooling takes
+          COOLING + GUEST_COOLING).  OFF / DHW are skipped.
+        - Entity not in ``solar_dominant_entities`` (shutdown
+          samples are saturated — would inflate the fit).
+        - Auxiliary not active during the hour.
+        - Reconstructed potential vector magnitude > 0.01.
+        - ``expected_unit_base ≥ unit_min_base[entity]`` (or
+          ``SOLAR_LEARNING_MIN_BASE`` fallback) — same gate as live
+          NLMS.
+        - ``actual_impact > 0`` (clamped negative impacts).
+        - ``actual_impact < BATCH_FIT_SATURATION_RATIO × base`` —
+          drop saturation-clamped samples that have no information
+          about the coefficient itself.
+
+        Algorithm:
+        - 3×3 normal equations + Cramer's rule (same arithmetic as
+          cold-start solver in ``_learn_unit_solar_coefficient``).
+        - Collinear fallback (1D projection along dominant direction)
+          when the determinant is degenerate.
+        - Clamp components to ``[0, SOLAR_COEFF_CAP]`` (#868 invariant
+          #4).
+        - Damp blend: ``new = α × batch + (1 − α) × current`` with
+          ``α = BATCH_FIT_DAMPING``.  When the regime has not learned
+          before (current is zero), the batch result is written
+          directly without damping — there is no prior to blend.
+
+        Returns
+        -------
+        Diagnostics dict ``{entity_id: {regime: {...}}}`` reporting
+        per slot: ``sample_count``, ``residual_rmse_kwh``,
+        ``coefficient_before``, ``coefficient_after``, ``damping``,
+        and ``skip_reason`` when the fit was not applied.
+        """
+        from .observation import WeightedSmear  # local import — heavy module
+        strategies = getattr(coordinator, "_unit_strategies", {}) or {}
+
+        # Time-window filter (#884 follow-up).  When the user runs the
+        # service shortly after a major release, a full-log fit absorbs
+        # pre-upgrade data and pulls coefficients toward old model
+        # behaviour.  Filtering once here (rather than per-entity)
+        # avoids re-iterating timestamps inside each regime collector.
+        # ``_filter_log_by_days_back`` parses datetimes properly —
+        # don't lex-compare ISO strings, they break under non-UTC
+        # offsets near the cutoff boundary.
+        filtered_log = _filter_log_by_days_back(hourly_log, days_back)
+
+        results: dict[str, dict] = {}
+        target_entities = (
+            [entity_id_filter] if entity_id_filter else list(energy_sensors)
+        )
+
+        for entity_id in target_entities:
+            if entity_id not in energy_sensors:
+                results[entity_id] = {
+                    "skip_reason": "unknown_entity",
+                }
+                continue
+
+            # MPC-managed sensors have no coherent dark-equivalent
+            # baseline — same exclusion rule as ``replay_solar_nlms``.
+            strategy = strategies.get(entity_id)
+            if isinstance(strategy, WeightedSmear) and strategy.use_synthetic:
+                results[entity_id] = {
+                    "skip_reason": "weighted_smear_excluded",
+                }
+                continue
+
+            unit_threshold = _resolve_min_base(
+                entity_id, unit_min_base, SOLAR_LEARNING_MIN_BASE
+            )
+
+            # Pre-compute potential reconstruction once per (entity, entry).
+            # The reconstruction depends on entry data + per-entity screen
+            # config but is regime-independent, so hoisting it outside the
+            # heating/cooling loop saves ~50 % of the reconstruction calls
+            # on a 365-day-retention install.
+            scr_fn = getattr(coordinator, "screen_config_for_entity", None)
+            if scr_fn is not None:
+                screen_cfg_for_entity = scr_fn(entity_id)
+            else:
+                screen_cfg_for_entity = getattr(coordinator, "screen_config", None)
+            entry_potentials: list[tuple[float, float, float, float]] = []
+            for entry in filtered_log:
+                (pot_s, pot_e, pot_w), magnitude = self._reconstruct_potential(
+                    entry,
+                    getattr(coordinator, "solar", None),
+                    screen_cfg_for_entity,
+                )
+                entry_potentials.append((pot_s, pot_e, pot_w, magnitude))
+
+            entity_results: dict[str, dict] = {}
+            for regime in ("heating", "cooling"):
+                samples, drop_counts = self._collect_batch_fit_samples(
+                    entity_id=entity_id,
+                    regime=regime,
+                    hourly_log=filtered_log,
+                    entry_potentials=entry_potentials,
+                    coordinator=coordinator,
+                    unit_threshold=unit_threshold,
+                    screen_affected_entities=screen_affected_entities,
+                )
+                regime_diag: dict = {
+                    "sample_count": len(samples),
+                    "drop_counts": drop_counts,
+                }
+
+                # Snapshot the current coefficient for blending + reporting.
+                entity_entry = solar_coefficients_per_unit.get(entity_id)
+                if isinstance(entity_entry, dict):
+                    current_dict = entity_entry.get(regime) or {}
+                else:
+                    current_dict = {}
+                current = {
+                    "s": float(current_dict.get("s", 0.0)),
+                    "e": float(current_dict.get("e", 0.0)),
+                    "w": float(current_dict.get("w", 0.0)),
+                }
+                regime_diag["coefficient_before"] = {
+                    k: round(v, 5) for k, v in current.items()
+                }
+
+                if len(samples) < BATCH_FIT_MIN_SAMPLES:
+                    regime_diag["skip_reason"] = "insufficient_samples"
+                    regime_diag["coefficient_after"] = regime_diag[
+                        "coefficient_before"
+                    ]
+                    entity_results[regime] = regime_diag
+                    continue
+
+                fit = self._solve_batch_fit_normal_equations(samples)
+                if fit is None:
+                    regime_diag["skip_reason"] = "degenerate_fit"
+                    regime_diag["coefficient_after"] = regime_diag[
+                        "coefficient_before"
+                    ]
+                    entity_results[regime] = regime_diag
+                    continue
+
+                # Clamp to [0, CAP] — invariant #4.  The solver itself
+                # may produce negative components from noise; the clamp
+                # is the physical truth.
+                clamped = {
+                    k: max(0.0, min(SOLAR_COEFF_CAP, v))
+                    for k, v in fit.items()
+                }
+
+                # Damp blend.  When the regime has no prior (current is
+                # all zeros), write the batch result directly — there is
+                # no information to preserve via damping.
+                has_prior = any(current[k] > 1e-6 for k in ("s", "e", "w"))
+                if has_prior:
+                    blended = {
+                        k: round(
+                            BATCH_FIT_DAMPING * clamped[k]
+                            + (1.0 - BATCH_FIT_DAMPING) * current[k],
+                            5,
+                        )
+                        for k in ("s", "e", "w")
+                    }
+                    damping_applied = BATCH_FIT_DAMPING
+                else:
+                    blended = {k: round(clamped[k], 5) for k in ("s", "e", "w")}
+                    damping_applied = 1.0
+
+                # Residual RMSE measured against the (clamped, undamped)
+                # batch fit — the question this answers is "how well does
+                # the joint LS fit explain the samples", not "how well
+                # does the damped result explain them".  Damping is a
+                # caution against single-batch overshoot; it doesn't
+                # affect the fit-quality signal.
+                regime_diag["residual_rmse_kwh"] = self._batch_fit_residual_rmse(
+                    samples, clamped
+                )
+                regime_diag["coefficient_after"] = blended
+                regime_diag["damping_applied"] = damping_applied
+
+                if dry_run:
+                    # Preview only — report ``coefficient_after`` so the
+                    # user can decide whether to commit, but don't drift
+                    # live state.  Diagnostic flag is explicit so the
+                    # coordinator's apply-summary log doesn't claim
+                    # something was applied.
+                    regime_diag["applied"] = False
+                    regime_diag["dry_run"] = True
+                else:
+                    self._update_unit_solar_coefficient(
+                        entity_id, blended, solar_coefficients_per_unit, regime
+                    )
+                    regime_diag["applied"] = True
+                entity_results[regime] = regime_diag
+
+            results[entity_id] = entity_results
+
+        return results
+
+    def _collect_batch_fit_samples(
+        self,
+        *,
+        entity_id: str,
+        regime: str,
+        hourly_log: list[dict],
+        entry_potentials: list[tuple[float, float, float, float]],
+        coordinator,
+        unit_threshold: float,
+        screen_affected_entities: frozenset[str] | None,
+        match_diagnose: bool = False,
+    ) -> tuple[list[tuple[float, float, float, float]], dict[str, int]]:
+        """Filter + assemble samples for one (entity, regime) batch fit.
+
+        Returns ``(samples, drop_counts)``.  Each sample is a 4-tuple
+        ``(pot_s, pot_e, pot_w, actual_impact)`` ready for the joint
+        normal equations.  ``drop_counts`` reports per-reason rejection
+        counters useful for diagnostics — a fit that ends with too few
+        samples can be inspected to see which gate did the rejecting.
+
+        ``entry_potentials`` is parallel to ``hourly_log``: each entry
+        carries its pre-reconstructed ``(pot_s, pot_e, pot_w, magnitude)``
+        for this entity (regime-independent — hoisted by the caller so
+        we don't recompute across heating/cooling passes).
+
+        ``match_diagnose=True`` (used by ``apply_implied_coefficient``)
+        switches the filter set to mirror ``DiagnosticsEngine.diagnose_solar``
+        so the LS fit produces the same number the user reads in the
+        ``implied_coefficient_30d`` diagnostic.  Specifically:
+
+        - Drops the ``expected_base ≥ unit_min_base`` gate (diagnose
+          only checks ``base is not None``).
+        - Includes shutdown samples (diagnose's headline ``implied_30d``
+          accumulator does not separate them; only the parallel
+          ``no_shutdown`` accumulator does).
+        - Reads ``base`` from the log entry's
+          ``unit_expected_breakdown[entity]`` rather than the current
+          ``correlation_data_per_unit`` lookup — diagnose uses the
+          log-time stored value.
+
+        Without this flag, the default filters apply (used by
+        ``batch_fit_solar_coefficients``).
+
+        Mode filter mirrors live ``_process_per_unit_learning``: only
+        ``MODE_HEATING`` and ``MODE_COOLING`` produce solar-learning
+        samples.  OFF / DHW / both guest modes are excluded — guest
+        in particular is documented (CLAUDE.md "Mode System") as
+        excluded from solar learning, and the live learner enforces
+        this.  Earlier this method also accepted guest modes; that
+        was a divergence found in code review and corrected.
+        """
+        samples: list[tuple[float, float, float, float]] = []
+        drop_counts: dict[str, int] = {
+            "wrong_mode": 0,
+            "auxiliary_active": 0,
+            "low_magnitude": 0,
+            "missing_temp_key": 0,
+            "shutdown": 0,
+            "below_min_base": 0,
+            "non_positive_impact": 0,
+            "saturated": 0,
+        }
+        target_mode = MODE_HEATING if regime == "heating" else MODE_COOLING
+        correlation_per_unit = coordinator.model.correlation_data_per_unit
+
+        for entry, (pot_s, pot_e, pot_w, magnitude) in zip(
+            hourly_log, entry_potentials
+        ):
+            unit_modes = entry.get("unit_modes", {}) or {}
+            entry_mode = unit_modes.get(entity_id, MODE_HEATING)
+            if entry_mode != target_mode:
+                drop_counts["wrong_mode"] += 1
+                continue
+
+            if entry.get("auxiliary_active", False):
+                drop_counts["auxiliary_active"] += 1
+                continue
+
+            # Shutdown filter: batch_fit excludes (the inequality learner
+            # owns those samples).  match_diagnose=True INCLUDES shutdown
+            # samples to reproduce ``diagnose_solar.implied_30d`` exactly
+            # — that headline accumulator includes them; only the parallel
+            # ``no_shutdown`` accumulator separates them out.
+            if not match_diagnose:
+                shutdown_entities = set(
+                    entry.get("solar_dominant_entities", []) or []
+                )
+                if entity_id in shutdown_entities:
+                    drop_counts["shutdown"] += 1
+                    continue
+
+            temp_key = entry.get("temp_key")
+            if temp_key is None:
+                drop_counts["missing_temp_key"] += 1
+                continue
+
+            if magnitude <= 0.01:
+                drop_counts["low_magnitude"] += 1
+                continue
+
+            # Base lookup: batch_fit reads CURRENT correlation_data; the
+            # diagnose-match path reads the LOG-TIME ``unit_expected_breakdown``
+            # so the LS sees the same base value diagnose's accumulator did.
+            # Diagnose-match falls back to the current correlation_data if
+            # the log entry lacks the field (legacy logs without
+            # ``unit_expected_breakdown``).
+            wind_bucket = entry.get("wind_bucket", "normal")
+            effective_bucket = (
+                COOLING_WIND_BUCKET if regime == "cooling" else wind_bucket
+            )
+            if match_diagnose:
+                stored = (entry.get("unit_expected_breakdown") or {}).get(
+                    entity_id
+                )
+                if stored is None:
+                    drop_counts["below_min_base"] += 1
+                    continue
+                expected_base = float(stored)
+            else:
+                unit_buckets = correlation_per_unit.get(entity_id, {}).get(
+                    temp_key, {}
+                )
+                expected_base = (
+                    unit_buckets.get(effective_bucket, 0.0)
+                    if unit_buckets
+                    else 0.0
+                )
+                if expected_base < unit_threshold:
+                    drop_counts["below_min_base"] += 1
+                    continue
+
+            actual = (entry.get("unit_breakdown", {}) or {}).get(entity_id, 0.0)
+            if regime == "heating":
+                actual_impact = expected_base - actual
+            else:
+                actual_impact = actual - expected_base
+
+            if actual_impact <= 0.0:
+                drop_counts["non_positive_impact"] += 1
+                continue
+
+            # Saturation gate is heating-physics: when sun fully covers
+            # heating demand, ``actual ≈ 0`` and ``actual_impact ≈ base``
+            # → coefficient is clipped, the sample carries no slope
+            # information.  Cooling has no equivalent — ``actual_impact =
+            # actual - base`` has no upper bound from physics, so dropping
+            # at ``≥ 0.95×base`` would discard the strongest cooling-load
+            # samples for no reason.
+            if (
+                regime == "heating"
+                and actual_impact >= BATCH_FIT_SATURATION_RATIO * expected_base
+            ):
+                drop_counts["saturated"] += 1
+                continue
+
+            samples.append((pot_s, pot_e, pot_w, actual_impact))
+
+        return samples, drop_counts
+
+    @staticmethod
+    def _solve_batch_fit_normal_equations(
+        samples: list[tuple[float, float, float, float]],
+    ) -> dict[str, float] | None:
+        """Joint 3×3 LS via Cramer's rule, with collinear 1D fallback.
+
+        Same arithmetic as the cold-start solver in
+        ``_learn_unit_solar_coefficient`` lines 985-1085 — extracted
+        here without the cold-start damping (the caller damps).
+        Returns a coefficient dict, or ``None`` if the fit cannot be
+        produced (degenerate Gram matrix and zero-magnitude direction
+        sum).
+        """
+        if not samples:
+            return None
+        sum_s2 = sum(s[0] ** 2 for s in samples)
+        sum_e2 = sum(s[1] ** 2 for s in samples)
+        sum_w2 = sum(s[2] ** 2 for s in samples)
+        sum_se = sum(s[0] * s[1] for s in samples)
+        sum_sw = sum(s[0] * s[2] for s in samples)
+        sum_ew = sum(s[1] * s[2] for s in samples)
+        sum_s_I = sum(s[0] * s[3] for s in samples)
+        sum_e_I = sum(s[1] * s[3] for s in samples)
+        sum_w_I = sum(s[2] * s[3] for s in samples)
+
+        determinant = (
+            sum_s2 * (sum_e2 * sum_w2 - sum_ew ** 2)
+            - sum_se * (sum_se * sum_w2 - sum_ew * sum_sw)
+            + sum_sw * (sum_se * sum_ew - sum_e2 * sum_sw)
+        )
+
+        if abs(determinant) > 1e-6:
+            det_s = (
+                sum_s_I * (sum_e2 * sum_w2 - sum_ew ** 2)
+                - sum_se * (sum_e_I * sum_w2 - sum_ew * sum_w_I)
+                + sum_sw * (sum_e_I * sum_ew - sum_e2 * sum_w_I)
+            )
+            det_e = (
+                sum_s2 * (sum_e_I * sum_w2 - sum_ew * sum_w_I)
+                - sum_s_I * (sum_se * sum_w2 - sum_ew * sum_sw)
+                + sum_sw * (sum_se * sum_w_I - sum_e_I * sum_sw)
+            )
+            det_w = (
+                sum_s2 * (sum_e2 * sum_w_I - sum_ew * sum_e_I)
+                - sum_se * (sum_se * sum_w_I - sum_e_I * sum_sw)
+                + sum_s_I * (sum_se * sum_ew - sum_e2 * sum_sw)
+            )
+            return {
+                "s": det_s / determinant,
+                "e": det_e / determinant,
+                "w": det_w / determinant,
+            }
+
+        # Collinear fallback: project onto dominant direction.
+        dir_s = sum(s[0] for s in samples)
+        dir_e = sum(s[1] for s in samples)
+        dir_w = sum(s[2] for s in samples)
+        dir_norm = (dir_s ** 2 + dir_e ** 2 + dir_w ** 2) ** 0.5
+        if dir_norm < 1e-6:
+            return None
+
+        d_s = dir_s / dir_norm
+        d_e = dir_e / dir_norm
+        d_w = dir_w / dir_norm
+        sum_proj_I = sum(
+            (s[0] * d_s + s[1] * d_e + s[2] * d_w) * s[3] for s in samples
+        )
+        sum_proj2 = sum(
+            (s[0] * d_s + s[1] * d_e + s[2] * d_w) ** 2 for s in samples
+        )
+        if sum_proj2 < 1e-6:
+            return None
+        c_scalar = sum_proj_I / sum_proj2
+        return {"s": c_scalar * d_s, "e": c_scalar * d_e, "w": c_scalar * d_w}
+
+    @staticmethod
+    def _batch_fit_residual_rmse(
+        samples: list[tuple[float, float, float, float]],
+        coeff: dict[str, float],
+    ) -> float:
+        """RMSE of (predicted_impact - actual_impact) over the sample set."""
+        if not samples:
+            return 0.0
+        sse = 0.0
+        for pot_s, pot_e, pot_w, impact in samples:
+            pred = (
+                coeff.get("s", 0.0) * pot_s
+                + coeff.get("e", 0.0) * pot_e
+                + coeff.get("w", 0.0) * pot_w
+            )
+            sse += (pred - impact) ** 2
+        return round((sse / len(samples)) ** 0.5, 5)
+
+    def compute_implied_for_apply(
+        self,
+        hourly_log: list[dict],
+        entity_id: str,
+        regime: str,
+        coordinator,
+        *,
+        unit_min_base: dict[str, float] | None = None,
+        screen_affected_entities: frozenset[str] | None = None,
+        n_windows: int = 3,
+        days_back: int | None = None,
+    ) -> dict:
+        """Per-(entity, regime) implied coefficient + stability windows.
+
+        Reuses ``_collect_batch_fit_samples`` to gather modulating-regime
+        samples (same filter gates as batch_fit), then runs the joint
+        3×3 LS over the full set for the headline ``implied_30d`` and
+        chunks the samples chronologically into ``n_windows`` sub-fits
+        for stability assessment.
+
+        Returns ``{implied: dict|None, windows: [dict|None,...],
+        sample_count: int, drop_counts: dict, days_back: int|None}``.
+        ``implied`` is None when there are too few samples to fit;
+        ``windows[i]`` is None when the chunk has too few samples to
+        solve.
+
+        ``days_back`` (default ``None`` = full log) restricts the input
+        window — recommended after a retrain or major release so the
+        fit doesn't absorb data from before the model state changed.
+        Mirrors the same parameter on ``batch_fit_solar_coefficients``.
+
+        Designed for the ``apply_implied_coefficient`` service — the
+        caller decides per-component stability and writes the partial
+        coefficient.  This helper does no clamping or write-through;
+        purely an analysis pass.
+        """
+        from .const import APPLY_IMPLIED_MIN_QUALIFYING_HOURS
+
+        # Time-window filter — see ``_filter_log_by_days_back`` for the
+        # parse-then-compare rationale (lex-compare on ISO strings is
+        # wrong under non-UTC offsets near the cutoff boundary).
+        filtered_log = _filter_log_by_days_back(hourly_log, days_back)
+
+        unit_threshold = _resolve_min_base(
+            entity_id, unit_min_base, SOLAR_LEARNING_MIN_BASE
+        )
+
+        # Per-entity reconstruction (same hoist as batch_fit).
+        scr_fn = getattr(coordinator, "screen_config_for_entity", None)
+        if scr_fn is not None:
+            screen_cfg_for_entity = scr_fn(entity_id)
+        else:
+            screen_cfg_for_entity = getattr(coordinator, "screen_config", None)
+        entry_potentials: list[tuple[float, float, float, float]] = []
+        for entry in filtered_log:
+            (pot_s, pot_e, pot_w), magnitude = self._reconstruct_potential(
+                entry,
+                getattr(coordinator, "solar", None),
+                screen_cfg_for_entity,
+            )
+            entry_potentials.append((pot_s, pot_e, pot_w, magnitude))
+
+        # ``apply_implied_coefficient`` must compute the same coefficient
+        # the user reads in ``diagnose_solar.implied_coefficient_30d`` —
+        # otherwise the user-facing promise of the service ("commit what
+        # diagnose shows") is broken.  ``match_diagnose=True`` switches
+        # the filter set: drops the per-unit min_base gate, includes
+        # shutdown samples, and reads base from the log-time
+        # ``unit_expected_breakdown`` field.
+        samples, drop_counts = self._collect_batch_fit_samples(
+            entity_id=entity_id,
+            regime=regime,
+            hourly_log=filtered_log,
+            entry_potentials=entry_potentials,
+            coordinator=coordinator,
+            unit_threshold=unit_threshold,
+            screen_affected_entities=screen_affected_entities,
+            match_diagnose=True,
+        )
+
+        result: dict = {
+            "sample_count": len(samples),
+            "drop_counts": drop_counts,
+            "days_back": days_back,
+            "implied": None,
+            "windows": [None] * n_windows,
+        }
+
+        if len(samples) < APPLY_IMPLIED_MIN_QUALIFYING_HOURS:
+            return result
+
+        # 30-day implied: full LS over all samples.
+        implied = self._solve_batch_fit_normal_equations(samples)
+        if implied is not None:
+            result["implied"] = {k: round(v, 4) for k, v in implied.items()}
+
+        # Stability windows: split chronologically into ``n_windows``
+        # equal chunks and fit each.  ``samples`` is already in log
+        # order from ``_collect_batch_fit_samples``.  Per-window
+        # min-samples is half the global threshold so a sparse late
+        # window still produces SOMETHING for the stability check
+        # (or None if completely empty).
+        per_window_min = max(8, APPLY_IMPLIED_MIN_QUALIFYING_HOURS // n_windows)
+        chunk_size = max(1, len(samples) // n_windows)
+        for i in range(n_windows):
+            start = i * chunk_size
+            end = start + chunk_size if i < n_windows - 1 else len(samples)
+            chunk = samples[start:end]
+            if len(chunk) < per_window_min:
+                continue
+            window_fit = self._solve_batch_fit_normal_equations(chunk)
+            if window_fit is not None:
+                result["windows"][i] = {
+                    "coefficient": {k: round(v, 4) for k, v in window_fit.items()},
+                    "qualifying_hours": len(chunk),
+                }
+        return result
+
+    @staticmethod
+    def assess_apply_implied_stability(
+        windows: list[dict | None],
+        *,
+        max_spread: float | None = None,
+        near_zero: float | None = None,
+    ) -> dict[str, dict]:
+        """Per-direction stability assessment for ``apply_implied_coefficient``.
+
+        For each direction ``s/e/w``, evaluates the values across the
+        non-empty stability windows:
+
+        - All values within ``near_zero`` magnitude → ``stable`` (the
+          windows agree the component is effectively zero).
+        - Sign-flip across non-trivial values → ``unstable``.
+        - ``max(|v|) / min(|v|) > max_spread`` on non-trivial values →
+          ``unstable``.
+        - Otherwise → ``stable``.
+        - Fewer than 2 non-empty windows → ``insufficient_windows``.
+
+        Returns ``{direction: {stable: bool, reason: str, values: list}}``.
+        Default thresholds come from ``APPLY_IMPLIED_MAX_SPREAD`` and
+        ``APPLY_IMPLIED_NEAR_ZERO``; explicit args override (used by
+        tests and callers that want different behaviour).
+        """
+        from .const import APPLY_IMPLIED_MAX_SPREAD, APPLY_IMPLIED_NEAR_ZERO
+
+        if max_spread is None:
+            max_spread = APPLY_IMPLIED_MAX_SPREAD
+        if near_zero is None:
+            near_zero = APPLY_IMPLIED_NEAR_ZERO
+
+        result: dict[str, dict] = {}
+        for d in ("s", "e", "w"):
+            values = [
+                w["coefficient"].get(d, 0.0)
+                for w in windows
+                if w is not None and isinstance(w.get("coefficient"), dict)
+            ]
+            entry: dict = {"values": values}
+            if len(values) < 2:
+                entry["stable"] = False
+                entry["reason"] = "insufficient_windows"
+                result[d] = entry
+                continue
+
+            # All near zero — windows consistently say "no signal here".
+            # Returning stable=True lets the caller write 0.0 and clear
+            # any stale prior on this component.
+            if all(abs(v) < near_zero for v in values):
+                entry["stable"] = True
+                entry["reason"] = "near_zero_consensus"
+                result[d] = entry
+                continue
+
+            # Sign flip — at least one value above near_zero has a
+            # different sign from any other non-zero value.  We check
+            # signs across ALL non-zero values (not just non-near-zero)
+            # because the user-facing red flag is "the windows disagree
+            # on the direction of the gain" — a +0.58 vs -0.035 split
+            # is qualitatively a sign-flip even though the negative
+            # value is small.  The near_zero_consensus check above
+            # already catches the all-tiny case.
+            non_zero = [v for v in values if v != 0]
+            signs = {1 if v > 0 else -1 for v in non_zero}
+            if len(signs) > 1:
+                entry["stable"] = False
+                entry["reason"] = "sign_flip"
+                result[d] = entry
+                continue
+
+            # Spread check on non-trivial values.
+            abs_vals = [abs(v) for v in values if abs(v) >= 0.001]
+            if len(abs_vals) >= 2 and max(abs_vals) / min(abs_vals) > max_spread:
+                entry["stable"] = False
+                entry["reason"] = "spread_exceeds_threshold"
+                result[d] = entry
+                continue
+
+            entry["stable"] = True
+            entry["reason"] = "ok"
+            result[d] = entry
+        return result

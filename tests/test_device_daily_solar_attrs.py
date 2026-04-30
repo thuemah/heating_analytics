@@ -53,17 +53,37 @@ def _build_coord_with_solar(
     coord.model = MagicMock()
     coord.model.correlation_data_per_unit = coord._correlation_data_per_unit
     coord.model.observation_counts = {}
-    coord.model.solar_coefficients_per_unit = {entity_id: coeff} if coeff else {}
+    # Mode-stratified per #868: wrap the test's flat coeff in the heating
+    # regime; cooling regime is zero (test focuses on heating-mode display).
+    if coeff is not None:
+        stratified = {
+            "heating": dict(coeff),
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+        }
+        coord.model.solar_coefficients_per_unit = {entity_id: stratified}
+    else:
+        coord.model.solar_coefficients_per_unit = {}
     coord.model.hourly_log = coord._hourly_log
 
     # Solar calculator needs a minimal coordinator pointer
     coord.screen_config = (True, True, True)
     coord.solar = SolarCalculator(coord)
+    # The HeatingDeviceDailySensor calls coord.get_unit_mode(); default to
+    # heating in the absence of an explicit mode setter (mock).
+    coord.get_unit_mode = MagicMock(return_value="heating")
 
-    # Solar-learning state
-    coord._learning_buffer_solar_per_unit = {entity_id: buffer} if buffer else {}
+    # Solar-learning state — buffer is now per-(entity, regime) (#868).
+    if buffer:
+        coord._learning_buffer_solar_per_unit = {
+            entity_id: {"heating": list(buffer), "cooling": []}
+        }
+    else:
+        coord._learning_buffer_solar_per_unit = {}
     coord.learning = MagicMock()
-    coord.learning._dead_zone_counts = {entity_id: dead_zone_count} if dead_zone_count else {}
+    if dead_zone_count:
+        coord.learning._dead_zone_counts = {(entity_id, "heating"): dead_zone_count}
+    else:
+        coord.learning._dead_zone_counts = {}
 
     return coord
 
@@ -174,3 +194,95 @@ class TestLearningStatusStateMatrix:
         )
         sensor = _make_sensor(coord)
         assert sensor.extra_state_attributes["solar_learning_status"] == "learning"
+
+
+class TestGuestModeRegimeRouting:
+    """Regression for the post-merge code-review finding: the regime
+    selector in ``HeatingDeviceDailySensor.extra_state_attributes`` was
+    ``"cooling" if unit_mode == "cooling" else "heating"`` — which routed
+    ``guest_cooling`` units to the heating regime, surfacing wrong
+    coefficient + dead-zone state.  The fix mirrors
+    ``solar.calculate_unit_coefficient`` and
+    ``learning._solar_coeff_regime``: GUEST_COOLING → cooling regime;
+    GUEST_HEATING / OFF / DHW → heating.
+    """
+
+    def test_guest_cooling_reads_cooling_regime_coefficient(self):
+        """A ``guest_cooling`` unit must surface its cooling-regime
+        coefficient, not the heating regime.  Pre-fix the heating
+        regime would have shown up here.
+        """
+        from custom_components.heating_analytics.const import MODE_GUEST_COOLING
+
+        coord = MagicMock()
+        coord.data = {
+            "daily_individual": {"sensor.vp_stue": 1.0},
+            "effective_wind": 3.0,
+            "forecast_today_per_unit": {"sensor.vp_stue": 10.0},
+            "solar_vector_s": 0.0,
+            "solar_vector_e": 0.0,
+            "solar_vector_w": 0.0,
+        }
+        coord._calculate_inertia_temp.return_value = 10.0
+        coord._get_wind_bucket.return_value = "normal"
+        coord._get_predicted_kwh_per_unit.return_value = 0.5
+        coord._correlation_data_per_unit = {
+            "sensor.vp_stue": {"10": {"normal": 0.5}}
+        }
+        coord._hourly_log = [{"timestamp": "2026-05-01T12:00:00"}]
+        coord.calculate_unit_rolling_power_watts = MagicMock(return_value=0)
+        coord.screen_config = (True, True, True)
+        # Heating + cooling regimes have visibly different coefficients.
+        stratified = {
+            "heating": {"s": 0.10, "e": 0.0, "w": 0.0},
+            "cooling": {"s": 0.55, "e": 0.20, "w": 0.0},
+        }
+        coord.model = MagicMock()
+        coord.model.correlation_data_per_unit = coord._correlation_data_per_unit
+        coord.model.observation_counts = {}
+        coord.model.solar_coefficients_per_unit = {"sensor.vp_stue": stratified}
+        coord.model.hourly_log = coord._hourly_log
+        coord.solar = SolarCalculator(coord)
+        coord.get_unit_mode = MagicMock(return_value=MODE_GUEST_COOLING)
+        coord._learning_buffer_solar_per_unit = {}
+        coord.learning = MagicMock()
+        coord.learning._dead_zone_counts = {}
+
+        sensor = _make_sensor(coord)
+        attrs = sensor.extra_state_attributes
+        # Pre-fix this asserted 0.10 (heating) — bug.  Post-fix the
+        # cooling regime is read because GUEST_COOLING routes there.
+        assert attrs["solar_coefficient_s"] == pytest.approx(0.55)
+        assert attrs["solar_coefficient_e"] == pytest.approx(0.20)
+
+    def test_guest_heating_reads_heating_regime_coefficient(self):
+        """``guest_heating`` is symmetric — must route to heating regime."""
+        from custom_components.heating_analytics.const import MODE_GUEST_HEATING
+
+        coord = _build_coord_with_solar(
+            coeff={"s": 0.30, "e": 0.0, "w": 0.0},
+        )
+        coord.get_unit_mode = MagicMock(return_value=MODE_GUEST_HEATING)
+        sensor = _make_sensor(coord)
+        attrs = sensor.extra_state_attributes
+        assert attrs["solar_coefficient_s"] == pytest.approx(0.30)
+
+    def test_guest_cooling_reads_cooling_regime_dead_zone_counter(self):
+        """The buffer + dead-zone status read must use the same regime
+        selector as the coefficient read; otherwise a guest_cooling unit
+        would show heating-regime learning status."""
+        from custom_components.heating_analytics.const import MODE_GUEST_COOLING
+
+        coord = _build_coord_with_solar(
+            coeff={"s": 0.10, "e": 0.0, "w": 0.0},  # heating-regime entry
+            dead_zone_count=12,                     # heating-regime counter
+        )
+        coord.get_unit_mode = MagicMock(return_value=MODE_GUEST_COOLING)
+        # Heating regime has the inflated counter; cooling regime is empty.
+        # Pre-fix the sensor would surface "dead_zone_warning_12/15"
+        # because it routes guest_cooling to heating.  Post-fix it
+        # routes to cooling, which has no buffer + no counter →
+        # ``cold_start``.
+        sensor = _make_sensor(coord)
+        attrs = sensor.extra_state_attributes
+        assert attrs["solar_learning_status"] == "cold_start"

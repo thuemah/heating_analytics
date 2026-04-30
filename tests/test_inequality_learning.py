@@ -27,6 +27,7 @@ from custom_components.heating_analytics.const import (
     SOLAR_COEFF_CAP,
     MODE_HEATING,
 )
+from tests.helpers import stratified_coeff
 
 
 # -----------------------------------------------------------------------------
@@ -38,7 +39,7 @@ class TestInequalityMath:
     def test_constraint_satisfied_no_update(self):
         """predicted_impact >= margin * base → non_binding, coeffs unchanged."""
         lm = LearningManager()
-        coeffs = {"u1": {"s": 1.0, "e": 0.0, "w": 0.0}}
+        coeffs = {"u1": stratified_coeff(s=1.0)}
         # pot_s=1.0 → predicted=1.0; base=0.5, margin=0.9 → target=0.45
         # 1.0 >= 0.45 → non_binding
         status = lm._update_unit_solar_inequality(
@@ -48,14 +49,14 @@ class TestInequalityMath:
             solar_coefficients_per_unit=coeffs,
         )
         assert status == "non_binding"
-        assert coeffs["u1"]["s"] == 1.0
-        assert coeffs["u1"]["e"] == 0.0
-        assert coeffs["u1"]["w"] == 0.0
+        assert coeffs["u1"]["heating"]["s"] == 1.0
+        assert coeffs["u1"]["heating"]["e"] == 0.0
+        assert coeffs["u1"]["heating"]["w"] == 0.0
 
     def test_constraint_violated_raises_coefficients(self):
         """predicted < margin * base → update raises coefficients."""
         lm = LearningManager()
-        coeffs = {"u1": {"s": 0.1, "e": 0.0, "w": 0.0}}
+        coeffs = {"u1": stratified_coeff(s=0.1)}
         # pot_s=1.0 → predicted=0.1; base=1.0, margin=0.9 → target=0.9
         # deficit = 0.8. Distribution proportional to pot_s/mag=1.0
         # new_s = 0.1 + 0.05 * 0.8 * 1.0 = 0.14
@@ -66,15 +67,17 @@ class TestInequalityMath:
             solar_coefficients_per_unit=coeffs,
         )
         assert status == "updated"
-        assert coeffs["u1"]["s"] == pytest.approx(0.14, abs=1e-4)
+        assert coeffs["u1"]["heating"]["s"] == pytest.approx(0.14, abs=1e-4)
         # Directions with zero potential not touched
-        assert coeffs["u1"]["e"] == 0.0
-        assert coeffs["u1"]["w"] == 0.0
+        assert coeffs["u1"]["heating"]["e"] == 0.0
+        assert coeffs["u1"]["heating"]["w"] == 0.0
+        # Cooling regime untouched (inequality is heating-only).
+        assert coeffs["u1"]["cooling"] == {"s": 0.0, "e": 0.0, "w": 0.0}
 
     def test_deficit_distributed_by_potential_magnitude(self):
         """Deficit splits proportionally across non-zero potential components."""
         lm = LearningManager()
-        coeffs = {"u1": {"s": 0.0, "e": 0.0, "w": 0.0}}
+        coeffs = {"u1": stratified_coeff()}
         # pot=(0.6, 0.3, 0.1), mag_total=1.0. base=1.0 → deficit=0.9
         # new_s = 0 + 0.05 * 0.9 * 0.6 = 0.027
         # new_e = 0 + 0.05 * 0.9 * 0.3 = 0.0135
@@ -85,14 +88,14 @@ class TestInequalityMath:
             battery_filtered_potential=(0.6, 0.3, 0.1),
             solar_coefficients_per_unit=coeffs,
         )
-        assert coeffs["u1"]["s"] == pytest.approx(0.027, abs=1e-4)
-        assert coeffs["u1"]["e"] == pytest.approx(0.0135, abs=1e-4)
-        assert coeffs["u1"]["w"] == pytest.approx(0.0045, abs=1e-4)
+        assert coeffs["u1"]["heating"]["s"] == pytest.approx(0.027, abs=1e-4)
+        assert coeffs["u1"]["heating"]["e"] == pytest.approx(0.0135, abs=1e-4)
+        assert coeffs["u1"]["heating"]["w"] == pytest.approx(0.0045, abs=1e-4)
 
     def test_zero_magnitude_returns_zero_magnitude(self):
         """Battery not yet populated → skip update."""
         lm = LearningManager()
-        coeffs = {"u1": {"s": 0.0, "e": 0.0, "w": 0.0}}
+        coeffs = {"u1": stratified_coeff()}
         status = lm._update_unit_solar_inequality(
             entity_id="u1",
             expected_unit_base=1.0,
@@ -100,7 +103,7 @@ class TestInequalityMath:
             solar_coefficients_per_unit=coeffs,
         )
         assert status == "zero_magnitude"
-        assert coeffs["u1"] == {"s": 0.0, "e": 0.0, "w": 0.0}
+        assert coeffs["u1"]["heating"] == {"s": 0.0, "e": 0.0, "w": 0.0}
 
     def test_seeds_from_zero_coefficients(self):
         """No prior coefficient → inequality seeds from zero."""
@@ -114,12 +117,14 @@ class TestInequalityMath:
         )
         assert status == "updated"
         assert "u1" in coeffs
-        assert coeffs["u1"]["s"] > 0.0
+        # Both regimes created on first write; only heating populated.
+        assert coeffs["u1"]["heating"]["s"] > 0.0
+        assert coeffs["u1"]["cooling"] == {"s": 0.0, "e": 0.0, "w": 0.0}
 
     def test_non_negative_clamp_applied(self):
         """Deficit can never drive coefficients negative (physical invariant)."""
         lm = LearningManager()
-        coeffs = {"u1": {"s": 0.0, "e": 0.0, "w": 0.0}}
+        coeffs = {"u1": stratified_coeff()}
         # Constraint: pot·coeff >= 0.9 * base. With coeffs=0 and pot>0, deficit > 0
         # → we can only add. No code path subtracts. Sanity check the clamp exists.
         lm._update_unit_solar_inequality(
@@ -128,14 +133,14 @@ class TestInequalityMath:
             battery_filtered_potential=(1.0, 1.0, 1.0),
             solar_coefficients_per_unit=coeffs,
         )
-        assert coeffs["u1"]["s"] >= 0.0
-        assert coeffs["u1"]["e"] >= 0.0
-        assert coeffs["u1"]["w"] >= 0.0
+        assert coeffs["u1"]["heating"]["s"] >= 0.0
+        assert coeffs["u1"]["heating"]["e"] >= 0.0
+        assert coeffs["u1"]["heating"]["w"] >= 0.0
 
     def test_cap_clamp_prevents_runaway(self):
         """Very large deficit is capped at SOLAR_COEFF_CAP per component."""
         lm = LearningManager()
-        coeffs = {"u1": {"s": SOLAR_COEFF_CAP - 0.01, "e": 0.0, "w": 0.0}}
+        coeffs = {"u1": stratified_coeff(s=SOLAR_COEFF_CAP - 0.01)}
         # Huge base, small coeff → deficit is huge. Step of 0.05 × large_deficit
         # + existing SOLAR_CAP - 0.01 would exceed cap without clamp.
         lm._update_unit_solar_inequality(
@@ -144,7 +149,7 @@ class TestInequalityMath:
             battery_filtered_potential=(1.0, 0.0, 0.0),
             solar_coefficients_per_unit=coeffs,
         )
-        assert coeffs["u1"]["s"] <= SOLAR_COEFF_CAP
+        assert coeffs["u1"]["heating"]["s"] <= SOLAR_COEFF_CAP
 
     def test_cooling_mode_not_exposed_via_wrapper(self):
         """This math is called only in heating-mode wiring; cooling inversion
@@ -228,9 +233,10 @@ class TestReplayInequality:
         )
         assert diag["inequality_updates"] > 0
         # West was the dominant potential — coefficient should reflect that
+        # in the heating regime (inequality is heating-only per #865).
         coeff = solar_coeffs.get("sensor.vp_stue")
         assert coeff is not None
-        assert coeff["w"] > 0.0
+        assert coeff["heating"]["w"] > 0.0
 
     def test_low_base_skipped(self):
         """Shutdown hour below SOLAR_SHUTDOWN_MIN_BASE is skipped with a counter."""

@@ -710,7 +710,7 @@ class ForecastManager:
 
         # 3. Call the internal processing function to get the kWh value
         # We pass a copy of inertia_history because _process_forecast_item modifies it.
-        predicted_kwh, _, _, _, _, _, unit_breakdown, _ = self._process_forecast_item(
+        predicted_kwh, _, _, _, _, _, unit_breakdown, _, _ = self._process_forecast_item(
             item=forecast_item,
             inertia_history=list(inertia_history),
             wind_unit=weather_wind_unit,
@@ -991,10 +991,78 @@ class ForecastManager:
                 # Seed with N prior hours of same temp to stabilize start
                 local_inertia_history = [first_temp] * history_needed
 
+        # Solar carry-over reservoir trajectory threading (#899).
+        # Earlier shipped form used ``state_now × decay^N`` per item, which
+        # correctly forward-decays the live state but assumes no recharge
+        # during the forecast period — long-horizon sunny-day forecasts
+        # under-credited carry-over benefit by 3-5 kWh/day.  Trajectory
+        # threading simulates the EMA per forecast hour using the same
+        # charge formula as the live system: each item's predicted
+        # ``solar_heating_wasted_kwh`` re-charges the local state so
+        # later hours of a sunny day see release from the morning's
+        # accumulated wasted, matching the production charge-and-
+        # discharge cycle.  When ``k == 0`` the charge term is zero and
+        # the simulation collapses to pure decay — bit-identical to the
+        # earlier ``decay^N`` form for default-config users.
+        #
+        # Recurrence: ``state_{t+1} = state_t × decay + (k × wasted_t) × (1 − decay)``.
+        # Per loop iteration: use ``local_carryover`` as override
+        # (= state at start of this forecast hour), then evolve it by
+        # ONE EMA step (decay + charge) for the next iteration.
+        # Type-guarded against MagicMock test fixtures.
+        _state_attr = getattr(self.coordinator, "_solar_carryover_state", 0.0)
+        carryover_now = _state_attr if isinstance(_state_attr, (int, float)) else 0.0
+        _decay_attr = getattr(self.coordinator, "solar_battery_decay", 0.80)
+        decay_for_forecast = _decay_attr if isinstance(_decay_attr, (int, float)) else 0.80
+        _k_attr = getattr(self.coordinator, "battery_thermal_feedback_k", 0.0)
+        k_for_forecast = _k_attr if isinstance(_k_attr, (int, float)) else 0.0
+        now_for_forecast = dt_util.now()
+
+        # Initial state: forward-decay ``carryover_now`` to the first
+        # forecast item's offset (no charge data for hours between now
+        # and forecast start, so pure decay is the only physically
+        # defensible choice for that gap).
+        local_carryover = carryover_now
+        current_offset = 0
+
+        def _item_offset(item: dict) -> int:
+            """Hour offset from ``now_for_forecast`` to item's datetime."""
+            dt_str = item.get("datetime")
+            if not dt_str:
+                return current_offset + 1
+            try:
+                item_dt = dt_util.parse_datetime(dt_str)
+                if item_dt is None:
+                    return current_offset + 1
+                delta_hours = (item_dt - now_for_forecast).total_seconds() / 3600.0
+                return max(0, int(round(delta_hours)))
+            except (ValueError, TypeError):
+                return current_offset + 1
+
         for f in processed_items:
-            predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, _, _ = self._process_forecast_item(
-                f, local_inertia_history, weather_wind_unit, current_cloud, ignore_aux=ignore_aux
+            item_offset = _item_offset(f)
+            # Pure-decay forward to this item's offset (handles initial
+            # forward-decay AND any gaps between sequential items).
+            while current_offset < item_offset:
+                local_carryover = local_carryover * decay_for_forecast
+                current_offset += 1
+
+            (predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms,
+             _, _, predicted_wasted) = self._process_forecast_item(
+                f, local_inertia_history, weather_wind_unit, current_cloud,
+                ignore_aux=ignore_aux,
+                carryover_state_override=local_carryover,
             )
+
+            # One EMA step to evolve local_carryover to the next hour:
+            #   state_{t+1} = state_t × decay + (k × wasted_t) × (1 − decay)
+            # When k == 0 or predicted_wasted == 0, this is pure decay.
+            charge_input = k_for_forecast * predicted_wasted if k_for_forecast > 0.0 else 0.0
+            local_carryover = (
+                local_carryover * decay_for_forecast
+                + charge_input * (1 - decay_for_forecast)
+            )
+            current_offset += 1
 
             total_kwh += predicted
             total_solar += solar_kwh
@@ -1028,7 +1096,8 @@ class ForecastManager:
         ignore_aux: bool = False,
         force_aux: bool = False,
         screen_override: float | None = None,
-        force_no_wind: bool = False
+        force_no_wind: bool = False,
+        carryover_state_override: float | None = None,
     ) -> tuple[float, float, float, float, float, float, dict, float]:
         """Process a single forecast item for energy prediction.
 
@@ -1141,14 +1210,22 @@ class ForecastManager:
             unit_modes=None, # Use current coordinator state modes (defaults to internal)
             override_solar_factor=effective_factor,
             override_solar_vector=effective_solar_vector,
+            carryover_state_override=carryover_state_override,
         )
 
         predicted = res["total_kwh"]
         solar_kwh = res["breakdown"]["solar_reduction_kwh"]
         unit_breakdown = res["unit_breakdown"]
         aux_impact_kwh = res["breakdown"]["aux_reduction_kwh"]
+        # Heating-only wasted exposed for forecast trajectory threading
+        # (#899): the loop in ``_calculate_from_hourly_forecast`` and
+        # ``_sum_forecast_energy_internal`` uses this to charge a local
+        # carryover-state simulation per forecast hour, capturing the
+        # charge-and-discharge cycle that the simpler ``decay^N``
+        # approach assumed away.
+        solar_heating_wasted = res["breakdown"].get("solar_heating_wasted_kwh", 0.0)
 
-        return predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown, aux_impact_kwh
+        return predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown, aux_impact_kwh, solar_heating_wasted
 
     def _calculate_from_daily_forecast(
         self,
@@ -1200,7 +1277,34 @@ class ForecastManager:
             is_aux = self.coordinator.auxiliary_heating_active
 
         # calculate_total_power returns Hourly Power (or energy per hour)
-        # We need to multiply by 24 for daily
+        # We need to multiply by 24 for daily.
+        #
+        # Carry-over reservoir override for daily forecast (#896 follow-up).
+        # The single calculate_total_power call below gets multiplied by
+        # 24.  Without an override every daily forecast would credit
+        # ``state × (1 − decay) × 24`` of release — for state=1 and
+        # decay=0.80 that's 4.8 kWh, vs the physically integrated 24h
+        # release ``state × (1 − decay²⁴) ≈ state × 1.0`` ≈ 1.0 kWh
+        # under the same conditions.  Material under-prediction of
+        # daily-forecast demand.  We solve algebraically: pass an
+        # override that makes ``override × (1 − decay) × 24`` equal to
+        # the integrated 24h release, i.e.
+        #   ``override = state × (1 − decay²⁴) / (24 × (1 − decay))``.
+        # For decay=0.80: factor ≈ 0.207, so the per-call subtraction
+        # is ~0.04 kWh and the × 24 daily total is ~1.0 kWh — matches
+        # physics.  For distant-day forecasts the live state has
+        # already been forward-decayed by the call at the hourly path
+        # if used; here it represents the state at start of day, so
+        # this formula correctly integrates over that day's discharge.
+        _state_attr = getattr(self.coordinator, "_solar_carryover_state", 0.0)
+        _carryover_state = _state_attr if isinstance(_state_attr, (int, float)) else 0.0
+        _decay_attr = getattr(self.coordinator, "solar_battery_decay", 0.80)
+        _decay = _decay_attr if isinstance(_decay_attr, (int, float)) else 0.80
+        if _carryover_state > 0.0 and 0.0 < _decay < 1.0:
+            _daily_factor = (1 - _decay ** 24) / (24 * (1 - _decay))
+            _carryover_for_daily = _carryover_state * _daily_factor
+        else:
+            _carryover_for_daily = 0.0
 
         res = self.coordinator.statistics.calculate_total_power(
             temp=avg_temp,
@@ -1210,6 +1314,7 @@ class ForecastManager:
             unit_modes=None,
             override_solar_factor=s_factor,
             override_solar_vector=s_vector,
+            carryover_state_override=_carryover_for_daily,
         )
 
         predicted_24h = res["total_kwh"] * 24.0
@@ -1259,6 +1364,25 @@ class ForecastManager:
         weather_wind_unit = self.coordinator._get_weather_wind_unit()
         current_cloud = self.coordinator._get_cloud_coverage()
 
+        # Solar carry-over reservoir trajectory threading (#899).
+        # See ``_calculate_from_hourly_forecast`` for the full rationale.
+        # Per-item EMA recurrence: state_{t+1} = state_t × decay +
+        # (k × wasted_t) × (1 − decay).  Items outside the [start, end]
+        # window still evolve the local state via pure-decay (no charge
+        # data available for those hours) so the in-window state at the
+        # first processed hour reflects the gap.  When ``k == 0`` the
+        # charge term is zero and the simulation reduces to pure decay
+        # — bit-identical to the earlier ``decay^N`` form.
+        _state_attr = getattr(self.coordinator, "_solar_carryover_state", 0.0)
+        carryover_now = _state_attr if isinstance(_state_attr, (int, float)) else 0.0
+        _decay_attr = getattr(self.coordinator, "solar_battery_decay", 0.80)
+        decay_for_forecast = _decay_attr if isinstance(_decay_attr, (int, float)) else 0.80
+        _k_attr = getattr(self.coordinator, "battery_thermal_feedback_k", 0.0)
+        k_for_forecast = _k_attr if isinstance(_k_attr, (int, float)) else 0.0
+        now_for_forecast = dt_util.now()
+        local_carryover = carryover_now
+        current_offset = 0
+
         for f in forecast_source:
             dt_str = f.get("datetime")
             if not dt_str: continue
@@ -1266,12 +1390,35 @@ class ForecastManager:
             if not f_dt: continue
             f_dt = dt_util.as_local(f_dt)
 
+            # Forward-decay local state to this item's offset (handles
+            # both the initial gap from now to first processed item and
+            # any gaps from skipped items).
+            item_offset = max(
+                0,
+                int(round((f_dt - now_for_forecast).total_seconds() / 3600.0)),
+            )
+            while current_offset < item_offset:
+                local_carryover = local_carryover * decay_for_forecast
+                current_offset += 1
+
             is_start_ok = (f_dt >= start_time) if include_start else (f_dt > start_time)
 
             if is_start_ok and f_dt < end_time:
                 res = self._process_forecast_item(
-                    f, local_history, weather_wind_unit, current_cloud, ignore_aux=ignore_aux, force_aux=force_aux, screen_override=screen_override, force_no_wind=force_no_wind
+                    f, local_history, weather_wind_unit, current_cloud,
+                    ignore_aux=ignore_aux, force_aux=force_aux,
+                    screen_override=screen_override, force_no_wind=force_no_wind,
+                    carryover_state_override=local_carryover,
                 )
+                # Capture predicted wasted for the trajectory charge step.
+                predicted_wasted = res[8]
+                # One EMA step to evolve state forward to next hour.
+                charge_input = k_for_forecast * predicted_wasted if k_for_forecast > 0.0 else 0.0
+                local_carryover = (
+                    local_carryover * decay_for_forecast
+                    + charge_input * (1 - decay_for_forecast)
+                )
+                current_offset += 1
                 predicted = res[0]
                 solar_kwh = res[1]
                 inertia_val = res[2]

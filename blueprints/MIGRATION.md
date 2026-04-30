@@ -1,4 +1,84 @@
-# Migration Guide: Manual Automations → Blueprint
+# Migration Guide
+
+Two migration paths are documented here:
+
+1. **v1 → v2**: behaviour changes in the climate_sync blueprint shipped with 1.3.5.
+2. **Manual automation → blueprint**: original v1-era guide, still valid for the
+   3-line conversion if you're starting from a hand-rolled automation.
+
+---
+
+## v1 → v2: climate_sync behaviour changes (1.3.5)
+
+The v1 climate_sync blueprint mapped any climate state outside `heat`/`cool`
+to the mode helper's `off` value.  v2 changes this in three ways:
+
+| Climate State          | v1 (1.3.4 and earlier) | v2 (1.3.5+)        |
+|------------------------|------------------------|--------------------|
+| `auto`, `heat_cool`    | `off` (incorrect)      | `heating`          |
+| `dry`, `fan_only`      | `off` (incorrect)      | *preserve*         |
+| `off` (standard mode)  | `off`                  | *preserve*         |
+| `off` (guest mode)     | `off`                  | `off` (unchanged)  |
+
+*preserve* = the mode helper is left at its current value.
+
+### Why the change?
+
+**Standard `off` → preserve.**  v1 silently set `mode=off` whenever the
+climate entity went to `off`, even when the off was transient (automation
+pause, modulation, brief user toggle).  This canceled Heating Analytics
+learning for the period and forced a cold-start re-run on the next
+on-cycle.  v2 reserves `MODE_OFF` for units the user explicitly disables
+— matching the convention already documented in
+`heat_pump_mode_sync.yaml`'s comment ("MODE_OFF is reserved for units
+that are deliberately disabled by the user").
+
+**Guest `off` → off (unchanged).**  Guest units genuinely idle when the
+guest leaves, so off is the correct mode.
+
+**`auto` / `heat_cool` → heating.**  v1 lumped these into the off
+default, mislabelling active heating as off.  These are active modes
+where the climate device picks heat or cool based on room temperature
+— for installations using this integration (predominantly heating-
+focused), heating is the right routing.
+
+**`dry` / `fan_only` → preserve.**  Small loads, neither heating nor
+cooling.  v1 marked them off; v2 leaves the mode helper untouched and
+lets per-unit base learning absorb whatever modest consumption appears.
+
+### What you need to do
+
+**Most users: nothing.**  The new behaviour is strictly more conservative —
+it fixes incorrect routing without breaking the heat/cool happy path.
+Pull the new blueprint, re-import in the automation editor (if HA caches
+old versions), and that's it.
+
+**Users who relied on `climate=off → mode=off` for standard units.**
+If you used a Lovelace climate card to manually turn off your heat pump
+and expected Heating Analytics to stop tracking, that side-effect is
+gone.  Either:
+- (Recommended) Set the select helper to `off` directly via the UI when
+  you want to stop tracking — explicit user intent, matches the
+  reserved-meaning of MODE_OFF.
+- (If you have many entities) Add a separate automation that mirrors
+  climate=off → mode=off for the specific entities where you want the
+  v1 behaviour.
+
+**Users who hit `auto` / `heat_cool` / `dry` / `fan_only` regularly.**
+Verify the mode helper now reflects the correct regime.  Heating-
+dominant installs should see no change beyond the obvious bug fix.
+
+### Rollback
+
+If v2 breaks something for your installation, the v1 blueprint is
+preserved in git history.  Check out `blueprints/climate_sync.yaml`
+at commit `caebf73` (or just before this change) and reload the
+blueprint.  Please open an issue describing the case so we can
+address it in a follow-up.
+
+---
+
+## Manual Automations → Blueprint
 
 This guide helps you convert existing manual climate sync automations to use the blueprint.
 

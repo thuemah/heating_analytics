@@ -53,6 +53,7 @@ def _reset_coord(hourly_log, *, energy_sensors=("sensor.heater1",)):
     coord._learning_buffer_aux_per_unit = {}
     coord._solar_coefficients_per_unit = {}
     coord._learning_buffer_solar_per_unit = {}
+    coord._last_batch_fit_per_unit = {}
     coord._observation_counts = {}
     coord._learned_u_coefficient = 0.15
     coord._daily_history = {}
@@ -118,9 +119,16 @@ class TestPureReset:
     @pytest.mark.asyncio
     async def test_single_unit_reset_preserves_others(self):
         coord = _reset_coord([], energy_sensors=("sensor.heater1", "sensor.heater2"))
+        # Mode-stratified per #868.
         coord._solar_coefficients_per_unit = {
-            "sensor.heater1": {"s": 0.2, "e": 0.1, "w": 0.05},
-            "sensor.heater2": {"s": 0.3, "e": 0.0, "w": 0.02},
+            "sensor.heater1": {
+                "heating": {"s": 0.2, "e": 0.1, "w": 0.05},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            },
+            "sensor.heater2": {
+                "heating": {"s": 0.3, "e": 0.0, "w": 0.02},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            },
         }
         result = await HeatingDataCoordinator.async_reset_solar_learning_data(
             coord, entity_id="sensor.heater1"
@@ -129,8 +137,51 @@ class TestPureReset:
         assert result["replay_from_history"] is False
         assert "sensor.heater1" not in coord._solar_coefficients_per_unit
         assert coord._solar_coefficients_per_unit["sensor.heater2"] == {
-            "s": 0.3, "e": 0.0, "w": 0.02
+            "heating": {"s": 0.3, "e": 0.0, "w": 0.02},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
         }
+
+    @pytest.mark.asyncio
+    async def test_all_units_reset_clears_last_batch_fit(self):
+        """All-units reset must clear ``_last_batch_fit_per_unit`` — those
+        snapshots reference pre-reset coefficient state and would mislead
+        diagnose_solar after the reset (#902 review)."""
+        coord = _reset_coord([])
+        coord._last_batch_fit_per_unit = {
+            "sensor.heater1": {
+                "timestamp": "2026-04-27T10:00:00",
+                "regimes": {"heating": {"applied": True, "sample_count": 40}},
+            },
+            "sensor.heater2": {
+                "timestamp": "2026-04-27T10:00:00",
+                "skip_reason": "weighted_smear_excluded",
+                "regimes": {},
+            },
+        }
+        await HeatingDataCoordinator.async_reset_solar_learning_data(coord)
+        assert coord._last_batch_fit_per_unit == {}
+
+    @pytest.mark.asyncio
+    async def test_per_entity_reset_clears_only_its_last_batch_fit(self):
+        """Per-entity reset clears that entity's batch-fit snapshot but
+        preserves other entities' snapshots (their coefficients are
+        untouched)."""
+        coord = _reset_coord([], energy_sensors=("sensor.heater1", "sensor.heater2"))
+        coord._last_batch_fit_per_unit = {
+            "sensor.heater1": {
+                "timestamp": "2026-04-27T10:00:00",
+                "regimes": {"heating": {"applied": True}},
+            },
+            "sensor.heater2": {
+                "timestamp": "2026-04-27T10:00:00",
+                "regimes": {"heating": {"applied": True}},
+            },
+        }
+        await HeatingDataCoordinator.async_reset_solar_learning_data(
+            coord, entity_id="sensor.heater1"
+        )
+        assert "sensor.heater1" not in coord._last_batch_fit_per_unit
+        assert "sensor.heater2" in coord._last_batch_fit_per_unit
 
 
 # -----------------------------------------------------------------------------
@@ -191,13 +242,18 @@ class TestReplayFromHistory:
         ]
         coord = _reset_coord(entries)
         coord._solar_coefficients_per_unit = {
-            "sensor.heater1": {"s": 99.0, "e": 99.0, "w": 99.0}  # clearly wrong starting point
+            "sensor.heater1": {
+                "heating": {"s": 99.0, "e": 99.0, "w": 99.0},  # clearly wrong starting point
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            }
         }
         await HeatingDataCoordinator.async_reset_solar_learning_data(
             coord, replay_from_history=True
         )
-        coeff = coord._solar_coefficients_per_unit.get("sensor.heater1")
-        assert coeff is not None, "replay must produce a coefficient"
+        # Mode-stratified per #868 — heating regime read.
+        entity_entry = coord._solar_coefficients_per_unit.get("sensor.heater1")
+        assert entity_entry is not None, "replay must produce a coefficient"
+        coeff = entity_entry["heating"]
         # Not the stale 99.0 values
         assert coeff["s"] != 99.0
 
@@ -242,11 +298,17 @@ class TestPerUnitReplayFilter:
             }
             entries.append(e)
         coord = _reset_coord(entries, energy_sensors=sensors)
-        # Pre-seed heater2 with a known coefficient to verify it's preserved
+        # Pre-seed heater2 with a known coefficient to verify it's preserved.
+        # Mode-stratified per #868.
         coord._solar_coefficients_per_unit = {
-            "sensor.heater2": {"s": 0.5, "e": 0.5, "w": 0.5}
+            "sensor.heater2": {
+                "heating": {"s": 0.5, "e": 0.5, "w": 0.5},
+                "cooling": {"s": 0.0, "e": 0.0, "w": 0.0},
+            }
         }
-        pre_heater2 = dict(coord._solar_coefficients_per_unit["sensor.heater2"])
+        pre_heater2 = {
+            r: dict(v) for r, v in coord._solar_coefficients_per_unit["sensor.heater2"].items()
+        }
 
         await HeatingDataCoordinator.async_reset_solar_learning_data(
             coord,

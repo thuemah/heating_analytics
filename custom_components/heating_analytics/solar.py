@@ -292,61 +292,72 @@ class SolarCalculator:
         self,
         global_solar_vector: tuple[float, float, float],
         unit_coeff: dict[str, float],
-        screen_transmittance: float = 1.0,
     ) -> float:
-        """Calculate solar impact in kW for a specific unit.
+        """Calculate solar impact in kWh for a specific unit.
 
-        Since #809, coefficients are learned against the potential (pre-screen)
-        solar vector. The prediction path passes the potential vector and
-        screen_transmittance separately:
+        Per CLAUDE.md invariant #1: prediction uses ``coeff × potential``
+        with no extra transmittance factor.  The coefficient absorbs
+        ``avg_transmittance`` via the NLMS learning target (``base − actual``),
+        so multiplying by the current transmittance here would yield
+        ``phys × trans² × potential`` — the trans² bug.  Callers must pass
+        the *potential* (pre-screen reconstructed) vector.
 
-            Impact = (Coeff_S × Pot_S + Coeff_E × Pot_E + Coeff_W × Pot_W) × transmittance
+            Impact = Coeff_S × Pot_S + Coeff_E × Pot_E + Coeff_W × Pot_W
 
         With the 3-component decomposition (S, E, W), all basis functions and
         coefficients are non-negative, so the dot product is always >= 0.
-        The max(0, ...) clamp is retained as defense-in-depth.
+        The ``max(0, ...)`` clamp is retained as defense-in-depth.
         """
         solar_s, solar_e, solar_w = global_solar_vector
         coeff_s = unit_coeff.get("s", 0.0)
         coeff_e = unit_coeff.get("e", 0.0)
         coeff_w = unit_coeff.get("w", 0.0)
 
-        impact = (coeff_s * solar_s + coeff_e * solar_e + coeff_w * solar_w) * screen_transmittance
+        impact = coeff_s * solar_s + coeff_e * solar_e + coeff_w * solar_w
         return max(0.0, impact)
 
-    def calculate_unit_coefficient(self, entity_id: str, temp_key: str) -> dict[str, float]:
-        """Calculate 3D solar coefficient vector (S, E, W) for a specific unit.
+    def calculate_unit_coefficient(
+        self, entity_id: str, temp_key: str, mode: str
+    ) -> dict[str, float]:
+        """Calculate 3D solar coefficient vector (S, E, W) for one (unit, mode).
 
-        Solar gain is a physical property of the window (area, orientation, shading) and is
-        independent of outdoor temperature. The coefficient is therefore stored and looked up
-        globally per unit rather than stratified by temperature bucket.
+        Mode-stratified per #868: heating-mode lookups read
+        ``solar_coefficients_per_unit[entity]["heating"]``; cooling-mode
+        lookups read ``["cooling"]``.  Each regime absorbs its own
+        ``E[1/COP]`` and converges to a physically distinct value.
 
-        Uses the following priority:
-        1. Learned coefficient for this unit (global, not temp-stratified).
-        2. Mode-appropriate global default (optimized for heat pumps).
+        Mode is required (not derived from ``temp_key``).  Strict
+        signature catches accidental mode-blind call sites; ``temp_key``
+        is preserved for future temp-stratified extensions but currently
+        unused for coefficient lookup.
+
+        OFF / DHW / unknown modes route to the heating regime as a safe
+        fallback — these modes don't drive a real solar prediction (a
+        unit in OFF contributes 0 kWh; DHW prediction is separate), so
+        the regime choice is semantically irrelevant but stable.
+
+        Priority:
+        1. Learned coefficient for ``[entity][regime]`` if non-zero.
+        2. Mode-appropriate global default (heating: 0.35, cooling:
+           0.40) decomposed along the configured primary azimuth.
         """
-        # Check storage structure: {unit: {"s": float, "e": float, "w": float}}
-        coeff = self.coordinator.model.solar_coefficients_per_unit.get(entity_id)
-        if coeff is not None:
-            return coeff
+        del temp_key  # reserved; coefficients are temperature-blind by design
+        regime = "cooling" if mode in (MODE_COOLING, MODE_GUEST_COOLING) else "heating"
+        entity_coeffs = self.coordinator.model.solar_coefficients_per_unit.get(entity_id)
+        if isinstance(entity_coeffs, dict):
+            regime_coeff = entity_coeffs.get(regime)
+            if isinstance(regime_coeff, dict) and any(
+                regime_coeff.get(k) for k in ("s", "e", "w")
+            ):
+                return regime_coeff
 
-        # 2. Mode-appropriate Default
-        # If no coefficients learned yet for this mode, use global defaults.
-        # We derive the mode from temp_key or fall back to current unit mode.
-        mode = None
-        try:
-            target_t = int(temp_key)
-            mode = MODE_HEATING if target_t < self.coordinator.balance_point else MODE_COOLING
-        except ValueError:
-            mode = self.coordinator.get_unit_mode(entity_id)
-
-        default_scalar = 0.0
-        if mode in (MODE_HEATING, MODE_GUEST_HEATING):
-            default_scalar = DEFAULT_SOLAR_COEFF_HEATING
-        elif mode in (MODE_COOLING, MODE_GUEST_COOLING):
+        # Mode-appropriate default — same scalar / azimuth decomposition
+        # path as before, just regime-keyed instead of mode-keyed.
+        if regime == "cooling":
             default_scalar = DEFAULT_SOLAR_COEFF_COOLING
+        else:
+            default_scalar = DEFAULT_SOLAR_COEFF_HEATING
 
-        # Decompose global scalar default along the configured primary azimuth
         az_rad = math.radians(self.coordinator.solar_azimuth)
         return {
             "s": default_scalar * max(0.0, -math.cos(az_rad)),
