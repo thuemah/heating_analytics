@@ -137,10 +137,11 @@ async def test_async_batch_fit_solar_persists_skip_records():
     await coord.async_batch_fit_solar()
     # Save IS expected: per-regime skip-records are durable state.
     coord._async_save_data.assert_awaited_once()
-    # last_batch_fit recorded the per-unit attempt with insufficient_samples.
+    # last_batch_fit recorded the per-unit attempt with the new
+    # Tobit gate name (#904 stage 2 swap from LS to Tobit).
     assert "sensor.heater1" in coord._last_batch_fit_per_unit
     heating = coord._last_batch_fit_per_unit["sensor.heater1"]["regimes"]["heating"]
-    assert heating["skip_reason"] == "insufficient_samples"
+    assert heating["skip_reason"] == "insufficient_uncensored"
 
 
 @pytest.mark.asyncio

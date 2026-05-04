@@ -197,6 +197,13 @@ MIN_EXTRAPOLATION_DELTA_T = 0.5  # Minimum Delta T (Degrees) required to trust e
 SNR_WEIGHT_FLOOR = 0.1  # Minimum weight for sunny hours (avoids bucket starvation)
 SNR_WEIGHT_K = 3.0      # Slope: w = max(FLOOR, 1 − K × solar_factor)
 
+# Global base EMA: skip threshold for solar-saturated hours.
+# When the estimated global net (base − solar_normalization_delta) is below
+# this value the EMA update is suppressed.  At 0.0 only fully-clipped hours
+# are skipped (global_net = 0); raise to e.g. 0.010 (≈ 10 W) to also skip
+# near-saturated hours where the learning signal is similarly unreliable.
+GLOBAL_BASE_SATURATION_SKIP_KWH = 0.0
+
 # Inequality learning for solar shutdown hours.
 # Hours flagged as shutdown (by detect_solar_shutdown_entities) feed a
 # parallel one-sided learner.  The learner enforces
@@ -212,18 +219,106 @@ INEQUALITY_STEP_SIZE = 0.05   # Half of NLMS_STEP_SIZE — conservative for new 
 INEQUALITY_MARGIN = 0.9       # Constraint: coeff·potential ≥ MARGIN × base (10% buffer)
 
 # Batch-fit solar coefficients (#884).  A periodic offline least-squares
-# fit over the modulating-regime hourly log, intended to escape the
-# mild-weather catch-22 where NLMS and inequality both produce zero
-# signal because expected base demand is near zero (e.g. west sun
-# peaks during the warmest part of the day).  Joint 3×3 normal
-# equations + Cramer's rule (same machinery as cold-start) over N
-# samples extracts the coefficient even when each sample's individual
-# SNR is too low for online learning.  Per (entity, mode) — heating
-# and cooling regimes are fit independently.  Conservative defaults
-# chosen ahead of field validation; revise after one season of data.
-BATCH_FIT_MIN_SAMPLES = 30           # Below this, skip — too noisy to fit
-BATCH_FIT_DAMPING = 0.3              # new = α × batch + (1 - α) × current
-BATCH_FIT_SATURATION_RATIO = 0.95    # Drop samples where impact ≥ ratio × base
+# Periodic batch Tobit MLE fit over the modulating-regime hourly log
+# (#884 LS introduction; #904 stage 2 swap to censoring-aware Tobit).
+# Escapes the mild-weather catch-22 where NLMS and inequality both
+# produce zero signal because expected base demand is near zero (e.g.
+# west sun peaks during the warmest part of the day).  Saturation-
+# clipped samples (HP fully off because the room got warm) are now
+# kept as right-censored data with threshold ``T = ratio × base``,
+# instead of being dropped as #884 did — Tobit's Mills-ratio
+# likelihood term recovers slope information from the censoring
+# point itself.  Per (entity, mode) — heating and cooling regimes
+# are fit independently.  Damping factor revised after one season
+# of data.
+BATCH_FIT_DAMPING = 0.3              # new = α × tobit + (1 - α) × current
+BATCH_FIT_SATURATION_RATIO = 0.95    # Censoring threshold: T_i = ratio × base_i
+
+# Tobit MLE solver (#904).  Type-I right-censored Gaussian regression
+# for solar coefficients.  Used by ``compute_tobit_for_diagnose``
+# (stage 0+1 shadow surface in ``diagnose_solar``) AND by
+# ``batch_fit_solar_coefficients`` (stage 2 live solver swap).
+# Sample-size gates are two-pronged: ``|U| ≥ TOBIT_MIN_UNCENSORED``
+# pre-fit (σ identifiability) and ``n_eff ≥ TOBIT_MIN_NEFF`` post-fit
+# (slope identifiability) — censored samples that sit far inside the
+# censoring region carry near-zero λ(q) and add no slope info, so we
+# cannot count raw |C| toward effective sample size.
+TOBIT_MIN_UNCENSORED = 20            # |U| floor — σ identifiability gate
+TOBIT_RUNNING_WINDOW = 200           # #904 stage 3 — sliding-window cap for the live learner's recent-sample buffer.  Bounded memory (≈200 × 32 bytes ≈ 6 KB per (entity, regime) at peak); covers ~30 days of qualifying hours for a typical heating-active VP.  Newton iteration on the current window each hour.
+
+# Outlier robustness (#919)
+OUTLIER_RESIDUAL_WINDOW = 50        # Window size for the robust residual filter
+OUTLIER_K_THRESHOLD = 5.0           # Filter samples where |residual| > k * sigma_robust
+OUTLIER_MIN_SAMPLES = 20            # Wait for enough baseline before filtering
+OUTLIER_REJECTED_POOL_SIZE = 20
+OUTLIER_PROMOTION_THRESHOLD = 10
+HARD_OUTLIER_CAP_FACTOR = 10.0
+HARD_OUTLIER_SANITY_MULTIPLIER = 10.0
+TOBIT_MIN_NEFF = 40                  # |U| + Σ_C λ(q)(λ(q)−q) floor — slope identifiability
+TOBIT_MAX_ITER = 30                  # Projected-Newton iter cap
+TOBIT_CONV_TOL = 1e-6                # ‖step‖∞ on (c, log σ)
+TOBIT_Q_CLIP = -5.0                  # Lower trust-region clip on q = (T − c·s)/σ (Greene §17.3)
+
+# Plausibility-gate v2 (#918, 1.3.5 default-on) — automatic discriminator
+# applied inside ``_update_unit_tobit_live`` after the Tobit fit succeeds.
+# Replaces the manual ``tobit_live_entities`` allow-list as the primary
+# gate so default-on Tobit can ship without asking users to opt-in
+# per-entity.
+#
+# Rationale: Tobit's value-add is recovering large coefficients from
+# censoring information, but only meaningful when the uncensored
+# samples have SOME slope to enhance.  Pure-noise loads (small
+# electric circuits, wine cellars, garage sockets) have no uncensored
+# slope anywhere — their Tobit fit is censoring-pattern-driven only,
+# producing non-physical coefficients.  Magnitude-ratio
+# ``|OLS|/|Tobit|`` failed to discriminate (Toshiba VP: 0.30,
+# noise-load gjæringskjeller: 0.36 — VP ratio is LOWER because
+# Tobit's amplification factor is similar regardless of the
+# underlying physical reality).  OLS-max-direction across S/E/W is
+# the right discriminator: legitimate VPs always show some
+# uncensored signal in some direction; noise loads do not.
+#
+# Calibration on maintainer install (2026-04-30, 10-day window):
+# Toshiba 0.33, Mitsubishi 0.12, gjæringskjeller 0.04, vinkjeller
+# 0.005, garage 0.007, yaser-socket 0.009.  Threshold 0.10 sits in
+# the gap.  Bump rule: revisit after N≥3 multi-install observations
+# of legitimate-VP false-positives (real solar response, OLS max <
+# 0.10) OR noise-load false-negatives (no real solar response, OLS
+# max ≥ 0.10).  Both directions logged at info-level when the
+# plausibility-gate fires so multi-install evidence accumulates
+# passively post-default-on.
+PLAUSIBILITY_MIN_OLS_MAX_DIRECTION = 0.10   # Largest |OLS_d| across S/E/W must clear this for Tobit to pass
+PLAUSIBILITY_MIN_TOBIT_MAGNITUDE = 0.05     # Skip plausibility-check when Tobit fit is itself near-zero (no harm: zero writes through)
+
+# Plausibility-gate v2 — direction-agreement check.  Magnitude-only
+# discrimination misses a real failure mode: Tobit's projected-Newton
+# active-set can pin a direction at zero from a wrong warm-start (e.g.
+# NLMS-cold-start delivers ``{s: 1.0, e: 0, w: 0}`` to Tobit while real
+# signal has shifted to W-dominant), producing a wrong-direction
+# magnitude that satisfies ``ols_max ≥ 0.10`` because OLS-on-uncensored
+# correctly identifies the W-direction signal.  The cosine check
+# requires Tobit's coefficient vector to point in roughly the same
+# direction as OLS-on-uncensored — catches the warm-start direction
+# pinning failure.  Threshold 0.5 ≈ 60° mismatch tolerance — lenient
+# enough that random noise doesn't trip it on legitimate fits.  Not
+# applied on cooling regime (cooling has no censoring → Tobit ≡ OLS
+# exactly → cosine ≡ 1).
+PLAUSIBILITY_MIN_DIRECTION_COSINE = 0.5
+
+# Plausibility-gate v2 — general step-size limiter on Tobit's per-hour
+# delta.  Cap each direction's per-hour change to 30 % of the prior
+# coefficient's maximum component whenever ANY direction's proposed
+# step exceeds that cap.  Triggered by step magnitude alone (not
+# plausibility-block history): fires both on the post-block recovery
+# path AND on any other hour where Tobit's Newton step would produce
+# a large discontinuity (e.g. fast-changing data, late-converging
+# warm-start).  On the worst-case post-block jump (NLMS-converged
+# 0.55 → Tobit-fit 1.65 = 200 % single-hour step), the limiter spreads
+# convergence over ~5 hours: 0.715 → 0.929 → 1.207 → 1.569 → 1.65.
+# Skipped on cold-start (``prior_max < 0.05``) — there's no prior to
+# cushion against and the bootstrap step would otherwise stay clamped
+# at zero.  Applied uniformly across heating and cooling regimes.
+PLAUSIBILITY_RATE_LIMIT_FRACTION = 0.30
 
 # Apply-implied-coefficient guard parameters (#884 follow-up).  The
 # diagnose_solar implied-LS fit is precise but can be noisy on
@@ -286,8 +381,30 @@ DEFAULT_UNCERTAINTY_P50 = 1.0
 DEFAULT_UNCERTAINTY_P95 = 2.0
 
 # Storage
-STORAGE_VERSION = 4  # v4: mode-stratified solar coefficients (see storage.py:_migrate_v3_to_v4)
+STORAGE_VERSION = 5  # v5: Tobit live-learner sufficient-statistic state (#904 stage 3, see storage.py:_migrate_v4_to_v5)
 STORAGE_KEY = f"{DOMAIN}.storage"
+
+# Solar model version (#904 stage 3 blocker 2 — manual reset hook).  Bump
+# this whenever ``solar.py`` formulas / constants change in a way that
+# affects the ``effective_solar_vector`` values we log at hour boundary.
+# On Tobit live-learner load, if the stored model version differs from
+# this constant the running sufficient-statistic is zeroed and rebuilt
+# from cold-start (NLMS fallback fires until n_eff ≥ TOBIT_MIN_NEFF
+# again).  Without this, Tobit would silently fit against logged
+# vectors that no longer match the model it reconstructs against.
+#
+# Bump checklist (when in doubt, bump):
+# - SolarCalculator azimuth-projection formula
+# - Kasten cloud exponent or any cloud-factor constant
+# - Air-mass formula or its base
+# - Screen transmittance formula or constants (DEFAULT_SOLAR_MIN_TRANSMITTANCE,
+#   SCREEN_DIRECT_TRANSMITTANCE, COMPOSITE_LEGACY_FLOOR)
+# - Solar-vector decomposition (S/E/W projection logic)
+# Not affected:
+# - Coefficient-learning constants (NLMS step, regularization, etc.)
+# - Tobit solver internals (TOBIT_MAX_ITER, TOBIT_CONV_TOL)
+# - Storage / serialization changes that don't alter the logged value
+SOLAR_MODEL_VERSION = 1
 
 # Attributes
 ATTR_EFFICIENCY = "efficiency_kwh_tdd"

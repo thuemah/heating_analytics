@@ -240,7 +240,11 @@ class StatisticsManager:
 
             # Solar Reduction
             unit_solar_reduction = 0.0
-            if self.coordinator.solar_enabled:
+            cooling_solar_cold_start = (
+                unit_mode in (MODE_COOLING, MODE_GUEST_COOLING)
+                and self._is_cooling_solar_cold_start(entity_id)
+            )
+            if self.coordinator.solar_enabled and not cooling_solar_cold_start:
                  unit_coeff = self.coordinator.solar.calculate_unit_coefficient(
                      entity_id, temp_key, unit_mode
                  )
@@ -261,6 +265,12 @@ class StatisticsManager:
                  unit_solar_reduction = self.coordinator.solar.calculate_unit_solar_impact(
                      entity_pot_vec, unit_coeff
                  )
+            # If cooling cold-start: unit_solar_reduction stays 0.  See
+            # ``_is_cooling_solar_cold_start`` for rationale (cooling
+            # mode applies solar additively without saturation cap; a
+            # migration-seeded coefficient produces phantom demand
+            # until the cooling base bucket has at least
+            # LEARNING_BUFFER_THRESHOLD samples).
 
             # Mode already resolved above (unit_mode) and reused here.
             if self.coordinator.solar_enabled:
@@ -505,6 +515,72 @@ class StatisticsManager:
             },
             "unit_breakdown": unit_breakdown
         }
+
+    def _is_cooling_solar_cold_start(self, entity_id: str) -> bool:
+        """Detect cooling-regime cold-start for an entity.
+
+        Two-pronged gate (#921):
+
+        1. **Base-model gate.** No ``"cooling"`` sub-bucket present in
+           any temp_key of ``correlation_data_per_unit[entity]`` — the
+           base learner has not seen any cooling-mode hours yet.  The
+           base bucket fills after ``LEARNING_BUFFER_THRESHOLD = 4``
+           cooling-mode hour boundaries.
+
+        2. **Solar-coefficient gate.** Cooling regime's coefficient
+           dict is missing a ``learned: True`` flag.  A
+           ``_migrate_v3_to_v4``-seeded cooling vector (verbatim copy
+           of the heating coefficient, retained to preserve user-set
+           values) carries no flag and reads as unlearned — exactly
+           what we want to gate.  Once any solar learner (NLMS /
+           cold-start solver / inequality / batch-fit / apply-implied)
+           writes the cooling coefficient, it stamps ``learned: True``
+           and the gate releases.  Legacy storage without the flag
+           reads as ``False`` → gated until next learner write
+           (self-healing), no migration required.
+
+        Why both prongs are needed: prong (1) alone releases after 4
+        cooling-mode hours, but the seeded solar coefficient typically
+        takes much longer to be overwritten by the solar learner
+        (which has its own ``expected_unit_base ≥ nlms_threshold``
+        gate that idling cooling rooms may not satisfy for many
+        hours).  Between hour 5 and the first solar-learner write the
+        seeded coefficient would otherwise drive phantom additive
+        demand.
+
+        Why it matters: ``solar.calculate_saturation`` ADDS solar
+        potential to cooling-mode demand (no saturation cap — the
+        physics is "sun heats room → cooling needs more energy").
+        A migration-seeded cooling coefficient on cold-start produces
+        phantom additive demand on every cooling-mode hour, with no
+        clamping by base demand.  For entities with high heating-time
+        seed values (e.g. Toshiba VP-Stue with seeded cooling W=0.42),
+        the phantom contribution is ~0.5 kWh/h per qualifying hour —
+        accumulates to several kWh of fictitious expected load over
+        a full afternoon of cooling.
+
+        Read-side gate: when this returns True, callers set
+        ``unit_solar_reduction = 0`` for cooling-mode prediction.
+        """
+        # Prong 1: base-model gate.
+        unit_data = self.coordinator.model.correlation_data_per_unit.get(entity_id)
+        if not isinstance(unit_data, dict):
+            return True
+        has_cooling_bucket = any(
+            isinstance(buckets, dict) and COOLING_WIND_BUCKET in buckets
+            for buckets in unit_data.values()
+        )
+        if not has_cooling_bucket:
+            return True
+
+        # Prong 2: solar-coefficient learned-flag gate.
+        solar_coeffs = self.coordinator.model.solar_coefficients_per_unit.get(entity_id)
+        if not isinstance(solar_coeffs, dict):
+            return True
+        cooling_coeff = solar_coeffs.get("cooling")
+        if not isinstance(cooling_coeff, dict):
+            return True
+        return not cooling_coeff.get("learned", False)
 
     def _resolve_bucket_for_extrapolation(self, bucket_data: dict, requested_bucket: str) -> str | None:
         """Resolve the best available bucket for extrapolation, preventing recursion loops.
@@ -1888,11 +1964,18 @@ class StatisticsManager:
         unit_data = self.coordinator.model.correlation_data_per_unit.get(entity_id, {})
         unit_mode_fb = self.coordinator.get_unit_mode(entity_id)
         # Per #885: route cooling-mode units to the dedicated bucket.
-        if unit_mode_fb == MODE_COOLING:
+        if unit_mode_fb in (MODE_COOLING, MODE_GUEST_COOLING):
             wind_bucket = COOLING_WIND_BUCKET
         unit_base_curr = self._get_prediction_from_model(unit_data, temp_key, wind_bucket, current_temp, self.coordinator.balance_point)
 
-        if self.coordinator.solar_enabled:
+        # Cooling cold-start solar guard — match the gate in
+        # ``calculate_total_power``.  See ``_is_cooling_solar_cold_start``
+        # for rationale.
+        cooling_solar_cold_start = (
+            unit_mode_fb in (MODE_COOLING, MODE_GUEST_COOLING)
+            and self._is_cooling_solar_cold_start(entity_id)
+        )
+        if self.coordinator.solar_enabled and not cooling_solar_cold_start:
              curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
              unit_coeff = self.coordinator.solar.calculate_unit_coefficient(
                  entity_id, temp_key, unit_mode_fb
@@ -1917,6 +2000,8 @@ class StatisticsManager:
              mode = MODE_HEATING if current_temp < self.coordinator.balance_point else MODE_COOLING
              unit_rate_curr = self.coordinator.solar.apply_correction(unit_base_curr, unit_solar_curr_kw, mode)
         else:
+             # Either solar disabled, or cooling cold-start (skip phantom
+             # additive demand from migration-seeded cooling coefficient).
              unit_rate_curr = unit_base_curr
 
         return unit_rate_curr * (minutes_passed / 60.0)

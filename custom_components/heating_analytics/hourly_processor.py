@@ -725,6 +725,34 @@ class HourlyProcessor:
                 screen_config=self.coordinator.screen_config,
                 screen_affected_entities=self.coordinator._screen_affected_set,
                 unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
+                experimental_tobit_live_learner=getattr(
+                    self.coordinator,
+                    "_experimental_tobit_live_learner",
+                    False,
+                ),
+                tobit_live_entities=getattr(
+                    self.coordinator,
+                    "_tobit_live_entities",
+                    frozenset(),
+                ),
+                # MPC-managed entities (Track C, WeightedSmear+use_synthetic):
+                # excluded from live Tobit even when allow-listed.  Same
+                # gating logic as ``batch_fit_solar`` applies (#884
+                # ``weighted_smear_excluded`` skip).  Derived from the
+                # coordinator's strategy table at config-build time so
+                # the live gate doesn't need to call back into the
+                # strategy machinery.
+                mpc_managed_entities=frozenset(
+                    eid
+                    for eid, strat in (
+                        getattr(self.coordinator, "_unit_strategies", {}) or {}
+                    ).items()
+                    if (
+                        strat is not None
+                        and strat.__class__.__name__ == "WeightedSmear"
+                        and getattr(strat, "use_synthetic", False)
+                    )
+                ),
             )
 
             learning_result = self.coordinator.learning.process_learning(
@@ -767,12 +795,48 @@ class HourlyProcessor:
                     final_learning_status = "skipped_dual_interference"
 
             # Calculate Thermodynamic Gross (Actual + Aux + Solar Adjustment)
-            # Make mode-aware: Add in Heating, Subtract in Cooling
-            # Use effective_solar_impact (battery-smoothed) so the gross reflects
-            # the full residual solar heat carried in building mass.
-            solar_adjustment = effective_solar_impact
-            if avg_temp >= self.coordinator.balance_point:
-                solar_adjustment = -effective_solar_impact
+            # Mode-aware per-unit (#921 follow-up).  Solar acts in OPPOSITE
+            # directions on heating vs cooling units within the same hour
+            # (heating: solar SAVED demand → add back into gross; cooling:
+            # solar ADDED demand → subtract from gross).  The previous
+            # ``avg_temp >= balance_point`` proxy was wrong on:
+            #   - Mixed-mode hours (some heating, some cooling units active).
+            #   - Cooling near BP / heating above BP (mode ≠ temperature).
+            # ``solar_heating_applied_kwh`` and ``solar_cooling_applied_kwh``
+            # from ``calculate_total_power`` are already per-unit-mode
+            # aggregates of THIS HOUR's applied solar.  Their ratio gives
+            # the per-mode share; we apply that share to the battery-
+            # smoothed scalar so lagged thermal-mass release still adjusts
+            # gross with the correct sign.
+            #
+            # Fallback: when no solar was applied this hour but the
+            # battery still carries residual (post-sunset thermal mass),
+            # the share ratio is undefined.  Classify by active unit
+            # modes — residual mass benefits heating, hurts cooling.
+            # Mixed or all-OFF/DHW: drop the adjustment (cannot apportion).
+            heating_applied = res_analysis["breakdown"].get("solar_heating_applied_kwh", 0.0)
+            cooling_applied = res_analysis["breakdown"].get("solar_cooling_applied_kwh", 0.0)
+            total_applied = heating_applied + cooling_applied
+            if total_applied > 1e-6:
+                mode_signed_fraction = (heating_applied - cooling_applied) / total_applied
+                solar_adjustment = effective_solar_impact * mode_signed_fraction
+            elif effective_solar_impact > 0:
+                has_heating_active = any(
+                    self.coordinator.get_unit_mode(eid) in (MODE_HEATING, MODE_GUEST_HEATING)
+                    for eid in self.coordinator.energy_sensors
+                )
+                has_cooling_active = any(
+                    self.coordinator.get_unit_mode(eid) in (MODE_COOLING, MODE_GUEST_COOLING)
+                    for eid in self.coordinator.energy_sensors
+                )
+                if has_heating_active and not has_cooling_active:
+                    solar_adjustment = effective_solar_impact
+                elif has_cooling_active and not has_heating_active:
+                    solar_adjustment = -effective_solar_impact
+                else:
+                    solar_adjustment = 0.0
+            else:
+                solar_adjustment = 0.0
 
             thermodynamic_gross_kwh = total_energy_kwh + aux_impact_kwh + solar_adjustment
 

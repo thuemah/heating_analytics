@@ -40,12 +40,22 @@ def _sanitize_solar_coeff(value: dict) -> dict:
     cardinal direction (south, east, west).  Solar gain can only reduce
     heating demand — negative coefficients are physically impossible.
     All three components are clamped to >= 0.
+
+    Preserves the optional ``learned`` flag (#921) when present.
+    Missing flag defaults to ``False`` — read sites use
+    ``.get("learned", False)`` so absence is semantically equivalent
+    to omitting the key, but persisting it once a learner has set it
+    keeps the round-trip stable.  No storage-version bump: the flag
+    is additive within the existing dict shape.
     """
-    return {
+    out = {
         "s": round(max(0.0, value.get("s", 0.0)), 5),
         "e": round(max(0.0, value.get("e", 0.0)), 5),
         "w": round(max(0.0, value.get("w", 0.0)), 5),
     }
+    if "learned" in value:
+        out["learned"] = bool(value["learned"])
+    return out
 
 
 def _sanitize_stratified(value: dict) -> dict:
@@ -292,6 +302,38 @@ def _migrate_v3_to_v4(data: dict) -> dict:
     return data
 
 
+def _migrate_v4_to_v5(data: dict) -> dict:
+    """Migrate storage v4 -> v5 — Tobit live-learner state.
+
+    Additive: three new top-level keys default to "Tobit live-learner
+    disabled" at the migration boundary.  The 1.3.5 default-on flip
+    (``_tobit_default_applied`` marker) happens at load-time AFTER
+    this migration, not here — keeping migration semantics ("seed
+    safe defaults") separate from runtime promotion semantics ("apply
+    1.3.5 default on first load").  See ``async_load_data`` for the
+    marker logic; the user can opt out via
+    ``heating_analytics.set_experimental_tobit_live_learner enabled: false``.
+
+    - ``tobit_sufficient_stats``: per-(entity, regime) running statistic
+      consumed by the live Tobit step.  Empty on first load post-upgrade
+      → cold-start; NLMS fallback fires until n_eff ≥ TOBIT_MIN_NEFF.
+    - ``experimental_tobit_live_learner``: the master gate.  Defaults
+      False here; the load-path promotes to True on first 1.3.5+ load
+      via the ``_tobit_default_applied`` marker.
+    - ``tobit_live_entities``: optional scope-restriction list.  Empty
+      list = auto-mode (plausibility-gate decides per entity);
+      non-empty = scope-override (only listed entities try Tobit).
+
+    This migration is idempotent: running it twice on the same input
+    produces the same result, because dict.setdefault is a no-op when
+    the key already exists.
+    """
+    data.setdefault("tobit_sufficient_stats", {})
+    data.setdefault("experimental_tobit_live_learner", False)
+    data.setdefault("tobit_live_entities", [])
+    return data
+
+
 class StorageManager:
     """Manages data persistence (JSON, CSV)."""
 
@@ -350,6 +392,13 @@ class StorageManager:
                 old_major_version,
             )
             old_data = _migrate_v3_to_v4(old_data)
+
+        if old_major_version < 5:
+            _LOGGER.info(
+                "Heating Analytics: migrating storage v%d -> v5 (Tobit live-learner state, #904 stage 3)",
+                old_major_version,
+            )
+            old_data = _migrate_v4_to_v5(old_data)
 
         return old_data
 
@@ -473,6 +522,91 @@ class StorageManager:
                 self._cleanup_removed_sensors(self.coordinator._last_batch_fit_per_unit)
             else:
                 self.coordinator._last_batch_fit_per_unit = {}
+
+            # Load Tobit live-learner state (#904 stage 3, storage v5).
+            # Three fields survive a v4 → v5 migration with documented
+            # defaults: sufficient_stats empty (cold-start), flag False
+            # (master gate off), allow-list empty (no entity opted in).
+            #
+            # Model-version reset hook: each (entity, regime) sufficient-
+            # stat carries a ``solar_model_version`` field at write time.
+            # On load we drop any stat where stored version != current
+            # SOLAR_MODEL_VERSION.  Live-learner falls back to NLMS until
+            # n_eff ≥ TOBIT_MIN_NEFF rebuilds against the new model.
+            from .const import SOLAR_MODEL_VERSION as _CURRENT_SOLAR_VERSION
+            loaded_tobit_stats = data.get("tobit_sufficient_stats", {})
+            if isinstance(loaded_tobit_stats, dict):
+                kept: dict = {}
+                version_drift_count = 0
+                for entity_id, regimes in loaded_tobit_stats.items():
+                    if not isinstance(regimes, dict):
+                        continue
+                    kept_regimes: dict = {}
+                    for regime, stat in regimes.items():
+                        if not isinstance(stat, dict):
+                            continue
+                        stored_version = stat.get(
+                            "solar_model_version", _CURRENT_SOLAR_VERSION
+                        )
+                        if stored_version != _CURRENT_SOLAR_VERSION:
+                            version_drift_count += 1
+                            continue
+                        kept_regimes[regime] = stat
+                    if kept_regimes:
+                        kept[entity_id] = kept_regimes
+                self.coordinator._tobit_sufficient_stats = kept
+                self._cleanup_removed_sensors(
+                    self.coordinator._tobit_sufficient_stats
+                )
+                if version_drift_count > 0:
+                    _LOGGER.info(
+                        "Tobit live-learner: dropped %d (entity, regime) "
+                        "sufficient-statistic(s) with stale "
+                        "solar_model_version (current = %d).  Affected "
+                        "slots will rebuild from cold-start; NLMS "
+                        "fallback covers the gap until n_eff ≥ floor.",
+                        version_drift_count,
+                        _CURRENT_SOLAR_VERSION,
+                    )
+            else:
+                self.coordinator._tobit_sufficient_stats = {}
+
+            self.coordinator._experimental_tobit_live_learner = bool(
+                data.get("experimental_tobit_live_learner", False)
+            )
+            loaded_allow_list = data.get("tobit_live_entities", [])
+            if isinstance(loaded_allow_list, list):
+                self.coordinator._tobit_live_entities = frozenset(
+                    s for s in loaded_allow_list if isinstance(s, str)
+                )
+            else:
+                self.coordinator._tobit_live_entities = frozenset()
+
+            # Default-on marker (#918, 1.3.5).  Missing marker → first
+            # load after upgrade from <= 1.3.4 (or fresh install).
+            # Flip the flag to True and stamp the marker so subsequent
+            # loads respect whatever value the user has set (including
+            # an explicit disable via set_experimental_tobit_live_learner).
+            # Idempotent: a second load with marker=True is a no-op.
+            # Persisted via async_save_data; the next save propagates
+            # the new flag value AND the marker.  No STORAGE_VERSION
+            # bump because this is additive and fresh-install / upgrade
+            # both converge on the same end state on first load.
+            self.coordinator._tobit_default_applied = bool(
+                data.get("_tobit_default_applied", False)
+            )
+            if not self.coordinator._tobit_default_applied:
+                _LOGGER.info(
+                    "Tobit live-learner: applying 1.3.5 default-on "
+                    "(was %s).  Plausibility-gate v2 decides per entity; "
+                    "non-empty allow-list overrides scope.  Disable via "
+                    "set_experimental_tobit_live_learner enabled: false "
+                    "to opt out — the marker prevents this from "
+                    "re-flipping on subsequent loads.",
+                    self.coordinator._experimental_tobit_live_learner,
+                )
+                self.coordinator._experimental_tobit_live_learner = True
+                self.coordinator._tobit_default_applied = True
 
             # Load unit modes
             loaded_unit_modes = data.get("unit_modes", {})
@@ -1042,6 +1176,21 @@ class StorageManager:
                     "unit_modes": self.coordinator._unit_modes,
                     "solar_optimizer_data": self.coordinator.solar_optimizer.get_data(),
                     "last_batch_fit_per_unit": self.coordinator._last_batch_fit_per_unit,
+                    # Tobit live-learner state (#904 stage 3, storage v5).
+                    # When the master flag is False these fields persist
+                    # untouched — flag-off installs save the migrated v5
+                    # defaults and load them back identically.
+                    "tobit_sufficient_stats": self.coordinator._tobit_sufficient_stats,
+                    "experimental_tobit_live_learner": self.coordinator._experimental_tobit_live_learner,
+                    "tobit_live_entities": list(self.coordinator._tobit_live_entities),
+                    # Default-on marker (#918, 1.3.5).  Persisted so the
+                    # load-time flip happens exactly once per install,
+                    # and so an explicit user-disable via
+                    # set_experimental_tobit_live_learner survives
+                    # restart.
+                    "_tobit_default_applied": bool(
+                        getattr(self.coordinator, "_tobit_default_applied", False)
+                    ),
                 }
                 await self._store.async_save(data)
                 self._last_save_time = now
@@ -1127,6 +1276,19 @@ class StorageManager:
             "potential_battery_e": self.coordinator._potential_battery_e,
             "potential_battery_w": self.coordinator._potential_battery_w,
             "battery_model": "ema",
+            # Tobit live-learner state (1.3.5+).  Including these
+            # in the backup ensures that user choices (explicit
+            # disable, scope-restriction list) and accumulated
+            # learner state (sufficient_stats sliding window)
+            # survive a backup → restore round-trip.  Without
+            # these fields a restore would silently fall back to
+            # default-on regardless of the user's stored intent.
+            "tobit_sufficient_stats": self.coordinator._tobit_sufficient_stats,
+            "experimental_tobit_live_learner": self.coordinator._experimental_tobit_live_learner,
+            "tobit_live_entities": list(self.coordinator._tobit_live_entities),
+            "_tobit_default_applied": bool(
+                getattr(self.coordinator, "_tobit_default_applied", True)
+            ),
         }
 
         def _write_json():
@@ -1170,6 +1332,7 @@ class StorageManager:
                 solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", 0.80),
             )
             data = _migrate_v3_to_v4(data)
+            data = _migrate_v4_to_v5(data)
 
             # Apply Data
             self.coordinator._correlation_data.clear()
@@ -1288,6 +1451,64 @@ class StorageManager:
 
             # Restore Solar Optimizer
             self.coordinator.solar_optimizer.set_data(data.get("solar_optimizer_data", {}))
+
+            # Restore Tobit live-learner state — CONDITIONAL on whether
+            # the backup actually contains it.  The discriminator is
+            # ``_tobit_default_applied``: this marker is added in 1.3.5+
+            # save paths but is NOT seeded by ``_migrate_v4_to_v5``
+            # (which only seeds the three v5-introduced fields:
+            # ``tobit_sufficient_stats``, ``experimental_tobit_live_learner``,
+            # ``tobit_live_entities`` — all to safe defaults).  So the
+            # marker's presence after migrations have run is a clean
+            # signal of "this backup was taken from a marker-aware
+            # install" — use it to decide whether to overwrite current-
+            # session state.  For pre-1.3.5 backups: preserve current
+            # session (no overwrite, no re-flip).  For 1.3.5+ backups:
+            # restore all four fields verbatim from backup — including
+            # an explicit user-disable.  Pre-fix this path unconditionally
+            # re-flipped the marker when missing from data, which
+            # clobbered every user-disable on every restore.
+            from .const import SOLAR_MODEL_VERSION as _CURRENT_SOLAR_VERSION_RESTORE
+            if "_tobit_default_applied" in data:
+                self.coordinator._tobit_default_applied = bool(
+                    data["_tobit_default_applied"]
+                )
+                self.coordinator._experimental_tobit_live_learner = bool(
+                    data.get("experimental_tobit_live_learner", True)
+                )
+                loaded_allow_list = data.get("tobit_live_entities", [])
+                if isinstance(loaded_allow_list, list):
+                    self.coordinator._tobit_live_entities = frozenset(
+                        s for s in loaded_allow_list if isinstance(s, str)
+                    )
+                else:
+                    self.coordinator._tobit_live_entities = frozenset()
+                loaded_tobit_stats = data.get("tobit_sufficient_stats", {})
+                if isinstance(loaded_tobit_stats, dict):
+                    kept: dict = {}
+                    for entity_id_t, regimes in loaded_tobit_stats.items():
+                        if not isinstance(regimes, dict):
+                            continue
+                        kept_regimes: dict = {}
+                        for regime_t, stat in regimes.items():
+                            if not isinstance(stat, dict):
+                                continue
+                            stored_version = stat.get(
+                                "solar_model_version", _CURRENT_SOLAR_VERSION_RESTORE
+                            )
+                            if stored_version != _CURRENT_SOLAR_VERSION_RESTORE:
+                                continue
+                            kept_regimes[regime_t] = stat
+                        if kept_regimes:
+                            kept[entity_id_t] = kept_regimes
+                    self.coordinator._tobit_sufficient_stats = kept
+                else:
+                    self.coordinator._tobit_sufficient_stats = {}
+            # else: backup is pre-1.3.5 / pre-marker.  Preserve current
+            # session's Tobit state — don't touch any field.  Migration
+            # has seeded data["tobit_sufficient_stats"] = {} etc. but
+            # those are migration safe-defaults, not the backup's
+            # intent, so we explicitly do NOT read them.
 
             await self.async_save_data(force=True)
 

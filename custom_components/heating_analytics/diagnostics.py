@@ -622,6 +622,7 @@ class DiagnosticsEngine:
         from .const import (
             MODE_HEATING, MODE_COOLING, MODE_OFF, MODE_DHW,
             MODE_GUEST_HEATING, MODE_GUEST_COOLING,
+            HARD_OUTLIER_SANITY_MULTIPLIER,
         )
         from .solar import SolarCalculator as _SC
 
@@ -697,7 +698,7 @@ class DiagnosticsEngine:
             return unit_accum[eid]
 
         # Global accumulators
-        excluded = {"aux": 0, "guest": 0, "saturated": 0, "low_vector": 0, "no_base": 0, "legacy": 0}
+        excluded = {"aux": 0, "guest": 0, "saturated": 0, "low_vector": 0, "no_base": 0, "legacy": 0, "outlier": 0}
         total_qualifying = 0
 
         # Battery calibration: collect per-day hourly sequences for decay sweep.
@@ -912,6 +913,12 @@ class DiagnosticsEngine:
                 base_unit = unit_expected_base.get(entity_id)
                 if base_unit is None:
                     excluded["no_base"] += 1
+                    continue
+
+                # Prior-free sanity check (#919 Part 5)
+                # Mirrors the match_diagnose=True path in _collect_batch_fit_samples
+                if base_unit > 0 and abs(actual_unit - base_unit) > HARD_OUTLIER_SANITY_MULTIPLIER * base_unit:
+                    excluded["outlier"] += 1
                     continue
 
                 # Implied solar reduction
@@ -1492,6 +1499,156 @@ class DiagnosticsEngine:
             else:
                 coefficient_split_delta = None
 
+            # Tobit MLE (#904 stage 0+1, shadow-only).  Censoring-aware
+            # estimator surfaced alongside ``implied_coefficient_30d``
+            # (which drops saturated rows) and ``implied_coefficient_inequality``
+            # (which lower-bounds via shutdown).  Modulating-regime fit
+            # only — shutdown rows excluded per CHOICE 3, saturated
+            # rows kept as right-censored at ``T = 0.95×base`` per
+            # CHOICE 2.  No production wiring; informational diagnostic
+            # for stage-1 evidence collection.  Heating regime only at
+            # this stage (mirrors the existing implied_30d display
+            # convention; cooling Tobit deferred until the heating
+            # path validates).
+            try:
+                tobit_fit = self.coordinator.learning.compute_tobit_for_diagnose(
+                    self.coordinator._hourly_log,
+                    entity_id,
+                    "heating",
+                    self.coordinator,
+                    unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
+                    days_back=days_back,
+                )
+            except Exception:  # noqa: BLE001
+                # Defensive: shadow diagnostic must never break diagnose_solar.
+                tobit_fit = {
+                    "coefficient": None,
+                    "skip_reason": "exception",
+                }
+            tobit_coeff = tobit_fit.get("coefficient")
+            tobit_diagnostics = {
+                "iterations": tobit_fit.get("iterations", 0),
+                "converged": tobit_fit.get("converged", False),
+                "failure_reason": tobit_fit.get("failure_reason"),
+                "sigma": tobit_fit.get("sigma"),
+                "log_likelihood": tobit_fit.get("log_likelihood"),
+                "n_uncensored": tobit_fit.get("n_uncensored", 0),
+                "n_censored": tobit_fit.get("n_censored", 0),
+                "censored_fraction": tobit_fit.get("censored_fraction", 0.0),
+                "n_eff": tobit_fit.get("n_eff", 0.0),
+                "skip_reason": tobit_fit.get("skip_reason"),
+            }
+
+            # Live Tobit-learner state (#904 stage 3).  Surfaces the
+            # running sufficient-statistic snapshot for the maintainer's
+            # validation window — without this there's no per-hour
+            # observability into the live learner's convergence.
+            # Always emitted (even when the master flag is off) so
+            # callers walking the per_unit dict don't need conditional
+            # presence checks.  The ``enabled`` and ``allow_listed``
+            # fields disambiguate active vs dormant state.
+            from .const import SOLAR_MODEL_VERSION as _CURRENT_SOLAR_VERSION
+            tobit_live_stats = (
+                self.coordinator._tobit_sufficient_stats.get(entity_id, {})
+                if isinstance(getattr(self.coordinator, "_tobit_sufficient_stats", None), dict)
+                else {}
+            )
+            shadow_entry = (
+                self.coordinator._nlms_shadow_coefficients.get(entity_id)
+                if isinstance(getattr(self.coordinator, "_nlms_shadow_coefficients", None), dict)
+                else None
+            )
+
+            def _build_regime_block(regime_name: str) -> dict:
+                slot = tobit_live_stats.get(regime_name) or {}
+                samples = slot.get("samples", [])
+                n_unc = sum(1 for s in samples if not s[4])
+                n_cens = sum(1 for s in samples if s[4])
+                last_step = slot.get("last_step", {})
+                shadow_regime = (
+                    shadow_entry.get(regime_name) if isinstance(shadow_entry, dict) else None
+                )
+                return {
+                    "in_cold_start": (
+                        last_step.get("skip_reason") in (
+                            "insufficient_uncensored",
+                            "insufficient_effective_samples",
+                        )
+                        or last_step.get("converged") is not True
+                    ),
+                    "n_uncensored": n_unc,
+                    "n_censored": n_cens,
+                    "n_eff": last_step.get("n_eff", float(n_unc)),
+                    "last_step_iterations": last_step.get("iterations", 0),
+                    "last_step_failure_reason": last_step.get("failure_reason"),
+                    "last_step_norm": last_step.get("step_norm", 0.0),
+                    "last_step_skip_reason": last_step.get("skip_reason"),
+                    "sigma": last_step.get("sigma"),
+                    "current_coefficient_nlms_shadow": (
+                        {k: round(float(shadow_regime.get(k, 0.0)), 4) for k in ("s", "e", "w")}
+                        if isinstance(shadow_regime, dict)
+                        else None
+                    ),
+                    "solar_model_version": slot.get(
+                        "solar_model_version", _CURRENT_SOLAR_VERSION
+                    ),
+                    "samples_since_reset": slot.get("samples_since_reset", 0),
+                }
+
+            # Both regimes surfaced (review I4, #912).  Cooling-active
+            # entities and dual-mode VPs need observability into both
+            # slots; previously only heating was reported and cooling
+            # was invisible.  Top-level ``enabled`` / scope state apply
+            # to both regimes equally so they live at the parent.
+            #
+            # Scope semantics (1.3.5+ default-on):
+            # ``in_scope_override`` reflects whether the entity is in
+            # the optional scope-restriction list (non-empty list =
+            # only listed entities try Tobit).  ``tobit_routed_to_live``
+            # reflects whether Tobit is actually running for this
+            # entity at this hour given all gates: master flag enabled
+            # AND (auto-mode OR in scope) AND not MPC-managed.  A user
+            # walking ``per_unit[entity_id].live_tobit_state`` should
+            # consult ``tobit_routed_to_live`` for "is Tobit on for me",
+            # not the legacy ``allow_listed`` field.
+            tobit_flag = bool(getattr(
+                self.coordinator, "_experimental_tobit_live_learner", False
+            ))
+            scope_list = getattr(
+                self.coordinator, "_tobit_live_entities", frozenset()
+            )
+            mpc_managed = frozenset(
+                eid
+                for eid, strat in (
+                    getattr(self.coordinator, "_unit_strategies", {}) or {}
+                ).items()
+                if (
+                    strat is not None
+                    and strat.__class__.__name__ == "WeightedSmear"
+                    and getattr(strat, "use_synthetic", False)
+                )
+            )
+            in_scope = (not scope_list) or (entity_id in scope_list)
+            tobit_routed = (
+                tobit_flag and in_scope and entity_id not in mpc_managed
+            )
+            live_tobit_state = {
+                "enabled": tobit_flag,
+                "scope_mode": "auto" if not scope_list else "override",
+                "in_scope_override": (
+                    entity_id in scope_list if scope_list else None
+                ),
+                "tobit_routed_to_live": tobit_routed,
+                # Legacy field name preserved for backward compatibility
+                # with consumers that walked ``allow_listed`` under the
+                # pre-1.3.5 opt-in semantic — now reports the effective
+                # routed state.  New consumers should use
+                # ``tobit_routed_to_live`` directly.
+                "allow_listed": tobit_routed,
+                "heating": _build_regime_block("heating"),
+                "cooling": _build_regime_block("cooling"),
+            }
+
             # Inactive-unit collapse (#896 follow-up).  Sensors with no
             # learned coefficient, no saturation, no shutdown signal, and
             # no flags carry no actionable information in the verbose
@@ -1531,6 +1688,29 @@ class DiagnosticsEngine:
                     "implied_coefficient_30d": implied_30d,
                     "qualifying_hours": acc["n"],
                     "mean_delta_kwh": round(mean_delta, 4),
+                    # Stage 3 (#912) review I5: live_tobit_state must
+                    # appear on the inactive branch too.  An entity
+                    # that's allow-listed but has no qualifying hours
+                    # collapses here, and ``allow_listed`` /
+                    # ``enabled`` are the only place to confirm the
+                    # gate is actually active for it.  Hides the
+                    # verbose per-regime detail (sample lists are
+                    # always empty on inactive units) but keeps the
+                    # gate-status fields.
+                    "live_tobit_state": {
+                        "enabled": live_tobit_state["enabled"],
+                        "allow_listed": live_tobit_state["allow_listed"],
+                        "heating": {
+                            "n_uncensored": live_tobit_state["heating"]["n_uncensored"],
+                            "n_censored": live_tobit_state["heating"]["n_censored"],
+                            "samples_since_reset": live_tobit_state["heating"]["samples_since_reset"],
+                        },
+                        "cooling": {
+                            "n_uncensored": live_tobit_state["cooling"]["n_uncensored"],
+                            "n_censored": live_tobit_state["cooling"]["n_censored"],
+                            "samples_since_reset": live_tobit_state["cooling"]["samples_since_reset"],
+                        },
+                    },
                     "flags": flags,
                 }
             else:
@@ -1547,6 +1727,9 @@ class DiagnosticsEngine:
                     "implied_coefficient_30d_no_shutdown": implied_no_shutdown,
                     "implied_coefficient_inequality": implied_inequality_coeff,
                     "implied_coefficient_physical": implied_physical,
+                    "implied_coefficient_tobit_30d": tobit_coeff,
+                    "tobit_diagnostics": tobit_diagnostics,
+                    "live_tobit_state": live_tobit_state,
                     "stability_windows": stability,
                     "mean_delta_kwh": round(mean_delta, 4),
                     "saturation_pct": round(100 * acc["saturated"] / acc["qualifying"], 1) if acc["qualifying"] > 0 else 0.0,

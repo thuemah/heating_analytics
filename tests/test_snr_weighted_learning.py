@@ -234,15 +234,23 @@ class TestLearnFromHistoricalImportUnderSnr:
         )
         return correlation_data.get("10", {}).get("normal", 0.0)
 
-    def test_full_weight_dark_hour_seeds_from_raw(self):
-        """w=1.0 on empty bucket → bucket seeded with raw actual."""
-        v = self._call(actual_kwh=1.0, snr_weight=1.0, solar_delta=99.0)
-        # Delta ignored — bucket reflects raw actual
-        assert v == pytest.approx(1.0)
+    def test_full_weight_dark_hour_seeds_from_normalized(self):
+        """w=1.0 on empty bucket → bucket seeded with dark-equivalent (#930)."""
+        v = self._call(actual_kwh=1.0, snr_weight=1.0, solar_delta=0.5)
+        # Cold-start seed = actual + delta = 1.5
+        assert v == pytest.approx(1.5)
 
-    def test_full_weight_ema_uses_raw_target(self):
-        """w=1.0 on existing bucket → EMA toward raw actual, not actual+delta."""
-        # bucket=2.0, actual=1.0, delta=0.5 → SNR target=1.0, new=2.0+0.5*(1.0-2.0)=1.5
+    def test_one_sided_lift_when_below_dark_target(self):
+        """bucket < dark_target → EMA pulls up toward dark-equivalent (#930)."""
+        # bucket=1.0, actual=1.0, delta=0.5 → dark_target=1.5, current<target
+        # new = 1.0 + 0.5*(1.5-1.0) = 1.25
+        v = self._call(actual_kwh=1.0, snr_weight=1.0, solar_delta=0.5, current_bucket=1.0)
+        assert v == pytest.approx(1.25)
+
+    def test_one_sided_uses_raw_when_above_dark_target(self):
+        """bucket >= dark_target → legacy EMA toward raw actual (#930)."""
+        # bucket=2.0, actual=1.0, delta=0.5 → dark_target=1.5, current>target
+        # new = 2.0 + 0.5*(1.0-2.0) = 1.5  (raw-actual path, not dark)
         v = self._call(actual_kwh=1.0, snr_weight=1.0, solar_delta=0.5, current_bucket=2.0)
         assert v == pytest.approx(1.5)
 

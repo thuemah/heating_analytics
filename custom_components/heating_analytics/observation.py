@@ -95,10 +95,34 @@ def detect_solar_shutdown_entities(
             threshold = float(override_val)
         else:
             threshold = SOLAR_SHUTDOWN_MIN_BASE
+
+        # Absolute parasitic-floor check fires when ``base > 0`` AND
+        # ``actual < ACTUAL_FLOOR`` — even when ``base < threshold``.
+        # Pre-fix the gate ordering put the ``base < threshold`` skip
+        # BEFORE the absolute check, which meant a low-modulation HP
+        # showing standby/parasitic consumption (~12 Wh) on a mild day
+        # with low base (~0.08 kWh) got missed: base failed the
+        # eligibility gate, the absolute actual-floor check never ran,
+        # and the hour was misclassified as modulating instead of
+        # shutdown.  Tobit / NLMS then ingested it with
+        # ``actual_impact ≈ 0.07 kWh`` ("86 % of base disappeared"),
+        # inflating the solar coefficient on what was physically a
+        # fully-off compressor.  See post-stage-3 audit (#904) for the
+        # field data.  ``base > 0`` is required so that an offline
+        # sensor (no data, base reads zero) is NOT mistaken for a
+        # shutdown — that case should remain "no signal", not
+        # "shutdown".
+        if base > 0.0 and actual < SOLAR_SHUTDOWN_ACTUAL_FLOOR:
+            flagged.append(entity_id)
+            continue
+
         if base < threshold:
+            # Below noise floor AND not parasitic — neither modulating-
+            # nor-shutdown-classifiable.  Existing behaviour preserved
+            # for non-parasitic low-base hours.
             continue
         ratio = actual / base if base > 0 else 1.0
-        if actual < SOLAR_SHUTDOWN_ACTUAL_FLOOR or ratio < SOLAR_SHUTDOWN_RATIO:
+        if ratio < SOLAR_SHUTDOWN_RATIO:
             flagged.append(entity_id)
     return tuple(flagged)
 
@@ -147,6 +171,32 @@ class LearningConfig:
     # detection per unit.  None or empty → all gate sites fall back to
     # the global SOLAR_*_MIN_BASE constants (legacy behaviour).
     unit_min_base: dict[str, float] | None = None
+
+    # Tobit live-learner gate (storage v5+, default-on on 1.3.5+).
+    # The master flag must be True AND the (entity, regime) must satisfy
+    # the scope predicate: empty ``tobit_live_entities`` = auto-mode
+    # (every eligible entity candidates Tobit, plausibility-gate v2
+    # decides per entity); non-empty list = scope-restrict to listed
+    # entities only (plausibility still applies within scope —
+    # explicit listing does not bypass the noise-load filter).  When
+    # the master flag is False (user explicit disable), NLMS runs as
+    # primary writer for every entity and the running sufficient-
+    # statistic state is untouched.
+    experimental_tobit_live_learner: bool = False
+    tobit_live_entities: frozenset[str] = field(default_factory=frozenset)
+    # MPC-managed entities (Track C, ``WeightedSmear(use_synthetic=True)``):
+    # excluded from live Tobit unconditionally — even when scope-listed
+    # by the user.  MPC's load-shifting produces samples that are not a
+    # function of solar potential at this hour (HP runs hard at 02:00
+    # without sun, idles at 12:00 with sun).  Tobit fitting against
+    # such samples produces non-physical coefficients.  Mirrors the
+    # ``weighted_smear_excluded`` skip path that
+    # ``batch_fit_solar_coefficients`` already applies; defense-in-depth
+    # so scope-list misconfiguration cannot accidentally feed Tobit
+    # MPC-managed data.  Track C users continue to use
+    # ``apply_implied_coefficient`` (path 5) for MPC-managed sensors,
+    # which is the documented mechanism.
+    mpc_managed_entities: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -284,6 +334,21 @@ class ModelState:
     # --- History (read-only references) ---
     daily_history: dict = field(default_factory=dict)
     hourly_log: list = field(default_factory=list)
+
+    # --- Tobit live-learner state (#904 stage 3) ---
+    # Mutable references owned by the coordinator; consumed by
+    # ``LearningManager._update_unit_tobit_live`` at hour boundaries.
+    # ``None`` is permitted on legacy ModelState construction sites
+    # (replay paths, tests pre-stage-3) — learning code falls back to
+    # NLMS-only when either is None.
+    tobit_sufficient_stats: dict | None = None
+    nlms_shadow_coefficients: dict | None = None
+    # Stage 3 (#912) review I1: NLMS shadow path uses a separate
+    # cold-start buffer to avoid aliasing main's buffer.  Coordinator
+    # owns the dict; legacy construction sites that pre-date stage 3
+    # pass None and the shadow path falls back to a fresh dict
+    # (acceptable for tests; production always provides it).
+    shadow_learning_buffer_solar_per_unit: dict | None = None
 
 
 # ---------------------------------------------------------------------------

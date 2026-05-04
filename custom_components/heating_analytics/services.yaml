@@ -324,6 +324,21 @@ batch_fit_solar:
       default: false
       selector:
         boolean:
+    seed_live_window:
+      name: Seed live Tobit window from batch samples
+      description: >-
+        When enabled (and not in dry-run), populate the live Tobit
+        sliding window with the same samples used by this batch fit.
+        Use this after a classification change (e.g. shutdown-detection
+        gate fix) to migrate Tobit's live state without a 25-day cold-
+        start.  Without this flag, Tobit's existing window keeps its
+        old samples and continues writing from them; with this flag
+        the window is rebuilt from the batch fit's correctly-classified
+        samples and Tobit's next qualifying hour refines from there.
+        Defaults off — opt-in only.
+      default: false
+      selector:
+        boolean:
 
 apply_implied_coefficient:
   name: Apply Implied Solar Coefficient
@@ -609,3 +624,98 @@ diagnose_solar:
       default: false
       selector:
         boolean:
+
+set_experimental_tobit_live_learner:
+  name: Set Tobit Live Learner Flag
+  description: >-
+    Toggle the master flag for the Tobit live coefficient learner.
+    Default is enabled on 1.3.5+ — pass enabled=false to opt out
+    and revert to NLMS-only learning across all entities.  The
+    disable persists across restarts.  Setting this true requires
+    confirm=true to acknowledge the model change.  When enabled,
+    an automatic plausibility-gate decides per entity whether Tobit
+    writes the live coefficient — see set_tobit_live_entities for
+    optional scope-restriction.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    enabled:
+      name: Enabled
+      description: True to enable the Tobit live-learner master flag, false to disable.
+      required: true
+      selector:
+        boolean:
+    confirm:
+      name: Confirm Activation
+      description: >-
+        Required when enabled=true.  Pass true to acknowledge that
+        the Tobit learner replaces NLMS as the primary writer for
+        plausibility-passing entities.
+      default: false
+      selector:
+        boolean:
+
+set_tobit_live_entities:
+  name: Set Tobit Live Scope
+  description: >-
+    Optional scope-override for the Tobit live code path.  Default
+    is auto-mode (empty list) — when the master flag is enabled,
+    every eligible entity is a candidate and the automatic
+    plausibility-gate decides per entity whether Tobit writes (noise
+    loads are blocked, legitimate VPs pass through).  Pass a
+    non-empty list to scope-restrict Tobit to ONLY those entities;
+    entities outside the list keep using NLMS regardless of the
+    plausibility-gate.  The plausibility-gate still applies within
+    the scope — explicitly allow-listing an entity does not bypass
+    the noise-load filter.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    entities:
+      name: Scope-restrict to these Energy Sensors
+      description: >-
+        Optional.  Empty list = auto-mode (every eligible entity
+        candidates Tobit, plausibility-gate decides).  Non-empty
+        list = scope-restrict to listed entities only; others stay
+        on NLMS.  The plausibility-gate still applies — auto-mode
+        already filters noise loads, so most installs do not need
+        an explicit scope.
+      required: true
+      selector:
+        entity:
+          domain: sensor
+          multiple: true
+
+reset_tobit_live_state:
+  name: Reset Tobit Live State
+  description: >-
+    Clear the running sufficient-statistic for one or all entities.
+    Without unit_entity_id: clears state for every entity.  With
+    unit_entity_id: clears state for that single entity only.
+    Coefficient values in solar_coefficients_per_unit are NOT touched;
+    use reset_solar_learning for that.  After this call the live
+    learner enters cold-start (NLMS-fallback covers until n_eff
+    rebuilds).
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor
+      description: >-
+        Optional energy sensor to reset.  Leave empty to clear state
+        for all entities.
+      selector:
+        entity:
+          domain: sensor

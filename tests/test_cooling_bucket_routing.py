@@ -277,6 +277,257 @@ class TestPredictionFallbackGuard:
         assert resolved is None
 
 
+class TestCoolingSolarColdStart:
+    """Cooling-regime cold-start guard: when an entity has never had
+    cooling-mode learning samples processed, the cooling solar
+    coefficient is migration-seeded from heating (per
+    ``_migrate_v3_to_v4`` which wraps the pre-1.3.4 flat coefficient
+    as both regimes verbatim).  Solar applies ADDITIVELY to cooling
+    demand (no saturation cap, per ``solar.calculate_saturation``
+    MODE_COOLING branch), so a stale seeded coefficient produces
+    phantom additive demand on the first cooling-mode hours of a
+    season.
+
+    Two-pronged read-side gate (#921): skip cooling solar contribution
+    when EITHER the cooling base bucket is empty OR the cooling solar
+    coefficient lacks a ``learned: True`` flag.  The flag-prong covers
+    the post-hour-4 transient where the base learner has released but
+    the solar coefficient is still migration-seeded.
+    """
+
+    def test_cold_start_when_no_cooling_buckets_anywhere(self):
+        """Entity with only heating buckets → cooling cold-start = True."""
+        coord = MagicMock()
+        coord.model.correlation_data_per_unit = {
+            "hp.unit": {
+                "10": {"normal": 1.0, "high_wind": 1.2},
+                "5": {"normal": 1.5},
+            }
+        }
+        stats = StatisticsManager(coord)
+        assert stats._is_cooling_solar_cold_start("hp.unit") is True
+
+    def test_not_cold_start_when_any_cooling_bucket_exists(self):
+        """One cooling-bucket entry AND learned=True cooling coefficient
+        → no longer cold-start (#921 two-pronged gate).
+        """
+        coord = MagicMock()
+        coord.model.correlation_data_per_unit = {
+            "hp.unit": {
+                "10": {"normal": 1.0},
+                "20": {COOLING_WIND_BUCKET: 0.05},  # one cooling sample
+            }
+        }
+        coord.model.solar_coefficients_per_unit = {
+            "hp.unit": {
+                "cooling": {"s": 0.1, "e": 0.1, "w": 0.1, "learned": True},
+            }
+        }
+        stats = StatisticsManager(coord)
+        assert stats._is_cooling_solar_cold_start("hp.unit") is False
+
+    def test_cold_start_when_cooling_bucket_present_but_coeff_unlearned(self):
+        """Base bucket populated but solar coefficient still seeded
+        (no ``learned`` flag) → still cold-start.  This is the failure
+        mode #921 was opened to address — base learner releases at
+        4 cooling hours, but solar learner takes much longer.
+        """
+        coord = MagicMock()
+        coord.model.correlation_data_per_unit = {
+            "hp.unit": {"20": {COOLING_WIND_BUCKET: 0.05}},
+        }
+        # Migration-seeded cooling: heating-equal vector, no learned key.
+        coord.model.solar_coefficients_per_unit = {
+            "hp.unit": {"cooling": {"s": 0.23, "e": 0.22, "w": 0.42}},
+        }
+        stats = StatisticsManager(coord)
+        assert stats._is_cooling_solar_cold_start("hp.unit") is True
+
+    def test_cold_start_when_cooling_coeff_learned_false_explicit(self):
+        """Explicit ``learned: False`` (e.g. just-initialized regime
+        before first learner write) → cold-start.
+        """
+        coord = MagicMock()
+        coord.model.correlation_data_per_unit = {
+            "hp.unit": {"20": {COOLING_WIND_BUCKET: 0.05}},
+        }
+        coord.model.solar_coefficients_per_unit = {
+            "hp.unit": {"cooling": {"s": 0.0, "e": 0.0, "w": 0.0, "learned": False}},
+        }
+        stats = StatisticsManager(coord)
+        assert stats._is_cooling_solar_cold_start("hp.unit") is True
+
+    def test_cold_start_for_unknown_entity(self):
+        """Entity never seen → cold-start (no buckets anywhere)."""
+        coord = MagicMock()
+        coord.model.correlation_data_per_unit = {}
+        stats = StatisticsManager(coord)
+        assert stats._is_cooling_solar_cold_start("hp.unit") is True
+
+    def test_cold_start_when_unit_data_is_not_dict(self):
+        """Defensive: malformed entity data → treat as cold-start."""
+        coord = MagicMock()
+        coord.model.correlation_data_per_unit = {"hp.unit": "garbage"}
+        stats = StatisticsManager(coord)
+        assert stats._is_cooling_solar_cold_start("hp.unit") is True
+
+    def test_calculate_total_power_skips_cooling_solar_on_cold_start(self):
+        """Headline production scenario: VP switches to cooling for the
+        first time ever.  Cooling solar coefficient is migration-seeded
+        with heating-time values (e.g. {s:0.23, e:0.22, w:0.42}).
+        Without the cold-start guard, ``solar.calculate_saturation``
+        adds the full ``solar_coeff × pot`` to cooling demand each
+        hour — phantom load that accumulates over the cooling period.
+
+        Test: with cooling cold-start active, the per-unit
+        ``solar_reduction_kwh`` must be 0.  Hour-boundary accumulation
+        of expected_kwh therefore stays tied to the cooling base
+        bucket (also 0 in cold-start), preventing the phantom-demand
+        deviation observed in the field.
+        """
+        from custom_components.heating_analytics.const import (
+            COOLING_WIND_BUCKET, MODE_COOLING,
+        )
+
+        # Coordinator stub: VP has heating-mode buckets only (never had
+        # cooling-mode learning).  Solar coefficient for cooling is the
+        # migration-seeded value.
+        coord = MagicMock()
+        coord.balance_point = 15.0
+        coord.solar_enabled = True
+        coord.solar_azimuth = 245.0
+        coord.solar_correction_percent = 100.0
+        coord.screen_config = (False, False, False)
+        coord.energy_sensors = ["hp.vp_stue"]
+        coord.aux_affected_entities = []
+        coord.aux_affected_set = set()
+        coord.auxiliary_heating_active = False
+        coord.get_unit_mode = lambda eid: MODE_COOLING
+        coord.screen_config_for_entity = lambda eid: (False, False, False)
+        coord._solar_carryover_state = 0.0
+        coord.solar_battery_decay = 0.80
+        coord.data = {"solar_factor": 0.7}
+        coord.model.correlation_data_per_unit = {
+            "hp.vp_stue": {
+                "5": {"normal": 1.5},  # heating data only
+                "10": {"normal": 1.0},
+            }
+        }
+        coord.model.aux_coefficients_per_unit = {}
+        coord._get_predicted_kwh = MagicMock(return_value=0.0)
+
+        # Cooling solar coefficient (migration-seeded, would produce
+        # phantom demand if applied additively).
+        coord.solar.calculate_unit_coefficient = MagicMock(
+            return_value={"s": 0.23, "e": 0.22, "w": 0.42}
+        )
+        # Strong west-side afternoon sun.
+        coord.solar.calculate_unit_solar_impact = MagicMock(return_value=0.30)
+
+        # Input-aware saturation mock: cooling mode returns
+        # (solar_potential, 0, net_demand + solar_potential) per
+        # the production semantics.  This lets the test see whether
+        # the gate correctly zeroed out the solar input upstream.
+        def _saturation(net_demand, solar_potential, mode):
+            if mode == MODE_COOLING:
+                return (solar_potential, 0.0, net_demand + solar_potential)
+            return (0.0, 0.0, net_demand)
+        coord.solar.calculate_saturation = MagicMock(side_effect=_saturation)
+
+        stats = StatisticsManager(coord)
+        result = stats.calculate_total_power(
+            temp=22.0,  # warm afternoon
+            effective_wind=2.0,
+            solar_impact=0.0,
+            is_aux_active=False,
+            override_solar_factor=0.7,
+            override_solar_vector=(0.2, 0.1, 0.7),
+            detailed=True,
+        )
+        # The unit's solar reduction in unit_breakdown must be 0,
+        # NOT the migration-seeded coefficient × potential ≈ 0.30.
+        unit_data = result["unit_breakdown"]["hp.vp_stue"]
+        assert unit_data["solar_reduction_kwh"] == 0.0, (
+            f"Cooling cold-start must zero out solar contribution; "
+            f"got solar_reduction_kwh={unit_data['solar_reduction_kwh']}"
+        )
+        assert unit_data["raw_solar_kwh"] == 0.0, (
+            f"raw_solar_kwh must also be 0 (we never compute solar "
+            f"impact in cold-start); got {unit_data['raw_solar_kwh']}"
+        )
+        # net_kwh in cooling cold-start: base (0) + cooling-solar (0) = 0.
+        assert unit_data["net_kwh"] == 0.0
+
+        # The solar calculation methods must NOT have been invoked
+        # for this cold-start entity (no wasted compute on a value
+        # we'd discard anyway).
+        coord.solar.calculate_unit_coefficient.assert_not_called()
+        coord.solar.calculate_unit_solar_impact.assert_not_called()
+
+    def test_calculate_total_power_applies_cooling_solar_when_initialized(self):
+        """Inverse: once the cooling base bucket has at least one entry,
+        the cold-start guard releases and cooling solar is applied as
+        normal.  Pins that the gate is one-sided — opens after first
+        cooling-mode learning, doesn't permanently block.
+        """
+        from custom_components.heating_analytics.const import (
+            COOLING_WIND_BUCKET, MODE_COOLING,
+        )
+
+        coord = MagicMock()
+        coord.balance_point = 15.0
+        coord.solar_enabled = True
+        coord.solar_azimuth = 245.0
+        coord.solar_correction_percent = 100.0
+        coord.screen_config = (False, False, False)
+        coord.energy_sensors = ["hp.vp_stue"]
+        coord.aux_affected_entities = []
+        coord.aux_affected_set = set()
+        coord.auxiliary_heating_active = False
+        coord.get_unit_mode = lambda eid: MODE_COOLING
+        coord.screen_config_for_entity = lambda eid: (False, False, False)
+        coord._solar_carryover_state = 0.0
+        coord.solar_battery_decay = 0.80
+        coord.data = {"solar_factor": 0.7}
+        # Cooling bucket has at least one entry → base-prong releases.
+        coord.model.correlation_data_per_unit = {
+            "hp.vp_stue": {
+                "20": {COOLING_WIND_BUCKET: 0.10},
+            }
+        }
+        # Cooling coefficient flagged learned → coeff-prong releases (#921).
+        coord.model.solar_coefficients_per_unit = {
+            "hp.vp_stue": {
+                "cooling": {"s": 0.23, "e": 0.22, "w": 0.42, "learned": True},
+            }
+        }
+        coord.model.aux_coefficients_per_unit = {}
+        coord._get_predicted_kwh = MagicMock(return_value=0.0)
+        coord.solar.calculate_unit_coefficient = MagicMock(
+            return_value={"s": 0.23, "e": 0.22, "w": 0.42}
+        )
+        coord.solar.calculate_unit_solar_impact = MagicMock(return_value=0.30)
+        coord.solar.calculate_saturation = MagicMock(
+            return_value=(0.30, 0.0, 0.40)
+        )
+
+        stats = StatisticsManager(coord)
+        result = stats.calculate_total_power(
+            temp=22.0,
+            effective_wind=2.0,
+            solar_impact=0.0,
+            is_aux_active=False,
+            override_solar_factor=0.7,
+            override_solar_vector=(0.2, 0.1, 0.7),
+            detailed=True,
+        )
+        # Solar IS applied now.
+        unit_data = result["unit_breakdown"]["hp.vp_stue"]
+        assert unit_data["raw_solar_kwh"] == 0.30
+        coord.solar.calculate_unit_coefficient.assert_called_once()
+        coord.solar.calculate_unit_solar_impact.assert_called_once()
+
+
 class TestRetrainReplay:
     """Retrain paths must honour the same cooling-bucket routing as live learning.
 

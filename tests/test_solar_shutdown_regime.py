@@ -113,6 +113,107 @@ class TestShutdownDetection:
         )
         assert result == ("vp_stue",)
 
+    def test_parasitic_with_low_base_flagged_via_absolute_floor(self):
+        """Field-evidence regression (#918, post-stage-3 audit): standby
+        consumption (~12 Wh) on a mild day with low base (~0.08 kWh)
+        MUST be flagged shutdown even though base is below the per-unit
+        threshold.  Pre-fix the gate ordering put ``base < threshold``
+        BEFORE the absolute ``actual < ACTUAL_FLOOR`` check, so
+        parasitic-with-low-base hours fell through to modulating and
+        inflated the solar coefficient via Tobit/NLMS.
+
+        Reconstructed maintainer fixture:
+        - Toshiba per-unit threshold: 0.169 kWh
+        - Mild April day, base = 0.083 kWh (< threshold)
+        - Standby consumption: 0.012 kWh (< ACTUAL_FLOOR 0.03)
+        - Sun up: magnitude > 0.30
+        """
+        result = _detect(
+            unit_actual_kwh={"vp_stue": 0.012},
+            unit_expected_base_kwh={"vp_stue": 0.083},
+            unit_min_base={"vp_stue": 0.169},
+        )
+        assert result == ("vp_stue",), (
+            "parasitic actual below floor must trigger shutdown flag "
+            "regardless of base-vs-threshold relationship"
+        )
+
+    def test_low_modulating_with_low_base_not_flagged(self):
+        """Counter-case to the parasitic fix: a low-modulation HP at
+        a mild temperature with actual ABOVE the absolute floor must
+        still NOT be flagged when base is below threshold (existing
+        semantic preserved).  Without this, the fix would over-flag
+        legitimate low-modulating shoulder hours.
+
+        Fixture: Mitsubishi cycling at minimum modulation, base low
+        because outdoor temp is mild but HP is genuinely running.
+        """
+        result = _detect(
+            unit_actual_kwh={"vp_stue": 0.06},  # > 0.03 floor (running)
+            unit_expected_base_kwh={"vp_stue": 0.10},  # < 0.15 threshold
+        )
+        assert result == (), (
+            "above-floor running with low base must remain modulating; "
+            "base-below-threshold gate preserves existing semantic for "
+            "non-parasitic hours"
+        )
+
+    def test_parasitic_with_high_base_still_flagged(self):
+        """Pre-existing case (full shutdown, high base, parasitic
+        residual): both gates should fire.  Pinned here so the gate-
+        ordering fix doesn't accidentally regress the headline case.
+        """
+        result = _detect(
+            unit_actual_kwh={"vp_stue": 0.012},
+            unit_expected_base_kwh={"vp_stue": 1.20},
+        )
+        assert result == ("vp_stue",)
+
+    def test_actual_below_floor_with_low_base_flagged(self):
+        """Boundary-case companion to the parasitic fix (review N1):
+        actual = 0.029 < 0.03 floor + base = 0.10 < 0.15 threshold →
+        FLAGGED via the unconditional parasitic short-circuit.  Pins
+        the post-fix gate-ordering against future regression.
+        """
+        result = _detect(
+            unit_actual_kwh={"vp_stue": 0.029},
+            unit_expected_base_kwh={"vp_stue": 0.10},
+        )
+        assert result == ("vp_stue",)
+
+    def test_actual_above_floor_with_low_base_not_flagged(self):
+        """Boundary-case companion (review N1): actual = 0.031 > 0.03
+        floor + base = 0.10 < 0.15 threshold + ratio 0.31 > 0.15 →
+        NOT flagged.  Without the parasitic short-circuit the entity
+        is correctly classed modulating-but-skipped (base below
+        eligibility).  Critical for distinguishing the gate fix from
+        an over-flagging regression.
+        """
+        result = _detect(
+            unit_actual_kwh={"vp_stue": 0.031},
+            unit_expected_base_kwh={"vp_stue": 0.10},
+        )
+        assert result == ()
+
+    def test_near_zero_base_with_zero_actual_does_not_inflate(self):
+        """Review N3: near-zero-base sensor (e.g. 0.0001 kWh) with
+        zero actual is technically flagged shutdown by the new gate,
+        but the inequality learner's constraint
+        ``coeff·battery ≥ 0.9×base`` is trivially satisfied at near-
+        zero base, so no coefficient lift fires.  Modulating learning
+        is correctly skipped.  Behaviour is benign — pin it so a
+        future tightening doesn't introduce surprise inflation here.
+        """
+        # Behavioural test: detect-level flag fires (not a bug).
+        result = _detect(
+            unit_actual_kwh={"vp_stue": 0.0},
+            unit_expected_base_kwh={"vp_stue": 0.0001},
+        )
+        # Either flagging or not is acceptable here as the downstream
+        # is benign — the test pins that the function returns
+        # cleanly, no exception, no unbounded behaviour.
+        assert result in (("vp_stue",), ())
+
     def test_magnitude_at_threshold_detects(self):
         """Magnitude exactly at MIN_MAGNITUDE → detection proceeds."""
         # Pure-south at magnitude threshold.

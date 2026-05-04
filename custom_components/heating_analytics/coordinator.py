@@ -194,6 +194,77 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # ``_solar_coefficients_per_unit`` and persist via storage.
         self._last_batch_fit_per_unit: dict[str, dict] = {}
 
+        # Tobit live-learner state (#904 stage 3, storage v5).
+        # ``_tobit_sufficient_stats[entity_id][regime]`` holds a sliding
+        # window of the most-recent ``TOBIT_RUNNING_WINDOW`` qualifying
+        # samples (each a tuple of (s, e, w, value, censored_flag)) plus
+        # the last Newton-step diagnostics and the slot's
+        # ``solar_model_version`` tag.  A closed-form 4×4 sufficient
+        # statistic is *not* possible because Tobit's Mills-ratio
+        # gradient depends on the current coefficient via ``q = (T −
+        # c·s) / σ`` — the second-moment matrix would need to be
+        # recomputed every iteration anyway, so the implementation
+        # keeps the raw samples and re-runs ``_solve_tobit_3d`` on the
+        # window each qualifying hour.  Memory cap is bounded:
+        # ~6 KB per (entity, regime) at the default window size.
+        # Updated at each qualifying hour
+        # (see ``learning._update_unit_tobit_live``); a Newton step
+        # via ``_solve_tobit_3d`` runs once n_eff ≥ TOBIT_MIN_NEFF.
+        # Below the threshold, NLMS-fallback writes the live coefficient
+        # while the window continues to accumulate (decision (3)
+        # in #912).  The flag and allow-list gate the entire path:
+        # both must be true for an (entity, regime) before the live
+        # Tobit step writes.  When inactive the legacy NLMS path runs
+        # bit-identically to pre-stage-3 behaviour.
+        self._tobit_sufficient_stats: dict[str, dict] = {}
+        # Init defaults reflect the 1.3.5+ default-on semantic so that
+        # FRESH-INSTALL paths (no storage, or storage corrupted /
+        # moved to .corrupt) — where ``async_load_data`` returns
+        # early before reaching the marker block — still observe
+        # ``flag = marker = True``.  The load-path's marker-flip
+        # block handles the upgrade-from-1.3.4 case where
+        # ``_migrate_v4_to_v5`` has seeded ``False`` defaults; in
+        # that case the load reads False, marker missing, and the
+        # block re-flips to True.  Storage-resident user disable
+        # (flag=False, marker=True) is preserved because the load
+        # path observes the persisted values and the marker check
+        # short-circuits.
+        self._experimental_tobit_live_learner: bool = True
+        self._tobit_live_entities: frozenset[str] = frozenset()
+        # Default-on marker (1.3.5+).  When this field is missing
+        # from storage on first load post-upgrade, the load path flips
+        # ``_experimental_tobit_live_learner`` to True and stamps the
+        # marker.  Subsequent loads observe marker=True and respect
+        # whatever value the user has set (including an explicit
+        # disable via set_experimental_tobit_live_learner).  Both
+        # service handlers also stamp the marker so an explicit user
+        # action survives even if the load-time flip happens to land
+        # between save cycles or fails to commit (race + save-fail
+        # protection).  Marker durability requires a successful save
+        # post-stamp, which the service handlers force; the load-time
+        # flip relies on the next debounced save (~1 minute typical) —
+        # if HA crashes within that window, the flip re-fires on the
+        # next start (cosmetic info-log; functionally idempotent).
+        #
+        # Storage-schema policy: introduced WITHOUT a STORAGE_VERSION
+        # bump.  CLAUDE.md's bump rule targets "schema-breaking"
+        # changes (value-type changes on existing keys, nested-map
+        # restructures, dropped keys).  An additive boolean that
+        # defaults to False at fresh-install AND at v4-shape upgrade
+        # (via the v4→v5 migration's ``setdefault``) AND on the
+        # load-time fixup path is structurally non-breaking — both
+        # fresh and upgraded installs converge on the same end state
+        # on first load.  Documenting the exception here so the next
+        # additive-bool field doesn't trigger the same review cycle.
+        # If a future field introduces a value-type change or a
+        # required-key semantic, that field bumps the version.
+        self._tobit_default_applied: bool = True
+        # NLMS shadow-coefficient under live Tobit (decision (2) in
+        # #912).  When Tobit is the live writer, NLMS still runs and
+        # writes here for parallel comparison in diagnose.  Removed
+        # at default-on promote.  In-memory only.
+        self._nlms_shadow_coefficients: dict[str, dict] = {}
+
         # Solar thermal battery: accumulates solar impact across hours with exponential decay.
         # Carries residual solar heat (stored in building mass) into post-solar hours.
         # Reset to 0 on restart — recovers within a few hours.
@@ -251,6 +322,16 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Mode-stratified per-unit solar cold-start buffer (#868):
         # {entity_id: {"heating": [(s, e, w, impact), ...], "cooling": [...]}}
         self._learning_buffer_solar_per_unit = {}
+
+        # Stage 3 (#912): NLMS shadow path runs in parallel with live Tobit
+        # for allow-listed entities to provide a reference signal during the
+        # eval window.  Shadow MUST have its own cold-start buffer separate
+        # from main — sharing produced an aliasing footgun where shadow's
+        # zero-impact hours could trigger a dead-zone reset that wiped the
+        # main learner's buffer (review I1).  Same shape as the main
+        # buffer.  Cleared in lock-step with the main shadow coefficient
+        # on any reset path.
+        self._shadow_learning_buffer_solar_per_unit = {}
 
         self._learning_buffer_global = {} # { "temp": { "wind_bucket": [normalized_values] } }
 
@@ -617,6 +698,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if entity_id in self._solar_coefficients_per_unit:
             del self._solar_coefficients_per_unit[entity_id]
             _LOGGER.debug(f"Cleared solar coefficients for {entity_id}")
+            
+        # Clear Outlier State (#919)
+        self.learning.reset_outlier_state(entity_id)
 
         # Clear Observation Counts
         if entity_id in self._observation_counts:
@@ -670,6 +754,20 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             # snapshot no longer matches the (now-empty) coefficient state.
             if entity_id in self._last_batch_fit_per_unit:
                 del self._last_batch_fit_per_unit[entity_id]
+            # Stage 3 (#912): the live Tobit sliding-window state and the
+            # NLMS shadow coefficient must be cleared in the same branch
+            # — otherwise the next qualifying hour writes the coefficient
+            # straight back from the still-populated window, which
+            # silently defeats the user's reset intent.  Same reasoning
+            # for the shadow cold-start buffer.
+            if entity_id in self._tobit_sufficient_stats:
+                del self._tobit_sufficient_stats[entity_id]
+                _LOGGER.debug(f"Cleared Tobit sliding window for {entity_id}")
+            if entity_id in self._nlms_shadow_coefficients:
+                del self._nlms_shadow_coefficients[entity_id]
+            if entity_id in self._shadow_learning_buffer_solar_per_unit:
+                del self._shadow_learning_buffer_solar_per_unit[entity_id]
+            self.learning.reset_outlier_state(entity_id)
             _LOGGER.info(f"Solar learning reset for unit: {entity_id}")
         else:
             self._solar_coefficients_per_unit.clear()
@@ -683,6 +781,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             # (entity_id != None) does NOT clear it: other units are
             # still operating against the same physical reservoir.
             self._solar_carryover_state = 0.0
+            # Stage 3 (#912): wipe the live Tobit windows + shadow
+            # coefficients + shadow cold-start buffers in lock-step
+            # with the coefficient table.  See per-entity branch for
+            # the rationale.
+            self._tobit_sufficient_stats.clear()
+            self._nlms_shadow_coefficients.clear()
+            self._shadow_learning_buffer_solar_per_unit.clear()
+            self.learning.reset_outlier_state()
             _LOGGER.info("Solar learning reset for all units")
 
         solar_replay_diagnostics: dict | None = None
@@ -737,6 +843,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         *,
         days_back: int | None = None,
         dry_run: bool = False,
+        seed_live_window: bool = False,
     ) -> dict:
         """Run a periodic batch least-squares fit on solar coefficients (#884).
 
@@ -779,6 +886,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             screen_affected_entities=getattr(self, "_screen_affected_set", None),
             days_back=days_back,
             dry_run=dry_run,
+            seed_live_window=seed_live_window,
         )
 
         applied_any = False
@@ -2844,6 +2952,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             learning_buffer_solar_per_unit=self._learning_buffer_solar_per_unit,
             daily_history=self._daily_history,
             hourly_log=self._hourly_log,
+            tobit_sufficient_stats=self._tobit_sufficient_stats,
+            nlms_shadow_coefficients=self._nlms_shadow_coefficients,
+            shadow_learning_buffer_solar_per_unit=self._shadow_learning_buffer_solar_per_unit,
         )
 
     # ------------------------------------------------------------------

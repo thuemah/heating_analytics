@@ -467,6 +467,9 @@ class RetrainEngine:
                         actual_temp=temp,
                         solar_normalization_delta=delta,
                         snr_weight=snr_w,
+                        solar_coefficients_per_unit=self.coordinator._solar_coefficients_per_unit,
+                        energy_sensors=self.coordinator.energy_sensors,
+                        unit_modes=entry.get("unit_modes"),
                     )
                     if "skipped" not in status:
                         learning_count_local += 1

@@ -8,7 +8,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, ServiceCall, Event, SupportsResponse
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
@@ -45,6 +45,9 @@ SERVICE_RESET_SOLAR_LEARNING = "reset_solar_learning"
 SERVICE_RETRAIN_FROM_HISTORY = "retrain_from_history"
 SERVICE_BATCH_FIT_SOLAR = "batch_fit_solar"
 SERVICE_APPLY_IMPLIED_COEFFICIENT = "apply_implied_coefficient"
+SERVICE_SET_EXPERIMENTAL_TOBIT_LIVE_LEARNER = "set_experimental_tobit_live_learner"
+SERVICE_SET_TOBIT_LIVE_ENTITIES = "set_tobit_live_entities"
+SERVICE_RESET_TOBIT_LIVE_STATE = "reset_tobit_live_state"
 SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=90)),
@@ -134,6 +137,7 @@ SERVICE_SCHEMA_BATCH_FIT_SOLAR = vol.Schema({
         vol.Coerce(int), vol.Range(min=1, max=730)
     ),
     vol.Optional("dry_run", default=False): cv.boolean,
+    vol.Optional("seed_live_window", default=False): cv.boolean,
 })
 
 SERVICE_SCHEMA_APPLY_IMPLIED_COEFFICIENT = vol.Schema({
@@ -161,6 +165,27 @@ SERVICE_SCHEMA_APPLY_IMPLIED_COEFFICIENT = vol.Schema({
     ),
     vol.Optional("dry_run", default=False): cv.boolean,
     vol.Optional("force", default=False): cv.boolean,
+})
+
+# Tobit live-learner experimental services (#904 stage 3, storage v5).
+# All three persist immediately and trigger _async_save_data so settings
+# survive restarts.  The ``confirm: true`` requirement on enable guards
+# against accidental activation via copy-paste — the gate matches the
+# storage-level "no UI" disposition (Alternative B in #912 design).
+SERVICE_SCHEMA_SET_EXPERIMENTAL_TOBIT_LIVE_LEARNER = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Required("enabled"): cv.boolean,
+    vol.Optional("confirm", default=False): cv.boolean,
+})
+
+SERVICE_SCHEMA_SET_TOBIT_LIVE_ENTITIES = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Required("entities"): vol.All(cv.ensure_list, [cv.entity_id]),
+})
+
+SERVICE_SCHEMA_RESET_TOBIT_LIVE_STATE = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("unit_entity_id"): cv.entity_id,
 })
 
 SERVICE_SCHEMA_COMPARE_PERIODS = vol.Schema({
@@ -400,9 +425,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # voluptuous defaults guarantee these keys exist post-schema.
         days_back = call.data.get("days_back", 30)
         dry_run = call.data.get("dry_run", False)
+        seed_live_window = call.data.get("seed_live_window", False)
         coord = _get_target_coordinator(hass, entity_id)
         scope = f"unit {unit_entity_id}" if unit_entity_id else "all units"
-        suffix = f" (last {days_back}d{', dry-run' if dry_run else ''})"
+        suffix_parts = [f"last {days_back}d"]
+        if dry_run:
+            suffix_parts.append("dry-run")
+        if seed_live_window:
+            suffix_parts.append("seed-live-window")
+        suffix = f" ({', '.join(suffix_parts)})"
         _LOGGER.info(
             f"Service called: batch_fit_solar for {scope}{suffix} "
             f"(coordinator={coord.entry.entry_id})"
@@ -411,6 +442,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entity_id=unit_entity_id,
             days_back=days_back,
             dry_run=dry_run,
+            seed_live_window=seed_live_window,
         )
 
     hass.services.async_register(
@@ -469,6 +501,132 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         handle_apply_implied_coefficient,
         schema=SERVICE_SCHEMA_APPLY_IMPLIED_COEFFICIENT,
         supports_response=SupportsResponse.ONLY,
+    )
+
+    # ------------------------------------------------------------------
+    # Tobit live-learner experimental services (#904 stage 3, storage v5)
+    # ------------------------------------------------------------------
+    async def handle_set_experimental_tobit_live_learner(call: ServiceCall):
+        """Toggle the master flag for the Tobit live-learner.
+
+        Default is True on 1.3.5+ via the load-time marker; this
+        handler exists so users can explicitly disable.  Disable
+        persists across restart because the marker is stamped both
+        at load-time and here — no path leaves it unset post-1.3.5.
+        ``confirm: true`` is required when enabling to guard against
+        accidental activation via copy-paste from documentation
+        snippets.
+        """
+        entity_id = call.data.get("entity_id")
+        enabled = bool(call.data["enabled"])
+        confirm = bool(call.data.get("confirm", False))
+        if enabled and not confirm:
+            # ServiceValidationError surfaces the message in HA's "Call
+            # Service" UI; raw ValueError was reported as a generic
+            # error and the rationale text never reached the user.
+            raise ServiceValidationError(
+                "set_experimental_tobit_live_learner: pass confirm=true "
+                "alongside enabled=true to acknowledge that the Tobit "
+                "learner replaces NLMS as primary writer for "
+                "plausibility-passing entities."
+            )
+        coord = _get_target_coordinator(hass, entity_id)
+        coord._experimental_tobit_live_learner = enabled
+        # Stamp the marker — guarantees this explicit user action
+        # commits regardless of whether the load-time flip happened
+        # to land between save cycles.  Belt-and-braces against the
+        # race where the user disables before async_load_data
+        # completes (handler set False, load reads missing-marker,
+        # load flips back to True): with the stamp here, a load
+        # following a service-disable observes marker=True and
+        # leaves the False intact.
+        coord._tobit_default_applied = True
+        scope_count = len(getattr(coord, "_tobit_live_entities", frozenset()))
+        scope_desc = (
+            "auto-mode (plausibility-gate decides per entity)"
+            if scope_count == 0
+            else f"scope-restricted to {scope_count} entities"
+        )
+        _LOGGER.info(
+            "Tobit live-learner master flag set to %s — %s",
+            enabled, scope_desc,
+        )
+        await coord._async_save_data(force=True)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_EXPERIMENTAL_TOBIT_LIVE_LEARNER,
+        handle_set_experimental_tobit_live_learner,
+        schema=SERVICE_SCHEMA_SET_EXPERIMENTAL_TOBIT_LIVE_LEARNER,
+    )
+
+    async def handle_set_tobit_live_entities(call: ServiceCall):
+        """Set the optional scope-override list for the Tobit live path.
+
+        Replaces the full list (not additive).  Empty list = auto-mode
+        (every eligible entity is candidate; plausibility-gate decides
+        per entity whether Tobit writes — noise loads filtered, real
+        VPs pass).  Non-empty list = scope-restrict to listed entities;
+        others stay on NLMS.  The plausibility-gate still applies
+        within the scope — explicit allow-listing does not bypass the
+        noise-load filter.  Stamps the marker for parity with the flag
+        handler.
+        """
+        entity_id = call.data.get("entity_id")
+        entities = list(call.data["entities"])
+        coord = _get_target_coordinator(hass, entity_id)
+        coord._tobit_live_entities = frozenset(entities)
+        coord._tobit_default_applied = True
+        _LOGGER.info(
+            "Tobit live-learner scope updated: %s",
+            ", ".join(sorted(entities)) if entities
+            else "auto-mode (empty list — plausibility-gate decides per entity)",
+        )
+        await coord._async_save_data(force=True)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_TOBIT_LIVE_ENTITIES,
+        handle_set_tobit_live_entities,
+        schema=SERVICE_SCHEMA_SET_TOBIT_LIVE_ENTITIES,
+    )
+
+    async def handle_reset_tobit_live_state(call: ServiceCall):
+        """Clear the running sufficient-statistic for one or all entities.
+
+        Without ``unit_entity_id``: clears state for all entities.
+        With ``unit_entity_id``: clears state for that single entity
+        only (both regimes).  Coefficient values in
+        ``solar_coefficients_per_unit`` are NOT touched — use
+        ``reset_solar_learning`` for that.  After this call the live
+        learner enters cold-start (NLMS-fallback fires until n_eff
+        ≥ TOBIT_MIN_NEFF rebuilds).
+        """
+        entity_id = call.data.get("entity_id")
+        unit_entity_id = call.data.get("unit_entity_id")
+        coord = _get_target_coordinator(hass, entity_id)
+        if unit_entity_id is None:
+            cleared = len(coord._tobit_sufficient_stats)
+            coord._tobit_sufficient_stats = {}
+            coord._nlms_shadow_coefficients = {}
+            _LOGGER.info(
+                "Tobit live-learner state cleared for %d entities (cold-start)",
+                cleared,
+            )
+        else:
+            coord._tobit_sufficient_stats.pop(unit_entity_id, None)
+            coord._nlms_shadow_coefficients.pop(unit_entity_id, None)
+            _LOGGER.info(
+                "Tobit live-learner state cleared for %s (cold-start)",
+                unit_entity_id,
+            )
+        await coord._async_save_data(force=True)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESET_TOBIT_LIVE_STATE,
+        handle_reset_tobit_live_state,
+        schema=SERVICE_SCHEMA_RESET_TOBIT_LIVE_STATE,
     )
 
     # Register Backup Service
@@ -807,5 +965,19 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_WIND_THRESHOLDS)
             hass.services.async_remove(DOMAIN, SERVICE_RESET_SOLAR_LEARNING)
             hass.services.async_remove(DOMAIN, SERVICE_RETRAIN_FROM_HISTORY)
+            # Diagnose surfaces
+            hass.services.async_remove(DOMAIN, SERVICE_DIAGNOSE_MODEL)
+            hass.services.async_remove(DOMAIN, SERVICE_DIAGNOSE_SOLAR)
+            # Per-unit threshold calibration (#871)
+            hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_UNIT_THRESHOLDS)
+            # Solar coefficient on-demand fitters (#884, #904)
+            hass.services.async_remove(DOMAIN, SERVICE_BATCH_FIT_SOLAR)
+            hass.services.async_remove(DOMAIN, SERVICE_APPLY_IMPLIED_COEFFICIENT)
+            # Tobit live-learner controls (#904 stage 3)
+            hass.services.async_remove(
+                DOMAIN, SERVICE_SET_EXPERIMENTAL_TOBIT_LIVE_LEARNER
+            )
+            hass.services.async_remove(DOMAIN, SERVICE_SET_TOBIT_LIVE_ENTITIES)
+            hass.services.async_remove(DOMAIN, SERVICE_RESET_TOBIT_LIVE_STATE)
 
     return unload_ok

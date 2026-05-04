@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import logging
+import math
+import statistics
 from typing import Callable
 
 from .const import (
     BATCH_FIT_DAMPING,
-    BATCH_FIT_MIN_SAMPLES,
     BATCH_FIT_SATURATION_RATIO,
     COLD_START_SOLAR_DAMPING,
     COOLING_WIND_BUCKET,
@@ -24,6 +25,7 @@ from .const import (
     NLMS_REGULARIZATION,
     NLMS_STEP_SIZE,
     PER_UNIT_LEARNING_RATE_CAP,
+    GLOBAL_BASE_SATURATION_SKIP_KWH,
     SNR_WEIGHT_FLOOR,
     SNR_WEIGHT_K,
     SOLAR_BATTERY_DECAY,
@@ -32,6 +34,18 @@ from .const import (
     SOLAR_LEARNING_MIN_BASE,
     SOLAR_SHUTDOWN_MIN_BASE,
     SOLAR_SHUTDOWN_MIN_MAGNITUDE,
+    TOBIT_CONV_TOL,
+    TOBIT_MAX_ITER,
+    TOBIT_MIN_NEFF,
+    TOBIT_MIN_UNCENSORED,
+    TOBIT_Q_CLIP,
+    OUTLIER_RESIDUAL_WINDOW,
+    OUTLIER_K_THRESHOLD,
+    OUTLIER_MIN_SAMPLES,
+    OUTLIER_REJECTED_POOL_SIZE,
+    OUTLIER_PROMOTION_THRESHOLD,
+    HARD_OUTLIER_CAP_FACTOR,
+    HARD_OUTLIER_SANITY_MULTIPLIER,
 )
 from .observation import HourlyObservation, ModelState, LearningConfig
 from .solar import SolarCalculator
@@ -249,6 +263,137 @@ class LearningManager:
         # is stuck (base model too low → no learnable signal), the counter
         # triggers a coefficient reset so cold-start can re-learn.
         self._dead_zone_counts: dict[str, int] = {}
+        # Outlier state (#919): per-unit robust residual window for filtering.
+        # Maps (entity_id) -> (regime, is_shutdown) -> {"baseline": [], "rejected": []}
+        self._outlier_state: dict[str, dict[tuple[str, bool], dict[str, list[float]]]] = {}
+
+    def reset_outlier_state(self, entity_id: str | None = None) -> None:
+        """Clear the MAD outlier state for a specific entity or all entities (#919).
+        
+        Called when solar learning is reset so the new coefficient does not get
+        evaluated against the baseline noise profile of the old setup.
+        """
+        if entity_id:
+            if entity_id in self._outlier_state:
+                del self._outlier_state[entity_id]
+                _LOGGER.debug("Cleared outlier state for %s", entity_id)
+        else:
+            self._outlier_state.clear()
+            _LOGGER.debug("Cleared outlier state for all entities")
+
+    def _is_outlier_residual(
+        self,
+        entity_id: str,
+        regime: str,
+        residual: float,
+        outlier_state: dict,
+        is_shutdown: bool = False,
+        actual: float = 0.0,
+        expected_base: float = 0.0,
+        unit_min_base: dict[str, float] | None = None,
+    ) -> bool:
+        """Check if a residual is an outlier based on robust history (#919).
+
+        Maintains a per-unit sliding window of recent residuals and calculates
+        the Median Absolute Deviation (MAD) as a robust estimator of scale.
+        Samples where |residual| > k * sigma_robust are flagged as outliers.
+
+        We use 1.4826 * MAD as a robust estimator of the standard deviation
+        (sigma) for normally distributed data.
+
+        Returns True if the residual is an outlier, False otherwise.
+        NOTE: When a genuine shift is promoted to baseline, this method
+        returns False to allow learning, but the sample is ALREADY
+        appended to the new baseline internally.
+        """
+        # Part 1 & 2: Use (regime, is_shutdown) as the key to separate 
+        # modulating vs shutdown behavior.
+        entity_outlier = outlier_state.setdefault(entity_id, {})
+        key = (regime, is_shutdown)
+        regime_state = entity_outlier.setdefault(key, {"baseline": [], "rejected": []})
+        baseline = regime_state["baseline"]
+        rejected = regime_state["rejected"]
+
+        # Part 5: Prior-free sanity check (guards against extreme glitches before 
+        # baseline is even formed).
+        if expected_base > 0 and abs(actual - expected_base) > HARD_OUTLIER_SANITY_MULTIPLIER * expected_base:
+            _LOGGER.warning(
+                "Hard outlier detected for %s [%s, shutdown=%s]: |act - exp|=%.3f > %.1f * exp(%.3f). Prior-free rejection.",
+                entity_id, regime, is_shutdown, abs(actual - expected_base), HARD_OUTLIER_SANITY_MULTIPLIER, expected_base
+            )
+            return True
+
+        # Check if we have enough samples to filter
+        n = len(baseline)
+        is_outlier = False
+        if n >= OUTLIER_MIN_SAMPLES:
+            median_res = statistics.median(baseline)
+            
+            # Absolute deviations from median
+            abs_devs = [abs(r - median_res) for r in baseline]
+            mad = statistics.median(abs_devs)
+            
+            # Part 4: Per-entity sigma floor.
+            # max(0.02, 0.05 * max(unit_min_base.get(entity, 0.5), 0.1))
+            min_base_val = _resolve_min_base(entity_id, unit_min_base, 0.5)
+            sigma_floor = max(0.02, 0.05 * max(min_base_val, 0.1))
+            sigma_robust = max(sigma_floor, 1.4826 * mad)
+            
+            # Compare distance from the robust center (median) rather than zero (#919).
+            if abs(residual - median_res) > OUTLIER_K_THRESHOLD * sigma_robust:
+                is_outlier = True
+                _LOGGER.warning(
+                    "Outlier detected for %s [%s, shutdown=%s]: |res - median|=%.3f > %.1f * sigma_robust(%.3f). Skipping learning.",
+                    entity_id, regime, is_shutdown, abs(residual - median_res), OUTLIER_K_THRESHOLD, sigma_robust
+                )
+        else:
+            # Part 3: Warm-up hard cap.
+            # While baseline is forming, reject residuals > 20 kWh (HARD_OUTLIER_CAP_FACTOR).
+            if abs(residual) > HARD_OUTLIER_CAP_FACTOR:
+                is_outlier = True
+                _LOGGER.warning(
+                    "Warm-up outlier detected for %s [%s, shutdown=%s]: |residual|=%.3f > %.1f. Skipping learning.",
+                    entity_id, regime, is_shutdown, abs(residual), HARD_OUTLIER_CAP_FACTOR
+                )
+
+        # Append to window regardless
+        if not is_outlier:
+            baseline.append(residual)
+            if len(baseline) > OUTLIER_RESIDUAL_WINDOW:
+                baseline.pop(0)
+            # If we just accepted a sample, clear the rejected pool (it wasn't a shift)
+            rejected.clear()
+        else:
+            # Part 2: Recovery from genuine shift (rejected pool promotion)
+            rejected.append(residual)
+            if len(rejected) >= OUTLIER_PROMOTION_THRESHOLD:
+                # If enough consecutive rejected samples are consistent with 
+                # EACH OTHER, promote them to baseline.
+                def get_mad(data: list[float]) -> float:
+                    if not data: return 0.0
+                    med = statistics.median(data)
+                    return statistics.median([abs(x - med) for x in data])
+
+                mad_rejected = get_mad(rejected)
+                # Use current baseline MAD if available, otherwise 0.5 as fallback.
+                # Use a small floor (0.01) to handle pure-zero baselines (0 < 2*0 is False).
+                mad_baseline = max(0.01, get_mad(baseline) if baseline else 0.5)
+                
+                if mad_rejected < 2 * mad_baseline:
+                    _LOGGER.info(
+                        "Genuine shift detected for %s [%s, shutdown=%s]: promoting %d rejected samples to baseline.",
+                        entity_id, regime, is_shutdown, len(rejected)
+                    )
+                    baseline.clear()
+                    baseline.extend(rejected)
+                    rejected.clear()
+                    # Allow current sample to be learned
+                    return False
+
+            if len(rejected) > OUTLIER_REJECTED_POOL_SIZE:
+                rejected.pop(0)
+                
+        return is_outlier
 
     def process_learning(
         self,
@@ -500,14 +645,70 @@ class LearningManager:
                     and avg_temp < (balance_point - 2.0)
                 )
 
-                if is_cold_cooling_regime:
+                # One-sided dark-equivalent floor (#930) gated by per-regime
+                # plausibility.  The lift target dark_target = actual + delta
+                # is only trustworthy if at least one solar coefficient in an
+                # active learning regime has actually been learned — otherwise
+                # delta is dominated by seeded/default coefficients and can
+                # inflate the target.  When no coefficient in the active
+                # regime is learned, fall back to legacy paths (saturation
+                # skip on saturated hours; raw-actual EMA otherwise).  The
+                # gate is loose by design (any learned coefficient unlocks
+                # the lift): mixed-fleet aggregation is still possible but
+                # the upward bound is dark_target which is itself bounded by
+                # SOLAR_COEFF_CAP × pot.
+                lift_gate_open = solar_enabled and any(
+                    solar_coefficients_per_unit.get(eid, {})
+                        .get(_solar_coeff_regime(unit_modes.get(eid, MODE_HEATING)) or "", {})
+                        .get("learned")
+                    for eid in energy_sensors
+                    if _solar_coeff_regime(unit_modes.get(eid, MODE_HEATING)) is not None
+                )
+                is_one_sided_lift = (
+                    lift_gate_open
+                    and base_expected_kwh > 0.0
+                    and base_expected_kwh < normalized_actual
+                )
+                # Solar-saturation skip (#929): when the global model is fully
+                # clipped (base ≤ solar_applied), the raw-actual EMA target is
+                # solar-reduced and pulls the bucket downward.  Suppress that
+                # update so dark hours own the downward correction.  When the
+                # one-sided lift fires, it owns the hour instead — but if the
+                # plausibility gate keeps the lift closed, this skip remains
+                # reachable so the legacy wrong-direction step is still avoided.
+                is_globally_saturated = (
+                    solar_enabled
+                    and base_expected_kwh > 0.0
+                    and solar_normalization_delta > 0.0
+                    and (base_expected_kwh - solar_normalization_delta)
+                        < GLOBAL_BASE_SATURATION_SKIP_KWH
+                    and not is_one_sided_lift
+                )
+
+                if is_globally_saturated:
+                    _LOGGER.debug(
+                        "Global base: skipping solar-saturated hour "
+                        "(base=%.3f kWh <= solar=%.3f kWh, T=%s W=%s)",
+                        base_expected_kwh, solar_normalization_delta,
+                        temp_key, wind_bucket,
+                    )
+                    learning_status = "skipped_global_saturation"
+                elif is_cold_cooling_regime:
                     _LOGGER.debug(
                         "Global base: skipping cold-cooling-regime hour "
                         "(T=%.1f, BP=%.1f, %d cooling unit(s))",
                         avg_temp, balance_point, len(active_modes),
                     )
                 elif solar_enabled:
-                    base_target = total_energy_kwh
+                    # Lift only fires when gate is open AND bucket sits below.
+                    # Otherwise the legacy raw-actual EMA path applies — which
+                    # under SNR weighting still attenuates sunny-hour pull and
+                    # is corrected by dark hours.
+                    if is_one_sided_lift:
+                        base_target = normalized_actual
+                    else:
+                        base_target = total_energy_kwh
+
                     snr_w = compute_snr_weight(
                         solar_factor,
                         solar_dominant_entities,
@@ -523,7 +724,7 @@ class LearningManager:
                     base_target = total_energy_kwh
                     base_effective_rate = learning_rate
 
-                if not is_cold_cooling_regime:
+                if not is_cold_cooling_regime and not is_globally_saturated:
                     if base_expected_kwh == 0.0:
                         # Cold Start: Use Buffered Learning.
                         # Shutdown hours (weight = 0) must NOT contaminate the
@@ -584,6 +785,24 @@ class LearningManager:
                 unit_min_base=unit_min_base,
                 solar_factor=solar_factor,
                 battery_filtered_potential=battery_filtered_potential,
+                experimental_tobit_live_learner=getattr(
+                    config, "experimental_tobit_live_learner", False
+                ),
+                tobit_live_entities=getattr(
+                    config, "tobit_live_entities", frozenset()
+                ),
+                mpc_managed_entities=getattr(
+                    config, "mpc_managed_entities", frozenset()
+                ),
+                tobit_sufficient_stats=getattr(
+                    model, "tobit_sufficient_stats", None
+                ),
+                nlms_shadow_coefficients=getattr(
+                    model, "nlms_shadow_coefficients", None
+                ),
+                shadow_learning_buffer_solar_per_unit=getattr(
+                    model, "shadow_learning_buffer_solar_per_unit", None
+                ),
             )
 
         return {
@@ -701,6 +920,12 @@ class LearningManager:
         solar_factor: float = 0.0,
         battery_filtered_potential: tuple[float, float, float] | None = None,
         unit_min_base: dict[str, float] | None = None,
+        experimental_tobit_live_learner: bool = False,
+        tobit_live_entities: frozenset[str] = frozenset(),
+        mpc_managed_entities: frozenset[str] = frozenset(),
+        tobit_sufficient_stats: dict | None = None,
+        nlms_shadow_coefficients: dict | None = None,
+        shadow_learning_buffer_solar_per_unit: dict | None = None,
     ):
         """Process learning for individual units."""
         for entity_id in energy_sensors:
@@ -811,13 +1036,132 @@ class LearningManager:
                 and not is_solar_shutdown
                 and expected_unit_base >= nlms_threshold
             ):
-                self._learn_unit_solar_coefficient(
-                    entity_id, temp_key,
-                    expected_unit_base, actual_unit, (potential_s, potential_e, potential_w),
-                    learning_rate, solar_coefficients_per_unit, learning_buffer_solar_per_unit,
-                    avg_temp, balance_point,
-                    unit_mode
+                # Stage 3 (#912) routing: when the experimental Tobit
+                # live learner is enabled AND this entity is in the
+                # allow-list AND the regime is heating/cooling, route
+                # the modulating-regime sample through the running-
+                # window Tobit Newton step.  When Tobit is the live
+                # writer (post-cold-start) NLMS continues to fire in
+                # shadow mode against ``nlms_shadow_coefficients`` for
+                # comparison during the validation window — see locked
+                # decision (2) in #912.  In Tobit cold-start (n_eff <
+                # TOBIT_MIN_NEFF) NLMS is the live writer; the running
+                # statistic accumulates in parallel so when Tobit
+                # warms up it has a fully-formed window (decision (3)).
+                regime_for_routing = _solar_coeff_regime(unit_mode)
+                # Allow-list semantic shift (#918, 1.3.5 default-on):
+                # empty list = "auto-mode, plausibility-gate decides per
+                # entity"; non-empty list = "scope override — only listed
+                # entities try Tobit, plausibility still applies within
+                # those".  Pre-1.3.5 semantics required entity_id to be
+                # explicitly in the list (default-off + manual opt-in).
+                # Existing maintainer installs with non-empty allow-lists
+                # keep the override behaviour; new users on default-on
+                # get auto-mode without configuration.
+                tobit_live_active = (
+                    experimental_tobit_live_learner
+                    and (
+                        not tobit_live_entities
+                        or entity_id in tobit_live_entities
+                    )
+                    and entity_id not in mpc_managed_entities
+                    and regime_for_routing is not None
+                    and tobit_sufficient_stats is not None
                 )
+                
+                # --- Outlier Robustness (#919) ---
+                # Check for outliers before they enter either path.
+                # Use current coefficient to estimate residual.
+                entity_coeffs = solar_coefficients_per_unit.get(entity_id, {})
+                regime_coeffs = entity_coeffs.get(regime_for_routing, {}) if isinstance(entity_coeffs, dict) else {}
+                
+                c_s = regime_coeffs.get("s", 0.0)
+                c_e = regime_coeffs.get("e", 0.0)
+                c_w = regime_coeffs.get("w", 0.0)
+                
+                predicted_impact = c_s * potential_s + c_e * potential_e + c_w * potential_w
+                if regime_for_routing == "heating":
+                    actual_impact_for_filter = expected_unit_base - actual_unit
+                else:
+                    actual_impact_for_filter = actual_unit - expected_unit_base
+                
+                residual = actual_impact_for_filter - predicted_impact
+                is_outlier = self._is_outlier_residual(
+                    entity_id, regime_for_routing, residual, self._outlier_state,
+                    is_shutdown=False,
+                    actual=actual_unit,
+                    expected_base=expected_unit_base,
+                    unit_min_base=unit_min_base,
+                )
+
+                tobit_applied = False
+                if tobit_live_active and not is_outlier:
+                    if regime_for_routing == "heating":
+                        actual_impact_for_tobit = expected_unit_base - actual_unit
+                    else:
+                        actual_impact_for_tobit = actual_unit - expected_unit_base
+                    # Match the batch_fit / compute_tobit_for_diagnose
+                    # filter for non-positive impacts — Tobit relies on
+                    # the censoring threshold being above the model's
+                    # noise floor, which a non-positive impact violates.
+                    if actual_impact_for_tobit > 0.0:
+                        tobit_result = self._update_unit_tobit_live(
+                            entity_id,
+                            regime_for_routing,
+                            (potential_s, potential_e, potential_w),
+                            actual_impact_for_tobit,
+                            expected_unit_base,
+                            tobit_sufficient_stats,
+                            solar_coefficients_per_unit,
+                        )
+                        tobit_applied = bool(tobit_result.get("applied"))
+
+                if tobit_applied and nlms_shadow_coefficients is not None and not is_outlier:
+                    # NLMS shadow: independent NLMS trajectory that
+                    # learns against its own state (separate from the
+                    # main / Tobit-written coefficient).  Used as a
+                    # reference signal in diagnose during the Stage 3
+                    # validation window.  Removed at default-on promote.
+                    # Shadow MUST use a SEPARATE cold-start buffer
+                    # (review I1, #912): sharing with main produces an
+                    # aliasing footgun where shadow's zero-impact hours
+                    # could trigger a dead-zone reset that wipes main's
+                    # buffer.  Dead-zone-reset is also suppressed for
+                    # the shadow path — it's a recovery mechanism for
+                    # the writer-of-record, and shadow is reference-
+                    # only.  ``shadow_learning_buffer_solar_per_unit``
+                    # is provided by the coordinator (#912).  None
+                    # fallback for older test fixtures that don't pass
+                    # it — defaults to a fresh dict (acceptable for
+                    # tests; production always provides it).
+                    shadow_buffer = (
+                        shadow_learning_buffer_solar_per_unit
+                        if shadow_learning_buffer_solar_per_unit is not None
+                        else {}
+                    )
+                    self._seed_shadow_from_main_if_empty(
+                        entity_id,
+                        solar_coefficients_per_unit,
+                        nlms_shadow_coefficients,
+                    )
+                    self._learn_unit_solar_coefficient(
+                        entity_id, temp_key,
+                        expected_unit_base, actual_unit, (potential_s, potential_e, potential_w),
+                        learning_rate, nlms_shadow_coefficients, shadow_buffer,
+                        avg_temp, balance_point,
+                        unit_mode,
+                        is_shadow_path=True,
+                    )
+                elif not tobit_applied and not is_outlier:
+                    # Tobit cold-start / disabled / not allow-listed —
+                    # NLMS is the live writer (current behaviour).
+                    self._learn_unit_solar_coefficient(
+                        entity_id, temp_key,
+                        expected_unit_base, actual_unit, (potential_s, potential_e, potential_w),
+                        learning_rate, solar_coefficients_per_unit, learning_buffer_solar_per_unit,
+                        avg_temp, balance_point,
+                        unit_mode
+                    )
             elif (
                 # Inequality learning for shutdown hours.
                 # Runs in parallel to NLMS: while NLMS is gated on
@@ -847,12 +1191,32 @@ class LearningManager:
                     or entity_id in screen_affected_entities
                 )
             ):
-                self._update_unit_solar_inequality(
-                    entity_id=entity_id,
-                    expected_unit_base=expected_unit_base,
-                    battery_filtered_potential=battery_filtered_potential,
-                    solar_coefficients_per_unit=solar_coefficients_per_unit,
-                )
+                # Outlier check for inequality (#919 Part 1)
+                regime_ineq = "heating"  # Inequality is heating only
+                entity_coeffs = solar_coefficients_per_unit.get(entity_id, {})
+                regime_coeffs = entity_coeffs.get(regime_ineq, {}) if isinstance(entity_coeffs, dict) else {}
+                c_s = regime_coeffs.get("s", 0.0)
+                c_e = regime_coeffs.get("e", 0.0)
+                c_w = regime_coeffs.get("w", 0.0)
+
+                pot_s, pot_e, pot_w = battery_filtered_potential
+                predicted_impact = c_s * pot_s + c_e * pot_e + c_w * pot_w
+                # For shutdown, implied actual impact is expected_unit_base
+                residual = expected_unit_base - predicted_impact
+
+                if not self._is_outlier_residual(
+                    entity_id, regime_ineq, residual, self._outlier_state,
+                    is_shutdown=True,
+                    actual=actual_unit,
+                    expected_base=expected_unit_base,
+                    unit_min_base=unit_min_base,
+                ):
+                    self._update_unit_solar_inequality(
+                        entity_id=entity_id,
+                        expected_unit_base=expected_unit_base,
+                        battery_filtered_potential=battery_filtered_potential,
+                        solar_coefficients_per_unit=solar_coefficients_per_unit,
+                    )
 
             # Step 2: Calculate Solar Impact using (possibly updated) coefficients
             # Use potential vector (not effective) because the coefficient already
@@ -964,6 +1328,36 @@ class LearningManager:
                     rate_multiplier=rate_multiplier,
                 )
 
+    @staticmethod
+    def _seed_shadow_from_main_if_empty(
+        entity_id: str,
+        solar_coefficients_per_unit: dict,
+        nlms_shadow_coefficients: dict,
+    ) -> bool:
+        """Seed NLMS shadow from main at handover (#912 review I2).
+
+        Without this, shadow's first qualifying hour as writer-of-record
+        finds an empty entry and enters cold-start while main has
+        months of NLMS-warm-up baked into its coefficient.  The
+        compare-shadow-to-main exercise would be cold-start-vs-converged
+        for ~2 weeks — uninformative.  Seeding copies the current main
+        coefficient so shadow starts at the same state and diverges
+        from there under independent NLMS evolution.
+
+        Subsequent calls find a populated shadow entry and skip the
+        seed (one-shot operation).  Returns True if a seed was applied
+        on this call, False if shadow was already populated.
+        """
+        if entity_id in nlms_shadow_coefficients:
+            return False
+        main_entry = solar_coefficients_per_unit.get(entity_id)
+        if not isinstance(main_entry, dict):
+            return False
+        nlms_shadow_coefficients[entity_id] = {
+            r: dict(main_entry.get(r, {})) for r in ("heating", "cooling")
+        }
+        return True
+
     def _learn_unit_solar_coefficient(
         self,
         entity_id: str,
@@ -977,6 +1371,8 @@ class LearningManager:
         avg_temp: float,
         balance_point: float,
         unit_mode: str,
+        *,
+        is_shadow_path: bool = False,
     ):
         """Update 3D solar coefficient (S, E, W) for one (entity, mode) slot.
 
@@ -1029,29 +1425,45 @@ class LearningManager:
         # reset so cold-start can re-learn from fresh data.  Dead-zone
         # counter is keyed by (entity, regime) so a stuck cooling coefficient
         # resets without disturbing heating, and vice versa.
+        # Stage 3 (#912) review I1: shadow path skips dead-zone reset.
+        # The recovery mechanism is for the writer-of-record (whose
+        # wrong coefficient prevents the base model from recovering);
+        # shadow is reference-only.  Skipping the dead-zone reset on
+        # shadow also avoids the aliasing footgun where shadow's
+        # zero-impact hours could trigger a counter-driven reset that
+        # wipes its own buffer mid-cold-start (the counter is on
+        # ``self._dead_zone_counts`` which IS shared, but the reset's
+        # effect — clearing the buffer — operates on the shadow's
+        # private buffer dict, so the shared counter just becomes
+        # noise rather than a footgun).  Cleaner to short-circuit.
         dead_key = (entity_id, regime)
-        if actual_impact == 0.0 and raw_impact < 0.0 and current_coeff is not None:
-            count = self._dead_zone_counts.get(dead_key, 0) + 1
-            self._dead_zone_counts[dead_key] = count
-            if count >= SOLAR_DEAD_ZONE_THRESHOLD:
-                # Reset only this regime — preserve the other one.
-                if isinstance(entity_coeffs, dict):
-                    entity_coeffs[regime] = {"s": 0.0, "e": 0.0, "w": 0.0}
-                # Clear regime buffer so cold-start begins fresh
-                buf_entry = learning_buffer_solar_per_unit.get(entity_id)
-                if isinstance(buf_entry, dict):
-                    buf_entry[regime] = []
-                self._dead_zone_counts[dead_key] = 0
-                _LOGGER.warning(
-                    "Solar dead zone detected: reset %s [%s] after %d "
-                    "consecutive zero-impact qualifying hours (base model too "
-                    "low to produce learnable signal)",
-                    entity_id, regime, count,
-                )
-            return
-        else:
-            # Any non-zero impact resets the counter
-            self._dead_zone_counts.pop(dead_key, None)
+        if not is_shadow_path:
+            if (
+                actual_impact == 0.0
+                and raw_impact < 0.0
+                and current_coeff is not None
+            ):
+                count = self._dead_zone_counts.get(dead_key, 0) + 1
+                self._dead_zone_counts[dead_key] = count
+                if count >= SOLAR_DEAD_ZONE_THRESHOLD:
+                    # Reset only this regime — preserve the other one.
+                    if isinstance(entity_coeffs, dict):
+                        entity_coeffs[regime] = {"s": 0.0, "e": 0.0, "w": 0.0}
+                    # Clear regime buffer so cold-start begins fresh
+                    buf_entry = learning_buffer_solar_per_unit.get(entity_id)
+                    if isinstance(buf_entry, dict):
+                        buf_entry[regime] = []
+                    self._dead_zone_counts[dead_key] = 0
+                    _LOGGER.warning(
+                        "Solar dead zone detected: reset %s [%s] after %d "
+                        "consecutive zero-impact qualifying hours (base model too "
+                        "low to produce learnable signal)",
+                        entity_id, regime, count,
+                    )
+                return
+            else:
+                # Any non-zero impact resets the counter
+                self._dead_zone_counts.pop(dead_key, None)
 
         # --- Buffered Learning Logic (Cold Start) ---
         if current_coeff is None:
@@ -1398,6 +1810,15 @@ class LearningManager:
         gain.  Heating and cooling regimes share this clamp but
         converge to different absolute values (each absorbs its own
         ``E[1/COP]``).
+
+        Stamps ``learned: True`` on the written regime (#921) so the
+        cooling cold-start gate (``_is_cooling_solar_cold_start``) can
+        distinguish learner-written values from migration-seeded
+        copies of the heating coefficient.  Legacy storage without
+        the flag reads as unlearned and self-heals on the first
+        learner write to that regime; no storage-version bump
+        required (additive field, ``.get("learned", False)``
+        defaulting works for legacy data).
         """
         if regime not in ("heating", "cooling"):
             raise ValueError(f"Invalid solar coefficient regime: {regime!r}")
@@ -1417,6 +1838,7 @@ class LearningManager:
             "s": round(max(0.0, value.get("s", 0.0)), 5),
             "e": round(max(0.0, value.get("e", 0.0)), 5),
             "w": round(max(0.0, value.get("w", 0.0)), 5),
+            "learned": True,
         }
 
     def _update_unit_solar_inequality(
@@ -1550,28 +1972,41 @@ class LearningManager:
         actual_temp: float,
         solar_normalization_delta: float = 0.0,
         snr_weight: float = 1.0,
+        solar_coefficients_per_unit: dict | None = None,
+        energy_sensors: list[str] | None = None,
+        unit_modes: dict[str, str] | None = None,
     ) -> str:
         """Process a single historical data point to train global models.
 
-        Target is raw ``actual_kwh`` and the EMA step is scaled by
-        ``snr_weight``.  Dark hours retain full rate, sunny hours
-        contribute proportionally, shutdown hours zero.  Caller is
-        responsible for computing the weight via
-        :func:`compute_snr_weight` from the hour's ``solar_factor`` and
-        ``solar_dominant_entities``.
+        Target is dark-equivalent ``actual_kwh + delta`` and the EMA step
+        is scaled by ``snr_weight`` (#xxx).  Dark hours retain full rate,
+        sunny hours contribute proportionally, shutdown hours zero.
+
+        Base path uses a one-sided dark-equivalent floor (#930) gated by
+        per-regime plausibility.  When at least one solar coefficient in
+        an active learning regime is marked ``learned``, the lift toward
+        ``actual_kwh + delta`` is enabled; otherwise the lift is
+        suppressed and the legacy raw-actual EMA path applies.  The
+        upward direction is bounded by ``dark_target`` and SOLAR_COEFF_CAP
+        so a single inflated-coefficient hour cannot drive runaway.
 
         ``actual_kwh`` for the aux path is taken at face value — aux
         learning does not share the COP-ceiling / shutdown-contamination
-        failure modes that motivated the SNR formulation.  Aux on sunny
-        hours is rare (aux typically fires in cold dark conditions) so
-        the residual bias is small and bounded.
-
-        ``solar_normalization_delta`` is still consumed by the aux path
-        below — aux learning on sunny hours needs the dark-equivalent
-        target so solar-induced reductions are not mis-attributed as aux
-        reductions.  The base path ignores it entirely.
+        failure modes that motivated the SNR formulation.
         """
-        normalized_actual = actual_kwh  # raw — SNR weight carries signal-quality
+        dark_target = max(0.0, actual_kwh + solar_normalization_delta)
+
+        lift_gate_open = True
+        if solar_coefficients_per_unit is not None and energy_sensors:
+            modes = unit_modes or {}
+            lift_gate_open = any(
+                solar_coefficients_per_unit.get(eid, {})
+                    .get(_solar_coeff_regime(modes.get(eid, MODE_HEATING)) or "", {})
+                    .get("learned")
+                for eid in energy_sensors
+                if _solar_coeff_regime(modes.get(eid, MODE_HEATING)) is not None
+            )
+
         effective_rate = learning_rate * max(0.0, snr_weight)
 
         if is_aux_active:
@@ -1606,14 +2041,17 @@ class LearningManager:
                 correlation_data[temp_key] = {}
 
             if current_pred != 0.0:
-                new_pred = current_pred + effective_rate * (normalized_actual - current_pred)
+                if lift_gate_open and current_pred < dark_target:
+                    target = dark_target
+                else:
+                    target = actual_kwh
+                new_pred = current_pred + effective_rate * (target - current_pred)
             else:
                 # Cold start: first non-zero sample seeds the bucket.
-                # Under SNR the first sample may be weighted down; we still
-                # seed from the raw value here because EMA needs a
-                # starting point.  Subsequent samples with high weight
-                # will dominate quickly via higher effective_rate.
-                new_pred = normalized_actual
+                # Seed with the dark-equivalent when the lift gate is open;
+                # otherwise seed with the raw actual to avoid trusting an
+                # unlearned coefficient on the very first sample.
+                new_pred = dark_target if lift_gate_open else actual_kwh
             correlation_data[temp_key][wind_bucket] = round(new_pred, 5)
             return "updated_base_model"
 
@@ -2280,24 +2718,29 @@ class LearningManager:
         screen_affected_entities: frozenset[str] | None = None,
         days_back: int | None = None,
         dry_run: bool = False,
+        seed_live_window: bool = False,
     ) -> dict:
-        """Periodic batch least-squares fit per (entity, mode) regime (#884).
+        """Periodic batch Tobit MLE fit per (entity, mode) regime (#904 stage 2).
 
-        Solves the joint 3×3 normal equations over the modulating-regime
-        hourly log to extract a coefficient that NLMS and inequality
-        cannot — specifically the mild-weather catch-22 where expected
-        base demand is near zero (e.g. west-facing rooms whose solar
-        peak coincides with the daily temperature maximum).  A
-        least-squares fit over N samples extracts the underlying
-        coefficient even when each individual sample carries tiny SNR
-        and net-zeroes in NLMS.
+        Solves the Type-I right-censored Gaussian regression over the
+        modulating-regime hourly log to extract a coefficient that
+        NLMS and inequality cannot — specifically the mild-weather
+        catch-22 where expected base demand is near zero (e.g. west-
+        facing rooms whose solar peak coincides with the daily
+        temperature maximum), and the saturation-information loss
+        that the original (#884) least-squares form discarded by
+        dropping right-censored samples (HP fully off because the
+        room got warm).  Tobit's Mills-ratio likelihood term
+        recovers slope information from the censoring point itself.
+        See ``_solve_tobit_3d`` for the solver and #904 for the
+        stage-1 evidence motivating the swap from LS to Tobit.
 
         Per (entity, regime): heating-mode hours fit the heating regime
         only; cooling-mode hours fit the cooling regime only.  Each
         regime absorbs its own ``E[1/COP_mode]`` (#868 invariant).
-        Inequality-flagged shutdown hours and saturated samples are
-        dropped — they violate the linear-regression assumptions of
-        the fit.
+        Inequality-flagged shutdown hours are excluded — they violate
+        the modulating-regime assumption (CHOICE 3 in #904); saturated
+        hours are kept as right-censored samples (CHOICE 2).
 
         ``days_back`` (default ``None`` = full log) restricts the input
         window.  Without this, a fit on a fresh upgrade would absorb
@@ -2306,7 +2749,7 @@ class LearningManager:
         30-day window after a major release fits against representative
         post-upgrade data.
 
-        ``dry_run`` (default ``False``) runs every gate and the LS
+        ``dry_run`` (default ``False``) runs every gate and the Tobit
         solve but does not write coefficients back to
         ``solar_coefficients_per_unit``.  The diagnostic dict reports
         ``coefficient_after`` so the user can preview the result; a
@@ -2317,36 +2760,48 @@ class LearningManager:
         - ``unit_modes[entity_id]`` resolves to ``regime`` (heating
           regime takes HEATING + GUEST_HEATING; cooling takes
           COOLING + GUEST_COOLING).  OFF / DHW are skipped.
-        - Entity not in ``solar_dominant_entities`` (shutdown
-          samples are saturated — would inflate the fit).
+        - Entity not in ``solar_dominant_entities`` (shutdown — owned
+          by the inequality learner, CHOICE 3).
         - Auxiliary not active during the hour.
         - Reconstructed potential vector magnitude > 0.01.
-        - ``expected_unit_base ≥ unit_min_base[entity]`` (or
-          ``SOLAR_LEARNING_MIN_BASE`` fallback) — same gate as live
-          NLMS.
+        - ``expected_unit_base > 0`` (Tobit drops the per-unit min-base
+          gate that LS used — the censoring threshold ``T = 0.95×base``
+          must be well-defined, but Tobit needs the mild-weather
+          shoulder hours that the live-NLMS gate would exclude).
         - ``actual_impact > 0`` (clamped negative impacts).
-        - ``actual_impact < BATCH_FIT_SATURATION_RATIO × base`` —
-          drop saturation-clamped samples that have no information
-          about the coefficient itself.
+        - Saturated rows (``actual_impact ≥ BATCH_FIT_SATURATION_RATIO
+          × base``) are kept and tagged ``censored_mask = True`` with
+          ``value = T``; unsaturated rows kept with
+          ``value = base − actual``.
 
         Algorithm:
-        - 3×3 normal equations + Cramer's rule (same arithmetic as
-          cold-start solver in ``_learn_unit_solar_coefficient``).
-        - Collinear fallback (1D projection along dominant direction)
-          when the determinant is degenerate.
-        - Clamp components to ``[0, SOLAR_COEFF_CAP]`` (#868 invariant
-          #4).
-        - Damp blend: ``new = α × batch + (1 − α) × current`` with
+        - Tobit MLE via ``_solve_tobit_3d``: projected-Newton on
+          ``(c_S, c_E, c_W, log σ)`` with active-set non-negativity
+          (invariant #4), trust-region clip on Mills-ratio q, warm-
+          start from 3×3 LS on uncensored rows.
+        - Sample-size gate: ``|U| ≥ TOBIT_MIN_UNCENSORED (20)``
+          (pre-fit; σ identifiability) and ``n_eff ≥ TOBIT_MIN_NEFF
+          (40)`` (post-fit; slope identifiability) per #904 CHOICE 4.
+        - Convergence required (``did_not_converge`` skip otherwise).
+        - Clamp components to ``[0, SOLAR_COEFF_CAP]`` (defence-in-
+          depth; the solver's active-set already enforces ≥0).
+        - Damp blend: ``new = α × tobit + (1 − α) × current`` with
           ``α = BATCH_FIT_DAMPING``.  When the regime has not learned
-          before (current is zero), the batch result is written
+          before (current is zero), the Tobit result is written
           directly without damping — there is no prior to blend.
 
         Returns
         -------
         Diagnostics dict ``{entity_id: {regime: {...}}}`` reporting
-        per slot: ``sample_count``, ``residual_rmse_kwh``,
-        ``coefficient_before``, ``coefficient_after``, ``damping``,
-        and ``skip_reason`` when the fit was not applied.
+        per slot: ``sample_count``, ``residual_rmse_kwh`` (uncensored
+        rows only — censored values store ``T`` not observed impact),
+        ``coefficient_before``, ``coefficient_after``,
+        ``damping_applied``, ``tobit_diagnostics`` (iterations,
+        convergence, sigma, n_uncensored, n_censored,
+        censored_fraction, n_eff, log_likelihood), and
+        ``skip_reason`` ∈ {``insufficient_uncensored``,
+        ``insufficient_effective_samples``, ``did_not_converge``,
+        ``warm_start_failed``} when the fit was not applied.
         """
         from .observation import WeightedSmear  # local import — heavy module
         strategies = getattr(coordinator, "_unit_strategies", {}) or {}
@@ -2407,7 +2862,7 @@ class LearningManager:
 
             entity_results: dict[str, dict] = {}
             for regime in ("heating", "cooling"):
-                samples, drop_counts = self._collect_batch_fit_samples(
+                samples, censored_mask, drop_counts = self._collect_batch_fit_samples(
                     entity_id=entity_id,
                     regime=regime,
                     hourly_log=filtered_log,
@@ -2415,7 +2870,11 @@ class LearningManager:
                     coordinator=coordinator,
                     unit_threshold=unit_threshold,
                     screen_affected_entities=screen_affected_entities,
+                    for_tobit=True,
+                    solar_coefficients_per_unit=solar_coefficients_per_unit,
                 )
+                n_unc = sum(1 for m in censored_mask if not m)
+                n_cens = len(samples) - n_unc
                 regime_diag: dict = {
                     "sample_count": len(samples),
                     "drop_counts": drop_counts,
@@ -2436,29 +2895,82 @@ class LearningManager:
                     k: round(v, 5) for k, v in current.items()
                 }
 
-                if len(samples) < BATCH_FIT_MIN_SAMPLES:
-                    regime_diag["skip_reason"] = "insufficient_samples"
+                # Pre-fit gate: σ identifiability requires ``|U| ≥ 20``
+                # (#904 CHOICE 4-B).  Below this floor we cannot warm-
+                # start Tobit's MLE — skip without invoking the solver.
+                if n_unc < TOBIT_MIN_UNCENSORED:
+                    regime_diag["skip_reason"] = "insufficient_uncensored"
                     regime_diag["coefficient_after"] = regime_diag[
                         "coefficient_before"
                     ]
+                    regime_diag["tobit_diagnostics"] = {
+                        "n_uncensored": n_unc,
+                        "n_censored": n_cens,
+                        "censored_fraction": (
+                            round(n_cens / len(samples), 3)
+                            if samples
+                            else 0.0
+                        ),
+                    }
                     entity_results[regime] = regime_diag
                     continue
 
-                fit = self._solve_batch_fit_normal_equations(samples)
+                fit = LearningManager._solve_tobit_3d(samples, censored_mask)
                 if fit is None:
-                    regime_diag["skip_reason"] = "degenerate_fit"
+                    regime_diag["skip_reason"] = "warm_start_failed"
                     regime_diag["coefficient_after"] = regime_diag[
                         "coefficient_before"
                     ]
                     entity_results[regime] = regime_diag
                     continue
 
-                # Clamp to [0, CAP] — invariant #4.  The solver itself
-                # may produce negative components from noise; the clamp
-                # is the physical truth.
+                tobit_diag = {
+                    "iterations": fit["iterations"],
+                    "converged": bool(fit["converged"]),
+                    "failure_reason": fit.get("failure_reason"),
+                    "sigma": round(fit["sigma"], 5),
+                    "log_likelihood": round(fit["log_likelihood"], 4),
+                    "n_uncensored": fit["n_uncensored"],
+                    "n_censored": fit["n_censored"],
+                    "censored_fraction": (
+                        round(n_cens / len(samples), 3) if samples else 0.0
+                    ),
+                    "n_eff": round(fit["n_eff"], 2),
+                }
+                regime_diag["tobit_diagnostics"] = tobit_diag
+
+                # Post-fit gate: slope identifiability requires
+                # ``n_eff = |U| + Σ_C λ(q)(λ(q)−q) ≥ 40`` — censored
+                # samples that sit far inside the censoring region
+                # (q ≪ 0) contribute λ(q) ≈ 0 and add no slope info,
+                # so we cannot count raw |C| toward the effective
+                # sample size.  Convergence failure is treated as a
+                # separate skip (the last iterate may still be
+                # informative for inspection).
+                if fit["n_eff"] < TOBIT_MIN_NEFF:
+                    regime_diag["skip_reason"] = "insufficient_effective_samples"
+                    regime_diag["coefficient_after"] = regime_diag[
+                        "coefficient_before"
+                    ]
+                    entity_results[regime] = regime_diag
+                    continue
+
+                if not fit["converged"]:
+                    regime_diag["skip_reason"] = "did_not_converge"
+                    regime_diag["coefficient_after"] = regime_diag[
+                        "coefficient_before"
+                    ]
+                    entity_results[regime] = regime_diag
+                    continue
+
+                # Clamp to [0, CAP] — invariant #4.  The solver's
+                # active-set already enforces non-negativity, but the
+                # CAP clamp is preserved as defence-in-depth against
+                # warm-start drift on pathological synthetic inputs.
                 clamped = {
-                    k: max(0.0, min(SOLAR_COEFF_CAP, v))
-                    for k, v in fit.items()
+                    "s": max(0.0, min(SOLAR_COEFF_CAP, float(fit["s"]))),
+                    "e": max(0.0, min(SOLAR_COEFF_CAP, float(fit["e"]))),
+                    "w": max(0.0, min(SOLAR_COEFF_CAP, float(fit["w"]))),
                 }
 
                 # Damp blend.  When the regime has no prior (current is
@@ -2480,13 +2992,16 @@ class LearningManager:
                     damping_applied = 1.0
 
                 # Residual RMSE measured against the (clamped, undamped)
-                # batch fit — the question this answers is "how well does
-                # the joint LS fit explain the samples", not "how well
-                # does the damped result explain them".  Damping is a
-                # caution against single-batch overshoot; it doesn't
-                # affect the fit-quality signal.
+                # Tobit fit on UNCENSORED samples only — censored rows
+                # carry threshold values (T) instead of observed
+                # ``actual_impact``, so including them would report a
+                # spurious residual whenever ``c·s > T`` (which is the
+                # correct prediction for a saturated hour).
+                uncensored_only = [
+                    samples[i] for i in range(len(samples)) if not censored_mask[i]
+                ]
                 regime_diag["residual_rmse_kwh"] = self._batch_fit_residual_rmse(
-                    samples, clamped
+                    uncensored_only, clamped
                 )
                 regime_diag["coefficient_after"] = blended
                 regime_diag["damping_applied"] = damping_applied
@@ -2504,11 +3019,162 @@ class LearningManager:
                         entity_id, blended, solar_coefficients_per_unit, regime
                     )
                     regime_diag["applied"] = True
+                    # Smooth migration path: seed the live Tobit window
+                    # from the same samples used in this batch fit.
+                    # Without this, after a classification change (e.g.
+                    # the parasitic-floor gate fix), users would either
+                    # need to ``reset_solar_learning`` and accept a 25-
+                    # day cold-start, or live with a polluted sliding
+                    # window that keeps writing biased coefficients.
+                    # ``seed_live_window=True`` rebuilds the window
+                    # in-place from the current batch's classified
+                    # samples (capped at TOBIT_RUNNING_WINDOW), sets
+                    # n_eff to the batch's value, and tags the slot at
+                    # the current SOLAR_MODEL_VERSION.  Tobit's next
+                    # qualifying hour finds a populated, current-
+                    # version window and refines from there — no cold-
+                    # start.  Opt-in only; default behaviour preserved.
+                    if seed_live_window:
+                        from .const import (
+                            SOLAR_MODEL_VERSION as _CURRENT_SOLAR_VERSION,
+                            TOBIT_RUNNING_WINDOW,
+                        )
+                        live_stats = getattr(
+                            coordinator, "_tobit_sufficient_stats", None
+                        )
+                        if isinstance(live_stats, dict):
+                            window_samples = [
+                                (
+                                    samples[i][0],
+                                    samples[i][1],
+                                    samples[i][2],
+                                    samples[i][3],
+                                    bool(censored_mask[i]),
+                                )
+                                for i in range(len(samples))
+                            ]
+                            # Cap from the most recent end — same as
+                            # the live learner trims on append.
+                            if len(window_samples) > TOBIT_RUNNING_WINDOW:
+                                window_samples = window_samples[
+                                    -TOBIT_RUNNING_WINDOW:
+                                ]
+                            entity_state = live_stats.setdefault(entity_id, {})
+                            entity_state[regime] = {
+                                "samples": window_samples,
+                                "solar_model_version": _CURRENT_SOLAR_VERSION,
+                                "samples_since_reset": len(window_samples),
+                                "last_step": {
+                                    "iterations": fit["iterations"],
+                                    "converged": bool(fit["converged"]),
+                                    "failure_reason": fit.get("failure_reason"),
+                                    # Round to match live ``_update_unit_tobit_live`` writes
+                                    # (review I3 on f5be736) — diagnose snapshots taken
+                                    # right after a seed otherwise show un-rounded values
+                                    # while later snapshots show rounded ones.
+                                    "sigma": round(fit["sigma"], 5) if fit.get("sigma") is not None else None,
+                                    "n_eff": round(fit.get("n_eff", float(n_unc)), 2),
+                                    "step_norm": 0.0,
+                                    "skip_reason": None,
+                                },
+                            }
+                            regime_diag["seeded_live_window"] = True
+                            regime_diag["seeded_window_size"] = len(window_samples)
+                        else:
+                            # Defensive observable signal (review N5 on
+                            # f5be736): coordinator without a dict-shaped
+                            # ``_tobit_sufficient_stats`` cannot be seeded.
+                            # Stage-3 storage migration should always
+                            # populate ``{}`` so this branch is unreachable
+                            # in production, but legacy mocks and
+                            # restoration paths mid-migration may present
+                            # ``None`` — silent no-op would mislead users
+                            # into thinking the seed succeeded.
+                            regime_diag["seeded_live_window"] = False
+                            regime_diag["seed_skip_reason"] = "stats_not_dict"
                 entity_results[regime] = regime_diag
 
             results[entity_id] = entity_results
 
         return results
+
+    @staticmethod
+    def _is_entity_shutdown_under_current_rules(
+        *,
+        entity_id: str,
+        entry: dict,
+        pot_tuple: tuple[float, float, float],
+        unit_min_base: float,
+    ) -> bool:
+        """Re-run shutdown detection against current code on a logged entry.
+
+        Used by the for_tobit sample-collection path so the seed /
+        batch_fit window reflects the *current* classification rules
+        even when the persisted log entry was written under earlier
+        (possibly buggy) gate logic.  See review B1 on f5be736 — the
+        gate-ordering fix in 1.3.5 means pre-fix log entries' stored
+        ``solar_dominant_entities`` may miss parasitic hours that the
+        current rules correctly flag as shutdown.
+
+        Mirrors the live ``detect_solar_shutdown_entities`` gate
+        sequence per-entity (no need to handle multi-entity behaviour
+        here since the caller is in a per-entity loop).  Reads:
+
+        - ``actual`` from ``entry["unit_breakdown"][entity]``.
+        - ``base`` from ``entry["unit_expected_breakdown"][entity]``;
+          falls back to ``unit_min_base × 2`` × ratio-floor as a
+          conservative "in-range" estimate when the field is missing
+          (legacy logs).  The fallback only matters for entries old
+          enough to predate ``unit_expected_breakdown``; on those the
+          reclassification can't be precise, but it's better than
+          trusting a possibly-buggy persisted flag.
+        - ``unit_modes`` from ``entry["unit_modes"]``; non-heating
+          modes return False (existing detector contract).
+        - ``auxiliary_active`` from ``entry["auxiliary_active"]``;
+          aux-dominant hours return False.
+        - ``magnitude`` from the caller-supplied potential tuple
+          (already reconstructed once, no need to redo).
+
+        Constants used (``SOLAR_SHUTDOWN_*``) are imported from
+        ``const.py`` and reflect the current rules; the function
+        re-imports them at call site to avoid stale-binding from a
+        potential future hot-reload.
+        """
+        from .const import (
+            SOLAR_SHUTDOWN_ACTUAL_FLOOR,
+            SOLAR_SHUTDOWN_MIN_BASE,
+            SOLAR_SHUTDOWN_MIN_MAGNITUDE,
+            SOLAR_SHUTDOWN_RATIO,
+            MODE_HEATING,
+        )
+
+        if entry.get("auxiliary_active", False):
+            return False
+        unit_modes = entry.get("unit_modes", {}) or {}
+        if unit_modes.get(entity_id, MODE_HEATING) != MODE_HEATING:
+            return False
+        magnitude = (pot_tuple[0] ** 2 + pot_tuple[1] ** 2 + pot_tuple[2] ** 2) ** 0.5
+        if magnitude < SOLAR_SHUTDOWN_MIN_MAGNITUDE:
+            return False
+        actual = (entry.get("unit_breakdown", {}) or {}).get(entity_id, 0.0)
+        base_raw = (entry.get("unit_expected_breakdown") or {}).get(entity_id)
+        if base_raw is None:
+            # Legacy log without unit_expected_breakdown.  Fall back to
+            # current correlation_data via the same path the rest of
+            # the collector uses isn't available here without coordinator
+            # access.  Skip reclassification — preserve the persisted
+            # flag's decision instead.
+            return entity_id in (entry.get("solar_dominant_entities", []) or [])
+        base = float(base_raw)
+        if base <= 0.0:
+            return False
+        if actual < SOLAR_SHUTDOWN_ACTUAL_FLOOR:
+            return True  # parasitic floor — fires regardless of base/threshold
+        threshold = unit_min_base if unit_min_base and unit_min_base > 0 else SOLAR_SHUTDOWN_MIN_BASE
+        if base < threshold:
+            return False
+        ratio = actual / base if base > 0 else 1.0
+        return ratio < SOLAR_SHUTDOWN_RATIO
 
     def _collect_batch_fit_samples(
         self,
@@ -2521,14 +3187,42 @@ class LearningManager:
         unit_threshold: float,
         screen_affected_entities: frozenset[str] | None,
         match_diagnose: bool = False,
-    ) -> tuple[list[tuple[float, float, float, float]], dict[str, int]]:
+        for_tobit: bool = False,
+        solar_coefficients_per_unit: dict | None = None,
+    ) -> tuple[list[tuple[float, float, float, float]], list[bool], dict[str, int]]:
         """Filter + assemble samples for one (entity, regime) batch fit.
 
-        Returns ``(samples, drop_counts)``.  Each sample is a 4-tuple
-        ``(pot_s, pot_e, pot_w, actual_impact)`` ready for the joint
-        normal equations.  ``drop_counts`` reports per-reason rejection
-        counters useful for diagnostics — a fit that ends with too few
-        samples can be inspected to see which gate did the rejecting.
+        Returns ``(samples, censored_mask, drop_counts)``.  Each sample
+        is a 4-tuple ``(pot_s, pot_e, pot_w, value)`` and ``censored_mask[i]``
+        is True iff ``samples[i]`` is right-censored at ``value``.
+        ``drop_counts`` reports per-reason rejection counters useful for
+        diagnostics — a fit that ends with too few samples can be
+        inspected to see which gate did the rejecting.
+
+        ``for_tobit=True`` (#904 stage 0+1) keeps saturated rows instead
+        of dropping them: each saturated row is appended with
+        ``value = BATCH_FIT_SATURATION_RATIO × expected_base`` (the
+        censoring threshold ``T_i``, NOT the observed ``actual_impact``)
+        and tagged ``censored_mask[i] = True``.  Shutdown rows are still
+        dropped — Tobit modulating-regime fit only (CHOICE 3).
+        Unit-threshold gate is dropped — Tobit needs the saturated-
+        information-rich shoulder hours, and the legacy LS noise-floor
+        path is unreachable after stage 2 (every caller passes either
+        ``for_tobit=True`` or ``match_diagnose=True``).  Base is still
+        read from the live ``correlation_data_per_unit`` for ``for_tobit``
+        callers (Tobit can run on logs without ``unit_expected_breakdown``);
+        ``match_diagnose=True`` reads from ``unit_expected_breakdown``
+        instead, see below.  The ``unit_threshold`` parameter is
+        retained for API compatibility but no longer consulted on any
+        live code path; it may be removed in a future cleanup once the
+        signature surgery is convenient.
+
+        Mutual exclusivity: ``for_tobit`` dominates over
+        ``match_diagnose`` for the shutdown filter (#904 CHOICE 3 —
+        Tobit always excludes shutdown rows, regardless of
+        ``match_diagnose``'s wish to reproduce the diagnose
+        accumulator).  No current caller passes both flags True;
+        documented for stage-3+ safety.
 
         ``entry_potentials`` is parallel to ``hourly_log``: each entry
         carries its pre-reconstructed ``(pot_s, pot_e, pot_w, magnitude)``
@@ -2562,6 +3256,7 @@ class LearningManager:
         was a divergence found in code review and corrected.
         """
         samples: list[tuple[float, float, float, float]] = []
+        censored_mask: list[bool] = []
         drop_counts: dict[str, int] = {
             "wrong_mode": 0,
             "auxiliary_active": 0,
@@ -2572,8 +3267,22 @@ class LearningManager:
             "non_positive_impact": 0,
             "saturated": 0,
         }
+        if for_tobit:
+            drop_counts["censored"] = 0
+            drop_counts["outlier"] = 0
         target_mode = MODE_HEATING if regime == "heating" else MODE_COOLING
         correlation_per_unit = coordinator.model.correlation_data_per_unit
+
+        # Pre-fit MAD pass (#919 Part 1): collect all candidates first,
+        # then filter by robust residual.
+        candidates: list[dict] = []
+
+        # Get current coefficients for residual calculation
+        entity_coeffs = (solar_coefficients_per_unit or {}).get(entity_id, {})
+        regime_coeffs = entity_coeffs.get(regime, {}) if isinstance(entity_coeffs, dict) else {}
+        c_s = float(regime_coeffs.get("s", 0.0))
+        c_e = float(regime_coeffs.get("e", 0.0))
+        c_w = float(regime_coeffs.get("w", 0.0))
 
         for entry, (pot_s, pot_e, pot_w, magnitude) in zip(
             hourly_log, entry_potentials
@@ -2588,12 +3297,16 @@ class LearningManager:
                 drop_counts["auxiliary_active"] += 1
                 continue
 
-            # Shutdown filter: batch_fit excludes (the inequality learner
-            # owns those samples).  match_diagnose=True INCLUDES shutdown
-            # samples to reproduce ``diagnose_solar.implied_30d`` exactly
-            # — that headline accumulator includes them; only the parallel
-            # ``no_shutdown`` accumulator separates them out.
-            if not match_diagnose:
+            if for_tobit:
+                if self._is_entity_shutdown_under_current_rules(
+                    entity_id=entity_id,
+                    entry=entry,
+                    pot_tuple=(pot_s, pot_e, pot_w),
+                    unit_min_base=unit_threshold,
+                ):
+                    drop_counts["shutdown"] += 1
+                    continue
+            elif not match_diagnose:
                 shutdown_entities = set(
                     entry.get("solar_dominant_entities", []) or []
                 )
@@ -2610,12 +3323,6 @@ class LearningManager:
                 drop_counts["low_magnitude"] += 1
                 continue
 
-            # Base lookup: batch_fit reads CURRENT correlation_data; the
-            # diagnose-match path reads the LOG-TIME ``unit_expected_breakdown``
-            # so the LS sees the same base value diagnose's accumulator did.
-            # Diagnose-match falls back to the current correlation_data if
-            # the log entry lacks the field (legacy logs without
-            # ``unit_expected_breakdown``).
             wind_bucket = entry.get("wind_bucket", "normal")
             effective_bucket = (
                 COOLING_WIND_BUCKET if regime == "cooling" else wind_bucket
@@ -2637,7 +3344,7 @@ class LearningManager:
                     if unit_buckets
                     else 0.0
                 )
-                if expected_base < unit_threshold:
+                if expected_base <= 0.0:
                     drop_counts["below_min_base"] += 1
                     continue
 
@@ -2651,23 +3358,107 @@ class LearningManager:
                 drop_counts["non_positive_impact"] += 1
                 continue
 
-            # Saturation gate is heating-physics: when sun fully covers
-            # heating demand, ``actual ≈ 0`` and ``actual_impact ≈ base``
-            # → coefficient is clipped, the sample carries no slope
-            # information.  Cooling has no equivalent — ``actual_impact =
-            # actual - base`` has no upper bound from physics, so dropping
-            # at ``≥ 0.95×base`` would discard the strongest cooling-load
-            # samples for no reason.
-            if (
-                regime == "heating"
-                and actual_impact >= BATCH_FIT_SATURATION_RATIO * expected_base
-            ):
-                drop_counts["saturated"] += 1
+            saturation_threshold = BATCH_FIT_SATURATION_RATIO * expected_base
+            is_saturated = (
+                regime == "heating" and actual_impact >= saturation_threshold
+            )
+            
+            # Calculate residual against current model
+            pred = c_s * pot_s + c_e * pot_e + c_w * pot_w
+            residual = actual_impact - pred
+            
+            candidates.append({
+                "pot": (pot_s, pot_e, pot_w),
+                "actual_impact": actual_impact,
+                "is_saturated": is_saturated,
+                "saturation_threshold": saturation_threshold,
+                "residual": residual,
+                "expected_base": expected_base,
+                "actual": actual,
+            })
+
+        if not candidates:
+            return [], [], drop_counts
+
+        # Robust residual filtering (#919 Part 1).
+        # Skip MAD-baseline filtering if match_diagnose=True or coefficients are missing.
+        # But ALWAYS apply the prior-free sanity check to maintain consistency
+        # with diagnose_solar.
+        use_mad = not match_diagnose and solar_coefficients_per_unit is not None
+        threshold = None
+        median_res = 0.0
+
+        if use_mad:
+            # Only use non-saturated samples for MAD calculation
+            uncensored_residuals = [c["residual"] for c in candidates if not c["is_saturated"]]
+            
+            # Always center on median to handle stale current-coefficients (#919).
+            if uncensored_residuals:
+                median_res = statistics.median(uncensored_residuals)
+            else:
+                median_res = 0.0
+
+            if len(uncensored_residuals) >= OUTLIER_MIN_SAMPLES:
+                abs_devs = [abs(r - median_res) for r in uncensored_residuals]
+                mad = statistics.median(abs_devs)
+                
+                # Sigma floor consistent with _is_outlier_residual
+                # unit_min_base is passed as unit_threshold in this method's API.
+                # Handle both float (direct value) and dict (per-entity map) cases.
+                # NOTE: _resolve_min_base defaults to 0.5 for unknown entities.
+                # For small loads (e.g. 0.01 kWh), this default creates an implicit
+                # 25 Wh sigma-floor, keeping the MAD filter latently "off" (safe)
+                # until a proper unit_min_base is configured for the sensor.
+                if isinstance(unit_threshold, (int, float)) and unit_threshold > 0:
+                    min_base_val = float(unit_threshold)
+                elif isinstance(unit_threshold, dict):
+                    min_base_val = _resolve_min_base(entity_id, unit_threshold, 0.5)
+                else:
+                    min_base_val = 0.5
+                
+                sigma_floor = max(0.02, 0.05 * max(min_base_val, 0.1))
+                sigma_robust = max(sigma_floor, 1.4826 * mad)
+                
+                threshold = OUTLIER_K_THRESHOLD * sigma_robust
+            else:
+                # Fallback for small windows: no MAD filtering, just hard cap.
+                # Still centered on median so stale model doesn't drop all samples.
+                threshold = HARD_OUTLIER_CAP_FACTOR
+
+        filtered_candidates = []
+        for c in candidates:
+            is_outlier_sample = False
+            # 1. Filter by MAD residual (conditional)
+            if threshold is not None and abs(c["residual"] - median_res) > threshold:
+                is_outlier_sample = True
+                
+            # 2. Filter by prior-free sanity (unconditional, matches diagnostics.py)
+            if not is_outlier_sample and c["expected_base"] > 0:
+                if abs(c["actual"] - c["expected_base"]) > HARD_OUTLIER_SANITY_MULTIPLIER * c["expected_base"]:
+                    is_outlier_sample = True
+            
+            if is_outlier_sample:
+                drop_counts["outlier"] = drop_counts.get("outlier", 0) + 1
                 continue
+            
+            filtered_candidates.append(c)
+        candidates = filtered_candidates
 
-            samples.append((pot_s, pot_e, pot_w, actual_impact))
+        for c in candidates:
+            if c["is_saturated"]:
+                if for_tobit:
+                    samples.append(
+                        (c["pot"][0], c["pot"][1], c["pot"][2], c["saturation_threshold"])
+                    )
+                    censored_mask.append(True)
+                    drop_counts["censored"] += 1
+                else:
+                    drop_counts["saturated"] += 1
+            else:
+                samples.append((c["pot"][0], c["pot"][1], c["pot"][2], c["actual_impact"]))
+                censored_mask.append(False)
 
-        return samples, drop_counts
+        return samples, censored_mask, drop_counts
 
     @staticmethod
     def _solve_batch_fit_normal_equations(
@@ -2762,6 +3553,425 @@ class LearningManager:
             sse += (pred - impact) ** 2
         return round((sse / len(samples)) ** 0.5, 5)
 
+    @staticmethod
+    def _tobit_mills(q: float) -> tuple[float, float]:
+        """Right-censoring Mills ratio λ(q) = φ(q) / (1 − Φ(q)) and survival.
+
+        Returns ``(λ(q), 1 − Φ(q))``.  Uses ``erfc`` for the survival
+        function to avoid catastrophic cancellation at large positive
+        ``q`` (where ``1 − Φ`` underflows in the naïve form).  At
+        ``q ≳ 8`` the Mills ratio is computed from the asymptotic
+        expansion ``λ(q) ≈ q + 1/q − 2/q³`` (Abramowitz & Stegun
+        26.2.13) — direct ``φ/erfc`` divides two near-zero numbers
+        and loses precision long before either underflows.
+        """
+        if q > 8.0:
+            # Asymptotic; survival underflows but Mills ratio is finite.
+            inv = 1.0 / q
+            lam = q + inv - 2.0 * inv * inv * inv
+            return (lam, 0.0)
+        if q < -38.0:
+            # Survival ≈ 1, pdf ≈ 0 → Mills ratio negligible.
+            return (0.0, 1.0)
+        surv = 0.5 * math.erfc(q / math.sqrt(2.0))
+        if surv < 1e-300:
+            inv = 1.0 / q if q != 0 else 0.0
+            return (q + inv, surv)
+        pdf = math.exp(-0.5 * q * q) / math.sqrt(2.0 * math.pi)
+        return (pdf / surv, surv)
+
+    @staticmethod
+    def _solve_tobit_3d(
+        samples: list[tuple[float, float, float, float]],
+        censored_mask: list[bool],
+        *,
+        coeff_init: dict[str, float] | None = None,
+        sigma_init: float | None = None,
+        max_iter: int = TOBIT_MAX_ITER,
+        tol: float = TOBIT_CONV_TOL,
+        q_clip: float = TOBIT_Q_CLIP,
+    ) -> dict | None:
+        """Type-I right-censored Gaussian regression MLE (3D solar coeff).
+
+        Maximises the Tobit log-likelihood for solar-coefficient learning
+        with saturation-clipped (HP-fully-off) samples treated as
+        right-censored data, jointly over ``(c_S, c_E, c_W, log σ)``:
+
+            ℓ(c, σ) = Σ_U [ −log σ − ½((y_i − c·s_i)/σ)² ]
+                    + Σ_C log( 1 − Φ((T_i − c·s_i)/σ) )                    (+ const)
+
+        where ``y_i = base − actual`` for uncensored rows and ``T_i =
+        BATCH_FIT_SATURATION_RATIO × base`` for censored rows.  Per
+        Olsen (1978) ℓ is globally concave in ``(c, log σ)``, so the
+        unique maximum can be reached by Newton iterations from any
+        feasible start.  Non-negativity (invariant #4) is enforced via
+        an active-set projected Newton step.
+
+        Sample format
+        -------------
+        ``samples[i] = (s_i, e_i, w_i, value_i)`` parallel to
+        ``censored_mask[i]``.  When ``censored_mask[i] = True``,
+        ``value_i`` is the censoring threshold ``T_i`` (NOT the observed
+        ``actual_impact``); when ``False``, it is the observed
+        ``y_i = base − actual``.  Caller responsibility — keeps the
+        solver independent of how saturation is detected.
+
+        Returns
+        -------
+        ``{"s", "e", "w", "sigma", "iterations", "converged",
+        "log_likelihood", "n_uncensored", "n_censored", "n_eff"}`` on
+        success, or ``None`` when the warm-start LS has too few rows
+        to form an initial estimate.  ``n_eff = |U| + Σ_C λ(q)(λ(q)−q)``
+        is the censoring-weighted effective sample size.
+
+        ``q_clip`` floor on ``q = (T − c·s)/σ`` inside the trust region
+        guards against the asymptotic regime where λ(q) ≈ 0 (model
+        predicts the unit fully on while data says fully off — the
+        censored sample carries no slope information here, but feeding
+        the limit value into the Newton step produces a pathological
+        zero contribution that destabilises the active-set logic).
+        """
+        n = len(samples)
+        if n != len(censored_mask) or n == 0:
+            return None
+
+        # Warm-start: LS on uncensored rows only.  Sigma seed = residual
+        # std of LS fit; we floor at a tiny value because a perfect-fit
+        # warm start with σ=0 makes the very first r_i blow up.
+        uncensored_samples = [
+            samples[i] for i in range(n) if not censored_mask[i]
+        ]
+        n_unc = len(uncensored_samples)
+        if n_unc < 3:
+            # σ identifiability requires at least 3 uncensored to seed
+            # the LS direction in 3D.  Below that we cannot warm-start
+            # and the caller's gate (TOBIT_MIN_UNCENSORED = 20) should
+            # already have rejected; defensive return.
+            return None
+
+        # Always run the LS fit on uncensored rows.  Two uses below:
+        # (1) when no warm-start c is supplied, LS becomes the c-init;
+        # (2) when a warm-start c IS supplied (live-learner replay),
+        # the LS residual still seeds σ — see the σ-init block.
+        # If LS is degenerate (collinear samples in the uncensored
+        # subset), fall back to the warm-start path.
+        ls_fit = LearningManager._solve_batch_fit_normal_equations(
+            uncensored_samples
+        )
+
+        if coeff_init is None:
+            if ls_fit is None:
+                return None
+            c = [
+                max(0.0, float(ls_fit["s"])),
+                max(0.0, float(ls_fit["e"])),
+                max(0.0, float(ls_fit["w"])),
+            ]
+        else:
+            c = [
+                max(0.0, float(coeff_init.get("s", 0.0))),
+                max(0.0, float(coeff_init.get("e", 0.0))),
+                max(0.0, float(coeff_init.get("w", 0.0))),
+            ]
+
+        # σ initialisation: seed σ from the LS-fit residuals (which
+        # are c-independent of the warm-start) rather than from the
+        # warm-start residuals.  Naïve σ-init from SSE-against-c
+        # yields a wildly inflated σ when c is biased — e.g. a live-
+        # learner warm-start from an NLMS-converged-but-saturation-
+        # biased coefficient gives σ ≈ 5–8× true at α=27 % censoring,
+        # while LS-residual σ stays within 5–15 % of truth across
+        # α ∈ [0, 50 %].  Inflated σ → Newton iter 1 over-corrects σ
+        # → line-search-budget exhausts → ``did_not_converge`` on
+        # iter 1.
+        #
+        # Important: this fix does NOT widen Newton's convergence
+        # basin (verified by pre-fix vs post-fix sweep — identical
+        # basin boundaries).  Newton from a biased c still fails to
+        # converge; it just fails 4 iterations later instead of on
+        # iter 1.  The escape from biased priors is implemented via
+        # LS-fallback retry in ``_update_unit_tobit_live``, not here.
+        # The σ-init fix is defense-in-depth: better diagnose
+        # visibility (failure shows up at iter 5 with the σ-Newton-
+        # step trajectory in the slot's last_step), and better σ
+        # at convergence on near-basin priors that DO succeed.
+        #
+        # When LS is degenerate (no usable σ seed), fall back to the
+        # warm-start residuals — preserves pre-fix behaviour for the
+        # corner case where LS itself cannot be computed.
+        if sigma_init is None:
+            if ls_fit is not None:
+                sse = 0.0
+                for s_i, e_i, w_i, y_i in uncensored_samples:
+                    pred = (
+                        ls_fit["s"] * s_i
+                        + ls_fit["e"] * e_i
+                        + ls_fit["w"] * w_i
+                    )
+                    sse += (y_i - pred) ** 2
+            else:
+                sse = 0.0
+                for s_i, e_i, w_i, y_i in uncensored_samples:
+                    pred = c[0] * s_i + c[1] * e_i + c[2] * w_i
+                    sse += (y_i - pred) ** 2
+            sigma = max(1e-3, (sse / max(1, n_unc)) ** 0.5)
+        else:
+            sigma = max(1e-3, float(sigma_init))
+        gamma = math.log(sigma)
+
+        def _loglik(c_vec: list[float], gamma_val: float) -> float:
+            sig = math.exp(gamma_val)
+            ll = 0.0
+            log_2pi = math.log(2.0 * math.pi)
+            for i in range(n):
+                s_i, e_i, w_i, val = samples[i]
+                pred = c_vec[0] * s_i + c_vec[1] * e_i + c_vec[2] * w_i
+                if censored_mask[i]:
+                    q_i = (val - pred) / sig
+                    if q_i < q_clip:
+                        q_i = q_clip
+                    _, surv = LearningManager._tobit_mills(q_i)
+                    if surv <= 0.0:
+                        # Asymptotic: log(survival) ≈ −q²/2 − log(q√2π) for q≫0
+                        if q_i > 0:
+                            ll -= 0.5 * q_i * q_i + math.log(
+                                q_i * math.sqrt(2.0 * math.pi)
+                            )
+                        else:
+                            return -math.inf
+                    else:
+                        ll += math.log(surv)
+                else:
+                    r_i = (val - pred) / sig
+                    ll += -0.5 * log_2pi - gamma_val - 0.5 * r_i * r_i
+            return ll
+
+        ll_curr = _loglik(c, gamma)
+
+        converged = False
+        failure_reason: str | None = None
+        last_iter = 0
+        for it in range(max_iter):
+            last_iter = it + 1
+            sigma = math.exp(gamma)
+
+            # Build gradient g (4-vec) and Hessian H (4×4) over (c, γ).
+            # Index convention: 0..2 = c_S, c_E, c_W; 3 = γ.
+            g = [0.0, 0.0, 0.0, 0.0]
+            H = [[0.0] * 4 for _ in range(4)]
+
+            for i in range(n):
+                s_i, e_i, w_i, val = samples[i]
+                pred = c[0] * s_i + c[1] * e_i + c[2] * w_i
+                vec = (s_i, e_i, w_i)
+                if censored_mask[i]:
+                    q_i = (val - pred) / sigma
+                    if q_i < q_clip:
+                        q_i = q_clip
+                    lam, _ = LearningManager._tobit_mills(q_i)
+                    weight = lam * (lam - q_i)  # ≥ 0 (Greene §17.3)
+                    # ∂ℓ/∂c_k = (s_ik / σ) · λ(q)
+                    coef_grad = lam / sigma
+                    for k in range(3):
+                        g[k] += coef_grad * vec[k]
+                    # ∂ℓ/∂γ = q · λ(q)
+                    g[3] += q_i * lam
+                    # H_cc block: −(1/σ²) · weight · s_ik s_il
+                    inv_sig2 = 1.0 / (sigma * sigma)
+                    for k in range(3):
+                        for l in range(3):
+                            H[k][l] -= inv_sig2 * weight * vec[k] * vec[l]
+                    # H_cγ:  −(1/σ) · λ(q) · [1 + q·(λ(q) − q)]
+                    cross = -(lam / sigma) * (1.0 + q_i * (lam - q_i))
+                    for k in range(3):
+                        H[k][3] += cross * vec[k]
+                        H[3][k] += cross * vec[k]
+                    # H_γγ: −q · λ(q) · [1 + q·(λ(q) − q)]
+                    H[3][3] -= q_i * lam * (1.0 + q_i * (lam - q_i))
+                else:
+                    r_i = (val - pred) / sigma
+                    # ∂ℓ/∂c_k = (s_ik / σ) · r_i
+                    coef_grad = r_i / sigma
+                    for k in range(3):
+                        g[k] += coef_grad * vec[k]
+                    # ∂ℓ/∂γ = −1 + r²
+                    g[3] += -1.0 + r_i * r_i
+                    # H_cc: −s_ik s_il / σ²
+                    inv_sig2 = 1.0 / (sigma * sigma)
+                    for k in range(3):
+                        for l in range(3):
+                            H[k][l] -= inv_sig2 * vec[k] * vec[l]
+                    # H_cγ: −2 r · s_ik / σ
+                    cross = -2.0 * r_i / sigma
+                    for k in range(3):
+                        H[k][3] += cross * vec[k]
+                        H[3][k] += cross * vec[k]
+                    # H_γγ: −2 r²
+                    H[3][3] -= 2.0 * r_i * r_i
+
+            # Active-set projection: a c-component pinned at zero with
+            # gradient pushing further negative stays at zero (KKT).
+            # γ is always free.  Free indices participate in the reduced
+            # Newton solve; pinned components contribute zero step.
+            free = [True, True, True, True]
+            for k in range(3):
+                if c[k] <= 0.0 and g[k] < 0.0:
+                    free[k] = False
+
+            free_idx = [k for k in range(4) if free[k]]
+            m = len(free_idx)
+            if m == 0:
+                converged = True
+                break
+
+            # First-order optimality: if the gradient is essentially zero
+            # on every free direction we are at the (local) maximum and
+            # there is nothing for Newton to do.  Catches the noiseless-
+            # warm-start case where the LS solution is already exact —
+            # without this guard the line search would halve α 10 times
+            # trying to find an improvement that cannot exist (every
+            # perturbation strictly decreases ll on a perfect-fit point)
+            # and bail out as ``line_search_failed`` even though the
+            # iterate IS the optimum.  Real data always has noise → real
+            # gradient ≠ 0 at the warm-start, so this branch only fires
+            # at the actual converged optimum.
+            grad_norm = max(abs(g[k]) for k in free_idx)
+            if grad_norm < tol:
+                converged = True
+                break
+
+            # Solve reduced system: −H[free, free] · Δ = g[free]
+            # We negate H so the matrix is positive-definite at maximum
+            # (negative-definite Hessian → minus is PD), then Gauss-elim.
+            A = [[-H[free_idx[r]][free_idx[col]] for col in range(m)]
+                 for r in range(m)]
+            b = [g[free_idx[r]] for r in range(m)]
+            # Tikhonov regulariser on the diagonal — guards against
+            # rank-deficient Newton at the boundary (e.g. when a c-comp
+            # pinned at 0 leaves the remaining 3-vector collinear).
+            for r in range(m):
+                A[r][r] += 1e-9
+
+            # Gauss-Jordan with partial pivoting.
+            singular = False
+            for r in range(m):
+                pivot_row = max(range(r, m), key=lambda x: abs(A[x][r]))
+                if abs(A[pivot_row][r]) < 1e-12:
+                    # Singular reduced Hessian — Newton step is undefined.
+                    # Olsen 1978's global concavity guarantees this should
+                    # not happen on data with non-zero solar variance, but
+                    # collinear sample windows or boundary-rank-deficient
+                    # active sets can still trip this in practice.  Bail
+                    # out as a solver FAILURE — ``converged = False``
+                    # must propagate so callers route to
+                    # ``did_not_converge``, NOT apply the last iterate.
+                    # Setting ``converged = True`` here (the pre-fix
+                    # behaviour) would silently write a coefficient that
+                    # has no Newton-step support.
+                    singular = True
+                    failure_reason = "singular_step"
+                    break
+                if pivot_row != r:
+                    A[r], A[pivot_row] = A[pivot_row], A[r]
+                    b[r], b[pivot_row] = b[pivot_row], b[r]
+                pivot = A[r][r]
+                for col in range(r, m):
+                    A[r][col] /= pivot
+                b[r] /= pivot
+                for r2 in range(m):
+                    if r2 != r and abs(A[r2][r]) > 0.0:
+                        factor = A[r2][r]
+                        for col in range(r, m):
+                            A[r2][col] -= factor * A[r][col]
+                        b[r2] -= factor * b[r]
+            if singular:
+                # converged stays False (initialised at top of solver);
+                # caller will route to did_not_converge.
+                break
+
+            delta = [0.0, 0.0, 0.0, 0.0]
+            for j, k in enumerate(free_idx):
+                delta[k] = b[j]
+
+            # Backtracking line search.  Try full Newton, halve up to
+            # 10 times if the projected step doesn't improve ℓ.  The
+            # global concavity (Olsen 1978) guarantees a step exists,
+            # but γ-direction Newton can over-shoot when σ is small.
+            alpha = 1.0
+            ll_new = -math.inf
+            c_new = c[:]
+            gamma_new = gamma
+            for _ls in range(10):
+                c_new = [
+                    max(0.0, c[k] + alpha * delta[k]) for k in range(3)
+                ]
+                gamma_new = gamma + alpha * delta[3]
+                # Bound γ to keep σ in a sane numerical range.
+                if gamma_new < -10.0:
+                    gamma_new = -10.0
+                elif gamma_new > 10.0:
+                    gamma_new = 10.0
+                ll_new = _loglik(c_new, gamma_new)
+                if ll_new > ll_curr - 1e-12:
+                    break
+                alpha *= 0.5
+            else:
+                # Line-search exhaustion: 10 alpha-halvings produced no
+                # improving step.  This is a SOLVER FAILURE — the Newton
+                # direction is unreliable on this iterate (typically
+                # high-censoring + numerically stiff windows).  ``converged
+                # = False`` propagates so callers route to
+                # ``did_not_converge``.  Setting ``converged = True`` here
+                # (pre-fix) would mask the failure as a successful exit
+                # and write the unimproved iterate to live state.
+                failure_reason = "line_search_failed"
+                break
+
+            step_norm = max(
+                abs(c_new[k] - c[k]) for k in range(3)
+            ) if delta[:3] else 0.0
+            step_norm = max(step_norm, abs(gamma_new - gamma))
+
+            c = c_new
+            gamma = gamma_new
+            ll_curr = ll_new
+
+            if step_norm < tol:
+                converged = True
+                break
+
+        sigma = math.exp(gamma)
+
+        # Effective sample size: |U| + Σ_C λ(q)(λ(q) − q).  Report so the
+        # caller (and downstream gates) can act on identifiability.
+        n_eff = float(n_unc)
+        n_cens = 0
+        for i in range(n):
+            if not censored_mask[i]:
+                continue
+            n_cens += 1
+            s_i, e_i, w_i, val = samples[i]
+            pred = c[0] * s_i + c[1] * e_i + c[2] * w_i
+            q_i = (val - pred) / sigma
+            if q_i < q_clip:
+                q_i = q_clip
+            lam, _ = LearningManager._tobit_mills(q_i)
+            n_eff += lam * (lam - q_i)
+
+        return {
+            "s": c[0],
+            "e": c[1],
+            "w": c[2],
+            "sigma": sigma,
+            "iterations": last_iter,
+            "converged": converged,
+            "failure_reason": failure_reason,
+            "log_likelihood": ll_curr,
+            "n_uncensored": n_unc,
+            "n_censored": n_cens,
+            "n_eff": n_eff,
+        }
+
     def compute_implied_for_apply(
         self,
         hourly_log: list[dict],
@@ -2831,7 +4041,11 @@ class LearningManager:
         # the filter set: drops the per-unit min_base gate, includes
         # shutdown samples, and reads base from the log-time
         # ``unit_expected_breakdown`` field.
-        samples, drop_counts = self._collect_batch_fit_samples(
+        #
+        # NOTE: ``match_diagnose=True`` explicitly skips the full MAD
+        # outlier baseline to ensure "trust diagnose, commit verbatim"
+        # consistency. Only the prior-free sanity check applies.
+        samples, _censored_mask, drop_counts = self._collect_batch_fit_samples(
             entity_id=entity_id,
             regime=regime,
             hourly_log=filtered_log,
@@ -2962,4 +4176,557 @@ class LearningManager:
             entry["stable"] = True
             entry["reason"] = "ok"
             result[d] = entry
+        return result
+
+    def _update_unit_tobit_live(
+        self,
+        entity_id: str,
+        regime: str,
+        sample_vector: tuple[float, float, float],
+        actual_impact: float,
+        expected_unit_base: float,
+        tobit_sufficient_stats: dict,
+        solar_coefficients_per_unit: dict,
+    ) -> dict:
+        """Live Tobit step on the running sufficient-statistic (#904 stage 3).
+
+        Append the new (s, e, w, value, censored) sample to the running
+        window, trim to ``TOBIT_RUNNING_WINDOW``, run one full Newton
+        iteration of ``_solve_tobit_3d`` over the current window, and
+        write the resulting coefficient to ``solar_coefficients_per_unit``.
+
+        The "running" aspect is a sliding window of recent raw samples
+        rather than a true closed-form sufficient statistic — Tobit's
+        Mills-ratio gradient at each Newton iterate depends on the
+        current ``c·sᵢ`` value of every censored sample, which cannot
+        be reduced to a fixed sum.  Sliding window keeps memory bounded
+        (~6 KB per slot at peak) while preserving exact MLE on the
+        window.
+
+        Caller MUST have verified:
+        - feature flag enabled
+        - allow-list semantic satisfied: ``not tobit_live_entities`` (auto-mode,
+          plausibility decides) OR ``entity_id in tobit_live_entities``
+          (scope override).  Plausibility-gate v2 still applies in both modes.
+        - entity_id NOT in mpc_managed_entities (Track C exclusion)
+        - regime != None (heating or cooling)
+        - solar_model_version on stored stats matches current
+          (storage load handles version-drift reset; if we got here,
+          the slot is current)
+
+        Plausibility-gate v2 applies after fit succeeds: heating regime
+        runs an unconstrained-OLS sub-fit on uncensored samples and
+        verifies (a) ``ols_max ≥ PLAUSIBILITY_MIN_OLS_MAX_DIRECTION`` and
+        (b) cosine similarity between Tobit and OLS vectors ≥
+        ``PLAUSIBILITY_MIN_DIRECTION_COSINE``.  Cooling skips the gate
+        entirely (no censoring → Tobit ≡ OLS).  First transition from
+        blocked → applied is rate-limited.
+
+        Returns
+        -------
+        Dict with keys: ``applied`` (bool — coefficient was written),
+        ``in_cold_start`` (bool — n_eff < TOBIT_MIN_NEFF, NLMS-fallback
+        should run instead), ``n_uncensored``, ``n_censored``, ``n_eff``,
+        ``last_step_iterations``, ``last_step_failure_reason``,
+        ``last_step_norm``, ``sigma``, ``samples_since_reset``.
+        Caller uses ``in_cold_start`` to decide whether to run the
+        NLMS-fallback path (which writes the live coefficient when
+        Tobit isn't yet identifiable).
+        """
+        import math
+        from .const import (
+            BATCH_FIT_SATURATION_RATIO,
+            PLAUSIBILITY_MIN_DIRECTION_COSINE,
+            PLAUSIBILITY_MIN_OLS_MAX_DIRECTION,
+            PLAUSIBILITY_MIN_TOBIT_MAGNITUDE,
+            PLAUSIBILITY_RATE_LIMIT_FRACTION,
+            SOLAR_COEFF_CAP,
+            SOLAR_MODEL_VERSION,
+            TOBIT_MIN_NEFF,
+            TOBIT_MIN_UNCENSORED,
+            TOBIT_RUNNING_WINDOW,
+        )
+
+        # Locate / initialise the running state for this (entity, regime).
+        entity_state = tobit_sufficient_stats.setdefault(entity_id, {})
+        slot = entity_state.setdefault(regime, {
+            "samples": [],
+            "samples_since_reset": 0,
+            "last_step": {},
+            "solar_model_version": SOLAR_MODEL_VERSION,
+        })
+
+        # Censoring decision matches batch_fit (#908) — saturated rows
+        # carry value = T = ratio × base instead of observed actual_impact.
+        # Cooling has no upper-saturation analog; censoring threshold
+        # only applies on the heating regime.
+        s_e_w = (
+            float(sample_vector[0]),
+            float(sample_vector[1]),
+            float(sample_vector[2]),
+        )
+        is_censored = (
+            regime == "heating"
+            and actual_impact >= BATCH_FIT_SATURATION_RATIO * expected_unit_base
+        )
+        if is_censored:
+            value = BATCH_FIT_SATURATION_RATIO * expected_unit_base
+        else:
+            value = actual_impact
+
+        # Append + trim.  Sliding window keeps the most recent
+        # TOBIT_RUNNING_WINDOW samples; older samples roll off
+        # automatically — the running estimator naturally tracks
+        # slow drift in install conditions without manual reset.
+        slot["samples"].append((s_e_w[0], s_e_w[1], s_e_w[2], value, is_censored))
+        if len(slot["samples"]) > TOBIT_RUNNING_WINDOW:
+            slot["samples"] = slot["samples"][-TOBIT_RUNNING_WINDOW:]
+        slot["samples_since_reset"] = slot.get("samples_since_reset", 0) + 1
+
+        n_total = len(slot["samples"])
+        n_unc = sum(1 for sample in slot["samples"] if not sample[4])
+        n_cens = n_total - n_unc
+
+        result = {
+            "applied": False,
+            "in_cold_start": True,
+            "n_uncensored": n_unc,
+            "n_censored": n_cens,
+            "n_eff": float(n_unc),
+            "last_step_iterations": 0,
+            "last_step_failure_reason": None,
+            "last_step_norm": 0.0,
+            "sigma": None,
+            "samples_since_reset": slot["samples_since_reset"],
+        }
+
+        if n_unc < TOBIT_MIN_UNCENSORED:
+            slot["last_step"] = {
+                "skip_reason": "insufficient_uncensored",
+                "n_uncensored": n_unc,
+            }
+            return result
+
+        # Pull the parallel arrays Tobit expects.  Storing as 4-tuples
+        # in slot["samples"] saves memory; convert to (samples, mask)
+        # at the call site.  ~200 elements max → trivial cost.
+        samples_4tup = [
+            (s[0], s[1], s[2], s[3]) for s in slot["samples"]
+        ]
+        censored_mask = [s[4] for s in slot["samples"]]
+
+        # Coefficient warm-start: feed Tobit the current (entity, regime)
+        # coefficient as initial point.  Per-hour Newton iteration thus
+        # makes incremental progress instead of restarting from LS each
+        # call — matches the "running" semantics and converges in 1-2
+        # iterations after the first hour.
+        entity_coeff_dict = solar_coefficients_per_unit.get(entity_id, {})
+        regime_coeff = entity_coeff_dict.get(regime) if isinstance(entity_coeff_dict, dict) else None
+        coeff_init = None
+        if isinstance(regime_coeff, dict) and any(
+            regime_coeff.get(k, 0.0) for k in ("s", "e", "w")
+        ):
+            coeff_init = regime_coeff
+
+        fit = LearningManager._solve_tobit_3d(
+            samples_4tup,
+            censored_mask,
+            coeff_init=coeff_init,
+        )
+
+        # LS-fallback on ANY Newton convergence failure with a non-
+        # None warm-start.  When the warm-start coefficient (NLMS-
+        # converged or Tobit-from-prior-hour) sits outside Tobit's
+        # local convergence basin (~±10 % of the true coefficient
+        # value, basin width depends on data; sharp boundary verified
+        # by basin-sweep probe), Newton fails to converge.  Typical
+        # failure is ``line_search_failed`` (the line-search budget
+        # exhausts when σ over-corrects on iter 1), but ``max_iter``
+        # and ``singular_step`` are also possible on noisier real-
+        # world data.  Retry on ANY non-converged outcome rather
+        # than gating on a specific failure_reason — LS-fallback
+        # runs the in-solver LS-warm-start path, which has its own
+        # well-behaved convergence basin determined by the data
+        # (not by the prior), and converges reliably (~4 iterations
+        # to truth) on any input the original Newton would have
+        # rejected.  The σ-init fix in ``_solve_tobit_3d`` (LS-
+        # residual seed instead of biased-c seed) does NOT widen the
+        # basin — verified by pre-fix vs post-fix sweep showing
+        # identical basin boundaries; it only extends Newton's
+        # iteration count before line-search-failure (1 → ~5 iter),
+        # giving better diagnose visibility but no convergence
+        # benefit.  LS-fallback provides the actual basin escape.
+        # Without it, production behaviour was: NLMS converged to
+        # a saturation-biased value (e.g. 0.55 vs true 1.65), Tobit
+        # took over at n_eff ≥ 40, every fit failed Newton, the
+        # live coefficient was never written, and NLMS continued
+        # writing the biased value indefinitely — defeating the
+        # entire Stage-3 design.  The rate-limiter then handles
+        # the resulting magnitude jump from the LS-Tobit fit.
+        if (
+            fit is not None
+            and coeff_init is not None
+            and not fit.get("converged", False)
+        ):
+            _LOGGER.debug(
+                "Tobit warm-start outside basin for %s/%s; "
+                "retrying with LS warm-start",
+                entity_id, regime,
+            )
+            fit = LearningManager._solve_tobit_3d(
+                samples_4tup,
+                censored_mask,
+                coeff_init=None,
+            )
+
+        if fit is None:
+            slot["last_step"] = {
+                "skip_reason": "warm_start_failed",
+                "n_uncensored": n_unc,
+            }
+            result["last_step_failure_reason"] = "warm_start_failed"
+            return result
+
+        result["sigma"] = round(fit["sigma"], 5)
+        result["last_step_iterations"] = fit["iterations"]
+        result["last_step_failure_reason"] = fit.get("failure_reason")
+        result["n_eff"] = round(fit["n_eff"], 2)
+
+        # Post-fit identifiability gate.
+        if fit["n_eff"] < TOBIT_MIN_NEFF:
+            slot["last_step"] = {
+                "skip_reason": "insufficient_effective_samples",
+                "n_eff": fit["n_eff"],
+            }
+            return result
+
+        if not fit["converged"]:
+            slot["last_step"] = {
+                "skip_reason": "did_not_converge",
+                "failure_reason": fit.get("failure_reason"),
+            }
+            return result
+
+        # Compute step norm vs current coefficient (for diagnose / drift
+        # detection — per-week-drift falsification).
+        prev_s = float((coeff_init or {}).get("s", 0.0))
+        prev_e = float((coeff_init or {}).get("e", 0.0))
+        prev_w = float((coeff_init or {}).get("w", 0.0))
+        new_s = max(0.0, min(SOLAR_COEFF_CAP, float(fit["s"])))
+        new_e = max(0.0, min(SOLAR_COEFF_CAP, float(fit["e"])))
+        new_w = max(0.0, min(SOLAR_COEFF_CAP, float(fit["w"])))
+
+        # State carried from the previous Tobit step on this slot —
+        # determines log severity (transition vs continuation) and
+        # whether the rate-limiter on first-post-block step applies.
+        prior_skip_reason = (slot.get("last_step") or {}).get("skip_reason")
+        was_plausibility_blocked = prior_skip_reason in (
+            "plausibility_no_uncensored_signal",
+            "plausibility_direction_mismatch",
+        )
+
+        # Plausibility-gate v2 — automatic discrimination against noise
+        # loads (small electric circuits, sockets, refrigeration
+        # appliances) whose Tobit fit is censoring-pattern-driven only.
+        # Heating regime only: cooling has no upper-saturation
+        # (``is_censored`` set to False on every cooling sample at slot
+        # write-time), so Tobit reduces to OLS exactly and the
+        # discrimination is degenerate (``tobit_max ≡ ols_max`` →
+        # plausibility-gate would only fire on the structurally-thin
+        # 0.05 < c < 0.10 band where small AC installs naturally
+        # converge).  Cooling fires through directly.
+        #
+        # Cold-start fires plausibility too: a noise-load entity at
+        # first-fit is exactly the case the gate is guarding against.
+        if regime == "heating":
+            tobit_max = max(abs(new_s), abs(new_e), abs(new_w))
+            ols_fit = None
+            if tobit_max > PLAUSIBILITY_MIN_TOBIT_MAGNITUDE:
+                uncensored_only = [
+                    (s[0], s[1], s[2], s[3])
+                    for s in slot["samples"]
+                    if not s[4]
+                ]
+                ols_fit = LearningManager._solve_batch_fit_normal_equations(
+                    uncensored_only
+                )
+            if ols_fit is not None:
+                ols_s = float(ols_fit.get("s", 0.0))
+                ols_e = float(ols_fit.get("e", 0.0))
+                ols_w = float(ols_fit.get("w", 0.0))
+                ols_max = max(abs(ols_s), abs(ols_e), abs(ols_w))
+
+                # Magnitude check: any uncensored direction must clear
+                # the floor.  Pure-noise loads have no uncensored slope
+                # anywhere; their Tobit fit is censoring-pattern-driven.
+                if ols_max < PLAUSIBILITY_MIN_OLS_MAX_DIRECTION:
+                    _log_fn = (
+                        _LOGGER.debug
+                        if was_plausibility_blocked
+                        else _LOGGER.info
+                    )
+                    _log_fn(
+                        "Tobit plausibility-gate blocked %s/%s: "
+                        "ols_max=%.3f < %.3f, tobit_max=%.3f "
+                        "(no uncensored signal — NLMS retains write authority)",
+                        entity_id, regime, ols_max,
+                        PLAUSIBILITY_MIN_OLS_MAX_DIRECTION, tobit_max,
+                    )
+                    slot["last_step"] = {
+                        "skip_reason": "plausibility_no_uncensored_signal",
+                        "ols_max": round(ols_max, 5),
+                        "tobit_max": round(tobit_max, 5),
+                        "n_eff": round(fit["n_eff"], 2),
+                        "iterations": fit["iterations"],
+                        "sigma": round(fit["sigma"], 5),
+                    }
+                    return result
+
+                # Direction-agreement check.  Tobit's projected-Newton
+                # active-set can pin a direction at zero from a wrong
+                # warm-start, producing a wrong-direction magnitude
+                # that satisfies the OLS-max floor (because OLS still
+                # identifies the real direction in the uncensored
+                # subset).  Cosine ≥ 0.5 (≈ 60° tolerance) ensures
+                # Tobit's vector points roughly with OLS's.
+                tobit_norm = math.sqrt(
+                    new_s * new_s + new_e * new_e + new_w * new_w
+                )
+                ols_norm = math.sqrt(
+                    ols_s * ols_s + ols_e * ols_e + ols_w * ols_w
+                )
+                # The 1e-9 norm guards skip the cosine test when either
+                # vector is structurally zero.  ``tobit_norm < 1e-9``
+                # means active-set clamped every direction to zero —
+                # the write is a no-op (zero coefficient overwriting
+                # zero or near-zero) and the plausibility check has
+                # nothing to discriminate.  ``ols_norm < 1e-9`` means
+                # OLS itself is degenerate (already covered by the
+                # magnitude floor above; defense-in-depth).  Both cases
+                # let the (near-)zero write proceed — equivalent to
+                # NLMS dead-zone behaviour, no cushion lost.
+                if tobit_norm > 1e-9 and ols_norm > 1e-9:
+                    cosine = (
+                        new_s * ols_s + new_e * ols_e + new_w * ols_w
+                    ) / (tobit_norm * ols_norm)
+                    if cosine < PLAUSIBILITY_MIN_DIRECTION_COSINE:
+                        _log_fn = (
+                            _LOGGER.debug
+                            if was_plausibility_blocked
+                            else _LOGGER.info
+                        )
+                        _log_fn(
+                            "Tobit plausibility-gate blocked %s/%s: "
+                            "direction cosine %.3f < %.3f vs OLS-uncensored "
+                            "(warm-start direction-pinning suspected — "
+                            "NLMS retains write authority)",
+                            entity_id, regime, cosine,
+                            PLAUSIBILITY_MIN_DIRECTION_COSINE,
+                        )
+                        slot["last_step"] = {
+                            "skip_reason": "plausibility_direction_mismatch",
+                            "ols_max": round(ols_max, 5),
+                            "tobit_max": round(tobit_max, 5),
+                            "direction_cosine": round(cosine, 4),
+                            "n_eff": round(fit["n_eff"], 2),
+                            "iterations": fit["iterations"],
+                            "sigma": round(fit["sigma"], 5),
+                        }
+                        return result
+
+        # Rate-limit (general step-size limiter): cap each direction's
+        # per-hour delta to ``PLAUSIBILITY_RATE_LIMIT_FRACTION × prior_max``
+        # whenever ANY direction's proposed step exceeds that cap.
+        # Triggered by step magnitude alone (not by plausibility-block
+        # history): a Tobit fit that wants to jump 200 % from the
+        # current coefficient is converged over 4-5 hours regardless of
+        # whether the entity was just unblocked or simply has fast-
+        # changing data.  Skipped on cold-start (``prior_max < ε``)
+        # because there's no prior to cushion against and the first
+        # bootstrap step would otherwise stay clamped at zero.
+        prior_max = max(prev_s, prev_e, prev_w)
+        proposed_step_max = max(
+            abs(new_s - prev_s),
+            abs(new_e - prev_e),
+            abs(new_w - prev_w),
+        )
+        rate_limit_active = (
+            prior_max > 0.05
+            and proposed_step_max
+            > PLAUSIBILITY_RATE_LIMIT_FRACTION * prior_max
+        )
+        if rate_limit_active:
+            cap = PLAUSIBILITY_RATE_LIMIT_FRACTION * prior_max
+            new_s = max(0.0, min(SOLAR_COEFF_CAP, prev_s + max(-cap, min(cap, new_s - prev_s))))
+            new_e = max(0.0, min(SOLAR_COEFF_CAP, prev_e + max(-cap, min(cap, new_e - prev_e))))
+            new_w = max(0.0, min(SOLAR_COEFF_CAP, prev_w + max(-cap, min(cap, new_w - prev_w))))
+            _LOGGER.debug(
+                "Tobit rate-limit: %s/%s step %.3f → cap %.3f (prior_max=%.3f)",
+                entity_id, regime, proposed_step_max, cap, prior_max,
+            )
+
+        # Plausibility-clear transition log (decoupled from rate-limit).
+        # Fires INFO once when the gate transitions from blocked to
+        # passing — actionable signal for the maintainer / multi-install
+        # falsification surface.  Annotates whether the rate-limiter is
+        # also smoothing the transition.
+        if was_plausibility_blocked:
+            _LOGGER.info(
+                "Tobit plausibility-gate clearing for %s/%s%s",
+                entity_id, regime,
+                " (rate-limited)" if rate_limit_active else "",
+            )
+
+        result["last_step_norm"] = round(
+            max(abs(new_s - prev_s), abs(new_e - prev_e), abs(new_w - prev_w)),
+            5,
+        )
+
+        # Write through the canonical helper so non-negativity (invariant
+        # #4) and SOLAR_COEFF_CAP clamps are uniform with NLMS / inequality
+        # / batch_fit / apply_implied write paths.
+        self._update_unit_solar_coefficient(
+            entity_id,
+            {"s": new_s, "e": new_e, "w": new_w},
+            solar_coefficients_per_unit,
+            regime,
+        )
+        slot["last_step"] = {
+            "iterations": fit["iterations"],
+            "converged": True,
+            "n_eff": round(fit["n_eff"], 2),
+            "sigma": round(fit["sigma"], 5),
+            "step_norm": result["last_step_norm"],
+        }
+        result["applied"] = True
+        result["in_cold_start"] = False
+        return result
+
+    def compute_tobit_for_diagnose(
+        self,
+        hourly_log: list[dict],
+        entity_id: str,
+        regime: str,
+        coordinator,
+        *,
+        unit_min_base: dict[str, float] | None = None,
+        screen_affected_entities: frozenset[str] | None = None,
+        days_back: int | None = 30,
+    ) -> dict:
+        """Per-(entity, regime) Tobit MLE for ``diagnose_solar`` (#904 stage 0+1).
+
+        Surfaces a censoring-aware coefficient estimate alongside
+        ``implied_coefficient_30d`` (unconstrained LS dropping saturated
+        rows) and ``implied_coefficient_inequality`` (lower-bound
+        replay).  Pure analysis — no production wiring, no writes to
+        ``solar_coefficients_per_unit``.  Promotion to live wiring is
+        gated on stage-1 evidence over the validation window.
+
+        Mirrors ``compute_implied_for_apply`` shape but routes through
+        ``_collect_batch_fit_samples(..., for_tobit=True)``: shutdown
+        rows excluded (modulating-regime fit; CHOICE 3), saturated rows
+        kept with ``value = T = BATCH_FIT_SATURATION_RATIO × base`` and
+        flagged in ``censored_mask``.
+
+        Returns
+        -------
+        ``{"coefficient", "sigma", "iterations", "converged",
+        "log_likelihood", "n_uncensored", "n_censored", "n_eff",
+        "censored_fraction", "drop_counts", "days_back",
+        "skip_reason"}`` — ``coefficient`` is ``None`` for the
+        ``insufficient_uncensored``, ``warm_start_failed``, and
+        ``insufficient_effective_samples`` skip paths.  For the
+        ``did_not_converge`` path the coefficient is **populated
+        with the last Newton iterate** for inspection (not None) —
+        callers must check ``skip_reason`` rather than
+        ``coefficient is None`` to detect the non-convergent case
+        and decide whether to trust the iterate.  ``log_likelihood``
+        is set whenever the solver ran (i.e. all paths except
+        ``insufficient_uncensored`` and ``warm_start_failed``).
+        """
+        filtered_log = _filter_log_by_days_back(hourly_log, days_back)
+
+        unit_threshold = _resolve_min_base(
+            entity_id, unit_min_base, SOLAR_LEARNING_MIN_BASE
+        )
+
+        scr_fn = getattr(coordinator, "screen_config_for_entity", None)
+        if scr_fn is not None:
+            screen_cfg_for_entity = scr_fn(entity_id)
+        else:
+            screen_cfg_for_entity = getattr(coordinator, "screen_config", None)
+        entry_potentials: list[tuple[float, float, float, float]] = []
+        for entry in filtered_log:
+            (pot_s, pot_e, pot_w), magnitude = self._reconstruct_potential(
+                entry,
+                getattr(coordinator, "solar", None),
+                screen_cfg_for_entity,
+            )
+            entry_potentials.append((pot_s, pot_e, pot_w, magnitude))
+
+        samples, censored_mask, drop_counts = self._collect_batch_fit_samples(
+            entity_id=entity_id,
+            regime=regime,
+            hourly_log=filtered_log,
+            entry_potentials=entry_potentials,
+            coordinator=coordinator,
+            unit_threshold=unit_threshold,
+            screen_affected_entities=screen_affected_entities,
+            for_tobit=True,
+            solar_coefficients_per_unit=solar_coefficients_per_unit,
+        )
+
+        n_total = len(samples)
+        n_unc = sum(1 for m in censored_mask if not m)
+        n_cens = n_total - n_unc
+        cens_frac = (n_cens / n_total) if n_total > 0 else 0.0
+
+        result: dict = {
+            "coefficient": None,
+            "sigma": None,
+            "iterations": 0,
+            "converged": False,
+            "n_uncensored": n_unc,
+            "n_censored": n_cens,
+            "n_eff": float(n_unc),
+            "censored_fraction": round(cens_frac, 3),
+            "drop_counts": drop_counts,
+            "days_back": days_back,
+            "skip_reason": None,
+        }
+
+        # CHOICE 4 gate: |U| ≥ 20 AND n_eff ≥ 40 (preliminary; pre-fit
+        # we only check the |U| floor — the n_eff floor is post-fit).
+        if n_unc < TOBIT_MIN_UNCENSORED:
+            result["skip_reason"] = "insufficient_uncensored"
+            return result
+
+        fit = LearningManager._solve_tobit_3d(samples, censored_mask)
+        if fit is None:
+            result["skip_reason"] = "warm_start_failed"
+            return result
+
+        result["sigma"] = round(fit["sigma"], 5)
+        result["iterations"] = fit["iterations"]
+        result["converged"] = bool(fit["converged"])
+        result["failure_reason"] = fit.get("failure_reason")
+        result["n_eff"] = round(fit["n_eff"], 2)
+        result["log_likelihood"] = round(fit["log_likelihood"], 4)
+
+        if fit["n_eff"] < TOBIT_MIN_NEFF:
+            result["skip_reason"] = "insufficient_effective_samples"
+            return result
+
+        if not fit["converged"]:
+            result["skip_reason"] = "did_not_converge"
+            # Still return the (last) coefficient — the caller can
+            # surface it for manual inspection but the skip_reason
+            # signals it's not trustworthy.
+
+        coeff = {
+            "s": max(0.0, min(SOLAR_COEFF_CAP, float(fit["s"]))),
+            "e": max(0.0, min(SOLAR_COEFF_CAP, float(fit["e"]))),
+            "w": max(0.0, min(SOLAR_COEFF_CAP, float(fit["w"]))),
+        }
+        result["coefficient"] = {k: round(v, 4) for k, v in coeff.items()}
         return result
