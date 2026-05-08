@@ -23,7 +23,8 @@ Think of it as a fitness tracker for your home's heating system.
 
 ## How It Works
 
-<img width="1308" height="1252" alt="flow4" src="https://github.com/user-attachments/assets/d1a3b194-ed9c-447c-bc50-3f16f759d6cc" />
+<img width="1308" height="1252" alt="553138952-d1a3b194-ed9c-447c-bc50-3f16f759d6cc" src="https://github.com/user-attachments/assets/fe90394f-e83d-4b4b-abf3-f78fa712ad0b" />
+
 
 
 
@@ -358,11 +359,13 @@ Rather than a single monolithic dashboard, the [`tools/`](https://github.com/thu
 | [heating_forecast_sensor_and_dashboard.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/heating_forecast_sensor_and_dashboard.yaml) | 48-hour hourly forecast with solar contribution |
 | [mushroom_glance_card.yaml](https://github.com/thuemah/heating_analytics/blob/main/tools/mushroom_glance_card.yaml) | Mushroom glance card for key metrics at a glance |
 
-<img width="682" height="1326" alt="week_ahead" src="https://github.com/user-attachments/assets/0666e162-e64f-4b49-b7c9-a82a12223692" />
 
-<img width="677" height="941" alt="model_comparison" src="https://github.com/user-attachments/assets/ea956d36-d809-470d-bcf3-3a08aa6d29e3" />
+<img width="682" height="1326" alt="553163441-0666e162-e64f-4b49-b7c9-a82a12223692" src="https://github.com/user-attachments/assets/db555776-54dc-48c3-bee7-6106c4d277b0" />
 
-<img width="611" height="605" alt="image" src="https://github.com/user-attachments/assets/4af1f748-3b0a-4d42-a0c1-3a84ab617c99" />
+<img width="677" height="941" alt="553163453-ea956d36-d809-470d-bcf3-3a08aa6d29e3" src="https://github.com/user-attachments/assets/7861ec86-ff6d-48bf-8451-340db2aebf01" />
+
+<img width="611" height="605" alt="557900246-4af1f748-3b0a-4d42-a0c1-3a84ab617c99" src="https://github.com/user-attachments/assets/463156c7-ff85-4824-8cd3-782211ccc727" />
+
 
 
 
