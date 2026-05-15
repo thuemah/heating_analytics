@@ -638,6 +638,9 @@ class HourlyProcessor:
                 unit_actual_kwh=self.coordinator._hourly_delta_per_unit,
                 unit_expected_base_kwh=self.coordinator._hourly_expected_base_per_unit,
                 unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
+                solar_affected_entities=getattr(
+                    self.coordinator, "_solar_affected_set", None
+                ),
             )
             is_solar_dominant = bool(solar_dominant_entities)
 
@@ -724,6 +727,7 @@ class HourlyProcessor:
                 per_unit_learning_enabled=should_learn_per_unit,
                 screen_config=self.coordinator.screen_config,
                 screen_affected_entities=self.coordinator._screen_affected_set,
+                solar_affected_entities=self.coordinator._solar_affected_set,
                 unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
                 experimental_tobit_live_learner=getattr(
                     self.coordinator,
@@ -882,6 +886,35 @@ class HourlyProcessor:
                 "solar_heating_wasted_kwh": round(solar_heating_wasted, 3),
                 "primary_entity": self.coordinator.weather_entity,
                 "secondary_entity": self.coordinator.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY),
+                **(
+                    {"dni": round(self.coordinator._collector.dni_sum / self.coordinator._collector.dni_count, 2)}
+                    if self.coordinator._collector.dni_count > 0
+                    else {}
+                ),
+                **(
+                    {"dhi": round(self.coordinator._collector.dhi_sum / self.coordinator._collector.dhi_count, 2)}
+                    if self.coordinator._collector.dhi_count > 0
+                    else {}
+                ),
+                **(
+                    {"cloud_coverage": round(
+                        self.coordinator._collector.cloud_coverage_sum
+                        / self.coordinator._collector.cloud_coverage_count, 1)}
+                    if self.coordinator._collector.cloud_coverage_count > 0
+                    else {}
+                ),
+                **(
+                    {"ghi_wm2": round(
+                        self.coordinator._collector.ghi_sum
+                        / self.coordinator._collector.ghi_count, 1)}
+                    if self.coordinator._collector.ghi_count > 0
+                    else {}
+                ),
+                **(
+                    {"solar_data_time": self.coordinator._collector.solar_data_time_last}
+                    if self.coordinator._collector.solar_data_time_last is not None
+                    else {}
+                ),
                 "crossover_day": self.coordinator.entry.data.get(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY),
                 # Model Update Info
                 "model_temp_key": temp_key,

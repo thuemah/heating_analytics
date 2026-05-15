@@ -79,6 +79,8 @@ SERVICE_SCHEMA_IMPORT = vol.Schema({
         vol.Optional("wind_gust"): cv.string,
         vol.Optional("cloud_coverage"): cv.string,
         vol.Optional("is_auxiliary"): cv.string,
+        vol.Optional("direct_normal_irradiance"): cv.string,
+        vol.Optional("diffuse_radiation"): cv.string,
     })
 })
 

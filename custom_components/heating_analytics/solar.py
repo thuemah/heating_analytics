@@ -342,6 +342,16 @@ class SolarCalculator:
            0.40) decomposed along the configured primary azimuth.
         """
         del temp_key  # reserved; coefficients are temperature-blind by design
+        # Per-entity solar-scope gate (#962).  Excluded entities return a
+        # zero-vector directly — bypassing the default-fallback decomposition
+        # at the bottom of this method that would otherwise inject a phantom
+        # coefficient (DEFAULT_SOLAR_COEFF × azimuth_decomposition) onto
+        # interior loads, slab-thermostat floor heating, etc.  Test
+        # coordinators without the helper read as legacy (all entities
+        # affected) so existing tests keep passing.
+        is_solar_affected_fn = getattr(self.coordinator, "is_solar_affected", None)
+        if callable(is_solar_affected_fn) and not is_solar_affected_fn(entity_id):
+            return {"s": 0.0, "e": 0.0, "w": 0.0}
         regime = "cooling" if mode in (MODE_COOLING, MODE_GUEST_COOLING) else "heating"
         entity_coeffs = self.coordinator.model.solar_coefficients_per_unit.get(entity_id)
         if isinstance(entity_coeffs, dict):

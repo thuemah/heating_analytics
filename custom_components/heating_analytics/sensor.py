@@ -273,7 +273,6 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
     def __init__(self, coordinator: HeatingDataCoordinator, entry: ConfigEntry) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator, entry)
-        self._peak_load_cache = {}
 
     @property
     def native_value(self) -> float:
@@ -324,57 +323,19 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
         else:
             classification = "Extreme"
 
-        # Peak Load Hour (Simulation with State Tracking & Caching)
+        # Peak Load Hour — read from the midnight forecast snapshot's 24-hour plan.
+        # The snapshot is captured once per day at midnight and covers hours 00–23,
+        # so the peak reflects the heaviest hour across the whole day rather than
+        # only the hours remaining after `now`. Non-retrospective: this is the
+        # day's forecast peak, not a hindsight recomputation against actuals.
         peak_hour = None
-        max_hour_kwh = -1.0
         now = dt_util.now()
-
-        # Cache Strategy: Invalidate every 15 minutes or if forecast object changes
-        cache_key = f"{now.hour}_{now.minute // 15}"
-
-        if self._peak_load_cache.get("key") == cache_key:
-            peak_hour = self._peak_load_cache.get("peak_hour")
-            max_hour_kwh = self._peak_load_cache.get("max_kwh")
-        else:
-            forecast_source = forecast_mgr._get_live_forecast_or_ref()
-            if forecast_source:
-                # Initialize Inertia (Stateful Simulation)
-                # We must start from CURRENT inertia and evolve it through the day
-                inertia_now = coordinator._calculate_inertia_temp() or 0.0
-                history_needed = len(coordinator.inertia_weights) - 1
-
-                # Fetch recent history to seed the simulation correctly (instead of flat line)
-                local_inertia = coordinator._get_inertia_list(now)
-                if not local_inertia:
-                    local_inertia = [inertia_now] * history_needed
-
-                # Working copy for simulation
-                sim_inertia = list(local_inertia)
-
-                weather_wind_unit = coordinator._get_weather_wind_unit()
-                current_cloud = coordinator._get_cloud_coverage()
-
-                for item in forecast_source:
-                    dt_str = item.get("datetime")
-                    if dt_str:
-                        f_dt = dt_util.parse_datetime(dt_str)
-                        if f_dt and dt_util.as_local(f_dt).date() == now.date():
-                            # Pass mutable sim_inertia: it will be updated by _process_forecast_item
-                            # This fixes the "Borderline Technical Error" (Inertia Reset)
-                            # 9-tuple return as of #899 trajectory threading.
-                            pred, _, _, _, _, _, _, _, _ = forecast_mgr._process_forecast_item(
-                                item, sim_inertia, weather_wind_unit, current_cloud, ignore_aux=False
-                            )
-                            if pred > max_hour_kwh:
-                                max_hour_kwh = pred
-                                peak_hour = f_dt.strftime("%H:00")
-
-            # Update Cache
-            self._peak_load_cache = {
-                "key": cache_key,
-                "peak_hour": peak_hour,
-                "max_kwh": max_hour_kwh
-            }
+        snapshot = forecast_mgr._midnight_forecast_snapshot
+        if snapshot and snapshot.get("date") == now.date().isoformat():
+            plan = snapshot.get("hourly_plan") or []
+            if plan:
+                peak_item = max(plan, key=lambda x: x.get("kwh", 0.0))
+                peak_hour = f"{peak_item.get('hour', 0):02d}:00"
 
         attrs["thermal_stress_index"] = round(stress_index, 1)
         attrs["day_classification"] = classification

@@ -16,13 +16,15 @@
           "name": "Integration Name",
           "weather_entity": "Weather Provider",
           "energy_sensors": "Heating Energy Meters",
-          "outdoor_temp_sensor": "Outdoor Temperature Sensor"
+          "outdoor_temp_sensor": "Outdoor Temperature Sensor",
+          "ghi_sensor": "Local GHI Sensor (W/m²)"
         },
         "data_description": {
           "name": "A name for this integration instance.",
           "weather_entity": "Used for forecasts, wind data, and as a fallback temperature source.",
           "energy_sensors": "All sensors measuring energy consumption (kWh) for your heating devices.",
-          "outdoor_temp_sensor": "Recommended. A local sensor improves accuracy. If left blank, the weather provider's current temperature is used as a fallback."
+          "outdoor_temp_sensor": "Recommended. A local sensor improves accuracy. If left blank, the weather provider's current temperature is used as a fallback.",
+          "ghi_sensor": "Optional. A local pyranometer or scraped weather-station value reporting Global Horizontal Irradiance in W/m². Logged per hour and surfaced in the ghi_signal_agreement diagnostic to validate the cloud_coverage-based solar pipeline against an independent measurement. No model effect until evidence justifies pipeline integration."
         }
       },
       "physics": {
@@ -52,9 +54,13 @@
           "screen_east": "External screens on east facade",
           "screen_west": "External screens on west facade",
           "screen_affected_entities": "Screen-affected Units",
+          "solar_affected_entities": "Solar-affected Units",
           "use_dedicated_wind_sensor": "Use Dedicated Wind Sensor",
           "secondary_weather_entity": "Secondary Weather Provider",
           "forecast_crossover_day": "Forecast Crossover Day",
+          "solar_hotspot_attenuation_gamma": "Solar Hotspot Attenuation (γ)",
+          "solar_redistribution_alpha": "Solar Tail Redistribution (α)",
+          "solar_redistribution_tau_hours": "Solar Tail Time Constant (τ)",
           "csv_auto_logging": "Enable CSV Logging",
           "max_energy_delta": "Spike Protection Threshold",
           "hourly_log_retention_days": "Hourly Log Retention"
@@ -69,9 +75,13 @@
           "screen_east": "Check if your east-facing windows have external motorised screens that respond to the screen-correction slider.",
           "screen_west": "Check if your west-facing windows have external motorised screens that respond to the screen-correction slider.",
           "screen_affected_entities": "Which heating units are in zones that have external screens. Units in zones without screens are treated as screen-independent — their solar coefficients are not attenuated by the screen-correction slider. Defaults to all units if left empty.",
+          "solar_affected_entities": "Which energy sensors actually have their consumption reduced by sun in the room. Check sensors (a) in rooms with sun exposure AND (b) where heating is controlled by air temperature. Uncheck floor-heating cables driven by a slab/floor-temperature thermostat (the cable runs to maintain slab setpoint regardless of sun in the room above) and sensors with no solar exposure (basement sensors, wine cellar, garage, parasitic loads). Excluded sensors get a zero solar coefficient and skip every solar learning path. Energy sensors added after initial config default to checked — uncheck if the new sensor doesn't respond to solar.",
           "use_dedicated_wind_sensor": "Override weather entity wind data with a dedicated sensor. Not recommended — local sensors near buildings are affected by turbulence and shielding, producing systematically low readings. Weather entity wind data is preferred.",
           "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting). Useful for validating a new weather source before switching.",
           "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions.",
+          "solar_hotspot_attenuation_gamma": "Experimental opt-in. Dimensionless multiplicative attenuation (1 − γ) applied to predicted solar gain for screened-facade units when the sun is high (elevation > 30°) and screens are actively deployed (slider < 80%). Compensates for residual hotspot/sky-light loss not captured by the per-direction screen transmittance. Leave at 0.0 (default, no behavioural change). Empirical envelope from field measurements puts useful values in the 0.2–0.4 range. Only applies to entities whose zone has at least one screened facade.",
+          "solar_redistribution_alpha": "Experimental opt-in. Fraction of the per-unit predicted solar gain that is temporally redistributed from the originator hour to the prior 3 hours (exponential-decay kernel). Applies only to low-elevation (sun < 30°) eligible hours where the empirical battery-tail effect was observed. Energy is conserved — this is redistribution, not amplification or attenuation. Leave at 0.0 (default, no behavioural change). Empirical envelope from field measurements puts useful values in the 0.4–0.6 range.",
+          "solar_redistribution_tau_hours": "Time constant (hours) of the exponential-decay kernel used by the tail redistribution. Larger τ spreads more weight to older lags; smaller τ concentrates weight on the most recent hour. Default 2.0 h gives a balanced 3-hour tail. Only active when α > 0.",
           "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
           "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
           "hourly_log_retention_days": "How many days of hourly-resolution data to keep. Longer retention enables cross-seasonal retraining and deeper diagnostics. 90 days is conservative (recommended for Raspberry Pi); 365 days uses approximately 9 MB of storage. Reducing this value permanently deletes hourly data beyond the new limit — daily summaries are not affected."
@@ -114,13 +124,15 @@
           "name": "Integration Name",
           "weather_entity": "Weather Provider",
           "energy_sensors": "Heating Energy Meters",
-          "outdoor_temp_sensor": "Outdoor Temperature Sensor"
+          "outdoor_temp_sensor": "Outdoor Temperature Sensor",
+          "ghi_sensor": "Local GHI Sensor (W/m²)"
         },
         "data_description": {
           "name": "A name for this integration instance.",
           "weather_entity": "Used for forecasts, wind data, and as a fallback temperature source.",
           "energy_sensors": "Add new heaters or permanently remove old ones. Do not use this field to replace a renamed or broken sensor — removing and re-adding a sensor destroys its learned history. Use the 'Heating Analytics: Replace Sensor' service call for that instead.",
-          "outdoor_temp_sensor": "Recommended. A local sensor improves accuracy. If left blank, the weather provider's current temperature is used as a fallback."
+          "outdoor_temp_sensor": "Recommended. A local sensor improves accuracy. If left blank, the weather provider's current temperature is used as a fallback.",
+          "ghi_sensor": "Optional. A local pyranometer or scraped weather-station value reporting Global Horizontal Irradiance in W/m². Logged per hour and surfaced in the ghi_signal_agreement diagnostic to validate the cloud_coverage-based solar pipeline against an independent measurement. No model effect until evidence justifies pipeline integration."
         }
       },
       "reconfigure_physics": {
@@ -150,9 +162,13 @@
           "screen_east": "External screens on east facade",
           "screen_west": "External screens on west facade",
           "screen_affected_entities": "Screen-affected Units",
+          "solar_affected_entities": "Solar-affected Units",
           "use_dedicated_wind_sensor": "Use Dedicated Wind Sensor",
           "secondary_weather_entity": "Secondary Weather Provider",
           "forecast_crossover_day": "Forecast Crossover Day",
+          "solar_hotspot_attenuation_gamma": "Solar Hotspot Attenuation (γ)",
+          "solar_redistribution_alpha": "Solar Tail Redistribution (α)",
+          "solar_redistribution_tau_hours": "Solar Tail Time Constant (τ)",
           "csv_auto_logging": "Enable CSV Logging",
           "max_energy_delta": "Spike Protection Threshold",
           "hourly_log_retention_days": "Hourly Log Retention"
@@ -167,9 +183,13 @@
           "screen_east": "Check if your east-facing windows have external motorised screens that respond to the screen-correction slider.",
           "screen_west": "Check if your west-facing windows have external motorised screens that respond to the screen-correction slider.",
           "screen_affected_entities": "Which heating units are in zones that have external screens. Units in zones without screens are treated as screen-independent — their solar coefficients are not attenuated by the screen-correction slider. Defaults to all units if left empty.",
+          "solar_affected_entities": "Which energy sensors actually have their consumption reduced by sun in the room. Check sensors (a) in rooms with sun exposure AND (b) where heating is controlled by air temperature. Uncheck floor-heating cables driven by a slab/floor-temperature thermostat (the cable runs to maintain slab setpoint regardless of sun in the room above) and sensors with no solar exposure (basement sensors, wine cellar, garage, parasitic loads). Excluded sensors get a zero solar coefficient and skip every solar learning path. Energy sensors added after initial config default to checked — uncheck if the new sensor doesn't respond to solar.",
           "use_dedicated_wind_sensor": "Override weather entity wind data with a dedicated sensor. Not recommended — local sensors near buildings are affected by turbulence and shielding, producing systematically low readings. Weather entity wind data is preferred.",
           "secondary_weather_entity": "Optional secondary provider for long-range forecasts (Shadow Forecasting). Useful for validating a new weather source before switching.",
           "forecast_crossover_day": "Number of days to use the primary weather source before switching to the secondary for longer-range predictions.",
+          "solar_hotspot_attenuation_gamma": "Experimental opt-in. Dimensionless multiplicative attenuation (1 − γ) applied to predicted solar gain for screened-facade units when the sun is high (elevation > 30°) and screens are actively deployed (slider < 80%). Compensates for residual hotspot/sky-light loss not captured by the per-direction screen transmittance. Leave at 0.0 (default, no behavioural change). Empirical envelope from field measurements puts useful values in the 0.2–0.4 range. Only applies to entities whose zone has at least one screened facade.",
+          "solar_redistribution_alpha": "Experimental opt-in. Fraction of the per-unit predicted solar gain that is temporally redistributed from the originator hour to the prior 3 hours (exponential-decay kernel). Applies only to low-elevation (sun < 30°) eligible hours where the empirical battery-tail effect was observed. Energy is conserved — this is redistribution, not amplification or attenuation. Leave at 0.0 (default, no behavioural change). Empirical envelope from field measurements puts useful values in the 0.4–0.6 range.",
+          "solar_redistribution_tau_hours": "Time constant (hours) of the exponential-decay kernel used by the tail redistribution. Larger τ spreads more weight to older lags; smaller τ concentrates weight on the most recent hour. Default 2.0 h gives a balanced 3-hour tail. Only active when α > 0.",
           "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
           "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
           "hourly_log_retention_days": "How many days of hourly-resolution data to keep. Longer retention enables cross-seasonal retraining and deeper diagnostics. 90 days is conservative (recommended for Raspberry Pi); 365 days uses approximately 9 MB of storage. Reducing this value permanently deletes hourly data beyond the new limit — daily summaries are not affected."

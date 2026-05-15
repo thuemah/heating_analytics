@@ -121,6 +121,16 @@ DEFAULT_SCREEN_WEST = True
 # pre-#xxx behaviour).
 CONF_SCREEN_AFFECTED_ENTITIES = "screen_affected_entities"
 
+# Per-entity scope for solar coefficient learning + prediction (#962).
+# Mirrors the screen_affected / aux_affected pattern: explicit user list of
+# energy sensors whose consumption responds to solar gain.  Entities outside
+# the list are excluded from all five solar learning paths (NLMS, inequality,
+# cold-start, batch-fit, apply-implied) AND from the read path
+# (calculate_unit_coefficient returns zero-vector instead of falling back to
+# DEFAULT_SOLAR_COEFF_HEATING decomposition).  None / missing → default to all
+# energy_sensors (legacy behaviour, no behaviour change on upgrade).
+CONF_SOLAR_AFFECTED_ENTITIES = "solar_affected_entities"
+
 DEFAULT_SOLAR_AZIMUTH = 180
 
 WIND_UNIT_MS = "m/s"

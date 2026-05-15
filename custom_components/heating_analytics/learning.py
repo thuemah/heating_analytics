@@ -782,6 +782,7 @@ class LearningManager:
                 solar_dominant_entities=solar_dominant_entities,
                 screen_config=config.screen_config,
                 screen_affected_entities=config.screen_affected_entities,
+                solar_affected_entities=config.solar_affected_entities,
                 unit_min_base=unit_min_base,
                 solar_factor=solar_factor,
                 battery_filtered_potential=battery_filtered_potential,
@@ -917,6 +918,7 @@ class LearningManager:
         solar_dominant_entities: tuple[str, ...] = (),
         screen_config: tuple[bool, bool, bool] | None = None,
         screen_affected_entities: frozenset[str] | None = None,
+        solar_affected_entities: frozenset[str] | None = None,
         solar_factor: float = 0.0,
         battery_filtered_potential: tuple[float, float, float] | None = None,
         unit_min_base: dict[str, float] | None = None,
@@ -933,6 +935,17 @@ class LearningManager:
             if unit_mode in (MODE_OFF, MODE_GUEST_HEATING, MODE_GUEST_COOLING):
                 # Skip learning for non-tracked/temporary modes
                 continue
+
+            # Per-entity solar-scope gate (#962).  Entities outside the
+            # user-configured solar_affected_entities list have base/aux
+            # learning continue normally but skip every solar branch
+            # (NLMS, inequality, cold-start buffer accumulation).  None
+            # sentinel = legacy / test coordinator path = all entities
+            # affected (preserves prior behaviour).
+            entity_solar_enabled = solar_enabled and (
+                solar_affected_entities is None
+                or entity_id in solar_affected_entities
+            )
 
             # Mode-stratified per-unit buckets (#885): cooling-mode samples
             # land in a dedicated "cooling" wind-bucket regardless of the
@@ -1030,7 +1043,7 @@ class LearningManager:
                 nlms_threshold = SOLAR_LEARNING_MIN_BASE
                 shutdown_threshold = SOLAR_SHUTDOWN_MIN_BASE
             if (
-                solar_enabled
+                entity_solar_enabled
                 and vector_magnitude > 0.1
                 and not is_aux_active
                 and not is_solar_shutdown
@@ -1180,7 +1193,7 @@ class LearningManager:
                 # under-lift during screen-closed hours).  Unscreened
                 # entities already have correct NLMS signal per the live
                 # path, so skipping inequality here is behaviourally safe.
-                solar_enabled
+                entity_solar_enabled
                 and is_solar_shutdown
                 and not is_aux_active
                 and expected_unit_base >= shutdown_threshold
@@ -2423,6 +2436,7 @@ class LearningManager:
         return_diagnostics: bool = False,
         unit_min_base: dict[str, float] | None = None,
         screen_affected_entities: frozenset[str] | None = None,
+        solar_affected_entities: frozenset[str] | None = None,
     ):
         """Re-run NLMS solar coefficient learning over historical entries.
 
@@ -2544,6 +2558,14 @@ class LearningManager:
             avg_temp = entry.get("temp", 0.0) or 0.0
 
             for entity_id in energy_sensors:
+                # Per-entity solar-scope gate (#962).  Excluded entities
+                # do not participate in solar replay at all — silently
+                # skip without inflating shutdown counters.
+                if (
+                    solar_affected_entities is not None
+                    and entity_id not in solar_affected_entities
+                ):
+                    continue
                 # aux_affected_entities is NOT a solar-NLMS exclusion list.
                 # Live learning only uses it for cooldown-path aux coefficient
                 # handling (learning.py:_process_per_unit_learning lines
@@ -2821,10 +2843,23 @@ class LearningManager:
             [entity_id_filter] if entity_id_filter else list(energy_sensors)
         )
 
+        # Solar-affected scope (#962): batch fit honours the same per-entity
+        # gate as the live learners.  None sentinel = legacy / test path =
+        # all entities included.
+        solar_affected = getattr(coordinator, "_solar_affected_set", None)
+        if not isinstance(solar_affected, (frozenset, set)):
+            solar_affected = None
+
         for entity_id in target_entities:
             if entity_id not in energy_sensors:
                 results[entity_id] = {
                     "skip_reason": "unknown_entity",
+                }
+                continue
+
+            if solar_affected is not None and entity_id not in solar_affected:
+                results[entity_id] = {
+                    "skip_reason": "excluded_from_solar",
                 }
                 continue
 

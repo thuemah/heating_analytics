@@ -36,6 +36,7 @@ def detect_solar_shutdown_entities(
     unit_actual_kwh: dict[str, float],
     unit_expected_base_kwh: dict[str, float],
     unit_min_base: dict[str, float] | None = None,
+    solar_affected_entities: frozenset[str] | None = None,
 ) -> tuple[str, ...]:
     """Detect VP units whose thermostat cut the compressor during sun (#838).
 
@@ -84,8 +85,22 @@ def detect_solar_shutdown_entities(
     # (None, MagicMock, malformed storage load) falls back to the global
     # constant — mirrors the same posture in learning._resolve_min_base.
     overrides = unit_min_base if isinstance(unit_min_base, dict) else {}
+    # Per-entity solar-scope gate (#962): entities outside the
+    # solar_affected_entities set cannot be "shut down by sun" — they have
+    # no solar response by user declaration.  Their low actual_kwh relative
+    # to base reflects other physics (slab-thermostat duty cycle, parasitic
+    # load patterns, etc.) and must not pollute solar_dominant_entities or
+    # flip solar_regime to "shutdown" downstream.  None sentinel = legacy
+    # path (all entities eligible) for test fixtures.
+    affected: frozenset[str] | None = (
+        solar_affected_entities
+        if isinstance(solar_affected_entities, (frozenset, set))
+        else None
+    )
     flagged: list[str] = []
     for entity_id in energy_sensors:
+        if affected is not None and entity_id not in affected:
+            continue
         if unit_modes.get(entity_id, MODE_HEATING) != MODE_HEATING:
             continue
         actual = unit_actual_kwh.get(entity_id, 0.0)
@@ -165,6 +180,18 @@ class LearningConfig:
     # others get ``(False, False, False)`` (transmittance=1.0) at learn time.
     # None = legacy behaviour (all entities affected, as before).
     screen_affected_entities: frozenset[str] | None = None
+
+    # Per-entity scope for solar coefficient learning entirely (#962).
+    # Entities outside this set are excluded from all five solar learning
+    # paths (NLMS, inequality, cold-start, batch-fit, apply-implied) and
+    # from prediction read-path.  Distinct from screen_affected_entities
+    # which only narrows the screen-transmittance treatment within the
+    # solar pipeline; this set decides whether the entity participates in
+    # solar at all.  Use case: floor-heating cables on slab thermostat
+    # (slab dominates over solar gain regardless of windows), interior
+    # loads with no solar exposure, parasitic basement consumption.
+    # None = legacy behaviour (all entities solar-affected).
+    solar_affected_entities: frozenset[str] | None = None
 
     # Per-unit min-base thresholds (#871).  Maps entity_id → calibrated
     # noise floor (kWh) used to gate NLMS, inequality, and shutdown
@@ -557,6 +584,15 @@ class ObservationCollector:
         "expected_per_unit",
         "expected_base_per_unit",
         "correction_sum",
+        "dni_sum",
+        "dni_count",
+        "dhi_sum",
+        "dhi_count",
+        "cloud_coverage_sum",
+        "cloud_coverage_count",
+        "ghi_sum",
+        "ghi_count",
+        "solar_data_time_last",
         "last_minute_processed",
     )
 
@@ -589,6 +625,33 @@ class ObservationCollector:
         self.expected_per_unit: dict[str, float] = {}
         self.expected_base_per_unit: dict[str, float] = {}
         self.correction_sum: float = 0.0
+        # DNI / DHI from weather entity (issue #933).  Counted independently
+        # of ``sample_count`` because the source may be unavailable on some
+        # ticks (primary lacks the attribute, secondary missing, value not
+        # yet refreshed) — averaging only over ticks that produced a value
+        # avoids dragging the mean toward zero.  ``solar_data_time_last``
+        # is the most recent ``solar_data_time`` attribute observed during
+        # the hour (any source); persisted to the hourly log so we can
+        # later detect stale-data hours without joining against the source
+        # entity history.
+        self.dni_sum: float = 0.0
+        self.dni_count: int = 0
+        self.dhi_sum: float = 0.0
+        self.dhi_count: int = 0
+        # Cloud_coverage logged per hour as the third arm of the
+        # DNI/DHI investigation — lets future signal_agreement readings
+        # compute Kasten directly from the source value rather than
+        # inverting it out of potential_solar_factor.
+        self.cloud_coverage_sum: float = 0.0
+        self.cloud_coverage_count: int = 0
+        # Optional local GHI sensor (#933 follow-up).  Accumulated only
+        # on ticks where the configured sensor returned a value;
+        # ``ghi_count == 0`` at hour boundary means the sensor is
+        # unconfigured or was unavailable for the whole hour, in which
+        # case ``ghi_wm2`` is omitted from the log entry.
+        self.ghi_sum: float = 0.0
+        self.ghi_count: int = 0
+        self.solar_data_time_last: str | None = None
         self.last_minute_processed: int | None = None
 
     def reset(self) -> None:
@@ -620,6 +683,15 @@ class ObservationCollector:
         self.expected_per_unit.clear()
         self.expected_base_per_unit.clear()
         self.correction_sum = 0.0
+        self.dni_sum = 0.0
+        self.dni_count = 0
+        self.dhi_sum = 0.0
+        self.dhi_count = 0
+        self.cloud_coverage_sum = 0.0
+        self.cloud_coverage_count = 0
+        self.ghi_sum = 0.0
+        self.ghi_count = 0
+        self.solar_data_time_last = None
         self.last_minute_processed = None
 
     def accumulate_weather(
@@ -633,6 +705,11 @@ class ObservationCollector:
         current_time: datetime,
         humidity: float | None = None,
         correction_percent: float = 100.0,
+        dni: float | None = None,
+        dhi: float | None = None,
+        cloud_coverage: float | None = None,
+        ghi: float | None = None,
+        solar_data_time: str | None = None,
     ) -> None:
         """Record one minute's weather readings."""
         self.wind_sum += effective_wind
@@ -646,6 +723,20 @@ class ObservationCollector:
         self.solar_vector_e_sum += solar_vector[1]
         self.solar_vector_w_sum += solar_vector[2]
         self.correction_sum += correction_percent
+        if dni is not None:
+            self.dni_sum += dni
+            self.dni_count += 1
+        if dhi is not None:
+            self.dhi_sum += dhi
+            self.dhi_count += 1
+        if cloud_coverage is not None:
+            self.cloud_coverage_sum += cloud_coverage
+            self.cloud_coverage_count += 1
+        if ghi is not None:
+            self.ghi_sum += ghi
+            self.ghi_count += 1
+        if solar_data_time is not None:
+            self.solar_data_time_last = solar_data_time
         self.bucket_counts[wind_bucket] += 1
         if is_aux_active:
             self.aux_count += 1

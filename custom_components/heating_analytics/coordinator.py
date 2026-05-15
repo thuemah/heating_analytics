@@ -90,6 +90,7 @@ from .const import (
     CONF_SCREEN_EAST,
     CONF_SCREEN_WEST,
     CONF_SCREEN_AFFECTED_ENTITIES,
+    CONF_SOLAR_AFFECTED_ENTITIES,
     DEFAULT_SOLAR_ENABLED,
     DEFAULT_SOLAR_AZIMUTH,
     DEFAULT_SOLAR_CORRECTION,
@@ -437,6 +438,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self.wind_gust_source = entry.data.get(CONF_WIND_GUST_SOURCE, SOURCE_SENSOR)
 
         self.weather_entity = entry.data.get("weather_entity")
+        # Optional local GHI (Global Horizontal Irradiance) sensor in W/m².
+        # Pyranometer or scraped weather-station value.  Logged per hour
+        # alongside cloud_coverage so the GHI signal_agreement diagnostic
+        # can validate Kasten-derived solar_factor against an independent
+        # measurement.  Pipeline integration is gated on diagnostic
+        # evidence — see ghi_signal_agreement in diagnose_solar.
+        self.ghi_sensor = entry.data.get("ghi_sensor")
         self.energy_sensors = entry.data.get("energy_sensors", [])
 
         # Per-unit learning strategies (#776) — must be after energy_sensors,
@@ -468,6 +476,44 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             }
             hass.config_entries.async_update_entry(entry, data=cleaned_data)
         self.battery_thermal_feedback_k = DEFAULT_BATTERY_THERMAL_FEEDBACK_K
+        # Experimental hotspot-loss attenuation for screened facades at high sun
+        # elevation (#950).  Opt-in multiplicative scale (1 − γ) applied to the
+        # per-unit solar-impact prediction when the entity has at least one
+        # screened facade, sun elevation > 30°, and the screen is actively
+        # deployed (correction_percent < 80).  γ = 0.0 (default) is a
+        # bit-identical no-op.  Empirical envelope from issue #950 puts useful
+        # values in the 0.2–0.4 range.  Applied at prediction time only — does
+        # NOT introduce a second transmittance term (invariant #1); the
+        # standard coeff × potential product is unchanged and γ is a separate
+        # multiplicative scaling.
+        try:
+            _gamma_raw = float(entry.data.get("solar_hotspot_attenuation_gamma", 0.0))
+        except (TypeError, ValueError):
+            _gamma_raw = 0.0
+        self.solar_hotspot_attenuation_gamma = max(0.0, min(1.0, _gamma_raw))
+        # Experimental tail-aware solar-impact redistribution for low-elev
+        # hours (#948).  When α > 0, the per-unit predicted solar reduction
+        # at hour H is split across the originator hour and the K=3 prior
+        # hours using an exponential-decay kernel with time constant τ.
+        # Applies only to low-elev (sun_elev < 30°) eligible originator
+        # hours; high-elev hours keep their full instantaneous credit.
+        # α = 0.0 (default) is a bit-identical no-op.  Empirical envelope
+        # from issue #948 puts useful values in the 0.4–0.6 range.  Past-
+        # hour potentials are reconstructed from ``_hourly_log`` on every
+        # ``calculate_total_power`` call — no new persistent state and no
+        # storage migration.  See invariant #1: redistribution is a purely
+        # temporal weighting of ``coeff × potential`` evaluated at
+        # different time offsets; no extra transmittance factor.
+        try:
+            _alpha_raw = float(entry.data.get("solar_redistribution_alpha", 0.0))
+        except (TypeError, ValueError):
+            _alpha_raw = 0.0
+        self.solar_redistribution_alpha = max(0.0, min(1.0, _alpha_raw))
+        try:
+            _tau_raw = float(entry.data.get("solar_redistribution_tau_hours", 2.0))
+        except (TypeError, ValueError):
+            _tau_raw = 2.0
+        self.solar_redistribution_tau_hours = max(0.5, min(6.0, _tau_raw))
         self.wind_gust_factor = entry.data.get("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)
         self.balance_point = entry.data.get("balance_point", 17.0)
         self.learning_rate = entry.data.get("learning_rate", 0.01)
@@ -510,6 +556,16 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if _screen_affected is None:
             _screen_affected = list(self.energy_sensors)
         self._screen_affected_set: frozenset[str] = frozenset(_screen_affected)
+
+        # Per-entity scope for solar coefficient learning + prediction (#962).
+        # Same None-defaults-to-all-energy_sensors pattern as the screen and
+        # aux lists.  Used by ``is_solar_affected`` to gate all five solar
+        # learning paths and the read path; entities outside this set get a
+        # zero solar coefficient and are skipped by the learners entirely.
+        _solar_affected = entry.data.get(CONF_SOLAR_AFFECTED_ENTITIES)
+        if _solar_affected is None:
+            _solar_affected = list(self.energy_sensors)
+        self._solar_affected_set: frozenset[str] = frozenset(_solar_affected)
 
         # Load Thermal Inertia Profile (Default to Normal/4h if missing)
         inertia_setting = self.entry.data.get(CONF_THERMAL_INERTIA, DEFAULT_THERMAL_INERTIA_HOURS)
@@ -821,6 +877,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 unit_strategies=self._unit_strategies,
                 daily_history=self._daily_history,
                 unit_min_base=self._per_unit_min_base_thresholds or None,
+                solar_affected_entities=(
+                    self._solar_affected_set
+                    if isinstance(getattr(self, "_solar_affected_set", None), (frozenset, set))
+                    else None
+                ),
                 return_diagnostics=True,
             )
             _LOGGER.info(
@@ -1062,6 +1123,18 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "skip_reason": "unknown_entity",
             }
 
+        # Per-entity solar-scope gate (#962): apply-implied is the user-driven
+        # "commit diagnose verbatim" path; commits are not allowed on entities
+        # the user has excluded from solar.
+        if not self.is_solar_affected(entity_id):
+            return {
+                "status": "skipped",
+                "unit_entity_id": entity_id,
+                "regime": regime,
+                "days_back": days_back,
+                "skip_reason": "excluded_from_solar",
+            }
+
         analysis = self.learning.compute_implied_for_apply(
             hourly_log=self._hourly_log,
             entity_id=entity_id,
@@ -1263,6 +1336,49 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         self.aux_affected_entities = new_aux_affected_entities
         self._aux_affected_set = set(new_aux_affected_entities) if new_aux_affected_entities else set()
+
+    def is_solar_affected(self, entity_id: str) -> bool:
+        """Return True if the entity participates in solar learning + prediction (#962).
+
+        Single source of truth for the per-entity solar-scope gate.  Read at
+        every solar learn/predict call site.  Membership is configured by the
+        user via ``CONF_SOLAR_AFFECTED_ENTITIES`` and defaults to all
+        ``energy_sensors`` on fresh install / upgrade (preserves prior
+        behaviour).
+        """
+        return entity_id in self._solar_affected_set
+
+    async def async_migrate_solar_affected(self, new_solar_affected_entities: list[str]) -> None:
+        """Reset solar learning state for entities removed from the list (#962).
+
+        Solar coefficients are not redistributable like aux (each represents
+        one unit's window physics, not a divisible house aggregate), so the
+        migration is a clean per-entity wipe via ``async_reset_solar_learning_data``
+        for each removed entity.  Untouched entities keep their state.
+
+        Behaviour matrix:
+        - First time the user saves with the field present → diff vs. the
+          implicit "all energy_sensors" set; entities user-removed get reset.
+        - Subsequent edits → diff vs. previously-saved list.
+        - No-op when nothing was removed (Tobit windows, NLMS state, buffers
+          all preserved on the surviving entities).
+        """
+        old_set = self._solar_affected_set
+        new_set = frozenset(new_solar_affected_entities or [])
+        removed = sorted(old_set - new_set)
+
+        if not removed:
+            self._solar_affected_set = new_set
+            return
+
+        _LOGGER.info(
+            "Solar Migration: removing %d entities from solar scope; resetting learning state for: %s",
+            len(removed), removed
+        )
+        for entity_id in removed:
+            await self.async_reset_solar_learning_data(entity_id=entity_id)
+
+        self._solar_affected_set = new_set
 
     def _add_aux_coefficient(self, entity_id: str, temp_key: str, wind_bucket: str, value_to_add: float):
         """Helper to safely add value to a coefficient, clamped to base model."""
@@ -1496,6 +1612,30 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         return DEFAULT_CLOUD_COVERAGE
 
+    def _get_ghi(self) -> float | None:
+        """Read the optional local GHI sensor in W/m².
+
+        Returns None when the sensor is unconfigured, missing, or
+        reports an unparseable / unavailable state.  Unlike
+        ``_get_cloud_coverage`` there is no fallback default — GHI is
+        only useful when actually measured.  Clamped to [0, 1500] to
+        guard against sensor spikes (clear-sky max GHI on a horizontal
+        surface is ~1100 W/m² at any latitude on Earth; > 1500 is
+        always a sensor fault).
+        """
+        if not self.ghi_sensor:
+            return None
+        state = self.hass.states.get(self.ghi_sensor)
+        if not state or state.state in ("unknown", "unavailable", None):
+            return None
+        try:
+            val = float(state.state)
+        except (TypeError, ValueError):
+            return None
+        if val < 0.0 or val > 1500.0:
+            return None
+        return val
+
     def _get_speed_in_ms(self, entity_id: str) -> float | None:
         """Get speed in m/s from an entity, converting from km/h, mph, or knots if needed."""
         if not entity_id:
@@ -1534,6 +1674,55 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             return convert_speed_to_ms(val, unit)
 
         return val
+
+    def _get_weather_attribute_with_fallback(self, attribute: str) -> float | None:
+        """Numeric attribute read with primary→secondary fallback (#933).
+
+        Returns the primary weather entity's attribute when present,
+        otherwise the secondary entity's, otherwise ``None``.  Independent
+        per-attribute fallback — used for ``direct_normal_irradiance`` /
+        ``diffuse_radiation`` where the primary integration may not expose
+        the field but a secondary (e.g. open-meteo fork) does.
+        """
+        val = self._get_weather_attribute(attribute)
+        if val is not None:
+            return val
+        secondary = self.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY)
+        if not secondary:
+            return None
+        state = self.hass.states.get(secondary)
+        if not state:
+            return None
+        raw = state.attributes.get(attribute)
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return None
+
+    def _get_weather_string_attribute_with_fallback(
+        self, attribute: str
+    ) -> str | None:
+        """String attribute read with primary→secondary fallback (#933).
+
+        Used for ``solar_data_time`` (ISO timestamp from the open-meteo
+        ``current`` block).  Mirrors the float variant but returns the raw
+        string without numeric conversion.
+        """
+        for entity_id in (
+            self.weather_entity,
+            self.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY),
+        ):
+            if not entity_id:
+                continue
+            state = self.hass.states.get(entity_id)
+            if not state:
+                continue
+            val = state.attributes.get(attribute)
+            if val is not None:
+                return str(val)
+        return None
 
     def _get_inertia_parameters(self) -> tuple[int, int]:
         """Helper to derive requirements from weights."""
@@ -2434,6 +2623,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         potential_solar_factor = 0.0
         solar_factor = 0.0
         solar_vector = (0.0, 0.0, 0.0)
+        cloud: float | None = None  # Used by hourly logging (#933 follow-up)
         if self.solar_enabled:
              elev, azim = self._get_sun_info_now()
              cloud = self._get_cloud_coverage()
@@ -2509,6 +2699,20 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             # Cache effective wind for sensors
             self.data["effective_wind"] = effective_wind
 
+            # DNI / DHI from weather entity, primary→secondary fallback (#933).
+            # Logged only — not consumed by the learning pipeline yet.  Both
+            # are W/m²; no unit conversion needed.  ``solar_data_time`` is
+            # the open-meteo observation timestamp, persisted so we can later
+            # detect stale-data hours (aliasing across the hour boundary).
+            dni = self._get_weather_attribute_with_fallback("direct_normal_irradiance")
+            dhi = self._get_weather_attribute_with_fallback("diffuse_radiation")
+            solar_data_time = self._get_weather_string_attribute_with_fallback("solar_data_time")
+            # Optional local GHI sensor (independent of weather_entity).
+            # When configured, accumulated per-tick and written to the
+            # hourly log; unaffected by primary/secondary weather fallback
+            # logic — the sensor is its own source.
+            ghi = self._get_ghi()
+
             # Update hourly aggregates (delegated to ObservationCollector)
             self._collector.accumulate_weather(
                 temp=temp,
@@ -2520,6 +2724,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 current_time=current_time,
                 humidity=humidity,
                 correction_percent=self.solar_correction_percent,
+                dni=dni,
+                dhi=dhi,
+                cloud_coverage=cloud,
+                ghi=ghi,
+                solar_data_time=solar_data_time,
             )
         else:
             effective_wind = 0.0

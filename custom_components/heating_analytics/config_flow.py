@@ -54,6 +54,7 @@ from .const import (
     CONF_SCREEN_EAST,
     CONF_SCREEN_WEST,
     CONF_SCREEN_AFFECTED_ENTITIES,
+    CONF_SOLAR_AFFECTED_ENTITIES,
     DEFAULT_SCREEN_SOUTH,
     DEFAULT_SCREEN_EAST,
     DEFAULT_SCREEN_WEST,
@@ -246,12 +247,38 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data[CONF_AUX_AFFECTED_ENTITIES] = data.get("energy_sensors", [])
         if CONF_SCREEN_AFFECTED_ENTITIES not in data:
             data[CONF_SCREEN_AFFECTED_ENTITIES] = data.get("energy_sensors", [])
+        if CONF_SOLAR_AFFECTED_ENTITIES not in data:
+            data[CONF_SOLAR_AFFECTED_ENTITIES] = data.get("energy_sensors", [])
 
         return data
 
     # ------------------------------------------------------------------ #
     # Schema builders                                                      #
     # ------------------------------------------------------------------ #
+
+    def _solar_affected_default_with_new(self, g) -> list[str]:
+        """Default for CONF_SOLAR_AFFECTED_ENTITIES with new-sensor opt-in (#962).
+
+        Returns ``saved_solar_list ∪ (current_energy_sensors − previous_energy_sensors)``
+        so that energy sensors added since the last save default to checked.
+        Initial-config / fresh-install (no previous list) returns the full
+        current energy_sensors list.
+
+        ``g`` is the bound ``(key, default)`` lookup that the schema builder
+        already uses for resolving form defaults.
+        """
+        current_energy = list(self._flow_data.get("energy_sensors", []))
+        if self._entry is None:
+            # Fresh install: all current sensors default-in.
+            return list(g(CONF_SOLAR_AFFECTED_ENTITIES, current_energy))
+        previous_energy = list(self._entry.data.get("energy_sensors", []))
+        saved_solar = list(g(CONF_SOLAR_AFFECTED_ENTITIES, current_energy))
+        new_sensors = [s for s in current_energy if s not in previous_energy]
+        # Preserve current-energy ordering for the union; deduplicate.
+        merged = list(dict.fromkeys(saved_solar + new_sensors))
+        # Filter to current_energy so removed sensors don't linger in default.
+        current_set = set(current_energy)
+        return [s for s in merged if s in current_set]
 
     def _schema_basics(self, user_input, defaults) -> vol.Schema:
         g = lambda k, d=None: self._v(user_input, defaults, k, d)
@@ -266,6 +293,16 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         }
         schema[vol.Optional("outdoor_temp_sensor", description={"suggested_value": g("outdoor_temp_sensor")})] = (
             selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", device_class="temperature"))
+        )
+        # Optional local GHI sensor (W/m²).  No device_class filter —
+        # user-scraped weather-station values often expose plain numeric
+        # state without the irradiance device_class set, so the broader
+        # `domain="sensor"` selector accommodates them.  Read by
+        # ``_get_ghi`` with [0, 1500] W/m² clamping.  Drives
+        # ``ghi_signal_agreement`` diagnostic; pipeline integration is
+        # gated on that diagnostic's evidence.
+        schema[vol.Optional("ghi_sensor", description={"suggested_value": g("ghi_sensor")})] = (
+            selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor"))
         )
         return vol.Schema(schema)
 
@@ -332,6 +369,35 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
             ),
+            # Per-entity scope for solar coefficient learning + prediction (#962).
+            # Uncheck a sensor if its consumption does NOT respond to solar gain
+            # in the room — typically (a) the sensor is in a room with no sun
+            # exposure, or (b) the sensor is a floor-heating cable controlled
+            # by a slab/floor-temperature thermostat (the slab's thermal mass
+            # dominates over solar gain, so the cable runs to maintain slab
+            # setpoint regardless of sun in the room above).  Unchecked
+            # sensors get a zero solar coefficient and skip all five solar
+            # learning paths — base/aux learning continues normally.
+            # Removing a sensor here triggers an automatic solar reset for
+            # that sensor.
+            #
+            # New-sensor default-in: if the user added energy sensors since
+            # the last reconfigure, those new sensors default to *checked*
+            # (included in the solar list).  Rationale: solar response is the
+            # common case — a new energy sensor for a new HP, new room,
+            # etc. is almost always solar-affected.  Slab-thermostat / interior-
+            # load exclusions are the minority.  User can immediately uncheck
+            # if the new sensor is in fact non-solar.  This diverges from
+            # screen_/aux_affected_entities which both default new sensors to
+            # *un*checked — but solar is the case where the wrong default
+            # injects phantom coefficients (#962), so the trade-off is
+            # asymmetric and the inverse default is justified.
+            vol.Optional(
+                CONF_SOLAR_AFFECTED_ENTITIES,
+                default=self._solar_affected_default_with_new(g),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
+            ),
             # Derive dedicated-wind default from whether a wind sensor is already configured
             vol.Optional(_CONF_DEDICATED_WIND, default=bool(g("wind_speed_sensor"))): selector.BooleanSelector(),
         }
@@ -342,6 +408,32 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema[vol.Optional(CONF_FORECAST_CROSSOVER_DAY, default=g(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY))] = (
             selector.NumberSelector(
                 selector.NumberSelectorConfig(min=1, max=7, step=1, mode="slider")
+            )
+        )
+        # Experimental hotspot-loss attenuation γ (#950).  Multiplicative
+        # scale (1 − γ) applied to per-unit solar prediction for screened
+        # facades at sun elevation > 30°.  γ = 0.0 is a no-op default.
+        schema[vol.Optional(
+            "solar_hotspot_attenuation_gamma",
+            default=g("solar_hotspot_attenuation_gamma", 0.0),
+        )] = selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.05, mode="slider")
+        )
+        # Experimental tail-aware redistribution α / τ (#948).  Temporal
+        # spreading of per-unit solar prediction at low-elev hours.
+        # α = 0.0 (default) is a no-op.
+        schema[vol.Optional(
+            "solar_redistribution_alpha",
+            default=g("solar_redistribution_alpha", 0.0),
+        )] = selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.05, mode="slider")
+        )
+        schema[vol.Optional(
+            "solar_redistribution_tau_hours",
+            default=g("solar_redistribution_tau_hours", 2.0),
+        )] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0.5, max=6.0, step=0.5, unit_of_measurement="h", mode="slider"
             )
         )
         # --- Lower-priority fields at the bottom ---
@@ -484,7 +576,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors = self._validate_basics(user_input)
             if not errors:
                 self._flow_data.update(user_input)
-                self._clear_absent_entity_keys(user_input, ["outdoor_temp_sensor"])
+                self._clear_absent_entity_keys(user_input, ["outdoor_temp_sensor", "ghi_sensor"])
                 return await self.async_step_physics()
         return self.async_show_form(
             step_id="user",
@@ -569,7 +661,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors["energy_sensors"] = "sensor_swap_detected"
             if not errors:
                 self._flow_data.update(user_input)
-                self._clear_absent_entity_keys(user_input, ["outdoor_temp_sensor"])
+                self._clear_absent_entity_keys(user_input, ["outdoor_temp_sensor", "ghi_sensor"])
                 return await self.async_step_reconfigure_physics()
         return self.async_show_form(
             step_id="reconfigure",
@@ -608,6 +700,15 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 coord = self.hass.data.get(DOMAIN, {}).get(self.context["entry_id"])
                 if coord:
                     await coord.async_migrate_aux_coefficients(new_aux)
+            # Solar-affected migration (#962): reset solar learning for any
+            # entity newly removed from the list.  No conservation strategy
+            # — solar coefficients are not redistributable (each represents
+            # one unit's window physics, not a divisible house-aggregate).
+            new_solar = user_input.get(CONF_SOLAR_AFFECTED_ENTITIES)
+            if new_solar is not None:
+                coord = self.hass.data.get(DOMAIN, {}).get(self.context["entry_id"])
+                if coord:
+                    await coord.async_migrate_solar_affected(new_solar)
             if self._needs_feature_config_step():
                 return await self.async_step_reconfigure_feature_config()
             return self.async_update_reload_and_abort(

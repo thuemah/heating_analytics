@@ -125,6 +125,46 @@ class TestObservationCollector:
         assert c.aux_count == 1  # Only second call had is_aux_active=True
         assert c.start_time == datetime(2023, 1, 1, 12, 0)
 
+    def test_accumulate_weather_dni_dhi(self):
+        """DNI/DHI/cloud_coverage/solar_data_time accumulate independently
+        of sample_count (#933).
+
+        Skipped ticks (None) must not pull the mean toward zero, and
+        solar_data_time tracks the most recent observation timestamp.
+        """
+        c = ObservationCollector()
+        t = datetime(2023, 1, 1, 12, 0)
+
+        c.accumulate_weather(
+            5.0, 3.0, "normal", 0.5, (0.0, 0.0, 0.0), False, t,
+            dni=300.0, dhi=80.0, cloud_coverage=40.0,
+            solar_data_time="2023-01-01T11:00",
+        )
+        c.accumulate_weather(5.0, 3.0, "normal", 0.5, (0.0, 0.0, 0.0), False, t)
+        c.accumulate_weather(
+            5.0, 3.0, "normal", 0.5, (0.0, 0.0, 0.0), False, t,
+            dni=400.0, dhi=100.0, cloud_coverage=60.0,
+            solar_data_time="2023-01-01T12:00",
+        )
+
+        assert c.sample_count == 3
+        assert c.dni_count == 2
+        assert c.dni_sum == pytest.approx(700.0)
+        assert c.dhi_count == 2
+        assert c.dhi_sum == pytest.approx(180.0)
+        assert c.cloud_coverage_count == 2
+        assert c.cloud_coverage_sum == pytest.approx(100.0)
+        assert c.solar_data_time_last == "2023-01-01T12:00"
+
+        c.reset()
+        assert c.dni_sum == 0.0
+        assert c.dni_count == 0
+        assert c.dhi_sum == 0.0
+        assert c.dhi_count == 0
+        assert c.cloud_coverage_sum == 0.0
+        assert c.cloud_coverage_count == 0
+        assert c.solar_data_time_last is None
+
     def test_accumulate_expected_distributes_to_units(self):
         """Expected accumulation populates per-unit dicts correctly."""
         c = ObservationCollector()

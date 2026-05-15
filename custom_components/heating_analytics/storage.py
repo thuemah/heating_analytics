@@ -1806,18 +1806,33 @@ class StorageManager:
             col_wind_gust = mapping.get("wind_gust")
             col_is_aux = mapping.get("is_auxiliary")
             col_cloud = mapping.get("cloud_coverage")
+            col_dni = mapping.get("direct_normal_irradiance")
+            col_dhi = mapping.get("diffuse_radiation")
 
-            if not all([col_ts, col_temp]):
-                _LOGGER.error("CSV import mapping is missing required keys: 'timestamp', 'temperature'")
-                return None, 0
-
-            # Weather-only mode if energy column is missing
+            # Weather-only mode if energy column is missing.
+            # In weather-only mode, only timestamp is strictly required —
+            # other fields are merged onto matching log entries only when
+            # mapped, so a pure DNI/DHI enrichment pass does not clobber
+            # existing temp/wind/cloud values from live observations.
+            # Full mode (with energy) still requires timestamp + temperature
+            # because the entry needs to be constructed from scratch.
             weather_only_mode = col_energy is None
             if weather_only_mode:
-                _LOGGER.info("CSV import in weather-only mode (no energy column). Will enrich existing data with weather information.")
+                if not col_ts:
+                    _LOGGER.error("CSV import (weather-only) requires 'timestamp' mapping")
+                    return None, 0
+                _LOGGER.info("CSV import in weather-only mode (no energy column). Will enrich existing data with mapped fields only.")
+            else:
+                if not all([col_ts, col_temp]):
+                    _LOGGER.error("CSV import (full mode) requires 'timestamp' and 'temperature' mapping")
+                    return None, 0
 
             all_rows = []
-            with open(file_path, mode='r', encoding='utf-8') as f:
+            # 'utf-8-sig' transparently strips a leading byte-order mark.
+            # Open-meteo's web-UI CSV exports include a UTF-8 BOM, which
+            # makes csv.DictReader read the first column header as
+            # '﻿time' under plain 'utf-8' and KeyError on lookups.
+            with open(file_path, mode='r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     all_rows.append(row)
@@ -1842,55 +1857,100 @@ class StorageManager:
                     if ts.tzinfo is None:
                         ts = dt_util.as_local(ts)
 
-                    temp = float(row[col_temp])
+                    # In weather-only mode each field is optional and only
+                    # gets included when the source column was mapped AND
+                    # the row has a value.  Tracking presence here so the
+                    # downstream merge can be field-conditional and a pure
+                    # DNI/DHI enrichment pass does not clobber temp/wind/
+                    # cloud values from live observations.
+                    temp = None
+                    if col_temp and row.get(col_temp):
+                        try:
+                            temp = float(row[col_temp])
+                        except (ValueError, TypeError):
+                            pass
+
                     kwh = None
                     if col_energy and row.get(col_energy):
                         kwh = float(row[col_energy])
 
-                    wind_speed = float(row[col_wind_speed]) if col_wind_speed and row.get(col_wind_speed) else 0.0
+                    wind_speed_present = col_wind_speed and row.get(col_wind_speed)
+                    wind_speed = float(row[col_wind_speed]) if wind_speed_present else 0.0
                     wind_gust = float(row[col_wind_gust]) if col_wind_gust and row.get(col_wind_gust) else None
                     is_aux = str(row.get(col_is_aux, '0')).lower() in ['1', 'true', 'yes', 'on'] if col_is_aux else False
 
                     effective_wind = self.coordinator._calculate_effective_wind(wind_speed, wind_gust)
                     wind_bucket = self.coordinator._get_wind_bucket(effective_wind)
 
-                    # Solar Factor Calculation
-                    solar_factor = 0.0
+                    # Solar Factor Calculation — only computed if cloud_coverage
+                    # was supplied.  In weather-only mode, an enrichment pass
+                    # without cloud_coverage must not synthesise a default-50%
+                    # solar_factor that overwrites the live observation.
+                    solar_factor = None
                     solar_impact_kwh = 0.0
-                    if self.coordinator.solar_enabled:
-                        # Parse cloud coverage from CSV (optional)
-                        cloud_coverage = None
-                        if col_cloud and row.get(col_cloud):
-                            try:
-                                cloud_coverage = float(row[col_cloud])
-                            except (ValueError, TypeError):
-                                pass
+                    cloud_coverage = None
+                    if col_cloud and row.get(col_cloud):
+                        try:
+                            cloud_coverage = float(row[col_cloud])
+                        except (ValueError, TypeError):
+                            pass
 
-                        # Fallback to 50% if not provided
-                        if cloud_coverage is None:
-                            cloud_coverage = 50.0
-
-                        # Calculate solar factor from sun position + cloud coverage
+                    if self.coordinator.solar_enabled and cloud_coverage is not None:
                         elev, azim = self.coordinator.solar.get_approx_sun_pos(ts)
                         solar_factor = self.coordinator.solar.calculate_solar_factor(elev, azim, cloud_coverage)
 
-                    # Weather-only mode: Store weather enrichment data
+                    # Optional irradiance fields (#933 research enrichment).
+                    # Stored raw alongside the existing cloud_factor-derived
+                    # solar_factor so research scripts can compare both
+                    # signals on the same timestamps without recomputing.
+                    dni = None
+                    dhi = None
+                    if col_dni and row.get(col_dni):
+                        try:
+                            dni = float(row[col_dni])
+                        except (ValueError, TypeError):
+                            pass
+                    if col_dhi and row.get(col_dhi):
+                        try:
+                            dhi = float(row[col_dhi])
+                        except (ValueError, TypeError):
+                            pass
+
                     if weather_only_mode:
-                        # Store weather data that will be used to update existing entries
-                        entry = {
-                            "timestamp": ts.isoformat(),
-                            "hour": ts.hour,
-                            "temp": temp,
-                            "tdd": round(abs(self.coordinator.balance_point - temp) / 24.0, 3),
-                            "effective_wind": effective_wind,
-                            "wind_bucket": wind_bucket,
-                            "solar_factor": round(solar_factor, 3),
-                        }
+                        # Build entry with only mapped fields so the merge
+                        # below can clobber-only-what-was-supplied.  An
+                        # enrichment pass with just timestamp + dni + dhi
+                        # leaves temp / wind / solar_factor untouched on
+                        # existing log entries.
+                        entry = {"timestamp": ts.isoformat(), "hour": ts.hour}
+                        if temp is not None:
+                            entry["temp"] = temp
+                            entry["tdd"] = round(abs(self.coordinator.balance_point - temp) / 24.0, 3)
+                        if wind_speed_present:
+                            entry["effective_wind"] = effective_wind
+                            entry["wind_bucket"] = wind_bucket
+                        if solar_factor is not None:
+                            entry["solar_factor"] = round(solar_factor, 3)
+                        if dni is not None:
+                            entry["dni"] = round(dni, 2)
+                        if dhi is not None:
+                            entry["dhi"] = round(dhi, 2)
                         new_log_entries.append(entry)
                     else:
-                        # Full mode: Create complete entry with energy data
-                        if kwh is None:
+                        # Full mode: Create complete entry with energy data.
+                        # temp is required (validated above).  If
+                        # cloud_coverage was not supplied, fall back to 50 %
+                        # so solar_factor is still computed — preserves the
+                        # pre-enrichment-aware import semantic for cold-start
+                        # imports that omit cloud data.
+                        if kwh is None or temp is None:
                             continue
+
+                        full_solar_factor = solar_factor if solar_factor is not None else (
+                            self.coordinator.solar.calculate_solar_factor(
+                                *self.coordinator.solar.get_approx_sun_pos(ts), 50.0,
+                            ) if self.coordinator.solar_enabled else 0.0
+                        )
 
                         entry = {
                             "timestamp": ts.isoformat(),
@@ -1902,9 +1962,13 @@ class StorageManager:
                             "actual_kwh": kwh,
                             "expected_kwh": 0.0,
                             "auxiliary_active": is_aux,
-                            "solar_factor": round(solar_factor, 3),
+                            "solar_factor": round(full_solar_factor, 3),
                             "solar_impact_kwh": round(solar_impact_kwh, 3),
                         }
+                        if dni is not None:
+                            entry["dni"] = round(dni, 2)
+                        if dhi is not None:
+                            entry["dhi"] = round(dhi, 2)
                         new_log_entries.append(entry)
 
                         # Track A: per-hour learning (only when daily_learning_mode is off)
@@ -1983,36 +2047,78 @@ class StorageManager:
 
                 if is_weather_only:
                     # Weather-only mode: Update existing entries with weather data
+                    #
+                    # Timestamp comparison must be timezone-aware: live log
+                    # entries are written in HA-local time with offset (Oslo
+                    # ≈ "+02:00" in CEST), while imports may carry UTC,
+                    # local-with-offset, or naive timestamps depending on
+                    # the source (ERA5 archive defaults to UTC).  String
+                    # equality on the raw ISO form would fail across these
+                    # representations even when they point to the same
+                    # physical moment, and would mis-handle DST boundaries.
+                    # JOIN key is normalised to UTC ISO; date key (used for
+                    # orphan-day classification and daily_history lookup)
+                    # stays in local time because that is how users — and
+                    # _daily_history — refer to calendar days.
+                    def _utc_key(ts_str):
+                        dt = dt_util.parse_datetime(ts_str)
+                        if dt is None:
+                            return None
+                        if dt.tzinfo is None:
+                            dt = dt_util.as_local(dt)
+                        return dt_util.as_utc(dt).isoformat()
+
+                    def _local_date(ts_str):
+                        dt = dt_util.parse_datetime(ts_str)
+                        if dt is None:
+                            return None
+                        if dt.tzinfo is None:
+                            dt = dt_util.as_local(dt)
+                        return dt_util.as_local(dt).date().isoformat()
+
                     updated_count = 0
-                    timestamp_to_entry = {e['timestamp']: e for e in entries}
+                    timestamp_to_entry = {}
+                    for e in entries:
+                        k = _utc_key(e['timestamp'])
+                        if k is not None:
+                            timestamp_to_entry[k] = e
 
                     # Identify all days currently present in hourly_log to avoid conflict with backfill
-                    existing_log_days = set(e['timestamp'][:10] for e in self.coordinator._hourly_log)
+                    existing_log_days = set()
+                    for e in self.coordinator._hourly_log:
+                        d = _local_date(e['timestamp'])
+                        if d is not None:
+                            existing_log_days.add(d)
 
                     for log_entry in self.coordinator._hourly_log:
-                        if log_entry['timestamp'] in timestamp_to_entry:
-                            weather_data = timestamp_to_entry[log_entry['timestamp']]
-                            # Update weather fields
-                            log_entry['temp'] = weather_data['temp']
-                            log_entry['tdd'] = weather_data['tdd']
-                            log_entry['effective_wind'] = weather_data['effective_wind']
-                            log_entry['wind_bucket'] = weather_data['wind_bucket']
-                            log_entry['solar_factor'] = weather_data['solar_factor']
-                            updated_count += 1
+                        k = _utc_key(log_entry['timestamp'])
+                        if k is None or k not in timestamp_to_entry:
+                            continue
+                        weather_data = timestamp_to_entry[k]
+                        # Field-conditional merge: only mapped fields
+                        # land on the existing entry, so a pure DNI/DHI
+                        # enrichment pass leaves temp / wind / cloud
+                        # values from live observations untouched.
+                        for field in ('temp', 'tdd', 'effective_wind',
+                                       'wind_bucket', 'solar_factor',
+                                       'dni', 'dhi'):
+                            if field in weather_data:
+                                log_entry[field] = weather_data[field]
+                        updated_count += 1
 
                     # ROTATED DATA HANDLING: Update daily_history for days NOT in hourly_log
                     # Group orphan entries by date
                     rotated_updates_count = 0
                     orphan_updates_by_date = {}
 
-                    for ts_iso, entry in timestamp_to_entry.items():
-                        date_str = ts_iso[:10]
+                    for entry in entries:
+                        date_str = _local_date(entry['timestamp'])
+                        if date_str is None:
+                            continue
                         # Only process if this day is completely missing from hourly_log
                         # (If it's present, _backfill will handle/overwrite it, so we skip)
                         if date_str not in existing_log_days:
-                            if date_str not in orphan_updates_by_date:
-                                orphan_updates_by_date[date_str] = []
-                            orphan_updates_by_date[date_str].append(entry)
+                            orphan_updates_by_date.setdefault(date_str, []).append(entry)
 
                     # Apply updates to daily_history
                     for date_str, daily_entries in orphan_updates_by_date.items():
@@ -2044,11 +2150,19 @@ class StorageManager:
                             for entry in daily_entries:
                                 hour = entry["hour"]
                                 if 0 <= hour <= 23:
-                                    # Update Vectors
-                                    vectors["temp"][hour] = entry["temp"]
-                                    vectors["wind"][hour] = entry["effective_wind"]
-                                    vectors["tdd"][hour] = entry["tdd"]
-                                    if self.coordinator.solar_enabled and "solar_rad" in vectors:
+                                    # Field-conditional vector update —
+                                    # entries from a partial-field
+                                    # enrichment pass may not carry every
+                                    # weather field.
+                                    if "temp" in entry:
+                                        vectors["temp"][hour] = entry["temp"]
+                                    if "effective_wind" in entry:
+                                        vectors["wind"][hour] = entry["effective_wind"]
+                                    if "tdd" in entry:
+                                        vectors["tdd"][hour] = entry["tdd"]
+                                    if (self.coordinator.solar_enabled
+                                            and "solar_rad" in vectors
+                                            and "solar_factor" in entry):
                                         vectors["solar_rad"][hour] = entry["solar_factor"]
                                     updated_day = True
 

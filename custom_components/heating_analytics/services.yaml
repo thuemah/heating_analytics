@@ -16,7 +16,7 @@ import_from_csv:
         text:
     column_mapping:
       name: Column Mapping
-      description: JSON object mapping CSV column names to 'timestamp', 'energy', 'temperature', 'wind_speed', and optionally 'wind_gust', 'cloud_coverage' and 'is_auxiliary'.
+      description: JSON object mapping CSV column names to 'timestamp', 'energy', 'temperature', 'wind_speed', and optionally 'wind_gust', 'cloud_coverage', 'is_auxiliary', 'direct_normal_irradiance', 'diffuse_radiation'. Only 'timestamp' and 'temperature' are required (omit 'energy' for weather-only enrichment of existing log entries).
       required: true
       selector:
         object:

@@ -25,6 +25,15 @@ from .solar import SolarCalculator
 
 _LOGGER = logging.getLogger(__name__)
 
+# Elevation buckets for `elevation_diagnostics` (#927).  Half-open
+# intervals [lo, hi) covering 0–90 °; the 60–90° bucket is closed at
+# 90 to admit zenith samples on equatorial installs.  Norway maxes
+# out at ~54 ° solar elevation in late June so the top bucket is
+# rarely populated here, but the schema is location-agnostic.
+ELEVATION_BUCKETS: tuple[tuple[int, int], ...] = (
+    (0, 15), (15, 30), (30, 45), (45, 60), (60, 90),
+)
+
 
 class DiagnosticsEngine:
     """Hosts the diagnose_model and diagnose_solar service implementations."""
@@ -694,6 +703,59 @@ class DiagnosticsEngine:
                         "heating_mild": {"delta_sum": 0.0, "n": 0},
                         "cooling":      {"delta_sum": 0.0, "n": 0},
                     },
+                    # Elevation-stratified residual buckets (#927 Tier 1).
+                    # Heating regime only — qualifying cooling samples are
+                    # rarer at this latitude and the user-facing hypothesis
+                    # (hotspot loss vs. thermal-mass battery) shows up
+                    # primarily in heating-mode shoulder-season afternoons.
+                    # Per-bucket lists kept in full so median + MAD can be
+                    # computed at response time; bounded by `qualifying`,
+                    # which is itself bounded by 30 days × ~12 daylight
+                    # hours = ~360 entries per entity in the worst case.
+                    "elevation_buckets": {
+                        f"{lo}-{hi}": {"residuals": [], "potential_mags": []}
+                        for lo, hi in ELEVATION_BUCKETS
+                    },
+                    # Lag-stratified residuals for Tier 2.  Per-bucket dict
+                    # of `lag_{k}` lists where each list holds `base_{H+k}
+                    # − actual_{H+k}` values for entries whose originator
+                    # hour H landed in that elevation bucket.  Same
+                    # bookkeeping as Tier 1's residuals but indexed by
+                    # forward-time offset rather than elevation only.
+                    # Skipped entries (mode change, missing tail, self-
+                    # qualifying solar at H+k) drop out of the lag they'd
+                    # have populated — n_per_lag varies with data sparsity.
+                    "elevation_lag_buckets": {
+                        f"{lo}-{hi}": {f"lag_{k}": [] for k in range(7)}
+                        for lo, hi in ELEVATION_BUCKETS
+                    },
+                    # Evening-tail walk for Tier 2.5: bypasses the
+                    # self-qualifying tail gate by searching forward
+                    # from the originator hour for the first dark
+                    # hour (solar_factor < 0.05), then walking up to
+                    # 6 h forward from that dark anchor.  Resolves the
+                    # afternoon-elevation data starvation that the
+                    # ordinary lag walk suffers on west-facade-
+                    # dominated entities — for a 14:00 originator at
+                    # 35° elevation, the lag walk hits 15-19:00 tails
+                    # which often still register solar_factor > 0.05
+                    # and are skipped to avoid double-counting.  The
+                    # evening walk skips past those hours to e.g.
+                    # 21:00 dark anchor and walks 21-03:00, freeing
+                    # the tail for accumulation.
+                    #
+                    # Per-bucket: flat list of (residual, dark_offset)
+                    # tuples across all originators × evening hours.
+                    # Each tuple contributes to the bucket's mean
+                    # residual at response time.  ``dark_offset`` is
+                    # the number of hours forward from the originator
+                    # to the first dark anchor — useful for diagnosing
+                    # what fraction of originators found a dark anchor
+                    # at all.
+                    "elevation_evening_tail_buckets": {
+                        f"{lo}-{hi}": {"residuals": [], "dark_offsets": []}
+                        for lo, hi in ELEVATION_BUCKETS
+                    },
                 }
             return unit_accum[eid]
 
@@ -713,6 +775,18 @@ class DiagnosticsEngine:
 
         # Hour-of-day residual curve (hours 6-18)
         hourly_residuals: dict[int, list[float]] = {h: [] for h in range(6, 19)}
+
+        # Timestamp → entry index for the lag walk in
+        # `elevation_diagnostics.lag` (#927 Tier 2).  Built once over the
+        # cutoff-filtered log so each per-(entity, sample) lag walk does
+        # constant-time lookups without re-scanning the log.  Cost on a
+        # 90-day log is ~2160 entries × dict insertion ≈ <1 ms.  Cleared
+        # implicitly when diagnose_solar returns; rebuilt next call.
+        log_by_timestamp: dict[str, dict] = {}
+        for _entry in self.coordinator._hourly_log:
+            _ts = _entry.get("timestamp", "")
+            if _ts and _ts[:10] >= cutoff:
+                log_by_timestamp[_ts] = _entry
 
         # Battery thermal-feedback sweep (#896): chronological tuples for
         # replay of the EMA under candidate k values.  Data shape mirrors the
@@ -892,6 +966,23 @@ class DiagnosticsEngine:
                 days_ago = (now.date() - _date.fromisoformat(ts[:10])).days
             except (ValueError, TypeError):
                 days_ago = 0
+
+            # Sun elevation for this entry — computed once outside the
+            # per-entity loop and reused across all entities (#927 Tier 1).
+            # Uses hour midpoint so the elevation reflects the average
+            # sun position across the hour, matching how solar_vector
+            # was accumulated in the live coordinator.  Returns None on
+            # parse failure or when astral is unavailable; downstream
+            # bucketing skips those entries.
+            entry_dt = dt_util.parse_datetime(ts) if ts else None
+            sun_elev_entry: float | None = None
+            if entry_dt is not None:
+                mid_dt = entry_dt + timedelta(minutes=30)
+                try:
+                    sun_pos = self.coordinator.solar.get_approx_sun_pos(mid_dt)
+                    sun_elev_entry = float(sun_pos[0])
+                except (TypeError, ValueError, IndexError):
+                    sun_elev_entry = None
 
             # Per-unit analysis
             for entity_id in self.coordinator.energy_sensors:
@@ -1094,7 +1185,330 @@ class DiagnosticsEngine:
                 if 6 <= hour <= 18:
                     hourly_residuals[hour].append(delta)
 
+                # Elevation-stratified residual (#927 Tier 1).  Heating
+                # regime only — see _get_unit_accum init comment for
+                # rationale.  Spec semantics (#927): residual sign is
+                # ``actual_impact - predicted = implied_solar - modeled_solar``,
+                # i.e. the negation of ``delta``.  Negative residual
+                # therefore means the model OVER-predicts solar reduction
+                # in that bucket (hotspot signature when concentrated at
+                # high elevation); positive means UNDER-predicts (battery
+                # signature, but Tier 1 alone cannot distinguish from
+                # plain calibration error — the lag-stratified Tier 2
+                # closes that gap).
+                if (
+                    sun_elev_entry is not None
+                    and 0.0 <= sun_elev_entry < 90.0
+                    and mode == MODE_HEATING
+                ):
+                    for lo, hi in ELEVATION_BUCKETS:
+                        if lo <= sun_elev_entry < hi:
+                            bucket_key = f"{lo}-{hi}"
+                            ev_bucket = acc["elevation_buckets"][bucket_key]
+                            ev_bucket["residuals"].append(implied_solar - modeled_solar)
+                            ev_bucket["potential_mags"].append(vector_mag)
+
+                            # Tier 2 lag walk (#927).  For each forward
+                            # offset k ∈ [0, 6], pull the H+k entry from
+                            # the timestamp index and append `tail_base −
+                            # tail_actual` for this entity to the
+                            # appropriate `lag_{k}` list.  Skip:
+                            #   • missing entry (gap in log),
+                            #   • mode change between H and H+k for this
+                            #     entity (different physical regime),
+                            #   • aux active at H+k (compromises base),
+                            #   • self-qualifying tail with
+                            #     solar_factor > 0.05 at H+k for k > 0
+                            #     (would double-count its own originator
+                            #     residual — the threshold mirrors the
+                            #     `signal_agreement` stability gate).
+                            # Lag 0 is the originator's own
+                            # `base − actual = implied_solar`, included
+                            # without the self-qualify gate.
+                            if entry_dt is not None:
+                                ev_lag = acc["elevation_lag_buckets"][bucket_key]
+                                for _k in range(7):
+                                    _tail_ts = (entry_dt + timedelta(hours=_k)).isoformat()
+                                    _tail = log_by_timestamp.get(_tail_ts)
+                                    if _tail is None:
+                                        continue
+                                    _tail_modes = _tail.get("unit_modes") or {}
+                                    _tail_mode = _tail_modes.get(entity_id, MODE_HEATING)
+                                    if _tail_mode != mode:
+                                        continue
+                                    if _tail.get("auxiliary_active", False):
+                                        continue
+                                    if _k > 0 and (_tail.get("solar_factor") or 0.0) > 0.05:
+                                        continue
+                                    _tail_base = (_tail.get("unit_expected_breakdown") or {}).get(entity_id)
+                                    _tail_actual = (_tail.get("unit_breakdown") or {}).get(entity_id)
+                                    if _tail_base is None or _tail_actual is None:
+                                        continue
+                                    ev_lag[f"lag_{_k}"].append(
+                                        float(_tail_base) - float(_tail_actual)
+                                    )
+
+                                # Evening-tail walk (Tier 2.5).  Find
+                                # the first dark hour (solar_factor <
+                                # 0.05) within 12 h of the originator,
+                                # then accumulate residuals over the 6
+                                # hours from that anchor.  No self-
+                                # qualifying gate inside the evening
+                                # window — the whole point is to
+                                # bypass the still-sunny afternoon
+                                # tails that the ordinary lag walk
+                                # cannot use on heavy-west installs.
+                                # Skips: missing entry, mode change,
+                                # aux active.
+                                _ev_acc = acc["elevation_evening_tail_buckets"][bucket_key]
+                                _dark_offset = None
+                                for _search in range(1, 13):
+                                    _search_ts = (
+                                        entry_dt + timedelta(hours=_search)
+                                    ).isoformat()
+                                    _candidate = log_by_timestamp.get(_search_ts)
+                                    if _candidate is None:
+                                        continue
+                                    if (_candidate.get("solar_factor") or 0.0) < 0.05:
+                                        _dark_offset = _search
+                                        break
+                                if _dark_offset is not None:
+                                    _ev_acc["dark_offsets"].append(_dark_offset)
+                                    for _ek in range(6):
+                                        _ev_ts = (
+                                            entry_dt
+                                            + timedelta(hours=_dark_offset + _ek)
+                                        ).isoformat()
+                                        _ev_entry = log_by_timestamp.get(_ev_ts)
+                                        if _ev_entry is None:
+                                            continue
+                                        _ev_modes = _ev_entry.get("unit_modes") or {}
+                                        if (
+                                            _ev_modes.get(entity_id, MODE_HEATING)
+                                            != mode
+                                        ):
+                                            continue
+                                        if _ev_entry.get("auxiliary_active", False):
+                                            continue
+                                        _ev_base = (
+                                            _ev_entry.get("unit_expected_breakdown") or {}
+                                        ).get(entity_id)
+                                        _ev_actual = (
+                                            _ev_entry.get("unit_breakdown") or {}
+                                        ).get(entity_id)
+                                        if _ev_base is None or _ev_actual is None:
+                                            continue
+                                        _ev_acc["residuals"].append(
+                                            float(_ev_base) - float(_ev_actual)
+                                        )
+                            break
+
         # --- Build results ---
+
+        def _median(values: list[float]) -> float:
+            n_v = len(values)
+            if n_v == 0:
+                return 0.0
+            s = sorted(values)
+            mid = n_v // 2
+            if n_v % 2 == 1:
+                return s[mid]
+            return (s[mid - 1] + s[mid]) / 2.0
+
+        def _mad(values: list[float], med: float) -> float:
+            if not values:
+                return 0.0
+            return _median([abs(v - med) for v in values])
+
+        def _build_elevation_evening_tail_block(
+            evening_acc: dict[str, dict[str, list[float]]],
+            min_samples: int = 10,
+        ) -> dict[str, dict]:
+            """Build the `elevation_diagnostics.evening_tail` response.
+
+            Per-bucket: emits ``n_originators_with_dark_anchor``,
+            ``mean_dark_offset_hours``, ``n_evening_hours`` and a
+            ``mean_residual_kwh`` scalar.  ``mean_residual_kwh`` is
+            the per-evening-hour reduction below baseline; positive
+            means consumption sustained below baseline through the
+            6-hour post-sunset window for that bucket's originators.
+
+            Compare directly against ``elevation_diagnostics.lag``
+            tail-sums by multiplying ``mean_residual_kwh × 6`` —
+            same units as ``tail_sum_lag1_to_6_kwh``, modulo that
+            the evening walk starts from sunset rather than H+1.
+
+            Decisive interpretation for the high-elevation hotspot
+            question:
+
+            - **Positive** ``mean_residual_kwh`` on 30-45° / 45-60°
+              buckets → energy reaches thermal mass after all,
+              just on a longer time-scale than the lag walk could
+              measure.  Hotspot loss as the dominant mechanism is
+              **refuted**; the high-elev Tier 1 over-prediction is
+              timing redistribution, not amplitude error.
+            - **Near-zero** ``mean_residual_kwh`` on the same
+              buckets → energy is genuinely lost (re-radiation
+              through glass, ceiling stratification bypassing
+              thermal mass).  Hotspot loss **confirmed** as
+              dominant mechanism; high-elev coefficient should be
+              modulated downward, not redistributed in time.
+
+            Set to None when ``n_evening_hours < min_samples``.
+            """
+            out: dict[str, dict] = {}
+            for bucket_key, data in evening_acc.items():
+                residuals = data["residuals"]
+                offsets = data["dark_offsets"]
+                n_h = len(residuals)
+                n_o = len(offsets)
+                if n_h < min_samples:
+                    out[bucket_key] = {
+                        "n_originators_with_dark_anchor": n_o,
+                        "n_evening_hours": n_h,
+                        "mean_residual_kwh": None,
+                        "mean_dark_offset_hours": (
+                            round(sum(offsets) / n_o, 2) if n_o > 0 else None
+                        ),
+                    }
+                    continue
+                out[bucket_key] = {
+                    "n_originators_with_dark_anchor": n_o,
+                    "n_evening_hours": n_h,
+                    "mean_residual_kwh": round(sum(residuals) / n_h, 4),
+                    "mean_dark_offset_hours": (
+                        round(sum(offsets) / n_o, 2) if n_o > 0 else None
+                    ),
+                }
+            return out
+
+        def _build_elevation_lag_block(
+            elev_lag_acc: dict[str, dict[str, list[float]]],
+            min_lag_samples: int = 10,
+        ) -> dict[str, dict]:
+            """Build the `elevation_diagnostics.lag` response (Tier 2).
+
+            Per-bucket: emits {lag_0, ..., lag_6} sub-blocks plus two
+            tail-sum scalars at different horizons.  Each sub-block
+            carries `n` and (when n ≥ ``min_lag_samples``)
+            `mean_residual_kwh` — the hours-mean of `base_{H+k} −
+            actual_{H+k}` across all samples whose originator landed
+            in this elevation bucket.
+
+            Two tail-sum windows are emitted side-by-side:
+
+            - **`tail_sum_lag1_to_3_kwh`** — short-horizon sum.
+              Captures the 1-3 h release window where most thermal-
+              mass battery effects peak (Toshiba's 0-15° release
+              empirically peaked at lag_2 in field data).  Crucially,
+              this scalar remains computable for afternoon-elevation
+              originators on west-facade-dominated installs where
+              the 6 h walk reaches into evening hours that fail the
+              self-qualifying tail gate (still-sunny tails on heavy-
+              west houses skip the lag walk and starve the longer
+              window).
+            - **`tail_sum_lag1_to_6_kwh`** — long-horizon sum.
+              Picks up the slow tail (4-6 h) on installs where the
+              afternoon-tail-starvation problem doesn't apply
+              (south-facing, no-screen, low-elevation originators).
+              Returns None on buckets where any of the longer lags
+              is under-sampled.
+
+            Interpretation of the tail-sum scalars:
+
+            - **Positive** (consumption stays below baseline 1-3 h or
+              1-6 h after the solar input) → thermal-mass battery:
+              stored energy releases gradually, Tier 1 alone would
+              under-credit the originator's actual contribution.
+            - **Near zero** alongside a large positive `lag_0` →
+              hotspot regime: instantaneous reduction without
+              sustained effect.  Beam-concentrated energy lost to
+              glass re-emission and ceiling-stratification before
+              reaching thermal mass.
+            - **Negative** is rare and usually means the lag walk is
+              picking up post-sunset rebound where the HP catches up
+              on missed setpoint after a sunny daytime.
+
+            Both scalars set to None when any lag in their window
+            has fewer than ``min_lag_samples`` populated entries —
+            partial sums would silently exaggerate the tail by
+            dropping under-sampled lags.  The 1-3 h scalar is
+            populated more often than the 1-6 h scalar by design;
+            both are reported so the consumer sees the trade-off.
+            """
+            out: dict[str, dict] = {}
+            for bucket_key, lag_data in elev_lag_acc.items():
+                per_lag: dict = {}
+                # Per-lag mean computation.
+                lag_means: dict[int, float | None] = {}
+                for k in range(7):
+                    rows = lag_data[f"lag_{k}"]
+                    n_l = len(rows)
+                    if n_l < min_lag_samples:
+                        per_lag[f"lag_{k}"] = {"n": n_l}
+                        lag_means[k] = None
+                    else:
+                        mean_r = sum(rows) / n_l
+                        per_lag[f"lag_{k}"] = {
+                            "n": n_l,
+                            "mean_residual_kwh": round(mean_r, 4),
+                        }
+                        lag_means[k] = mean_r
+
+                def _window_sum(start: int, end_inclusive: int) -> float | None:
+                    vals = [lag_means[k] for k in range(start, end_inclusive + 1)]
+                    if any(v is None for v in vals):
+                        return None
+                    return sum(vals)
+
+                short_sum = _window_sum(1, 3)
+                long_sum = _window_sum(1, 6)
+                per_lag["tail_sum_lag1_to_3_kwh"] = (
+                    round(short_sum, 4) if short_sum is not None else None
+                )
+                per_lag["tail_sum_lag1_to_6_kwh"] = (
+                    round(long_sum, 4) if long_sum is not None else None
+                )
+                out[bucket_key] = per_lag
+            return out
+
+        def _build_elevation_block(
+            elev_acc: dict[str, dict[str, list[float]]],
+            min_samples: int = 5,
+        ) -> dict[str, dict]:
+            """Build the `elevation_diagnostics.instantaneous` response.
+
+            Buckets with fewer than ``min_samples`` qualifying hours
+            return ``{"n": <count>}`` only — the median / MAD / normalised
+            ratio would be too noisy to surface usefully on small ``n``.
+            ``mean_potential`` ≤ 1e-3 in a populated bucket means the
+            sample's solar input was effectively zero; return None for
+            ``median_residual_normalised`` rather than divide by ~0.
+            """
+            out: dict[str, dict] = {}
+            for bucket_key, data in elev_acc.items():
+                residuals = data["residuals"]
+                pots = data["potential_mags"]
+                n_b = len(residuals)
+                if n_b < min_samples:
+                    out[bucket_key] = {"n": n_b}
+                    continue
+                med = _median(residuals)
+                mad = _mad(residuals, med)
+                mean_pot = sum(pots) / n_b
+                if mean_pot > 1e-3:
+                    norm = round(med / mean_pot, 4)
+                else:
+                    norm = None
+                out[bucket_key] = {
+                    "n": n_b,
+                    "median_residual": round(med, 4),
+                    "mad_residual": round(mad, 4),
+                    "mean_potential": round(mean_pot, 4),
+                    "median_residual_normalised": norm,
+                }
+            return out
+
         def _solve_normal(a, n, min_samples=10):
             """Solve normal equations for implied coefficient.
 
@@ -1182,11 +1596,28 @@ class DiagnosticsEngine:
             unit_strategies=self.coordinator._unit_strategies,
             daily_history=self.coordinator._daily_history,
             unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
+            solar_affected_entities=(
+                self.coordinator._solar_affected_set
+                if isinstance(
+                    getattr(self.coordinator, "_solar_affected_set", None),
+                    (frozenset, set),
+                )
+                else None
+            ),
             return_diagnostics=True,
         )
 
         per_unit = {}
+        # Per-entity solar-scope (#962): excluded entities get a one-line stub
+        # so the dict still contains every configured energy_sensor (consumers
+        # that walk per_unit can find them) without the verbose coefficient /
+        # stability / lag blocks for entities the user has declared do not
+        # respond to solar.
+        is_solar_affected_fn = getattr(self.coordinator, "is_solar_affected", None)
         for entity_id, acc in unit_accum.items():
+            if callable(is_solar_affected_fn) and not is_solar_affected_fn(entity_id):
+                per_unit[entity_id] = {"excluded_from_solar": True}
+                continue
             # #868: report both regimes separately.  ``current_coefficient``
             # remains the prediction-time view (heating regime + default
             # fallback) for backwards compatibility with consumers that
@@ -1299,7 +1730,33 @@ class DiagnosticsEngine:
             # Screen stratification (#826).  Report mean delta per correction
             # bucket along with n, so downstream (and humans) can distinguish
             # "tiny sample, noisy" from "real bias".
-            screen_stratified = {}
+            #
+            # Per-entity screen-scope (#963).  Entities outside
+            # ``screen_affected_entities`` get a fixed transmittance of 1.0
+            # at learn / predict time regardless of correction_percent.  The
+            # screen_stratified binning is then a binning by something
+            # correlated with screen position rather than by transmittance
+            # itself — typically sun availability (closed = night / cloudy,
+            # open = sunny day).  Reporting bias_gap_kwh + flagging
+            # ``transmittance_floor_*`` on those entities surfaces a
+            # confound (Simpson-style), not a model failure: a non-zero
+            # bias_gap is the expected signature of binning by sun
+            # magnitude.  Mark the block ``screen_config_active: false``
+            # and suppress flag emission for those entities so downstream
+            # consumers can interpret the numbers correctly.
+            screen_config_for_entity_fn = getattr(
+                self.coordinator, "screen_config_for_entity", None
+            )
+            if callable(screen_config_for_entity_fn):
+                try:
+                    _ent_screen_cfg = screen_config_for_entity_fn(entity_id)
+                except (TypeError, ValueError):
+                    _ent_screen_cfg = None
+            else:
+                _ent_screen_cfg = None
+            screen_config_active = bool(_ent_screen_cfg) and any(_ent_screen_cfg)
+
+            screen_stratified = {"screen_config_active": screen_config_active}
             for bkey, b in acc["correction_buckets"].items():
                 if b["n"] > 0:
                     # Trimmed (#896 follow-up): only ``n`` and
@@ -1315,9 +1772,11 @@ class DiagnosticsEngine:
                 else:
                     screen_stratified[bkey] = {"n": 0}
             # Bias trend: does |mean_delta| grow as screens close?  Only
-            # meaningful when both extremes have enough samples.
+            # meaningful when both extremes have enough samples AND the
+            # model is actually applying transmittance to this entity.
             if (
-                acc["correction_buckets"]["open"]["n"] >= 10
+                screen_config_active
+                and acc["correction_buckets"]["open"]["n"] >= 10
                 and acc["correction_buckets"]["closed"]["n"] >= 10
             ):
                 open_bias = (
@@ -1444,13 +1903,19 @@ class DiagnosticsEngine:
                         "correction_range_pct": round(corr_var, 1),
                         "informative": corr_var >= 40.0,  # ≥40 pct points of slider variance
                         "best": best,
+                        # Per-entity screen-scope (#963).  When the entity
+                        # is unscreened the sweep is structurally a no-op
+                        # — its best.screen_direct_transmittance is not a
+                        # recommendation that the model would act on.
+                        "screen_config_active": screen_config_active,
                     }
                     if rmse_uniform and coeff_uniform:
                         sensitivity["verdict"] = "uniform_across_candidates"
                     else:
                         sensitivity["candidates"] = results
                     if (
-                        sensitivity["informative"]
+                        screen_config_active
+                        and sensitivity["informative"]
                         and abs(best["screen_direct_transmittance"] - 0.08) > 0.04
                     ):
                         flags.append("sensitivity_suggests_transmittance_retune")
@@ -1743,6 +2208,13 @@ class DiagnosticsEngine:
                     "temporal_bias": {
                         "morning_mean_delta": round(acc["morning_delta"] / acc["morning_n"], 4) if acc["morning_n"] > 0 else None,
                         "afternoon_mean_delta": round(acc["afternoon_delta"] / acc["afternoon_n"], 4) if acc["afternoon_n"] > 0 else None,
+                    },
+                    "elevation_diagnostics": {
+                        "instantaneous": _build_elevation_block(acc["elevation_buckets"]),
+                        "lag": _build_elevation_lag_block(acc["elevation_lag_buckets"]),
+                        "evening_tail": _build_elevation_evening_tail_block(
+                            acc["elevation_evening_tail_buckets"]
+                        ),
                     },
                     "last_batch_fit": self._format_last_batch_fit(entity_id),
                     "flags": flags,
@@ -2343,11 +2815,17 @@ class DiagnosticsEngine:
         # signal source agrees nothing is actionable; otherwise
         # ``review_recommended`` and the user reads ``units_with_flags``,
         # ``global_flags``, and the battery sub-blocks for specifics.
+        # Excluded entities (#962) are not counted toward either active or
+        # inactive — they have no solar role at all, so reporting them as
+        # "inactive" would conflate "no solar signal yet" with "deliberately
+        # excluded from solar".
         active_count = sum(
-            1 for u in per_unit.values() if not u.get("inactive", False)
+            1 for u in per_unit.values()
+            if not u.get("inactive", False) and not u.get("excluded_from_solar", False)
         )
         inactive_count = sum(
-            1 for u in per_unit.values() if u.get("inactive", False)
+            1 for u in per_unit.values()
+            if u.get("inactive", False) and not u.get("excluded_from_solar", False)
         )
         units_with_flags = [
             {"entity_id": eid, "flags": u["flags"]}
@@ -2448,6 +2926,783 @@ class DiagnosticsEngine:
             },
             "per_unit": per_unit,
             "per_unit_thresholds": per_unit_thresholds,
+            "dni_dhi_shadow": self._compute_dni_dhi_shadow_report(days_back),
+            "ghi_signal_agreement": self._compute_ghi_signal_agreement(days_back),
+        }
+
+    def _compute_ghi_signal_agreement(self, days_back: int) -> dict:
+        """Compare Kasten-derived solar_factor against measured GHI.
+
+        Pre-geometry scalar comparison, mirroring the
+        ``signal_agreement`` block in the DNI/DHI shadow report but
+        with a genuinely independent input — a local pyranometer or
+        scraped weather-station GHI value, not a cloud_cover-derived
+        re-encoding from a public API.
+
+        Per-hour signals (both ∈ [0, 1.5], pre-geometry):
+
+        - ``kasten_cloud_factor = potential_solar_factor /
+          no_cloud_reference(elev, azim)`` — recovered from the same
+          field used by the DNI signal_agreement block.
+        - ``ghi_normalized = ghi_wm2 / (1361 × sin(elev) × 0.7^airmass)``
+          — Beer-Lambert clear-sky horizontal-flux estimate.  Diffuse-
+          on-clear-sky is intentionally not modelled, mirroring the
+          DNI normalisation; the resulting ``ghi_normalized`` peaks
+          slightly above 1.0 on clear days, which is informative as
+          mean_bias rather than an error.
+
+        High Pearson r AND low RMSE across all regimes means
+        cloud_coverage × Kasten already explains what the pyranometer
+        measures — measured GHI carries no new information and the
+        cloud_coverage pipeline is information-bound by definition.
+        Lower correlation on the broken-cloud regime is the signature
+        that justifies eventually replacing the ``cloud_factor`` step
+        with ``ghi_normalised`` in ``solar.calculate_solar_factor``;
+        an MPC-grade fix gated on this evidence.
+
+        Returns ``{"available": False, ...}`` when no GHI data has
+        been logged yet (sensor unconfigured or unavailable for the
+        whole window) or when fewer than 30 hours qualify after the
+        stability gate.
+
+        Same stability gate as ``signal_agreement``: ``elev ≥ 5°``,
+        ``no_cloud_reference > 0.1``, ``potential_solar_factor >
+        0.05``.  Restricts comparison to numerically stable midday
+        hours where both signals carry sub-1 % relative uncertainty.
+
+        Regime classification reads ``cloud_coverage`` from the log
+        when present (clear < 30, broken 30-70, overcast ≥ 70).
+        Falls back to GHI-magnitude classification when cloud_coverage
+        is missing on legacy entries: < 200 W/m² overcast, > 700 W/m²
+        clear, otherwise broken.
+        """
+        cutoff = (dt_util.now() - timedelta(days=days_back)).date().isoformat()
+
+        pairs: list[tuple[float, float, str]] = []
+        n_total_with_ghi = 0
+        n_skipped_unstable = 0
+
+        for entry in self.coordinator._hourly_log:
+            ts = entry.get("timestamp", "")
+            if ts[:10] < cutoff:
+                continue
+            ghi_val = entry.get("ghi_wm2")
+            if ghi_val is None:
+                continue
+            n_total_with_ghi += 1
+
+            entry_dt = dt_util.parse_datetime(ts) if ts else None
+            if entry_dt is None:
+                continue
+            try:
+                sun_pos = self.coordinator.solar.get_approx_sun_pos(
+                    entry_dt + timedelta(minutes=30)
+                )
+                elev = float(sun_pos[0])
+                azim = float(sun_pos[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if elev < 5.0:
+                continue
+
+            sin_elev = math.sin(math.radians(elev))
+            airmass = 1.0 / max(sin_elev, 0.087)
+            ghi_clear = 1361.0 * sin_elev * (0.7 ** airmass)
+            if ghi_clear < 1.0:
+                continue
+            try:
+                ghi_norm = max(0.0, min(1.5, float(ghi_val) / ghi_clear))
+            except (TypeError, ValueError):
+                continue
+
+            potential_sf = entry.get("potential_solar_factor")
+            if not isinstance(potential_sf, (int, float)) or potential_sf < 0:
+                continue
+            try:
+                no_cloud_ref = self.coordinator.solar.calculate_solar_factor(
+                    elev, azim, 0.0
+                )
+            except (TypeError, ValueError):
+                continue
+            if no_cloud_ref <= 0.1 or float(potential_sf) <= 0.05:
+                if no_cloud_ref > 1e-6:
+                    n_skipped_unstable += 1
+                continue
+            kasten_cf = max(0.0, min(1.5, float(potential_sf) / no_cloud_ref))
+
+            cloud = entry.get("cloud_coverage")
+            if isinstance(cloud, (int, float)):
+                if cloud < 30:
+                    regime = "clear"
+                elif cloud < 70:
+                    regime = "broken"
+                else:
+                    regime = "overcast"
+            else:
+                if ghi_val < 200.0:
+                    regime = "overcast"
+                elif ghi_val > 700.0:
+                    regime = "clear"
+                else:
+                    regime = "broken"
+
+            pairs.append((kasten_cf, ghi_norm, regime))
+
+        if n_total_with_ghi == 0:
+            return {
+                "available": False,
+                "reason": "no_ghi_data",
+                "ghi_sensor_configured": (
+                    getattr(self.coordinator, "ghi_sensor", None) is not None
+                ),
+            }
+        if len(pairs) < 30:
+            return {
+                "available": False,
+                "reason": "insufficient_qualifying_hours",
+                "n_hours_with_ghi": n_total_with_ghi,
+                "n_qualifying": len(pairs),
+                "n_skipped_unstable_recovery": n_skipped_unstable,
+            }
+
+        def _stats(rows: list[tuple[float, float]]) -> dict:
+            n = len(rows)
+            if n < 5:
+                return {
+                    "n_hours": n,
+                    "correlation": None,
+                    "rmse": None,
+                    "mean_bias_kasten_minus_ghi": None,
+                }
+            mx = sum(r[0] for r in rows) / n
+            my = sum(r[1] for r in rows) / n
+            num = sum((r[0] - mx) * (r[1] - my) for r in rows)
+            dx = math.sqrt(sum((r[0] - mx) ** 2 for r in rows))
+            dy = math.sqrt(sum((r[1] - my) ** 2 for r in rows))
+            corr = num / (dx * dy) if dx > 1e-9 and dy > 1e-9 else None
+            rmse = math.sqrt(sum((r[0] - r[1]) ** 2 for r in rows) / n)
+            return {
+                "n_hours": n,
+                "correlation": round(corr, 4) if corr is not None else None,
+                "rmse": round(rmse, 4),
+                "mean_bias_kasten_minus_ghi": round(mx - my, 4),
+            }
+
+        return {
+            "available": True,
+            "definition": (
+                "kasten_cloud_factor = potential_solar_factor / "
+                "no_cloud_reference(elev, azim); "
+                "ghi_normalized = ghi_wm2 / (1361 * sin(elev) * 0.7^airmass)"
+            ),
+            "n_hours_with_ghi": n_total_with_ghi,
+            "n_skipped_unstable_recovery": n_skipped_unstable,
+            "stability_gate": (
+                "elev >= 5° AND no_cloud_reference > 0.1 AND potential_solar_factor > 0.05"
+            ),
+            "all": _stats([(p[0], p[1]) for p in pairs]),
+            "by_regime": {
+                reg: _stats([(p[0], p[1]) for p in pairs if p[2] == reg])
+                for reg in ("clear", "broken", "overcast")
+            },
+        }
+
+    def _compute_dni_dhi_shadow_report(self, days_back: int) -> dict:
+        """Shadow-comparison of cloud_factor vs DNI/DHI signal (#933).
+
+        Walks recent hourly_log entries that carry both the legacy
+        3-vector (``solar_vector_*``) AND the DNI/DHI fields populated by
+        1.3.6 live logging or CSV import, fits two unconstrained LS
+        models against a shared target (``solar_impact_kwh``), and
+        reports residual standard deviation per cloud regime.
+
+        Regime classification is descriptive only:
+          * ``clear``     — DNI > 400 W/m² and DHI/DNI < 0.3
+          * ``overcast``  — DNI < 50 W/m²
+          * ``broken``    — everything else (the regime where the
+                            cloud_factor scalar is structurally
+                            mis-attributed per the issue rationale)
+
+        The 4D model uses the geometric beam projection
+        ``dni × max(0, cos(elev)·{−cos(az), sin(az), −sin(az)})`` per
+        facade plus raw DHI as a facade-agnostic diffuse signal,
+        consistent with the per-facade-coupling proposal in #933.
+
+        Returns ``{"available": False, ...}`` when the overlap set is
+        too small to fit reliably.  Pure diagnostic — no model writes.
+
+        **Two targets emitted side-by-side.**
+
+        * ``target_field = "solar_impact_kwh"`` (top-level fields) —
+          legacy self-referential target.  Live model's own output
+          (``unit_coeff × solar_vector`` battery-smoothed), so the 3D
+          regression has a built-in self-correlation advantage; it is
+          essentially recovering the implied coefficient over the
+          window.  A genuine 4D win on the broken-cloud regime would
+          have to overcome this advantage; a tie does not falsify the
+          #933 hypothesis.  Kept as the headline report for backward
+          compatibility with the 1.3.6 wave-1 surface.
+        * ``cross_check_actual`` (sub-block) — non-self-referential
+          target derived from the meter and the global dark-sky base
+          bucket: ``y_actual = correlation_data[temp_key][wind_bucket]
+          − actual_kwh``.  This is the same target NLMS uses for its
+          per-unit base-EMA learning, so neither pipeline has a self-
+          correlation advantage — both signals must explain the same
+          implied solar reduction from first principles.  Hours are
+          gated to heating-mode-dominant non-shutdown samples (skip
+          ``auxiliary_active``, ``guest_impact_kwh > 0``,
+          ``solar_dominant_entities`` non-empty, any unit in cooling
+          mode, missing global base bucket).  This is the read that
+          informs the #933 promotion decision: if 4D still wins on
+          ``broken`` under the actual target, the cloud_factor →
+          DNI/DHI signal-replacement hypothesis is supported.
+        """
+        cutoff = (dt_util.now() - timedelta(days=days_back)).date().isoformat()
+        correlation_data = self.coordinator._correlation_data or {}
+        correlation_data_per_unit = (
+            getattr(self.coordinator, "_correlation_data_per_unit", None) or {}
+        )
+        energy_sensors = list(getattr(self.coordinator, "energy_sensors", []) or [])
+
+        # Cooling-mode set: any unit in {COOLING, GUEST_COOLING} disqualifies
+        # the hour for the actual-target gate (mixed-mode contamination).
+        # OFF / DHW / heating units are tolerated.
+        _COOLING_MODES = frozenset((MODE_COOLING, MODE_GUEST_COOLING))
+        _LEARNABLE_PER_UNIT_MODES = frozenset(
+            (MODE_HEATING, MODE_GUEST_HEATING)
+        )
+
+        samples: list[dict] = []
+        for entry in self.coordinator._hourly_log:
+            ts = entry.get("timestamp", "")
+            if ts[:10] < cutoff:
+                continue
+            dni = entry.get("dni")
+            dhi = entry.get("dhi")
+            sv_s = entry.get("solar_vector_s")
+            sv_e = entry.get("solar_vector_e")
+            sv_w = entry.get("solar_vector_w")
+            target_self = entry.get("solar_impact_kwh")
+            if dni is None or dhi is None or target_self is None:
+                continue
+            try:
+                dni_f = float(dni)
+                dhi_f = float(dhi)
+                y_self = float(target_self)
+                # Empty-string / None on early 2D→3D-padding entries
+                # collapses to 0.0 — the legacy log shape has W absent.
+                sv_s_f = float(sv_s) if sv_s not in (None, "") else 0.0
+                sv_e_f = float(sv_e) if sv_e not in (None, "") else 0.0
+                sv_w_f = float(sv_w) if sv_w not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                continue
+            try:
+                dt_obj = datetime.fromisoformat(ts)
+            except (TypeError, ValueError):
+                continue
+            elev, azim = self.coordinator.solar.get_approx_sun_pos(dt_obj)
+            if elev <= 0.0:
+                continue
+            elev_rad = math.radians(elev)
+            az_rad = math.radians(azim)
+            cos_elev = math.cos(elev_rad)
+            sin_elev = math.sin(elev_rad)
+            geom_s = max(0.0, cos_elev * -math.cos(az_rad))
+            geom_e = max(0.0, cos_elev * math.sin(az_rad))
+            geom_w = max(0.0, cos_elev * -math.sin(az_rad))
+
+            # Pre-geometry scalar comparison signals (signal_agreement
+            # block).  ``kasten_cf`` recovered from logged
+            # ``potential_solar_factor`` divided by the no-cloud
+            # equivalent at this sun position; ``dni_normalized`` is
+            # ``dni / dni_clear_sky(elev)`` using a Beer-Lambert clear-
+            # sky beam estimate (1361 W/m² × 0.7^airmass).  Both are in
+            # [0, 1] and pre-geometry — directly comparable.  Either
+            # may be None when the entry lacks ``potential_solar_factor``
+            # (older log format) or when sun is too low for a stable
+            # clear-sky reference.
+            kasten_cf: float | None = None
+            dni_normalized: float | None = None
+            kasten_skipped_unstable_recovery = False
+            potential_sf = entry.get("potential_solar_factor")
+            if elev >= 5.0:
+                # Skip very-low-sun hours where airmass blows up and
+                # both signals are near-zero ratios of near-zero values.
+                airmass = 1.0 / max(sin_elev, 0.087)  # min sin(5°)
+                dni_clear = 1361.0 * (0.7 ** airmass)
+                if dni_clear > 1.0:
+                    dni_normalized = max(0.0, min(1.5, dni_f / dni_clear))
+                if isinstance(potential_sf, (int, float)) and potential_sf >= 0:
+                    try:
+                        no_cloud_ref = self.coordinator.solar.calculate_solar_factor(
+                            elev, azim, 0.0
+                        )
+                    except (TypeError, ValueError):
+                        no_cloud_ref = 0.0
+                    # Stable-recovery gate.  ``calculate_solar_factor``
+                    # multiplies in the Kelvin-Twist ``az_factor`` whose
+                    # Zone 2/3 floor is 0.05–0.1 when sun is far from
+                    # the configured ``solar_azimuth``.  Combined with
+                    # ``potential_solar_factor``'s 3-decimal rounding
+                    # in the hourly log, that turns the inversion
+                    # ``potential_sf / no_cloud_ref`` into noise
+                    # amplification on early-morning / late-evening
+                    # hours — observed empirically as negative-corr
+                    # artifacts in early field reports.  Gating to
+                    # ``no_cloud_ref > 0.1 ∧ potential_sf > 0.05``
+                    # restricts the comparison to hours where both
+                    # numerator and denominator carry sub-1 % relative
+                    # uncertainty, leaving a clean read on the midday
+                    # hours where the cloud_factor recovery is
+                    # numerically stable.  Skipped hours are counted
+                    # and surfaced via ``n_skipped_unstable_recovery``
+                    # so the caller can see the gate's reach.
+                    if no_cloud_ref > 0.1 and float(potential_sf) > 0.05:
+                        kasten_cf = max(0.0, min(1.5, float(potential_sf) / no_cloud_ref))
+                    elif no_cloud_ref > 1e-6:
+                        kasten_skipped_unstable_recovery = True
+            # Skip hours with no signal at all in either pipeline — they
+            # bias the residual toward zero and tell us nothing about
+            # which model fits the regime better.
+            if (
+                y_self == 0.0
+                and dni_f == 0.0
+                and dhi_f == 0.0
+                and sv_s_f == 0.0
+                and sv_e_f == 0.0
+                and sv_w_f == 0.0
+            ):
+                continue
+            if dni_f < 50.0:
+                regime = "overcast"
+            elif dni_f > 400.0 and (dhi_f / max(dni_f, 1.0)) < 0.3:
+                regime = "clear"
+            else:
+                regime = "broken"
+
+            # ---- Actual-target gate (non-self-referential) ----
+            # y_actual = global_base − actual_kwh, qualified to heating-
+            # mode-dominant non-shutdown hours.  Same target NLMS uses
+            # for its dark-equivalent base learning, so neither pipeline
+            # has a self-correlation advantage.
+            y_actual: float | None = None
+            if (
+                not entry.get("auxiliary_active", False)
+                and float(entry.get("guest_impact_kwh") or 0.0) <= 0.0
+                and not entry.get("solar_dominant_entities")
+            ):
+                unit_modes = entry.get("unit_modes") or {}
+                if not any(m in _COOLING_MODES for m in unit_modes.values()):
+                    temp_key = entry.get("temp_key")
+                    wind_bucket = entry.get("wind_bucket")
+                    base_house = (
+                        correlation_data.get(temp_key, {}).get(wind_bucket)
+                        if temp_key is not None and wind_bucket is not None
+                        else None
+                    )
+                    actual = entry.get("actual_kwh")
+                    if (
+                        isinstance(base_house, (int, float))
+                        and base_house > 0.0
+                        and isinstance(actual, (int, float))
+                    ):
+                        y_actual = float(base_house) - float(actual)
+
+            # ---- Per-entity actual target (cross_check_actual.per_entity) ----
+            # Same target shape as house cross-check but using each
+            # entity's own ``unit_base − unit_actual``.  Eliminates two
+            # confounds the house aggregate inherits: (a) cross-unit
+            # mixing where a single screen-affected entity's signal
+            # contaminates the regression's S/E/W columns via
+            # ``actual_kwh = sum(unit_breakdown)``, and (b) global base
+            # bucket bias from the legacy solar pipeline (per-entity
+            # buckets are smaller in absolute terms but built from the
+            # same SNR-weighted dark-equivalent path so the bias is
+            # entity-localised, not house-aggregated).
+            #
+            # Per-entity gates:
+            #  * skip if ``auxiliary_active`` (aux reduces unit actual
+            #    independent of solar — contaminates the per-unit
+            #    regression target same as the house version)
+            #  * skip if entity flagged in ``solar_dominant_entities``
+            #    for this hour (shutdown — actual ≈ 0, makes
+            #    ``unit_base − actual ≈ unit_base`` regardless of sun)
+            #  * skip if entity's mode is not in
+            #    ``{HEATING, GUEST_HEATING}`` (cooling/OFF/DHW are
+            #    out-of-regime for the heating-side coefficient)
+            #  * skip if per-entity base bucket is missing or
+            #    non-positive
+            y_per_entity: dict[str, float] = {}
+            unit_breakdown = entry.get("unit_breakdown") or {}
+            solar_dominant = set(entry.get("solar_dominant_entities") or [])
+            unit_modes_full = entry.get("unit_modes") or {}
+            temp_key = entry.get("temp_key")
+            wind_bucket = entry.get("wind_bucket")
+            if (
+                not entry.get("auxiliary_active", False)
+                and temp_key is not None
+                and wind_bucket is not None
+            ):
+                for eid in energy_sensors:
+                    if eid in solar_dominant:
+                        continue
+                    mode = unit_modes_full.get(eid, MODE_HEATING)
+                    if mode not in _LEARNABLE_PER_UNIT_MODES:
+                        continue
+                    unit_actual = unit_breakdown.get(eid)
+                    if not isinstance(unit_actual, (int, float)):
+                        continue
+                    unit_base = (
+                        correlation_data_per_unit.get(eid, {})
+                        .get(temp_key, {})
+                        .get(wind_bucket)
+                    )
+                    if not isinstance(unit_base, (int, float)) or unit_base <= 0.0:
+                        continue
+                    y_per_entity[eid] = float(unit_base) - float(unit_actual)
+
+            samples.append({
+                "regime": regime,
+                "x3": (sv_s_f, sv_e_f, sv_w_f),
+                "x4": (dni_f * geom_s, dni_f * geom_e, dni_f * geom_w, dhi_f),
+                "y_self": y_self,
+                "y_actual": y_actual,
+                "y_per_entity": y_per_entity,
+                "kasten_cf": kasten_cf,
+                "dni_normalized": dni_normalized,
+                "kasten_skipped_unstable_recovery": kasten_skipped_unstable_recovery,
+            })
+
+        # Need enough overlap to fit a 4-parameter model robustly.  Below
+        # this floor, surface the count so the caller can trust-but-verify
+        # but skip the regression.
+        if len(samples) < 60:
+            return {
+                "available": False,
+                "n_hours": len(samples),
+                "reason": "insufficient_overlap_data",
+            }
+
+        def _solve_lstsq(
+            dim: int, key: str, sample_subset: list[dict], y_field: str,
+        ) -> tuple[list[float], list[float]] | None:
+            """Solve X^T X β = X^T y via Gaussian elimination with partial pivot."""
+            xtx = [[0.0] * dim for _ in range(dim)]
+            xty = [0.0] * dim
+            for s in sample_subset:
+                x = s[key]
+                y = s[y_field]
+                for i in range(dim):
+                    xty[i] += x[i] * y
+                    for j in range(dim):
+                        xtx[i][j] += x[i] * x[j]
+            # Tikhonov ridge for collinearity (geometry vectors degenerate
+            # at solar noon when sun is exactly south, etc.).  Magnitude
+            # tied to mean diagonal so it scales with the data.
+            mean_diag = sum(xtx[i][i] for i in range(dim)) / dim if dim else 0.0
+            ridge = max(1e-9, 1e-6 * mean_diag)
+            for i in range(dim):
+                xtx[i][i] += ridge
+            # Gaussian elimination
+            a = [row[:] + [xty[i]] for i, row in enumerate(xtx)]
+            for i in range(dim):
+                pivot_row = max(range(i, dim), key=lambda r: abs(a[r][i]))
+                a[i], a[pivot_row] = a[pivot_row], a[i]
+                if abs(a[i][i]) < 1e-12:
+                    return None
+                for r in range(i + 1, dim):
+                    factor = a[r][i] / a[i][i]
+                    for c in range(i, dim + 1):
+                        a[r][c] -= factor * a[i][c]
+            beta = [0.0] * dim
+            for i in range(dim - 1, -1, -1):
+                s_val = a[i][dim] - sum(a[i][j] * beta[j] for j in range(i + 1, dim))
+                beta[i] = s_val / a[i][i]
+            residuals = []
+            for s in sample_subset:
+                x = s[key]
+                yhat = sum(beta[i] * x[i] for i in range(dim))
+                residuals.append(s[y_field] - yhat)
+            return beta, residuals
+
+        def _std(vals: list[float]) -> float:
+            if not vals:
+                return 0.0
+            mean = sum(vals) / len(vals)
+            return (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
+
+        regimes = ("clear", "broken", "overcast")
+
+        def _build_block(
+            sample_subset: list[dict],
+            y_field: str,
+            target_field: str,
+            target_caveat: str,
+        ) -> dict:
+            if len(sample_subset) < 60:
+                return {
+                    "available": False,
+                    "target_field": target_field,
+                    "n_hours": len(sample_subset),
+                    "reason": "insufficient_overlap_data",
+                }
+            fit3 = _solve_lstsq(3, "x3", sample_subset, y_field)
+            fit4 = _solve_lstsq(4, "x4", sample_subset, y_field)
+            if fit3 is None or fit4 is None:
+                return {
+                    "available": False,
+                    "target_field": target_field,
+                    "n_hours": len(sample_subset),
+                    "reason": "singular_design_matrix",
+                }
+            b3, r3 = fit3
+            b4, r4 = fit4
+            per_regime: dict[str, dict] = {}
+            for reg in regimes:
+                r3r = [r3[i] for i, s in enumerate(sample_subset) if s["regime"] == reg]
+                r4r = [r4[i] for i, s in enumerate(sample_subset) if s["regime"] == reg]
+                std3 = _std(r3r)
+                std4 = _std(r4r)
+                improvement = (
+                    round(100.0 * (std3 - std4) / std3, 1)
+                    if std3 > 1e-9 else None
+                )
+                per_regime[reg] = {
+                    "n_hours": len(r3r),
+                    "residual_std_3d_kwh": round(std3, 4),
+                    "residual_std_4d_kwh": round(std4, 4),
+                    "improvement_pct": improvement,
+                }
+            std3_all = _std(r3)
+            std4_all = _std(r4)
+            overall_improvement = (
+                round(100.0 * (std3_all - std4_all) / std3_all, 1)
+                if std3_all > 1e-9 else None
+            )
+            return {
+                "available": True,
+                "target_field": target_field,
+                "target_caveat": target_caveat,
+                "n_hours": len(sample_subset),
+                "regime_counts": {
+                    reg: sum(1 for s in sample_subset if s["regime"] == reg)
+                    for reg in regimes
+                },
+                "shadow_4d_coefficient": {
+                    "s_direct": round(b4[0], 6),
+                    "e_direct": round(b4[1], 6),
+                    "w_direct": round(b4[2], 6),
+                    "diffuse":  round(b4[3], 6),
+                },
+                "shadow_3d_coefficient": {
+                    "s": round(b3[0], 4),
+                    "e": round(b3[1], 4),
+                    "w": round(b3[2], 4),
+                },
+                "residuals": {
+                    "all": {
+                        "residual_std_3d_kwh": round(std3_all, 4),
+                        "residual_std_4d_kwh": round(std4_all, 4),
+                        "improvement_pct": overall_improvement,
+                    },
+                    "by_regime": per_regime,
+                },
+                "broken_regime_improvement_pct": (
+                    per_regime.get("broken", {}).get("improvement_pct")
+                ),
+            }
+
+        # Headline self-referential block (kept top-level for backward
+        # compatibility with the 1.3.6 wave-1 surface).
+        self_block = _build_block(
+            samples, "y_self", "solar_impact_kwh",
+            "self_referential_3d_advantage",
+        )
+
+        # Cross-check on actual-meter target (non-self-referential).
+        actual_samples = [s for s in samples if s["y_actual"] is not None]
+        cross_check = _build_block(
+            actual_samples,
+            "y_actual",
+            "global_base_minus_actual_kwh",
+            "non_self_referential",
+        )
+
+        # Per-entity cross-check.  Iterates each configured energy
+        # sensor and runs the same 3D / 4D regression against that
+        # entity's own ``unit_base − unit_actual`` target.  Sub-blocks
+        # land on ``cross_check.per_entity[entity_id]`` so a caller
+        # walking the dict can answer "which entities show real 4D
+        # gain?" without having to interpret a house-aggregate fit
+        # contaminated by mixing.
+        per_entity_blocks: dict[str, dict] = {}
+        # Source for the ``learned`` flag: the live coordinator's
+        # ``solar_coefficients_per_unit[eid]["heating"]["learned"]`` is
+        # set by ``_update_unit_solar_coefficient`` on the first write
+        # by any solar-learner path (NLMS / inequality / cold-start /
+        # batch / apply-implied).  Migration-seeded coefficients carry
+        # no flag and read as unlearned — exactly the entities whose
+        # per-entity blocks would otherwise contaminate the filtered
+        # aggregation with default-coefficient noise.
+        coeff_store = (
+            getattr(self.coordinator, "_solar_coefficients_per_unit", None) or {}
+        )
+
+        def _entity_has_learned(eid: str) -> bool:
+            entity_coeffs = coeff_store.get(eid)
+            if not isinstance(entity_coeffs, dict):
+                return False
+            heating = entity_coeffs.get("heating")
+            if not isinstance(heating, dict):
+                return False
+            return bool(heating.get("learned"))
+
+        # Per-entity solar-scope (#962): excluded entities collapse to a
+        # one-line stub here too, matching the main per_unit block.
+        is_solar_affected_fn = getattr(self.coordinator, "is_solar_affected", None)
+
+        for eid in energy_sensors:
+            if callable(is_solar_affected_fn) and not is_solar_affected_fn(eid):
+                per_entity_blocks[eid] = {"excluded_from_solar": True}
+                continue
+            entity_samples = [
+                {**s, "_y_eid": s["y_per_entity"][eid]}
+                for s in samples
+                if eid in s["y_per_entity"]
+            ]
+            block = _build_block(
+                entity_samples,
+                "_y_eid",
+                "unit_base_minus_unit_actual_kwh",
+                "non_self_referential_per_entity",
+            )
+            screen_config_fn = getattr(
+                self.coordinator, "screen_config_for_entity", None
+            )
+            if callable(screen_config_fn):
+                try:
+                    sc = screen_config_fn(eid)
+                except (TypeError, ValueError):
+                    sc = None
+                if sc is not None:
+                    try:
+                        block["screen_config"] = [bool(v) for v in sc]
+                    except (TypeError, ValueError):
+                        pass
+            block["learned"] = _entity_has_learned(eid)
+            per_entity_blocks[eid] = block
+        if per_entity_blocks:
+            cross_check["per_entity"] = per_entity_blocks
+
+            # ``per_entity_filtered`` aggregates only entities that have
+            # actually learned a heating coefficient (per the live
+            # ``learned`` flag) AND have an available block.  Drops
+            # default-coefficient entities whose per-entity fits are
+            # rein noise from the headline numbers.  Hours-weighted
+            # average of the per-entity ``improvement_pct`` per regime.
+            eligible = [
+                (eid, b) for eid, b in per_entity_blocks.items()
+                if b.get("learned") and b.get("available")
+            ]
+            if eligible:
+                def _weighted_pct(regime: str | None) -> tuple[float | None, int]:
+                    weighted_sum = 0.0
+                    n_total = 0
+                    for _eid, b in eligible:
+                        if regime is None:
+                            n = b.get("n_hours", 0)
+                            imp = b.get("residuals", {}).get("all", {}).get("improvement_pct")
+                        else:
+                            reg_block = (
+                                b.get("residuals", {}).get("by_regime", {}).get(regime, {})
+                            )
+                            n = reg_block.get("n_hours", 0)
+                            imp = reg_block.get("improvement_pct")
+                        if imp is None or n <= 0:
+                            continue
+                        weighted_sum += float(imp) * n
+                        n_total += n
+                    if n_total == 0:
+                        return None, 0
+                    return round(weighted_sum / n_total, 1), n_total
+
+                regime_pct: dict[str, dict] = {}
+                for reg in regimes:
+                    pct, n = _weighted_pct(reg)
+                    regime_pct[reg] = {"improvement_pct": pct, "n_hours": n}
+                all_pct, all_n = _weighted_pct(None)
+                cross_check["per_entity_filtered"] = {
+                    "n_entities": len(eligible),
+                    "entities": [eid for eid, _ in eligible],
+                    "all": {"improvement_pct": all_pct, "n_hours": all_n},
+                    "by_regime": regime_pct,
+                    "broken_regime_improvement_pct": (
+                        regime_pct.get("broken", {}).get("improvement_pct")
+                    ),
+                }
+
+        # ``signal_agreement`` — pre-geometry scalar comparison of the
+        # Kasten-derived cloud_factor against ``dni / dni_clear_sky``.
+        # Both signals live in [0, 1] and capture "how much beam survived
+        # the atmosphere this hour".  High Pearson r AND low RMSE means
+        # DNI re-encodes what cloud_coverage × Kasten already says (no
+        # new information); divergence on broken-cloud regime is the
+        # signature that the issue #933 hypothesis predicts.
+        agreement_pairs = [
+            (s["kasten_cf"], s["dni_normalized"], s["regime"])
+            for s in samples
+            if s.get("kasten_cf") is not None and s.get("dni_normalized") is not None
+        ]
+
+        def _pearson_rmse_bias(pairs: list[tuple[float, float]]) -> dict:
+            n = len(pairs)
+            if n < 5:
+                return {"n_hours": n, "correlation": None, "rmse": None, "mean_bias": None}
+            mean_x = sum(p[0] for p in pairs) / n
+            mean_y = sum(p[1] for p in pairs) / n
+            num = sum((p[0] - mean_x) * (p[1] - mean_y) for p in pairs)
+            den_x = (sum((p[0] - mean_x) ** 2 for p in pairs)) ** 0.5
+            den_y = (sum((p[1] - mean_y) ** 2 for p in pairs)) ** 0.5
+            corr = num / (den_x * den_y) if den_x > 1e-9 and den_y > 1e-9 else None
+            rmse = (sum((p[0] - p[1]) ** 2 for p in pairs) / n) ** 0.5
+            # Positive bias = Kasten higher than DNI-normalized (Kasten
+            # over-attributes transmittance, predicts more sun than DNI
+            # actually shows).  Negative bias = Kasten under-attributes.
+            bias = mean_x - mean_y
+            return {
+                "n_hours": n,
+                "correlation": round(corr, 4) if corr is not None else None,
+                "rmse": round(rmse, 4),
+                "mean_bias_kasten_minus_dni": round(bias, 4),
+            }
+
+        signal_agreement = {
+            "definition": (
+                "kasten_cloud_factor = potential_solar_factor / "
+                "no_cloud_reference(elev, azim); "
+                "dni_normalized = dni / (1361 * 0.7^airmass)"
+            ),
+            "n_skipped_unstable_recovery": sum(
+                1 for s in samples if s.get("kasten_skipped_unstable_recovery")
+            ),
+            "stability_gate": (
+                "no_cloud_reference > 0.1 AND potential_solar_factor > 0.05"
+            ),
+            "all": _pearson_rmse_bias([(p[0], p[1]) for p in agreement_pairs]),
+            "by_regime": {
+                reg: _pearson_rmse_bias(
+                    [(p[0], p[1]) for p in agreement_pairs if p[2] == reg]
+                )
+                for reg in regimes
+            },
+        }
+
+        # Flatten the headline block at the top level (matches 1.3.6
+        # wave-1 surface) and attach cross_check_actual as a sibling.
+        return {
+            **self_block,
+            "signal_agreement": signal_agreement,
+            "cross_check_actual": cross_check,
         }
 
     def calibrate_per_unit_min_base_thresholds(

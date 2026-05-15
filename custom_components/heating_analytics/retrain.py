@@ -45,6 +45,17 @@ def _screen_affected_set_or_none(coordinator) -> frozenset[str] | None:
     return None
 
 
+def _solar_affected_set_or_none(coordinator) -> frozenset[str] | None:
+    """Return coordinator._solar_affected_set if it is a real set/frozenset (#962).
+
+    MagicMock-safe sibling of :func:`_screen_affected_set_or_none`.
+    """
+    value = getattr(coordinator, "_solar_affected_set", None)
+    if isinstance(value, (frozenset, set)):
+        return value
+    return None
+
+
 class RetrainEngine:
     """Hosts the retrain_from_history service implementation."""
 
@@ -314,6 +325,7 @@ class RetrainEngine:
                 daily_history=self.coordinator._daily_history,
                 unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
                 screen_affected_entities=_screen_affected_set_or_none(self.coordinator),
+                solar_affected_entities=_solar_affected_set_or_none(self.coordinator),
                 return_diagnostics=True,
             )
             solar_replay_updates = solar_replay_diagnostics.get("updates", 0)
@@ -510,6 +522,7 @@ class RetrainEngine:
                 daily_history=self.coordinator._daily_history,
                 unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
                 screen_affected_entities=_screen_affected_set_or_none(self.coordinator),
+                solar_affected_entities=_solar_affected_set_or_none(self.coordinator),
                 return_diagnostics=True,
             )
             solar_replay_updates = solar_replay_diagnostics.get("updates", 0)

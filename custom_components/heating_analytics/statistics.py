@@ -84,6 +84,7 @@ class StatisticsManager:
         detailed: bool = True,
         known_aux_impact_kwh: float | None = None,
         carryover_state_override: float | None = None,
+        override_now: datetime | None = None,
     ) -> dict:
         """Calculate total power and breakdown using Hybrid "Global Stabilizer" logic.
 
@@ -163,6 +164,147 @@ class StatisticsManager:
         potential_solar_vector = SolarCalculator.reconstruct_potential_vector(
             effective_solar_vector, screen_pct, screen_cfg
         )
+
+        # Experimental hotspot-loss attenuation (#950).  When configured γ > 0
+        # AND sun elevation > 30° AND screen is actively deployed
+        # (correction_percent < 80), per-entity solar impact is scaled by
+        # (1 − γ) for entities with at least one screened facade.  γ = 0.0
+        # (default) makes this branch a bit-identical no-op.  Note: this is a
+        # MULTIPLICATIVE attenuation applied AFTER coeff × potential; it does
+        # NOT introduce a second transmittance term — invariant #1 holds.
+        # Forecast-path guard.  When the caller supplies override_solar_factor
+        # OR override_solar_vector (forecast / replay path) WITHOUT a matching
+        # ``override_now`` for the prediction target hour, both #948 and
+        # #950 fall back to dt_util.now() which is the wall clock at
+        # execution time, not the target hour.  That would fire the gates
+        # against the wrong sun position and look up the wrong past-hour
+        # window.  Detect that case and disable both interventions
+        # explicitly — the alternative (silently using dt_util.now()) was
+        # the bug.  Callers that want interventions on forecast paths
+        # must pass override_now too.
+        _is_forecast_path = (
+            override_solar_factor is not None or override_solar_vector is not None
+        )
+        _target_now = (
+            override_now if override_now is not None
+            else (None if _is_forecast_path else dt_util.now())
+        )
+        _interventions_disabled = _is_forecast_path and override_now is None
+
+        # Hoisted sun-elevation for the target hour.  Both #948 and #950
+        # gate on this value so we compute it once per call.  When
+        # interventions are disabled (forecast path without override_now)
+        # we skip the lookup entirely — saves an astral call on cold
+        # forecast paths.
+        _now_elev: float = 0.0
+        if not _interventions_disabled and _target_now is not None:
+            try:
+                _now_elev, _ = self.coordinator.solar.get_approx_sun_pos(_target_now)
+            except Exception:
+                _now_elev = 0.0
+
+        _hotspot_gamma = float(
+            getattr(self.coordinator, "solar_hotspot_attenuation_gamma", 0.0) or 0.0
+        )
+        _hotspot_active = (
+            not _interventions_disabled
+            and _hotspot_gamma > 0.0
+            and screen_pct < 80.0
+            and _now_elev > 30.0
+        )
+
+        # Experimental tail-aware solar-impact redistribution for low-elev
+        # hours (#948).  When α > 0, the per-unit predicted solar reduction
+        # at hour H is split across the originator hour and the K=3 prior
+        # hours using an exponential-decay kernel with time constant τ.
+        # Applies only to low-elev (sun_elev < 30°) eligible originator
+        # hours; high-elev hours keep their full instantaneous credit.
+        # The redistribution is purely temporal weighting of ``coeff ×
+        # potential`` evaluated at different time offsets — no extra
+        # transmittance factor (invariant #1).  Past-hour potentials are
+        # reconstructed via ``SolarCalculator.reconstruct_potential_vector``
+        # per-entity (invariants #2, #3).  α = 0.0 is a bit-identical
+        # no-op.  Co-exists with #950 (hotspot): elevation gate makes them
+        # mutually exclusive per-hour — high-elev hours route to #950 only,
+        # low-elev hours route to #948 only.
+        _alpha_raw = getattr(self.coordinator, "solar_redistribution_alpha", 0.0)
+        _tau_raw = getattr(self.coordinator, "solar_redistribution_tau_hours", 2.0)
+        _redistribution_alpha = (
+            float(_alpha_raw) if isinstance(_alpha_raw, (int, float)) else 0.0
+        )
+        _redistribution_tau = (
+            float(_tau_raw) if isinstance(_tau_raw, (int, float)) and _tau_raw > 0
+            else 2.0
+        )
+        _redistribution_active = (
+            not _interventions_disabled and _redistribution_alpha > 0.0
+        )
+        _redist_K = 3
+        _redist_current_eligible = False
+        _redist_past_meta: list[dict] = []  # length K, oldest first; entries may be None
+        _redist_weights: list[float] = [0.0] * _redist_K  # w_k, k=1..K (index 0 = lag 1)
+        if _redistribution_active:
+            # Kernel weights: w_k = α · exp(−k/τ) / Σ_{j=1..K} exp(−j/τ)
+            _raw = [math.exp(-(k + 1) / _redistribution_tau) for k in range(_redist_K)]
+            _z = sum(_raw)
+            if _z > 0.0:
+                _redist_weights = [_redistribution_alpha * r / _z for r in _raw]
+            # Current-hour eligibility: sun_elev < 30 AND solar_factor > 0.05
+            # Reuses the hoisted _now_elev (one astral call per
+            # calculate_total_power call; shared with #950).
+            if override_solar_factor is not None:
+                _now_factor = float(override_solar_factor)
+            else:
+                _now_factor = float(
+                    self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0) or 0.0
+                )
+            _redist_current_eligible = (
+                _now_elev < 30.0 and _now_factor > 0.05
+            )
+            # Walk back K=3 hours from the target prediction hour, looking
+            # up by timestamp at H-1, H-2, H-3 (top-of-hour).  Past hour
+            # H-k is eligible iff solar_factor > 0.05 AND past midpoint
+            # sun_elev < 30°.  Missing entries (gaps in log) yield None —
+            # past contribution skipped.
+            _h_now = _target_now.replace(minute=0, second=0, microsecond=0)
+            _log = getattr(self.coordinator, "_hourly_log", None) or []
+            # Build an index from "YYYY-MM-DDTHH" prefix → entry for O(K)
+            # lookup; bounded to last ~K+8 entries to keep it cheap.
+            _log_tail = _log[-(_redist_K + 8):] if len(_log) > (_redist_K + 8) else _log
+            _by_hour: dict[str, dict] = {}
+            for _e in _log_tail:
+                _ts = _e.get("timestamp")
+                if isinstance(_ts, str) and len(_ts) >= 13:
+                    _by_hour[_ts[:13]] = _e
+            for _k in range(1, _redist_K + 1):
+                _h_past = _h_now - timedelta(hours=_k)
+                _key = _h_past.isoformat()[:13]
+                _e = _by_hour.get(_key)
+                if _e is None:
+                    _redist_past_meta.append(None)
+                    continue
+                _s_factor = float(_e.get("solar_factor", 0.0) or 0.0)
+                _vs = _e.get("solar_vector_s")
+                _ve = _e.get("solar_vector_e")
+                _vw = _e.get("solar_vector_w", 0.0)
+                if _vs is None or _ve is None or _s_factor <= 0.05:
+                    _redist_past_meta.append(None)
+                    continue
+                # Midpoint elevation for eligibility check.
+                try:
+                    _past_elev, _ = self.coordinator.solar.get_approx_sun_pos(
+                        _h_past + timedelta(minutes=30)
+                    )
+                except Exception:
+                    _past_elev = 0.0
+                if _past_elev >= 30.0:
+                    _redist_past_meta.append(None)
+                    continue
+                _past_corr = float(_e.get("correction_percent", 100.0) or 100.0)
+                _redist_past_meta.append({
+                    "vec_eff": (float(_vs), float(_ve), float(_vw or 0.0)),
+                    "correction": _past_corr,
+                })
 
         # --- Track A: Global Model (Top-Down / Master) ---
         # 1. Global Base Prediction
@@ -262,9 +404,49 @@ class StatisticsManager:
                      entity_pot_vec = SolarCalculator.reconstruct_potential_vector(
                          effective_solar_vector, screen_pct, entity_scr_cfg
                      )
-                 unit_solar_reduction = self.coordinator.solar.calculate_unit_solar_impact(
+                 # Split the entity's solar contribution into an
+                 # ORIGINATOR term (current hour) and a redistributed
+                 # TAIL term (past hours via #948 kernel).  Reason: the
+                 # #950 hotspot attenuation models loss at the high-elev
+                 # ORIGINATOR hour, NOT at the past low-elev hours that
+                 # contribute via the kernel.  Scaling the combined sum
+                 # would double-attenuate the tail terms.  Keep #950 on
+                 # the originator only.  Per-hour the two interventions
+                 # remain mutually exclusive (low-elev → #948 originator
+                 # scaling, high-elev → #950 originator scaling) — the
+                 # tail term is independent of current-hour gating.
+                 _unit_originator = self.coordinator.solar.calculate_unit_solar_impact(
                      entity_pot_vec, unit_coeff
                  )
+                 _unit_tail = 0.0
+                 # Tail-aware redistribution (#948).  Uses CURRENT
+                 # unit_coeff for past-hour reconstruction (kernel
+                 # intent: "given today's model, what does past solar's
+                 # contribution look like now") — invariant #1: only
+                 # coeff × potential, no extra transmittance term.
+                 if _redistribution_active:
+                     if _redist_current_eligible:
+                         _unit_originator *= (1.0 - _redistribution_alpha)
+                     for _k_idx, _past in enumerate(_redist_past_meta):
+                         if _past is None:
+                             continue
+                         _past_pot_vec = SolarCalculator.reconstruct_potential_vector(
+                             _past["vec_eff"], _past["correction"], entity_scr_cfg
+                         )
+                         _past_impact = self.coordinator.solar.calculate_unit_solar_impact(
+                             _past_pot_vec, unit_coeff
+                         )
+                         _unit_tail += _redist_weights[_k_idx] * _past_impact
+                 # Hotspot attenuation (#950): scale ORIGINATOR ONLY by
+                 # (1 − γ) when the entity has at least one screened
+                 # facade and the gate (γ > 0, elev > 30°,
+                 # correction_percent < 80) fired.  Redistributed tail
+                 # terms — which originated at past LOW-elev hours where
+                 # the hotspot mechanism does not apply — are preserved.
+                 # See block above for invariant-#1 note.
+                 if _hotspot_active and any(entity_scr_cfg):
+                     _unit_originator *= (1.0 - _hotspot_gamma)
+                 unit_solar_reduction = _unit_originator + _unit_tail
             # If cooling cold-start: unit_solar_reduction stays 0.  See
             # ``_is_cooling_solar_cold_start`` for rationale (cooling
             # mode applies solar additively without saturation cap; a

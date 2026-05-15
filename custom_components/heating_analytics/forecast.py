@@ -1202,6 +1202,19 @@ class ForecastManager:
         # It does `temp_key = str(int(round(temp)))`.
         # So passing inertia_val works perfectly.
 
+        # Pass the target forecast hour as override_now so #948/#950
+        # gates evaluate sun elevation at the prediction target, not at
+        # wall-clock execution time.  Falls back to dt_util.now() if the
+        # item lacks a parseable timestamp (interventions then disabled
+        # via the forecast-path guard).
+        _item_dt = None
+        _item_ts = item.get("datetime")
+        if isinstance(_item_ts, str):
+            try:
+                _item_dt = dt_util.parse_datetime(_item_ts)
+            except (TypeError, ValueError):
+                _item_dt = None
+
         res = self.coordinator.statistics.calculate_total_power(
             temp=inertia_val,
             effective_wind=effective_wind,
@@ -1211,6 +1224,7 @@ class ForecastManager:
             override_solar_factor=effective_factor,
             override_solar_vector=effective_solar_vector,
             carryover_state_override=carryover_state_override,
+            override_now=_item_dt,
         )
 
         predicted = res["total_kwh"]
@@ -1700,6 +1714,17 @@ class ForecastManager:
             if f_data is None:
                 continue
 
+            # Parse log timestamp so #948/#950 evaluate against the
+            # logged hour, not wall clock.  Fall back to None on parse
+            # failure (interventions then disabled for that hour).
+            _log_dt = None
+            _log_ts = log.get("timestamp")
+            if isinstance(_log_ts, str):
+                try:
+                    _log_dt = dt_util.parse_datetime(_log_ts)
+                except (TypeError, ValueError):
+                    _log_dt = None
+
             # Scenario A: What the plan SHOULD have been (Forecast Weather, Normal Mode)
             res_planned = self.coordinator.statistics.calculate_total_power(
                 temp=f_data["temp"],
@@ -1708,6 +1733,7 @@ class ForecastManager:
                 is_aux_active=False,  # Crucial: Plan always assumes Normal mode
                 override_solar_factor=f_data.get("solar_factor", 0.0),
                 override_solar_vector=f_data.get("solar_vector"),
+                override_now=_log_dt,
             )
             planned_kwh = res_planned["total_kwh"]
 
@@ -1727,6 +1753,7 @@ class ForecastManager:
                 is_aux_active=log.get("auxiliary_active", False),
                 override_solar_factor=log.get("solar_factor", 0.0),
                 override_solar_vector=log_solar_vector,
+                override_now=_log_dt,
             )
             reality_adjusted_kwh = res_reality["total_kwh"]
 
@@ -1744,6 +1771,9 @@ class ForecastManager:
             f_data_curr = forecast_map.get(current_hour)
 
             if current_temp is not None and f_data_curr is not None:
+                # Current partial hour — top-of-hour timestamp for the
+                # #948/#950 gates.
+                _curr_dt = now.replace(minute=0, second=0, microsecond=0)
                 # Scenario A Rate (Forecast Weather, Normal Mode)
                 res_planned_rate = self.coordinator.statistics.calculate_total_power(
                     temp=f_data_curr["temp"],
@@ -1752,6 +1782,7 @@ class ForecastManager:
                     is_aux_active=False,
                     override_solar_factor=f_data_curr.get("solar_factor", 0.0),
                     override_solar_vector=f_data_curr.get("solar_vector"),
+                    override_now=_curr_dt,
                 )
                 planned_rate = res_planned_rate["total_kwh"]
 
@@ -1769,6 +1800,7 @@ class ForecastManager:
                     is_aux_active=self.coordinator.auxiliary_heating_active,
                     override_solar_factor=self.coordinator.data.get("solar_factor", 0.0),
                     override_solar_vector=live_solar_vector,
+                    override_now=_curr_dt,
                 )
                 reality_adjusted_rate = res_reality_rate["total_kwh"]
 
