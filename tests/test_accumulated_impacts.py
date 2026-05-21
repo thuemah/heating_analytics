@@ -6,22 +6,6 @@ from homeassistant.util import dt as dt_util
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 
 
-@pytest.fixture
-def mock_coordinator():
-    """Fixture for a mock coordinator."""
-    coordinator = MagicMock(spec=HeatingDataCoordinator)
-    coordinator.data = {}
-    coordinator._hourly_log = []
-    coordinator._hourly_delta_per_unit = {}
-    coordinator._hourly_expected_base_per_unit = {}
-    coordinator.auxiliary_heating_active = False
-    coordinator.get_unit_mode = MagicMock(return_value="heating")
-    coordinator._collector.aux_impact_hour = 0.0  # Added for new minute-by-minute tracking
-    coordinator._collector.energy_hour = 0.0
-    coordinator.balance_point = 17.0
-    return coordinator
-
-
 def test_accumulated_impacts_start_of_day(mock_coordinator):
     """Test accumulated impacts at the beginning of the day."""
     current_time = dt_util.parse_datetime("2023-01-01T00:15:00+00:00")

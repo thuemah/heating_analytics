@@ -54,10 +54,9 @@ DEFAULT_SOLAR_COEFF_COOLING = 0.40
 
 # Solar thermal battery: exponential decay factor applied per hour.
 # Models how solar energy absorbed by building mass is released over time.
-# 0.80 → half-life ~3.1 h; appropriate for typical Norwegian construction
-# with concrete floor slabs.  Per-installation calibration
-# available via diagnose_solar with apply_battery_decay: true.
-SOLAR_BATTERY_DECAY = 0.80
+# 0.50 → half-life ~1.0 h.  Per-installation calibration available via
+# diagnose_solar with apply_battery_decay: true.
+SOLAR_BATTERY_DECAY = 0.50
 
 # Saturation-wasted thermal-feedback coefficient (#896).  Fraction of
 # saturation-wasted solar (heating mode only) fed back into the solar
@@ -73,6 +72,19 @@ SOLAR_BATTERY_DECAY = 0.80
 # validation in progress.
 CONF_BATTERY_THERMAL_FEEDBACK_K = "battery_thermal_feedback_k"
 DEFAULT_BATTERY_THERMAL_FEEDBACK_K = 0.0
+
+# Experimental: route the live solar read-path (prediction, base
+# learning, the legacy battery, aux normalisation, display sensors)
+# through the existing 4D shadow pipeline (#962).  Default off — flag
+# is a read-path route only.  Toggle does NOT reset
+# ``_solar_coefficients_per_unit``; the 3D shadow continues to learn
+# in parallel so rollback is symmetric.  See ``CLAUDE.md > Solar
+# Model > 4D shadow learner > Promotion criterion`` for the gates.
+# NOTE: this commit introduces the flag only — no read-path wiring is
+# performed.  The flag is a no-op end-to-end until follow-up patches
+# wire the five live read sites.
+CONF_EXPERIMENTAL_4D_PRIMARY = "experimental_4d_primary"
+DEFAULT_EXPERIMENTAL_4D_PRIMARY = False
 
 # Composite legacy floor for screen transmittance.  Used for facades configured
 # WITHOUT explicit per-direction screen presence (CONF_SCREEN_SOUTH/EAST/WEST):
@@ -244,6 +256,11 @@ INEQUALITY_MARGIN = 0.9       # Constraint: coeff·potential ≥ MARGIN × base 
 BATCH_FIT_DAMPING = 0.3              # new = α × tobit + (1 - α) × current
 BATCH_FIT_SATURATION_RATIO = 0.95    # Censoring threshold: T_i = ratio × base_i
 
+# Service name for the 4D shadow batch-fit (#954).  Strict shadow —
+# writes only to ``_solar_coefficients_4d_per_unit``; no production
+# read-path consumer yet.
+SERVICE_BATCH_FIT_SOLAR_4D = "batch_fit_solar_4d"
+
 # Tobit MLE solver (#904).  Type-I right-censored Gaussian regression
 # for solar coefficients.  Used by ``compute_tobit_for_diagnose``
 # (stage 0+1 shadow surface in ``diagnose_solar``) AND by
@@ -391,7 +408,23 @@ DEFAULT_UNCERTAINTY_P50 = 1.0
 DEFAULT_UNCERTAINTY_P95 = 2.0
 
 # Storage
-STORAGE_VERSION = 5  # v5: Tobit live-learner sufficient-statistic state (#904 stage 3, see storage.py:_migrate_v4_to_v5)
+STORAGE_VERSION = 7  # v7: per-facade direct-beam obstruction critical_elev (#991, see storage.py:_migrate_v6_to_v7)
+
+# Direct-beam obstruction gate (#991).  Per-facade critical sun elevation
+# at which an external overhang / neighbouring structure / fixed shading
+# blocks the direct beam.  Above ``critical_elev``, ``pot_dir_facade``
+# is zeroed in ``calculate_unit_potential_4d``; diffuse is unaffected.
+# Each facade is fit independently from elevation-binned residuals via
+# ``fit_solar_obstruction``.  ``None`` = no gate (default, no
+# obstruction detected or insufficient samples).  Applied globally
+# across all entities — bypasses ``screen_affected_entities`` since
+# overhang geometry is a building-level invariant.
+OBSTRUCTION_FIT_MIN_ELEV_DEG = 15.0
+OBSTRUCTION_FIT_MAX_ELEV_DEG = 70.0
+OBSTRUCTION_FIT_STEP_DEG = 1.0
+OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE = 10
+OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD = 0.10
+OBSTRUCTION_FIT_DOMINANCE_RATIO = 0.5
 STORAGE_KEY = f"{DOMAIN}.storage"
 
 # Solar model version (#904 stage 3 blocker 2 — manual reset hook).  Bump

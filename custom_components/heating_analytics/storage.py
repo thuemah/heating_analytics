@@ -28,6 +28,7 @@ from .const import (
     ATTR_MIDNIGHT_UNIT_ESTIMATES,
     ATTR_MIDNIGHT_UNIT_MODES,
     DEFAULT_DAILY_LEARNING_RATE,
+    SOLAR_BATTERY_DECAY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ def _migrate_pre_v3(
     data: dict,
     *,
     solar_azimuth: float = 0.0,
-    solar_battery_decay: float = 0.80,
+    solar_battery_decay: float = SOLAR_BATTERY_DECAY,
 ) -> dict:
     """Bundle every pre-v3 inline migration into a single versioned step.
 
@@ -334,6 +335,38 @@ def _migrate_v4_to_v5(data: dict) -> dict:
     return data
 
 
+def _migrate_v5_to_v6(data: dict) -> dict:
+    """v5 -> v6: add empty 4D solar-coefficient state.
+
+    Adds:
+      * ``_solar_coefficients_4d_per_unit``: per-entity 4D coefficient dict
+        (S, E, W, diffuse) split by regime (heating/cooling).
+      * ``_learning_buffer_solar_4d_per_unit``: per-entity cold-start buffer
+        for the 4D learner.
+
+    Both default to empty dicts.  The 4D shadow learner (#954) writes to
+    them on first qualifying hour; pre-v6 installs have no 4D history.
+    """
+    data = dict(data)
+    data.setdefault("_solar_coefficients_4d_per_unit", {})
+    data.setdefault("_learning_buffer_solar_4d_per_unit", {})
+    return data
+
+
+def _migrate_v6_to_v7(data: dict) -> dict:
+    """v6 -> v7: add empty per-facade direct-beam obstruction state (#991).
+
+    Adds ``_critical_elev_per_facade``: ``{"s": None, "e": None, "w": None}``.
+    ``None`` = no gate applied.  The fit service
+    (``heating_analytics.fit_solar_obstruction``) writes per-facade values
+    after elevation-binned residual analysis finds a step-function
+    signature exceeding the SSE-improvement threshold.
+    """
+    data = dict(data)
+    data.setdefault("_critical_elev_per_facade", {"s": None, "e": None, "w": None})
+    return data
+
+
 class StorageManager:
     """Manages data persistence (JSON, CSV)."""
 
@@ -383,7 +416,7 @@ class StorageManager:
             old_data = _migrate_pre_v3(
                 old_data,
                 solar_azimuth=getattr(self.coordinator, "solar_azimuth", 0.0),
-                solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", 0.80),
+                solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", SOLAR_BATTERY_DECAY),
             )
 
         if old_major_version < 4:
@@ -399,6 +432,20 @@ class StorageManager:
                 old_major_version,
             )
             old_data = _migrate_v4_to_v5(old_data)
+
+        if old_major_version < 6:
+            _LOGGER.info(
+                "Heating Analytics: migrating storage v%d -> v6 (4D solar-coefficient scaffolding, #954)",
+                old_major_version,
+            )
+            old_data = _migrate_v5_to_v6(old_data)
+
+        if old_major_version < 7:
+            _LOGGER.info(
+                "Heating Analytics: migrating storage v%d -> v7 (per-facade direct-beam obstruction, #991)",
+                old_major_version,
+            )
+            old_data = _migrate_v6_to_v7(old_data)
 
         return old_data
 
@@ -651,6 +698,47 @@ class StorageManager:
                 self._cleanup_removed_sensors(self.coordinator._learning_buffer_solar_per_unit)
             else:
                 self.coordinator._learning_buffer_solar_per_unit = {}
+
+            # Load parallel 4D solar-coefficient state (#954, storage v6).
+            # Canonical shape is emitted directly by ``_migrate_v5_to_v6`` —
+            # this load path does not branch on legacy shapes.  Empty dict
+            # on first migration; populated by the 4D shadow learner on
+            # first qualifying hour.
+            loaded_solar_4d = data.get("_solar_coefficients_4d_per_unit", {})
+            if isinstance(loaded_solar_4d, dict):
+                self.coordinator._solar_coefficients_4d_per_unit = {
+                    eid: v for eid, v in loaded_solar_4d.items()
+                    if isinstance(v, dict)
+                }
+                self._cleanup_removed_sensors(
+                    self.coordinator._solar_coefficients_4d_per_unit
+                )
+            else:
+                self.coordinator._solar_coefficients_4d_per_unit = {}
+
+            loaded_buffer_solar_4d = data.get("_learning_buffer_solar_4d_per_unit", {})
+            if isinstance(loaded_buffer_solar_4d, dict):
+                self.coordinator._learning_buffer_solar_4d_per_unit = {
+                    eid: v for eid, v in loaded_buffer_solar_4d.items()
+                    if isinstance(v, dict)
+                }
+                self._cleanup_removed_sensors(
+                    self.coordinator._learning_buffer_solar_4d_per_unit
+                )
+            else:
+                self.coordinator._learning_buffer_solar_4d_per_unit = {}
+
+            # Per-facade direct-beam obstruction state (#991, storage v7).
+            # Canonical shape emitted by ``_migrate_v6_to_v7``: dict with
+            # keys s/e/w mapping to ``float | None``.  ``None`` = no gate.
+            loaded_crit = data.get("_critical_elev_per_facade", {}) or {}
+            if isinstance(loaded_crit, dict):
+                self.coordinator._critical_elev_per_facade = {
+                    f: (float(loaded_crit[f]) if isinstance(loaded_crit.get(f), (int, float)) else None)
+                    for f in ("s", "e", "w")
+                }
+            else:
+                self.coordinator._critical_elev_per_facade = {"s": None, "e": None, "w": None}
 
             # Load per-unit min-base thresholds (#871).  Absent on legacy
             # installs → empty dict → all gate sites fall back to the
@@ -1172,6 +1260,11 @@ class StorageManager:
                     "learning_buffer_aux_per_unit": self.coordinator._learning_buffer_aux_per_unit,
                     "solar_coefficients_per_unit": self.coordinator._solar_coefficients_per_unit,
                     "learning_buffer_solar_per_unit": self.coordinator._learning_buffer_solar_per_unit,
+                    # Parallel 4D solar-coefficient state (#954, storage v6).
+                    "_solar_coefficients_4d_per_unit": self.coordinator._solar_coefficients_4d_per_unit,
+                    "_learning_buffer_solar_4d_per_unit": self.coordinator._learning_buffer_solar_4d_per_unit,
+                    # Per-facade direct-beam obstruction state (#991, storage v7).
+                    "_critical_elev_per_facade": self.coordinator._critical_elev_per_facade,
                     "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
                     "unit_modes": self.coordinator._unit_modes,
                     "solar_optimizer_data": self.coordinator.solar_optimizer.get_data(),
@@ -1268,6 +1361,11 @@ class StorageManager:
             "learning_buffer_aux_per_unit": self.coordinator._learning_buffer_aux_per_unit,
             "solar_coefficients_per_unit": self.coordinator._solar_coefficients_per_unit,
             "learning_buffer_solar_per_unit": self.coordinator._learning_buffer_solar_per_unit,
+            # Parallel 4D solar-coefficient state (#954, storage v6).
+            "_solar_coefficients_4d_per_unit": self.coordinator._solar_coefficients_4d_per_unit,
+            "_learning_buffer_solar_4d_per_unit": self.coordinator._learning_buffer_solar_4d_per_unit,
+            # Per-facade direct-beam obstruction state (#991, storage v7).
+            "_critical_elev_per_facade": self.coordinator._critical_elev_per_facade,
             "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
             "last_batch_fit_per_unit": self.coordinator._last_batch_fit_per_unit,
             "solar_battery_state": self.coordinator._solar_battery_state,
@@ -1329,10 +1427,12 @@ class StorageManager:
             data = _migrate_pre_v3(
                 data,
                 solar_azimuth=getattr(self.coordinator, "solar_azimuth", 0.0),
-                solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", 0.80),
+                solar_battery_decay=getattr(self.coordinator, "solar_battery_decay", SOLAR_BATTERY_DECAY),
             )
             data = _migrate_v3_to_v4(data)
             data = _migrate_v4_to_v5(data)
+            data = _migrate_v5_to_v6(data)  # #954: 4D solar scaffolding
+            data = _migrate_v6_to_v7(data)  # #991: per-facade obstruction state
 
             # Apply Data
             self.coordinator._correlation_data.clear()
@@ -1445,6 +1545,29 @@ class StorageManager:
                     for regime, samples in buf.items()
                     if isinstance(samples, list) and regime in ("heating", "cooling")
                 }
+
+            # Restore parallel 4D solar state (#954, storage v6).  Migration
+            # above seeds empty dicts on pre-v6 backups.
+            raw_solar_4d = data.get("_solar_coefficients_4d_per_unit", {})
+            self.coordinator._solar_coefficients_4d_per_unit = {
+                eid: v for eid, v in raw_solar_4d.items()
+                if isinstance(v, dict)
+            } if isinstance(raw_solar_4d, dict) else {}
+            raw_buffer_solar_4d = data.get("_learning_buffer_solar_4d_per_unit", {})
+            self.coordinator._learning_buffer_solar_4d_per_unit = {
+                eid: v for eid, v in raw_buffer_solar_4d.items()
+                if isinstance(v, dict)
+            } if isinstance(raw_buffer_solar_4d, dict) else {}
+
+            # Restore per-facade obstruction state (#991, storage v7).
+            raw_crit = data.get("_critical_elev_per_facade", {}) or {}
+            if isinstance(raw_crit, dict):
+                self.coordinator._critical_elev_per_facade = {
+                    f: (float(raw_crit[f]) if isinstance(raw_crit.get(f), (int, float)) else None)
+                    for f in ("s", "e", "w")
+                }
+            else:
+                self.coordinator._critical_elev_per_facade = {"s": None, "e": None, "w": None}
 
             # Restore Unit Modes
             self.coordinator._unit_modes = data.get("unit_modes", {})
@@ -1633,7 +1756,7 @@ class StorageManager:
                 "deviation": log_entry["deviation"],
                 "auxiliary_active": log_entry["auxiliary_active"],
                 "solar_factor": log_entry.get("solar_factor", 0.0),
-                "solar_impact_kwh": log_entry.get("solar_impact_kwh", 0.0),
+                "solar_impact_kwh": self.coordinator.hourly_solar_impact_kwh(log_entry),
                 "model_updated": log_entry.get("model_updated", False),
             }
 

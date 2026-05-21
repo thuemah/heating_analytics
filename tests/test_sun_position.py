@@ -2,46 +2,20 @@
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone
 import pytest
-from homeassistant.util import dt as dt_util
 from custom_components.heating_analytics.solar import SolarCalculator
-
-
-# Mock config entry
-class MockConfigEntry:
-    def __init__(self):
-        self.entry_id = "test_entry"
-        self.data = {
-            "outdoor_temp_sensor": "sensor.outdoor_temp",
-            "wind_speed_sensor": "sensor.wind_speed",
-            "weather_entity": "weather.test",
-            "energy_sensors": [],
-        }
-
-
-@pytest.fixture
-def mock_hass():
-    hass = MagicMock()
-    hass.data = {}
-    # Set location (Oslo, Norway)
-    hass.config.latitude = 59.9139
-    hass.config.longitude = 10.7522
-    hass.config.elevation = 0
-    return hass
-
-
-@pytest.fixture
-def mock_coordinator(mock_hass):
-    coordinator = MagicMock()
-    coordinator.hass = mock_hass
-    coordinator.solar_window_area = 10.0
-    coordinator.solar_azimuth = 180.0  # South
-    coordinator.balance_point = 17.0
-    coordinator._solar_coefficients = {}
-    return coordinator
 
 
 @pytest.fixture
 def solar_calc(mock_coordinator):
+    """Solar calculator with Oslo location setup."""
+    # Set location (Oslo, Norway)
+    mock_coordinator.hass.config.latitude = 59.9139
+    mock_coordinator.hass.config.longitude = 10.7522
+    mock_coordinator.hass.config.elevation = 0
+
+    mock_coordinator.solar_window_area = 10.0
+    mock_coordinator.solar_azimuth = 180.0  # South
+    mock_coordinator.balance_point = 17.0
     return SolarCalculator(mock_coordinator)
 
 

@@ -1,43 +1,21 @@
 """Test Model Comparison Logic consistency."""
 import pytest
 from unittest.mock import MagicMock, patch
-from datetime import date, datetime, timedelta
-import sys
-
-# Imports from custom_components (mocks provided by conftest.py)
+from datetime import date, datetime
 from custom_components.heating_analytics.sensor import HeatingModelComparisonWeekSensor, HeatingModelComparisonDaySensor
 from custom_components.heating_analytics.const import ATTR_PREDICTED, ATTR_SOLAR_PREDICTED
-
-@pytest.fixture
-def mock_coordinator():
-    coordinator = MagicMock()
-    coordinator.data = {
-        ATTR_PREDICTED: 10.0, # Today's model
-        ATTR_SOLAR_PREDICTED: 0.0,
-    }
-    # Mock calculate_modeled_energy to capture calls and return dummy values
-    # Must return 5-tuple now: (kwh, solar, temp, wind, tdd)
-    coordinator.calculate_modeled_energy = MagicMock(return_value=(50.0, 0.0, 10.0, 5.0, 10.0))
-
-    # Mock forecast.get_future_day_prediction to avoid ValueError during unpacking
-    # Return None to trigger fallback logic (or a valid tuple if needed)
-    coordinator.forecast.get_future_day_prediction = MagicMock(return_value=None)
-
-    # Mock forecast.calculate_future_energy to avoid ValueError during unpacking in _get_today_data
-    coordinator.forecast.calculate_future_energy = MagicMock(return_value=(0.0, 0.0, None))
-
-    return coordinator
-
-@pytest.fixture
-def mock_entry():
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    entry.title = "Test Heating Analytics"
-    return entry
 
 @pytest.mark.asyncio
 async def test_week_sensor_iso_logic(mock_coordinator, mock_entry):
     """Test that Week Sensor uses ISO week logic for Last Year."""
+    # Setup specific mock_coordinator defaults
+    mock_coordinator.data = {
+        ATTR_PREDICTED: 10.0,
+        ATTR_SOLAR_PREDICTED: 0.0,
+    }
+    mock_coordinator.calculate_modeled_energy = MagicMock(return_value=(50.0, 0.0, 10.0, 5.0, 10.0))
+    mock_coordinator.forecast.get_future_day_prediction = MagicMock(return_value=None)
+    mock_coordinator.forecast.calculate_future_energy = MagicMock(return_value=(0.0, 0.0, None))
 
     # Instantiate Sensor
     sensor = HeatingModelComparisonWeekSensor(mock_coordinator, mock_entry)
@@ -90,6 +68,14 @@ async def test_week_sensor_iso_logic(mock_coordinator, mock_entry):
 @pytest.mark.asyncio
 async def test_day_sensor_calendar_logic(mock_coordinator, mock_entry):
     """Test that Day Sensor still uses Calendar logic."""
+    # Setup specific mock_coordinator defaults
+    mock_coordinator.data = {
+        ATTR_PREDICTED: 10.0,
+        ATTR_SOLAR_PREDICTED: 0.0,
+    }
+    mock_coordinator.calculate_modeled_energy = MagicMock(return_value=(50.0, 0.0, 10.0, 5.0, 10.0))
+    mock_coordinator.forecast.get_future_day_prediction = MagicMock(return_value=None)
+    mock_coordinator.forecast.calculate_future_energy = MagicMock(return_value=(0.0, 0.0, None))
 
     sensor = HeatingModelComparisonDaySensor(mock_coordinator, mock_entry)
 
@@ -143,6 +129,15 @@ async def test_day_sensor_calendar_logic(mock_coordinator, mock_entry):
 @pytest.mark.asyncio
 async def test_last_year_actual_missing_data(mock_coordinator, mock_entry):
     """Test that missing historical data is handled gracefully (None)."""
+    # Setup specific mock_coordinator defaults
+    mock_coordinator.data = {
+        ATTR_PREDICTED: 10.0,
+        ATTR_SOLAR_PREDICTED: 0.0,
+    }
+    mock_coordinator.calculate_modeled_energy = MagicMock(return_value=(50.0, 0.0, 10.0, 5.0, 10.0))
+    mock_coordinator.forecast.get_future_day_prediction = MagicMock(return_value=None)
+    mock_coordinator.forecast.calculate_future_energy = MagicMock(return_value=(0.0, 0.0, None))
+
     sensor = HeatingModelComparisonDaySensor(mock_coordinator, mock_entry)
     mock_now = datetime(2024, 1, 1, 12, 0, 0)
 

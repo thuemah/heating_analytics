@@ -22,34 +22,12 @@ from custom_components.heating_analytics.sensor import (
     HeatingLastHourDeviationSensor
 )
 
-@pytest.fixture
-def mock_coordinator():
-    coordinator = MagicMock()
-    coordinator.data = {}
-    # Initialize internal stats to prevent comparison errors with MagicMock
-    coordinator._hourly_log = []
-    coordinator._collector.bucket_counts = {"with_auxiliary_heating": 0}
-    coordinator._collector.sample_count = 0
-    coordinator._collector.wind_sum = 0.0
-    # Initialize orphaned accumulators to avoid MagicMock recursion
-    coordinator._daily_orphaned_aux = 0.0
-    coordinator._collector.orphaned_aux = 0.0
-    coordinator.wind_unit = "m/s"
-    coordinator.wind_threshold = 5.5
-    coordinator.extreme_wind_threshold = 10.8
-    coordinator.wind_gust_factor = 0.6
-    return coordinator
-
-@pytest.fixture
-def mock_entry():
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    entry.title = "Test Heating"
-    return entry
-
 @pytest.mark.asyncio
 async def test_forecast_today_sensor(hass: HomeAssistant, mock_coordinator, mock_entry):
     """Test HeatingForecastTodaySensor."""
+    # Specialized setup
+    mock_entry.title = "Test Heating"
+    
     # Setup data
     mock_coordinator.data = {
         ATTR_FORECAST_TODAY: 50.0,

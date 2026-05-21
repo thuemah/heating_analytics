@@ -13,6 +13,7 @@ from datetime import date as _date, datetime, timedelta
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    ENERGY_GUARD_THRESHOLD,
     MODE_COOLING,
     MODE_DHW,
     MODE_GUEST_COOLING,
@@ -21,7 +22,9 @@ from .const import (
     MODE_OFF,
     SOLAR_BATTERY_DECAY,
 )
-from .solar import SolarCalculator
+from .helpers import compute_base_ema_step
+from .learning import compute_snr_weight, _solar_coeff_regime
+from .solar import SolarCalculator, resolve_dni_dhi
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -713,7 +716,10 @@ class DiagnosticsEngine:
                     # which is itself bounded by 30 days × ~12 daylight
                     # hours = ~360 entries per entity in the worst case.
                     "elevation_buckets": {
-                        f"{lo}-{hi}": {"residuals": [], "potential_mags": []}
+                        f"{lo}-{hi}": {
+                            "unsaturated": {"residuals": [], "potential_mags": []},
+                            "saturated": {"residuals": [], "potential_mags": []},
+                        }
                         for lo, hi in ELEVATION_BUCKETS
                     },
                     # Lag-stratified residuals for Tier 2.  Per-bucket dict
@@ -1023,9 +1029,40 @@ class DiagnosticsEngine:
                 # Check saturation
                 acc = _get_unit_accum(entity_id)
                 acc["qualifying"] += 1
-                if mode == MODE_HEATING and actual_unit < 0.05 * base_unit and base_unit > 0.05:
+                # Heating saturation: ``actual_unit < 0.05 * base_unit`` is
+                # equivalent to ``implied_solar >= 0.95 * base_unit`` which
+                # is ``BATCH_FIT_SATURATION_RATIO``.
+                is_saturated_heating = (
+                    mode == MODE_HEATING
+                    and base_unit > 0.05
+                    and actual_unit < 0.05 * base_unit
+                )
+                if is_saturated_heating:
                     acc["saturated"] += 1
                     excluded["saturated"] += 1
+                    # Emit the elevation residual into the saturated sub-bucket
+                    # before bailing — needed to disambiguate HP-capacity
+                    # censoring from genuine Kasten elevation×airmass bias in
+                    # elevation_diagnostics.
+                    if sun_elev_entry is not None and 0.0 <= sun_elev_entry < 90.0:
+                        _implied_sat = max(0.0, base_unit - actual_unit)
+                        _potential_sat = _SC.reconstruct_potential_vector(
+                            (solar_s, solar_e, solar_w),
+                            correction if correction is not None else 100.0,
+                            self.coordinator.screen_config_for_entity(entity_id),
+                        )
+                        _coeff_sat = self.coordinator.solar.calculate_unit_coefficient(
+                            entity_id, entry.get("temp_key", "10"), mode
+                        )
+                        _modeled_sat = self.coordinator.solar.calculate_unit_solar_impact(
+                            _potential_sat, _coeff_sat
+                        )
+                        for lo, hi in ELEVATION_BUCKETS:
+                            if lo <= sun_elev_entry < hi:
+                                ev_sat = acc["elevation_buckets"][f"{lo}-{hi}"]["saturated"]
+                                ev_sat["residuals"].append(_implied_sat - _modeled_sat)
+                                ev_sat["potential_mags"].append(vector_mag)
+                                break
                     continue
 
                 implied_solar = max(0.0, implied_solar)
@@ -1204,7 +1241,7 @@ class DiagnosticsEngine:
                     for lo, hi in ELEVATION_BUCKETS:
                         if lo <= sun_elev_entry < hi:
                             bucket_key = f"{lo}-{hi}"
-                            ev_bucket = acc["elevation_buckets"][bucket_key]
+                            ev_bucket = acc["elevation_buckets"][bucket_key]["unsaturated"]
                             ev_bucket["residuals"].append(implied_solar - modeled_solar)
                             ev_bucket["potential_mags"].append(vector_mag)
 
@@ -1473,26 +1510,30 @@ class DiagnosticsEngine:
             return out
 
         def _build_elevation_block(
-            elev_acc: dict[str, dict[str, list[float]]],
+            elev_acc: dict[str, dict[str, dict[str, list[float]]]],
             min_samples: int = 5,
         ) -> dict[str, dict]:
             """Build the `elevation_diagnostics.instantaneous` response.
 
-            Buckets with fewer than ``min_samples`` qualifying hours
+            Each elevation bucket is split into ``unsaturated`` and
+            ``saturated`` sub-blocks so the reader can distinguish
+            HP-capacity censoring (saturation: ``actual < 0.05·base``,
+            equivalent to ``implied_solar ≥ BATCH_FIT_SATURATION_RATIO``)
+            from genuine Kasten elevation×airmass bias (unsaturated
+            modulating-regime hours).  Heating regime only; cooling
+            samples are excluded upstream.
+
+            Sub-blocks with fewer than ``min_samples`` qualifying hours
             return ``{"n": <count>}`` only — the median / MAD / normalised
             ratio would be too noisy to surface usefully on small ``n``.
-            ``mean_potential`` ≤ 1e-3 in a populated bucket means the
+            ``mean_potential`` ≤ 1e-3 in a populated sub-block means the
             sample's solar input was effectively zero; return None for
             ``median_residual_normalised`` rather than divide by ~0.
             """
-            out: dict[str, dict] = {}
-            for bucket_key, data in elev_acc.items():
-                residuals = data["residuals"]
-                pots = data["potential_mags"]
+            def _summarise(residuals: list[float], pots: list[float]) -> dict:
                 n_b = len(residuals)
                 if n_b < min_samples:
-                    out[bucket_key] = {"n": n_b}
-                    continue
+                    return {"n": n_b}
                 med = _median(residuals)
                 mad = _mad(residuals, med)
                 mean_pot = sum(pots) / n_b
@@ -1500,12 +1541,21 @@ class DiagnosticsEngine:
                     norm = round(med / mean_pot, 4)
                 else:
                     norm = None
-                out[bucket_key] = {
+                return {
                     "n": n_b,
                     "median_residual": round(med, 4),
                     "mad_residual": round(mad, 4),
                     "mean_potential": round(mean_pot, 4),
                     "median_residual_normalised": norm,
+                }
+
+            out: dict[str, dict] = {}
+            for bucket_key, data in elev_acc.items():
+                unsat = data["unsaturated"]
+                sat = data["saturated"]
+                out[bucket_key] = {
+                    "unsaturated": _summarise(unsat["residuals"], unsat["potential_mags"]),
+                    "saturated": _summarise(sat["residuals"], sat["potential_mags"]),
                 }
             return out
 
@@ -1604,6 +1654,8 @@ class DiagnosticsEngine:
                 )
                 else None
             ),
+            wind_threshold=self.coordinator.wind_threshold,
+            extreme_wind_threshold=self.coordinator.extreme_wind_threshold,
             return_diagnostics=True,
         )
 
@@ -2927,6 +2979,9 @@ class DiagnosticsEngine:
             "per_unit": per_unit,
             "per_unit_thresholds": per_unit_thresholds,
             "dni_dhi_shadow": self._compute_dni_dhi_shadow_report(days_back),
+            "base_model_4d_shadow": self._compute_base_model_4d_shadow_report(days_back),
+            "total_power_4d_divergence": self._compute_total_power_4d_divergence_report(days_back),
+            "shoulder_saturation_blast_radius": self._compute_shoulder_saturation_blast_radius(days_back),
             "ghi_signal_agreement": self._compute_ghi_signal_agreement(days_back),
         }
 
@@ -3900,4 +3955,811 @@ class DiagnosticsEngine:
             len(result["updated"]), len(result["rejected"]), len(result["skipped"]),
         )
         return result
+
+    def _compute_base_model_4d_shadow_report(self, days_back: int) -> dict:
+        """Path-B promotion metric for the 4D solar shadow learner (#954).
+
+        Re-aggregates the last ``days_back`` days of base-bucket EMA twice
+        in parallel — once with ``solar_normalization_delta`` (3D, status
+        quo) and once with ``solar_normalization_delta_4d`` (4D shadow,
+        per-hour field landed in 7b8cb0a) — and reports per-cell
+        ``drift_kwh`` plus the per-step EMA jitter RMS for each path.
+
+        A bucket whose normalisation delta correctly captures the hourly
+        solar contribution converges to a stable value and per-step EMA
+        jitter trends toward zero.  A noisy / biased delta keeps nudging
+        the bucket inconsistently and step jitter stays high.  Lower
+        ``step_*_rms`` therefore means flatter base buckets — better
+        physics.  The headline ``shoulder_ratio = 4d_rms / 3d_rms`` over
+        ``[7-14°C, normal-wind]`` cells is the dominant promotion gate.
+
+        Strict diagnostic — reads only ``hourly_log`` and the live
+        ``correlation_data`` seed; writes nothing back to model state.
+        Returns ``{"available": False, "reason":
+        "no_4d_tagged_hours", ...}`` when the 4D learner has not yet
+        produced any tagged hours (fresh install, or 4D potential never
+        qualified).  No synthetic-delta fallback — the absence is the
+        signal.
+        """
+        cutoff = (dt_util.now() - timedelta(days=days_back)).date().isoformat()
+        correlation_data = self.coordinator._correlation_data or {}
+        learning_rate = float(getattr(self.coordinator, "learning_rate", 0.0) or 0.0)
+        energy_sensors = list(getattr(self.coordinator, "energy_sensors", []) or [])
+        total_units = max(1, len(energy_sensors))
+
+        _COOLING_MODES = frozenset((MODE_COOLING, MODE_GUEST_COOLING))
+
+        # Walk hourly_log once, gather qualifying samples grouped by cell
+        # in chronological order (the log itself is chronological).
+        per_cell: dict[tuple, list[dict]] = {}
+        n_skipped_no_4d = 0
+        for entry in self.coordinator._hourly_log:
+            ts = entry.get("timestamp", "")
+            if ts[:10] < cutoff:
+                continue
+            d3 = entry.get("solar_normalization_delta")
+            d4 = entry.get("solar_normalization_delta_4d")
+            actual = entry.get("actual_kwh")
+            temp_key = entry.get("temp_key")
+            wind_bucket = entry.get("wind_bucket")
+            if (
+                d3 is None
+                or actual is None
+                or temp_key is None
+                or wind_bucket is None
+            ):
+                # Missing essentials — silently skip; not the 4D gate.
+                continue
+            if d4 is None:
+                n_skipped_no_4d += 1
+                continue
+            # Same gates as base learning: aux active, guest impact,
+            # cooling-mode hours all excluded.
+            if entry.get("auxiliary_active", False):
+                continue
+            try:
+                if float(entry.get("guest_impact_kwh") or 0.0) > 0.0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            unit_modes = entry.get("unit_modes") or {}
+            if any(m in _COOLING_MODES for m in unit_modes.values()):
+                continue
+            try:
+                actual_f = float(actual)
+                d3_f = float(d3)
+                d4_f = float(d4)
+                sf_f = float(entry.get("solar_factor") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            sde = entry.get("solar_dominant_entities") or []
+            per_cell.setdefault((temp_key, wind_bucket), []).append(
+                {
+                    "actual": actual_f,
+                    "d3": d3_f,
+                    "d4": d4_f,
+                    "sf": sf_f,
+                    "sde": sde,
+                }
+            )
+
+        total_hours = sum(len(v) for v in per_cell.values())
+        if total_hours == 0:
+            return {
+                "available": False,
+                "n_hours": 0,
+                "n_hours_skipped_no_4d_delta": n_skipped_no_4d,
+                "days_back": days_back,
+                "reason": "no_4d_tagged_hours",
+            }
+
+        # Walk each cell's samples chronologically, applying the live
+        # base-EMA update twice (once per delta).  Both sims start from
+        # the same seed (the cell's current live value) — fair comparison.
+        per_cell_out: dict[str, dict] = {}
+        shoulder_temps = list(range(7, 15))  # [7..14]
+        shoulder_step_3d_sq: list[float] = []
+        shoulder_step_4d_sq: list[float] = []
+        shoulder_cell_count = 0
+
+        for (temp_key, wind_bucket), samples in per_cell.items():
+            if not samples:
+                continue
+            seed = correlation_data.get(temp_key, {}).get(wind_bucket, 0.0)
+            try:
+                seed_f = float(seed) if seed is not None else 0.0
+            except (TypeError, ValueError):
+                seed_f = 0.0
+
+            bucket_3d = seed_f
+            bucket_4d = seed_f
+            step_3d_sq_sum = 0.0
+            step_4d_sq_sum = 0.0
+
+            for s in samples:
+                # #967: EMA step routed through ``helpers.compute_base_ema_step``
+                # so the diagnostic simulation uses the same arithmetic
+                # source-of-truth the live writer will when its inline
+                # form (learning.py:990) is migrated.  Target construction
+                # (``max(0, actual + delta)``) stays caller-side per the
+                # helper's contract.
+                target_3d = max(0.0, s["actual"] + s["d3"])
+                target_4d = max(0.0, s["actual"] + s["d4"])
+                weight = compute_snr_weight(s["sf"], s["sde"], total_units)
+                bucket_3d, step_3d = compute_base_ema_step(
+                    bucket_3d, target_3d, learning_rate, weight,
+                )
+                bucket_4d, step_4d = compute_base_ema_step(
+                    bucket_4d, target_4d, learning_rate, weight,
+                )
+                step_3d_sq_sum += step_3d * step_3d
+                step_4d_sq_sum += step_4d * step_4d
+
+            n = len(samples)
+            step_3d_rms = math.sqrt(step_3d_sq_sum / n)
+            step_4d_rms = math.sqrt(step_4d_sq_sum / n)
+            ratio: float | None
+            if step_3d_rms > 0.0:
+                ratio = round(step_4d_rms / step_3d_rms, 5)
+            else:
+                ratio = None
+
+            cell_key = f"{temp_key}/{wind_bucket}"
+            per_cell_out[cell_key] = {
+                "n": n,
+                "bucket_3d_initial": round(seed_f, 5),
+                "bucket_3d_final": round(bucket_3d, 5),
+                "bucket_4d_final": round(bucket_4d, 5),
+                "drift_kwh": round(bucket_4d - bucket_3d, 5),
+                "step_3d_rms": round(step_3d_rms, 6),
+                "step_4d_rms": round(step_4d_rms, 6),
+                "step_4d_to_3d_ratio": ratio,
+            }
+
+            # Shoulder aggregate: integer temp_key in [7..14] AND
+            # normal-wind bucket.  temp_key is logged as a string of the
+            # rounded integer temperature; coerce defensively.
+            try:
+                tk_int = int(temp_key)
+            except (TypeError, ValueError):
+                tk_int = None
+            if (
+                tk_int is not None
+                and tk_int in shoulder_temps
+                and wind_bucket == "normal"
+            ):
+                shoulder_step_3d_sq.append(step_3d_rms * step_3d_rms)
+                shoulder_step_4d_sq.append(step_4d_rms * step_4d_rms)
+                shoulder_cell_count += 1
+
+        if shoulder_cell_count > 0:
+            rms_3d = math.sqrt(sum(shoulder_step_3d_sq) / shoulder_cell_count)
+            rms_4d = math.sqrt(sum(shoulder_step_4d_sq) / shoulder_cell_count)
+            shoulder_ratio: float | None
+            if rms_3d > 0.0:
+                shoulder_ratio = round(rms_4d / rms_3d, 5)
+            else:
+                shoulder_ratio = None
+            headline = {
+                "bucket_drift_rms_3d_shoulder": round(rms_3d, 6),
+                "bucket_drift_rms_4d_shoulder": round(rms_4d, 6),
+                "shoulder_ratio": shoulder_ratio,
+                "shoulder_cell_count": shoulder_cell_count,
+            }
+        else:
+            headline = {
+                "bucket_drift_rms_3d_shoulder": 0.0,
+                "bucket_drift_rms_4d_shoulder": 0.0,
+                "shoulder_ratio": None,
+                "shoulder_cell_count": 0,
+            }
+
+        return {
+            "available": True,
+            "n_hours": total_hours,
+            "n_hours_skipped_no_4d_delta": n_skipped_no_4d,
+            "days_back": days_back,
+            "shoulder_temps": shoulder_temps,
+            "headline": headline,
+            "per_cell": per_cell_out,
+        }
+
+    def _replay_4d_solar_total(self, entry: dict) -> float | None:
+        """Post-mortem replay of whole-house 4D solar impact for one hour.
+
+        Reuses the live 4D pipeline (``resolve_dni_dhi`` +
+        ``calculate_unit_potential_4d``) with current 4D coefficients to
+        reconstruct an estimated 4D solar total for hours that pre-date
+        the shadow learner being active OR where 4D logging skipped.
+
+        Returns ``None`` when inputs are insufficient — no logged
+        ``dni``/``dhi`` and no logged ``cloud_coverage`` for the entry,
+        or no parseable timestamp.
+
+        Caveat: uses CURRENT learned 4D coefficients applied to historical
+        hours (same temporal-mismatch assumption the 3D path implicitly
+        makes in this diagnose block).
+        """
+        ts = entry.get("timestamp", "")
+        try:
+            ts_dt = datetime.fromisoformat(ts)
+        except (TypeError, ValueError):
+            return None
+
+        coord = self.coordinator
+        solar_calc = getattr(coord, "solar", None)
+        if not isinstance(solar_calc, SolarCalculator):
+            # Real coordinators wire a SolarCalculator instance; MagicMock-
+            # based test coordinators that don't exercise the replay get
+            # a no-op fallback here.
+            return None
+
+        try:
+            sun_elev, sun_az = solar_calc.get_approx_sun_pos(ts_dt)
+        except Exception:  # noqa: BLE001 - best-effort replay
+            return None
+        if sun_elev <= 0.0:
+            return 0.0  # night — no solar; 4D estimate is exactly 0
+
+        dni_in = entry.get("dni")
+        dhi_in = entry.get("dhi")
+        cloud_in = entry.get("cloud_coverage")
+        ghi_in = entry.get("ghi_wm2")
+        day_of_year = ts_dt.timetuple().tm_yday
+        try:
+            dni, dhi, source = resolve_dni_dhi(
+                dni_in=dni_in,
+                dhi_in=dhi_in,
+                ghi_in=ghi_in,
+                cloud_coverage_pct=cloud_in,
+                sun_elev_deg=sun_elev,
+                day_of_year=day_of_year,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if source == "none":
+            return None
+
+        correction = float(entry.get("correction_percent", 0.0) or 0.0)
+        unit_modes = entry.get("unit_modes") or {}
+        coeffs_4d = getattr(coord, "_solar_coefficients_4d_per_unit", {}) or {}
+        if not isinstance(coeffs_4d, dict):
+            return None
+        is_solar_affected = getattr(coord, "is_solar_affected", None)
+
+        total_4d = 0.0
+        for entity_id in (getattr(coord, "energy_sensors", None) or []):
+            if callable(is_solar_affected) and not is_solar_affected(entity_id):
+                continue
+            mode = unit_modes.get(entity_id, MODE_HEATING)
+            regime = _solar_coeff_regime(mode)
+            if regime is None:
+                continue
+            entity_coeffs = coeffs_4d.get(entity_id, {})
+            regime_coeffs = (
+                entity_coeffs.get(regime, {})
+                if isinstance(entity_coeffs, dict)
+                else {}
+            )
+            c_s = float(regime_coeffs.get("s", 0.0))
+            c_e = float(regime_coeffs.get("e", 0.0))
+            c_w = float(regime_coeffs.get("w", 0.0))
+            c_d = float(regime_coeffs.get("diffuse", 0.0))
+            if c_s == 0.0 and c_e == 0.0 and c_w == 0.0 and c_d == 0.0:
+                continue  # entity has no 4D learning yet — would skew toward 0
+
+            screen_cfg = (
+                coord.screen_config_for_entity(entity_id)
+                if hasattr(coord, "screen_config_for_entity")
+                else (False, False, False)
+            )
+            try:
+                p_s, p_e, p_w, p_d = solar_calc.calculate_unit_potential_4d(
+                    entity_id=entity_id,
+                    dni=dni,
+                    dhi=dhi,
+                    sun_elev_deg=sun_elev,
+                    sun_azimuth_deg=sun_az,
+                    screen_config=screen_cfg,
+                    correction_percent=correction,
+                )
+            except Exception:  # noqa: BLE001
+                return None
+            total_4d += c_s * p_s + c_e * p_e + c_w * p_w + c_d * p_d
+
+        return total_4d
+
+    def _compute_total_power_4d_divergence_report(self, days_back: int) -> dict:
+        """Side-by-side replay of 3D vs 4D ``calculate_total_power`` (#962).
+
+        Walks each qualifying entry in ``hourly_log`` over the last
+        ``days_back`` days, replays both ``calculate_total_power`` (3D,
+        forced via ``override_solar_factor`` + ``override_solar_vector``)
+        and ``calculate_total_power_4d`` (forced via ``override_dni_dhi``
+        + ``override_sun_pos``) on identical base / aux / mode inputs,
+        and aggregates per-hour deltas grouped by cloud regime.
+
+        Cloud regime classification matches
+        ``_compute_dni_dhi_shadow_report`` exactly:
+          * ``clear``     — DNI > 400 W/m² and DHI/DNI < 0.3
+          * ``overcast``  — DNI < 50 W/m²
+          * ``broken``    — everything else
+
+        Strict diagnostic — reads only ``hourly_log``; writes nothing.
+        Both replay calls run with ``detailed=False`` to skip the
+        per-unit breakdown dict on a ~360 daylight-hour window.
+
+        Returns ``{"available": False, "reason": ...}`` when there are
+        too few eligible hours to characterise any regime reliably.
+        """
+        # Verdict thresholds — diagnostic only, kept local so future
+        # tuning is visible in the report itself rather than buried in
+        # const.py.  See the ``verdict_thresholds`` block in the
+        # returned dict.
+        _MIN_REGIME_HOURS = 5
+        _VERDICT_MIN_BROKEN_HOURS = 20
+        _VERDICT_ALIGNED_REL_MAX = 0.05  # < 5 % median rel delta
+        _VERDICT_DIVERGE_REL_MIN = 0.10  # ≥ 10 % median rel delta
+
+        log_iter = getattr(self.coordinator, "_hourly_log", None) or []
+        cutoff = (dt_util.now() - timedelta(days=days_back)).date().isoformat()
+
+        # Bucketed per-hour samples per regime; ``all`` aggregates
+        # everything for the headline row.
+        regime_samples: dict[str, list[dict]] = {
+            "clear": [], "broken": [], "overcast": [],
+        }
+        n_total_window = 0
+        n_skipped_missing_fields = 0
+        n_skipped_below_horizon = 0
+        n_skipped_errors = 0
+
+        for entry in log_iter:
+            ts = entry.get("timestamp", "")
+            if ts[:10] < cutoff:
+                continue
+            n_total_window += 1
+
+            # Required schema — pre-#933 entries lack DNI/DHI and early
+            # 2D→3D-padding entries lack ``solar_vector_w``.  Both
+            # populations are silently dropped via
+            # ``n_skipped_missing_fields``.
+            dni = entry.get("dni")
+            dhi = entry.get("dhi")
+            sv_s = entry.get("solar_vector_s")
+            sv_e = entry.get("solar_vector_e")
+            sv_w = entry.get("solar_vector_w")
+            solar_factor = entry.get("solar_factor")
+            temp = entry.get("temp")
+            eff_wind = entry.get("effective_wind")
+            correction = entry.get("correction_percent")
+            if (
+                dni is None or dhi is None
+                or sv_s in (None, "") or sv_e in (None, "")
+                or sv_w in (None, "")
+                or solar_factor is None
+                or temp is None or eff_wind is None
+                or correction is None
+            ):
+                n_skipped_missing_fields += 1
+                continue
+
+            try:
+                dni_f = float(dni)
+                dhi_f = float(dhi)
+                sv_s_f = float(sv_s)
+                sv_e_f = float(sv_e)
+                sv_w_f = float(sv_w)
+                sf_f = float(solar_factor)
+                temp_f = float(temp)
+                wind_f = float(eff_wind)
+            except (TypeError, ValueError):
+                n_skipped_missing_fields += 1
+                continue
+
+            # Parse timestamp; compute sun position once.
+            try:
+                dt_obj = datetime.fromisoformat(ts)
+            except (TypeError, ValueError):
+                n_skipped_missing_fields += 1
+                continue
+            try:
+                elev, azim = self.coordinator.solar.get_approx_sun_pos(dt_obj)
+            except Exception:  # noqa: BLE001 — defensive against mocks
+                n_skipped_errors += 1
+                continue
+            if elev <= 0.0:
+                n_skipped_below_horizon += 1
+                continue
+
+            # Cloud regime — same convention as
+            # ``_compute_dni_dhi_shadow_report``.
+            if dni_f < 50.0:
+                regime = "overcast"
+            elif dni_f > 400.0 and (dhi_f / max(dni_f, 1.0)) < 0.3:
+                regime = "clear"
+            else:
+                regime = "broken"
+
+            is_aux = bool(entry.get("auxiliary_active", False))
+            unit_modes = entry.get("unit_modes") or None
+
+            # Replay both pipelines.  ``detailed=False`` — the per-unit
+            # breakdown is hot for a 360-hour window.  Defensive try /
+            # except so one bad hour cannot kill the whole report.
+            try:
+                r3 = self.coordinator.statistics.calculate_total_power(
+                    temp=temp_f,
+                    effective_wind=wind_f,
+                    solar_impact=0.0,
+                    is_aux_active=is_aux,
+                    unit_modes=unit_modes,
+                    override_solar_factor=sf_f,
+                    override_solar_vector=(sv_s_f, sv_e_f, sv_w_f),
+                    detailed=False,
+                    override_now=dt_obj,
+                )
+                r4 = self.coordinator.statistics.calculate_total_power_4d(
+                    temp=temp_f,
+                    effective_wind=wind_f,
+                    solar_impact=0.0,
+                    is_aux_active=is_aux,
+                    unit_modes=unit_modes,
+                    detailed=False,
+                    override_now=dt_obj,
+                    override_dni_dhi=(dni_f, dhi_f),
+                    override_sun_pos=(elev, azim),
+                    override_correction_percent=float(correction),
+                )
+            except Exception:  # noqa: BLE001
+                n_skipped_errors += 1
+                continue
+
+            try:
+                delta_total = float(r4["total_kwh"]) - float(r3["total_kwh"])
+                delta_solar = (
+                    float(r4["breakdown"]["solar_reduction_kwh"])
+                    - float(r3["breakdown"]["solar_reduction_kwh"])
+                )
+                delta_solar_heating = (
+                    float(r4["breakdown"]["solar_heating_applied_kwh"])
+                    - float(r3["breakdown"]["solar_heating_applied_kwh"])
+                )
+                gbase = float(r3.get("global_base_kwh", 0.0))
+            except (KeyError, TypeError, ValueError):
+                n_skipped_errors += 1
+                continue
+
+            regime_samples[regime].append({
+                "delta_total": delta_total,
+                "delta_solar_applied": delta_solar,
+                "delta_solar_heating_applied": delta_solar_heating,
+                "global_base_kwh": gbase,
+            })
+
+        n_eligible = sum(len(v) for v in regime_samples.values())
+
+        if n_eligible == 0:
+            return {
+                "available": False,
+                "reason": "no_hours_with_dni_dhi" if n_skipped_missing_fields else "no_eligible_hours",
+                "days_back": days_back,
+                "window_cutoff": cutoff,
+                "n_total_log_entries": n_total_window,
+                "n_eligible_hours": 0,
+                "n_skipped_missing_fields": n_skipped_missing_fields,
+                "n_skipped_below_horizon": n_skipped_below_horizon,
+                "n_skipped_errors": n_skipped_errors,
+                "regime_counts": {k: 0 for k in ("clear", "broken", "overcast")},
+            }
+
+        def _median(values: list[float]) -> float:
+            n_v = len(values)
+            if n_v == 0:
+                return 0.0
+            s = sorted(values)
+            mid = n_v // 2
+            if n_v % 2 == 1:
+                return s[mid]
+            return (s[mid - 1] + s[mid]) / 2.0
+
+        def _mean(values: list[float]) -> float:
+            if not values:
+                return 0.0
+            return sum(values) / len(values)
+
+        def _stats_for(samples: list[dict]) -> dict:
+            if not samples:
+                return {
+                    "n_hours": 0,
+                    "median_abs_delta_total_kwh": None,
+                    "median_signed_delta_total_kwh": None,
+                    "median_abs_delta_solar_applied_kwh": None,
+                    "median_signed_delta_solar_applied_kwh": None,
+                    "median_abs_delta_solar_heating_applied_kwh": None,
+                    "median_signed_delta_solar_heating_applied_kwh": None,
+                    "median_relative_delta_total": None,
+                    "mean_abs_delta_total_kwh": None,
+                }
+            d_total = [s["delta_total"] for s in samples]
+            d_solar = [s["delta_solar_applied"] for s in samples]
+            d_solar_h = [s["delta_solar_heating_applied"] for s in samples]
+            rel = [
+                abs(s["delta_total"]) / max(s["global_base_kwh"], 0.1)
+                for s in samples
+            ]
+            return {
+                "n_hours": len(samples),
+                "median_abs_delta_total_kwh": round(_median([abs(x) for x in d_total]), 4),
+                "median_signed_delta_total_kwh": round(_median(d_total), 4),
+                "median_abs_delta_solar_applied_kwh": round(_median([abs(x) for x in d_solar]), 4),
+                "median_signed_delta_solar_applied_kwh": round(_median(d_solar), 4),
+                "median_abs_delta_solar_heating_applied_kwh": round(_median([abs(x) for x in d_solar_h]), 4),
+                "median_signed_delta_solar_heating_applied_kwh": round(_median(d_solar_h), 4),
+                "median_relative_delta_total": round(_median(rel), 4),
+                "mean_abs_delta_total_kwh": round(_mean([abs(x) for x in d_total]), 4),
+            }
+
+        per_regime = {k: _stats_for(v) for k, v in regime_samples.items()}
+        all_samples = [s for v in regime_samples.values() for s in v]
+        per_regime["all"] = _stats_for(all_samples)
+
+        # Verdict on the broken-cloud regime — this is where the 4D
+        # pipeline is hypothesised to diverge from 3D (per #933 / #962).
+        broken = per_regime["broken"]
+        any_undersampled = any(
+            per_regime[k]["n_hours"] < _MIN_REGIME_HOURS
+            for k in ("clear", "broken", "overcast")
+        )
+        if any_undersampled:
+            verdict = "insufficient_data"
+        elif broken["n_hours"] >= _VERDICT_MIN_BROKEN_HOURS:
+            rel = broken["median_relative_delta_total"] or 0.0
+            if rel >= _VERDICT_DIVERGE_REL_MIN:
+                verdict = "4d_meaningfully_diverges_on_broken"
+            elif rel < _VERDICT_ALIGNED_REL_MAX:
+                verdict = "4d_aligned_with_3d"
+            else:
+                verdict = "4d_diverges_modestly_on_broken"
+        else:
+            verdict = "4d_diverges_modestly_on_broken"
+
+        return {
+            "available": True,
+            "days_back": days_back,
+            "window_cutoff": cutoff,
+            "n_total_log_entries": n_total_window,
+            "n_eligible_hours": n_eligible,
+            "n_skipped_missing_fields": n_skipped_missing_fields,
+            "n_skipped_below_horizon": n_skipped_below_horizon,
+            "n_skipped_errors": n_skipped_errors,
+            "regime_counts": {
+                "clear": per_regime["clear"]["n_hours"],
+                "broken": per_regime["broken"]["n_hours"],
+                "overcast": per_regime["overcast"]["n_hours"],
+            },
+            "per_regime": per_regime,
+            "verdict": verdict,
+            "verdict_thresholds": {
+                "min_regime_hours_for_verdict": _MIN_REGIME_HOURS,
+                "min_broken_hours_for_threshold_verdict": _VERDICT_MIN_BROKEN_HOURS,
+                "aligned_relative_delta_max": _VERDICT_ALIGNED_REL_MAX,
+                "diverges_relative_delta_min": _VERDICT_DIVERGE_REL_MIN,
+            },
+        }
+
+    def _compute_shoulder_saturation_blast_radius(self, days_back: int) -> dict:
+        """Quantify saturation-clamp blast radius on shoulder buckets (#928).
+
+        For each shoulder hour (``temp ∈ [BP-3, BP+1]``) over the last
+        ``days_back`` days, compute four whole-house "expected" variants
+        and the absolute residual against ``actual_kwh``:
+
+          - ``expected_3d_clamped``    — logged ``expected_kwh``
+                                         (status quo; per-unit clamped)
+          - ``expected_3d_unclamped``  — ``expected_kwh - solar_wasted_kwh``
+                                         (whole-house proxy; can be negative)
+          - ``expected_4d_clamped``    — ``max(0, sum_base - solar_impact_4d_kwh)``
+                                         where ``sum_base = expected_kwh + solar_impact_kwh``
+          - ``expected_4d_unclamped``  — ``sum_base - solar_impact_4d_kwh``
+
+        Stratifies into ``all_shoulder`` and ``saturation_events_only``
+        (hours where 3D clamp fired, i.e. ``solar_wasted_kwh > 0``) and
+        reports median |residual| per variant per group.
+
+        4D source ladder per hour: prefer logged ``solar_impact_4d_kwh``
+        from the live shadow learner; otherwise post-mortem replay via
+        ``_replay_4d_solar_total`` from logged DNI/DHI (or synthetic
+        Kasten when only ``cloud_coverage`` is available).  This keeps
+        the 4D variants populated across the rollout window of the
+        shadow learner instead of waiting K weeks for tagging coverage,
+        AND keeps the verdict comparison fair (matched populations).
+
+        Whole-house proxies — per-unit clamp behaviour cannot be exactly
+        recovered from logged whole-house aggregates, but for AGGREGATE
+        medians the proxy is faithful enough to decide whether the
+        saturation discontinuity is the dominant driver of shoulder
+        deviation (vs. Kasten cloud-bias driving over-estimated solar
+        input in the first place).
+
+        Strict diagnostic — reads only ``hourly_log``; writes nothing.
+        Returns ``{"available": False, "reason": ...}`` when there are
+        too few qualifying samples.
+        """
+        cutoff = (dt_util.now() - timedelta(days=days_back)).date().isoformat()
+        bp = float(getattr(self.coordinator, "balance_point", 17.0) or 17.0)
+        shoulder_lo = bp - 3.0
+        shoulder_hi = bp + 1.0
+
+        all_residuals: dict[str, list[float]] = {
+            "expected_3d_clamped": [],
+            "expected_3d_unclamped": [],
+            "expected_4d_clamped": [],
+            "expected_4d_unclamped": [],
+        }
+        sat_residuals: dict[str, list[float]] = {
+            "expected_3d_clamped": [],
+            "expected_3d_unclamped": [],
+            "expected_4d_clamped": [],
+            "expected_4d_unclamped": [],
+        }
+        n_shoulder = 0
+        n_saturation = 0
+        n_4d_tagged = 0
+        n_4d_replayed = 0
+        n_4d_unavailable = 0
+
+        for entry in self.coordinator._hourly_log:
+            ts = entry.get("timestamp", "")
+            if ts[:10] < cutoff:
+                continue
+            temp = entry.get("temp")
+            actual = entry.get("actual_kwh")
+            expected_3d = entry.get("expected_kwh")
+            solar_eff = entry.get("solar_impact_kwh")
+            solar_wasted = entry.get("solar_wasted_kwh", 0.0)
+            if temp is None or actual is None or expected_3d is None or solar_eff is None:
+                continue
+            if not (shoulder_lo <= float(temp) <= shoulder_hi):
+                continue
+
+            n_shoulder += 1
+            sum_base = float(expected_3d) + float(solar_eff)
+            saturation_fired = float(solar_wasted) > ENERGY_GUARD_THRESHOLD
+            if saturation_fired:
+                n_saturation += 1
+
+            variants: dict[str, float] = {
+                "expected_3d_clamped": float(expected_3d),
+                "expected_3d_unclamped": float(expected_3d) - float(solar_wasted),
+            }
+
+            solar_4d_logged = entry.get("solar_impact_4d_kwh")
+            solar_4d_value: float | None = None
+            if solar_4d_logged is not None:
+                solar_4d_value = float(solar_4d_logged)
+                n_4d_tagged += 1
+            else:
+                replay = self._replay_4d_solar_total(entry)
+                if replay is not None:
+                    solar_4d_value = replay
+                    n_4d_replayed += 1
+                else:
+                    n_4d_unavailable += 1
+
+            if solar_4d_value is not None:
+                e4_unclamped = sum_base - solar_4d_value
+                variants["expected_4d_unclamped"] = e4_unclamped
+                variants["expected_4d_clamped"] = max(0.0, e4_unclamped)
+
+            for name, exp in variants.items():
+                resid = abs(float(actual) - exp)
+                all_residuals[name].append(resid)
+                if saturation_fired:
+                    sat_residuals[name].append(resid)
+
+        if n_shoulder < 5:
+            return {
+                "available": False,
+                "reason": "no_shoulder_hours",
+                "n_shoulder_hours": n_shoulder,
+                "days_back": days_back,
+                "balance_point": bp,
+                "shoulder_window": [shoulder_lo, shoulder_hi],
+            }
+
+        def _median(values: list[float]) -> float:
+            n_v = len(values)
+            if n_v == 0:
+                return 0.0
+            s = sorted(values)
+            mid = n_v // 2
+            if n_v % 2 == 1:
+                return s[mid]
+            return (s[mid - 1] + s[mid]) / 2.0
+
+        def _med_block(group: dict[str, list[float]]) -> dict:
+            return {
+                k: round(_median(v), 4) if v else None
+                for k, v in group.items()
+            }
+
+        median_abs = {
+            "all_shoulder": _med_block(all_residuals),
+            "saturation_events_only": _med_block(sat_residuals),
+        }
+
+        # Verdict ref must be matched to whatever 4D-coverage population
+        # we have; with replay populating most/all hours the matched-3D
+        # baseline is also computed on (almost) all hours, but if some
+        # entries were skipped (no DNI/DHI/cloud), we restrict the
+        # comparison to the 4D-populated subset.
+        verdict = "no_meaningful_difference"
+        sat_4d_count = len(sat_residuals["expected_4d_clamped"])
+        sat_3d_count = len(sat_residuals["expected_3d_clamped"])
+        if sat_4d_count > 0 and sat_4d_count < sat_3d_count:
+            # Partial 4D coverage — recompute matched 3D ref on the same
+            # subset by walking again.  Cheap; we already filtered the
+            # populations, but did not retain the mapping back to which
+            # hour's 3D residual corresponds to a 4D-populated hour.
+            # Rather than tracking that mapping, rerun the inner walk
+            # to gather a matched 3D baseline.
+            matched_3d: list[float] = []
+            for entry in self.coordinator._hourly_log:
+                ts = entry.get("timestamp", "")
+                if ts[:10] < cutoff:
+                    continue
+                temp = entry.get("temp")
+                actual = entry.get("actual_kwh")
+                expected_3d = entry.get("expected_kwh")
+                solar_wasted = entry.get("solar_wasted_kwh", 0.0)
+                if temp is None or actual is None or expected_3d is None:
+                    continue
+                if not (shoulder_lo <= float(temp) <= shoulder_hi):
+                    continue
+                if not (float(solar_wasted) > ENERGY_GUARD_THRESHOLD):
+                    continue
+                # Same 4D-availability check as the main loop.
+                if entry.get("solar_impact_4d_kwh") is None:
+                    if self._replay_4d_solar_total(entry) is None:
+                        continue
+                matched_3d.append(abs(float(actual) - float(expected_3d)))
+            ref = _median(matched_3d) if matched_3d else None
+        else:
+            ref = median_abs["saturation_events_only"].get("expected_3d_clamped")
+
+        sat_med = median_abs["saturation_events_only"]
+        if ref is not None and ref > ENERGY_GUARD_THRESHOLD:
+            e4u = sat_med.get("expected_4d_unclamped")
+            e3u = sat_med.get("expected_3d_unclamped")
+            improvements: list[tuple[str, float]] = []
+            if e4u is not None:
+                improvements.append(("4d_unclamped_meaningfully_better",
+                                     (ref - e4u) / ref))
+            if e3u is not None:
+                improvements.append(("soft_saturation_alone_meaningfully_better",
+                                     (ref - e3u) / ref))
+            improvements.sort(key=lambda kv: kv[1], reverse=True)
+            if improvements and improvements[0][1] >= 0.20:
+                verdict = improvements[0][0]
+
+        return {
+            "available": True,
+            "days_back": days_back,
+            "balance_point": bp,
+            "shoulder_window": [shoulder_lo, shoulder_hi],
+            "n_shoulder_hours": n_shoulder,
+            "n_saturation_events": n_saturation,
+            "n_4d_tagged_hours": n_4d_tagged,
+            "n_4d_replayed_hours": n_4d_replayed,
+            "n_4d_unavailable_hours": n_4d_unavailable,
+            "saturation_event_share": (
+                round(n_saturation / n_shoulder, 3) if n_shoulder else 0.0
+            ),
+            "median_abs_residual": median_abs,
+            "matched_3d_ref_kwh": (
+                round(ref, 4) if ref is not None else None
+            ),
+            "verdict": verdict,
+        }
 

@@ -60,6 +60,13 @@ def _reset_coord(hourly_log, *, energy_sensors=("sensor.heater1",)):
     coord._async_save_data = AsyncMock()
     coord.learning = LearningManager()
     coord.solar = SolarCalculator(coord)
+    coord.wind_threshold = 8.0
+    coord.extreme_wind_threshold = 10.8
+    coord._get_wind_bucket = lambda w: (
+        "extreme_wind" if w >= coord.extreme_wind_threshold
+        else "high_wind" if w >= coord.wind_threshold
+        else "normal"
+    )
     coord._unit_strategies = build_strategies(
         energy_sensors=list(energy_sensors),
         track_c_enabled=False,

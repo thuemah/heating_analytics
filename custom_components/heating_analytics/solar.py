@@ -29,6 +29,252 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _eccentricity(day_of_year: int) -> float:
+    """Earth-orbit eccentricity correction factor E_0 (Spencer-style approx)."""
+    return 1.0 + 0.033 * math.cos(2.0 * math.pi * day_of_year / 365.0)
+
+
+def erbs_decomposition(
+    ghi: float,
+    sun_elev_deg: float,
+    day_of_year: int,
+) -> tuple[float, float]:
+    """Erbs (1982) GHI -> (DNI, DHI) decomposition.
+
+    Returns (DNI, DHI) in W/m^2.  Splits the measured global horizontal
+    irradiance into a direct-normal component and a diffuse-horizontal
+    component using the diffuse-fraction model of Erbs, Klein & Duffie
+    (1982).  The model is the meteorological standard reference for
+    single-sensor pyranometer / lux-sensor fallback when neither native
+    DNI nor native DHI is available.
+
+    Documented broken-cloud bias: kT in [0.6, 0.8] tends to over-estimate
+    diffuse fraction by ~10 % on partly-cloudy hours.  This bias is itself
+    measurable downstream via the 4D shadow learner - it is not opaque
+    like the Kasten 3.4 elevation x airmass distortion that motivated the
+    DNI/DHI work in the first place.
+
+    Algorithm:
+        sin_elev = sin(max(0, sun_elev_deg))
+        I_sc     = 1367 W/m^2 (solar constant)
+        E_0      = 1 + 0.033*cos(2*pi*n/365)  (eccentricity correction)
+        GHI_ext  = I_sc * E_0 * sin_elev    (extraterrestrial horizontal)
+        kT       = ghi / GHI_ext            (clearness index)
+        kd       = piecewise-polynomial in kT (see below)
+        DHI      = kd * ghi
+        DNI      = (ghi - DHI) / sin_elev
+
+    Piecewise diffuse fraction (Erbs et al. 1982):
+        kT <= 0.22:        kd = 1.0 - 0.09*kT
+        0.22 < kT <= 0.80: kd = 0.9511 - 0.1604*kT + 4.388*kT^2
+                                - 16.638*kT^3 + 12.336*kT^4
+        kT > 0.80:         kd = 0.165
+
+    Edge cases:
+        sun_elev_deg <= 0 or ghi <= 0 -> return (0.0, 0.0)
+        GHI_ext < 1 W/m^2 (numerical floor near sunrise/sunset) ->
+            return (0.0, ghi)  (treat all measured irradiance as diffuse;
+            DNI is meaningless when the sun is below the horizon)
+        kT > 1.0 (sensor noise / non-physical) -> clamp to 1.0 for kd
+            lookup and treat all surplus as DNI.
+
+    Args:
+        ghi: Global horizontal irradiance in W/m^2 (typically 0-1100).
+        sun_elev_deg: Sun elevation angle in degrees (negative below horizon).
+        day_of_year: 1-366, used for eccentricity correction.
+
+    Returns:
+        (dni, dhi) tuple in W/m^2.  Both >= 0.  DNI clamped to >= 0 in
+        case of numerical rounding when kT ~ 1.
+    """
+    if sun_elev_deg <= 0 or ghi <= 0:
+        return (0.0, 0.0)
+
+    sin_elev = math.sin(math.radians(sun_elev_deg))
+    e_0 = _eccentricity(day_of_year)
+    ghi_ext = 1367.0 * e_0 * sin_elev
+
+    if ghi_ext < 1.0:
+        # Sun too low for meaningful DNI; everything is diffuse.
+        return (0.0, ghi)
+
+    kT = ghi / ghi_ext
+    kT_for_kd = min(kT, 1.0)
+
+    if kT_for_kd <= 0.22:
+        kd = 1.0 - 0.09 * kT_for_kd
+    elif kT_for_kd <= 0.80:
+        kd = (
+            0.9511
+            - 0.1604 * kT_for_kd
+            + 4.388 * kT_for_kd ** 2
+            - 16.638 * kT_for_kd ** 3
+            + 12.336 * kT_for_kd ** 4
+        )
+    else:
+        kd = 0.165
+
+    dhi = kd * ghi
+    dni = max(0.0, (ghi - dhi) / sin_elev)
+    return (dni, dhi)
+
+
+def resolve_dni_dhi(
+    dni_in: float | None,
+    dhi_in: float | None,
+    ghi_in: float | None,
+    cloud_coverage_pct: float | None,
+    sun_elev_deg: float,
+    day_of_year: int,
+) -> tuple[float, float, str]:
+    """Resolve (DNI, DHI) from whichever signals are available.
+
+    Priority ladder (per user choice in design discussion):
+
+        1. GHI sensor -> Erbs decomposition       (source = "erbs_from_ghi")
+        2. Native DNI + DHI                        (source = "native")
+        3. cloud_coverage -> synthetic GHI -> Erbs (source = "kasten_synthetic")
+        4. Nothing available                       (source = "none")
+
+    Rationale for putting GHI ahead of native: a local pyranometer
+    measures the actual sky at the building.  Open-Meteo native DNI/DHI
+    is satellite/model-derived and carries the same regional smoothing
+    bias as the cloud_coverage signal.  Erbs introduces a documented
+    broken-cloud diffuse-fraction bias (see ``erbs_decomposition``),
+    but on installs that have a real GHI sensor the local-truth
+    advantage dominates.  Installs without a GHI sensor get the native
+    path (no Erbs bias), and installs without either fall back to the
+    cloud-cover synthetic path.
+
+    Synthetic GHI from cloud_coverage uses the same Kasten 3.4 attenuation
+    as the live pipeline applied to a simple clear-sky model:
+
+        GHI_clear    = 1367 * E_0 * sin_elev * 0.7^(1/sin_elev)
+        cloud_frac   = cloud_coverage_pct / 100
+        cloud_factor = 1 - 0.75 * cloud_frac^3.4
+        GHI_synth    = GHI_clear * cloud_factor
+
+    This deliberately collapses the same information that the legacy
+    pipeline already has - the kasten_synthetic path is mainly there
+    to keep the downstream 4D code path uniform.  It is NOT expected
+    to improve over the 3D Kasten path; its role is to keep the ladder
+    well-defined when no real DNI/DHI/GHI is configured.
+
+    Args:
+        dni_in, dhi_in: From hourly_log["dni"] / ["dhi"], if available.
+            Both must be non-None for the native path.
+        ghi_in: From hourly_log["ghi"], if a GHI sensor is configured.
+        cloud_coverage_pct: From hourly_log["cloud_coverage_avg"] or
+            equivalent.  Falls through if None.
+        sun_elev_deg: Sun elevation for this hour.  <= 0 -> no sun, return
+            (0, 0, "no_sun").
+        day_of_year: 1-366, threaded into Erbs.
+
+    Returns:
+        (dni, dhi, source) where source in {"erbs_from_ghi", "native",
+        "kasten_synthetic", "no_sun", "none"}.
+    """
+    if sun_elev_deg <= 0:
+        return (0.0, 0.0, "no_sun")
+
+    if ghi_in is not None and ghi_in > 0:
+        dni, dhi = erbs_decomposition(ghi_in, sun_elev_deg, day_of_year)
+        return (dni, dhi, "erbs_from_ghi")
+
+    if dni_in is not None and dhi_in is not None:
+        return (max(0.0, dni_in), max(0.0, dhi_in), "native")
+
+    if cloud_coverage_pct is not None:
+        sin_elev = math.sin(math.radians(sun_elev_deg))
+        air_mass = 1.0 / sin_elev
+        ghi_clear = 1367.0 * _eccentricity(day_of_year) * sin_elev * (0.7 ** air_mass)
+        ghi_synth = max(0.0, ghi_clear * _kasten_cloud_attenuation(cloud_coverage_pct))
+        dni, dhi = erbs_decomposition(ghi_synth, sun_elev_deg, day_of_year)
+        return (dni, dhi, "kasten_synthetic")
+
+    return (0.0, 0.0, "none")
+
+
+def resolve_dni_dhi_for_forecast(
+    weather_hour: dict,
+    sun_elev_deg: float,
+    day_of_year: int,
+    ghi_in: float | None = None,
+) -> tuple[float, float, str]:
+    """Resolve ``(DNI, DHI, source)`` for a forecast-hour dict (#978).
+
+    Wrapper around :func:`resolve_dni_dhi` that knows how to pull native
+    DNI/DHI and cloud-coverage out of a per-hour forecast item dict (as
+    produced by HA's ``weather.get_forecasts`` for an Open-Meteo-style
+    entity).  ``ghi_in`` is plumbed through for completeness but defaults
+    to ``None``: Open-Meteo forecast does not expose forecast GHI per
+    hour on the standard ``weather.get_forecasts`` payload, so installs
+    with a local GHI sensor have live-only data and forecasted hours
+    fall through to the native or Kasten paths.
+
+    The cloud_coverage fallback mirrors the inline pattern already used
+    twice in ``forecast.py`` (around lines ~147-150 / ~1148-1151) so the
+    Kasten leg of the ladder fires off the same condition→% map the
+    legacy 3D scalar path uses.
+
+    Args:
+        weather_hour: One forecast item from ``weather.get_forecasts``.
+            Reads ``direct_normal_irradiance``, ``diffuse_radiation``,
+            ``cloud_coverage`` (with ``condition`` → ``CLOUD_COVERAGE_MAP``
+            fallback) from the dict; missing keys collapse to ``None``.
+        sun_elev_deg: Sun elevation at the forecast hour midpoint.
+        day_of_year: 1-366, threaded into Erbs.
+        ghi_in: Optional explicit GHI; defaults to None (see above).
+
+    Returns:
+        ``(dni, dhi, source)`` per :func:`resolve_dni_dhi`.
+    """
+    dni_in = weather_hour.get("direct_normal_irradiance")
+    dhi_in = weather_hour.get("diffuse_radiation")
+    cloud_cov = weather_hour.get("cloud_coverage")
+    if cloud_cov is None:
+        # Fall back to condition-derived cloud cover, mirroring the
+        # inline pattern in forecast.py for the 3D scalar path.
+        from .const import CLOUD_COVERAGE_MAP
+        cond = weather_hour.get("condition")
+        mapped = CLOUD_COVERAGE_MAP.get(cond) if cond else None
+        cloud_cov = float(mapped) if mapped is not None else None
+    elif cloud_cov is not None:
+        try:
+            cloud_cov = float(cloud_cov)
+        except (TypeError, ValueError):
+            cloud_cov = None
+    return resolve_dni_dhi(dni_in, dhi_in, ghi_in, cloud_cov, sun_elev_deg, day_of_year)
+
+
+def _kasten_cloud_attenuation(cloud_coverage_pct: float) -> float:
+    """Kasten & Czeplak (1980) cloud-factor: 1 - 0.75 * (N/8)^3.4.
+
+    Single source for the Kasten exponent 3.4 — see CLAUDE.md > Solar Model
+    for why this specific exponent is invariant.
+    """
+    cloud_frac = max(0.0, min(1.0, cloud_coverage_pct / 100.0))
+    return 1.0 - 0.75 * cloud_frac ** 3.4
+
+
+def _clear_sky_elevation_factor(elevation_deg: float) -> float:
+    """Vertical-geometry clear-sky factor: cos(elev) * 0.7^airmass.
+
+    Elevation clamped at 1° minimum to keep air mass finite (sin of near-zero
+    angles produces astronomically large AM values with no physical meaning).
+    Returns 0.0 below the horizon.
+    """
+    if elevation_deg <= 0.0:
+        return 0.0
+    safe_elev = max(1.0, elevation_deg)
+    elev_rad = math.radians(safe_elev)
+    am = 1.0 / math.sin(elev_rad)
+    intensity = 0.7 ** am
+    raw_elev_factor = max(0.0, math.cos(elev_rad))
+    return raw_elev_factor * intensity
+
+
 class SolarCalculator:
     """Calculates solar impact on heating/cooling."""
 
@@ -36,27 +282,31 @@ class SolarCalculator:
         """Initialize with reference to coordinator (for configuration/state)."""
         self.coordinator = coordinator
 
-    def calculate_solar_factor(self, elevation: float, azimuth: float, cloud_coverage: float) -> float:
-        """Calculate solar factor (0.0 - 1.0)."""
-        # 1. Elevation Factor
-        # Air Mass and Atmospheric Transmittance Logic
+    def calculate_solar_factor(
+        self,
+        elevation: float,
+        azimuth: float,
+        cloud_coverage: float,
+        *,
+        cloud_attenuation_override: float | None = None,
+    ) -> float:
+        """Calculate solar factor (0.0 - 1.0).
+
+        ``cloud_attenuation_override`` (kw-only) lets the caller substitute
+        a precomputed cloud-transmission factor in [0, 1] for the default
+        Kasten-from-cloud_coverage value.  Used by the 4D-anchored SNR path
+        (#981) so base-EMA weighting consumes the same DNI/DHI signal the
+        live read-path uses, instead of the regional cloud_coverage signal
+        that can diverge from native DNI/DHI on broken-cloud hours.  When
+        DNI/DHI come from the ``kasten_synthetic`` ladder branch the
+        override equals ``_kasten_cloud_attenuation(cloud_coverage)`` by
+        construction, so output is bit-identical to the default path on
+        installs without native DNI/DHI or a local GHI sensor.
+        """
         if elevation <= 0.0:
             return 0.0
 
-        # Cap elevation at 1° minimum to keep air mass finite (sin of near-zero angles
-        # produces astronomically large AM values that carry no physical meaning).
-        safe_elev = max(1.0, elevation)
-        elev_rad = math.radians(safe_elev)
-
-        # Calculate Air Mass (AM) and atmospheric transmittance intensity
-        am = 1.0 / math.sin(elev_rad)
-        intensity = 0.7 ** am
-
-        # Switch to Vertical Geometry: cos(elevation)
-        # This gives higher factors for low sun (Winter) and lower for high sun (Summer)
-        raw_elev_factor = max(0.0, math.cos(elev_rad))
-
-        elev_factor = raw_elev_factor * intensity
+        elev_factor = _clear_sky_elevation_factor(elevation)
 
         # 2. Azimuth Factor (Peak at Configured Azimuth)
         # Kelvin Twist: Uses a 3-zone logic to account for self-shading (egenskygge)
@@ -95,15 +345,10 @@ class SolarCalculator:
             # Zone 3: Backside
             az_factor = BACKSIDE_FLOOR
 
-        # 3. Cloud Factor (Kasten & Czeplak 1980)
-        # G/G_clear = 1 - 0.75 × (N/8)^3.4 where N is oktas.
-        # With cloud_frac = cloud_coverage/100 as fractional sky cover,
-        # the exponent 3.4 produces a nearly constant bias (~1%) across
-        # all cloud levels when using satellite/model-derived percentages,
-        # allowing per-unit coefficients to represent window physics
-        # rather than compensating for cloud-model error.
-        cloud_frac = cloud_coverage / 100.0
-        cloud_factor = 1.0 - 0.75 * cloud_frac ** 3.4
+        if cloud_attenuation_override is not None:
+            cloud_factor = max(0.0, min(1.0, cloud_attenuation_override))
+        else:
+            cloud_factor = _kasten_cloud_attenuation(cloud_coverage)
 
         return elev_factor * az_factor * cloud_factor
 
@@ -123,21 +368,7 @@ class SolarCalculator:
         if elevation <= 0.0:
             return 0.0, 0.0, 0.0
 
-        # Elevation Factor
-        safe_elev = max(1.0, elevation)
-        elev_rad = math.radians(safe_elev)
-
-        am = 1.0 / math.sin(elev_rad)
-        intensity = 0.7 ** am
-
-        raw_elev_factor = max(0.0, math.cos(elev_rad))
-        elev_factor = raw_elev_factor * intensity
-
-        # Cloud Factor (Kasten & Czeplak 1980 — matches calculate_solar_factor)
-        cloud_frac = cloud_coverage / 100.0
-        cloud_factor = 1.0 - 0.75 * cloud_frac ** 3.4
-
-        base_intensity = elev_factor * cloud_factor
+        base_intensity = _clear_sky_elevation_factor(elevation) * _kasten_cloud_attenuation(cloud_coverage)
 
         # 3D Decomposition — non-negative basis functions
         az_rad = math.radians(azimuth)
@@ -146,6 +377,97 @@ class SolarCalculator:
         solar_west = base_intensity * max(0.0, -math.sin(az_rad))
 
         return solar_south, solar_east, solar_west
+
+    def calculate_unit_potential_4d(
+        self,
+        entity_id: str,
+        dni: float,
+        dhi: float,
+        sun_elev_deg: float,
+        sun_azimuth_deg: float,
+        screen_config: tuple[bool, bool, bool] | None,
+        correction_percent: float,
+    ) -> tuple[float, float, float, float]:
+        """4D solar potential for a unit (#954 shadow learner).
+
+        Decomposes (DNI, DHI) into per-facade direct components plus an
+        isotropic diffuse component, both attenuated by the per-direction
+        screen transmittance.  Returns the four-component potential
+        vector that the shadow-learner NLMS / Tobit will fit against.
+
+        Geometry (consistent with the 3D ``calculate_solar_vector``
+        decomposition):
+            cos(elev) factor projects DNI onto the horizontal plane;
+            per-facade horizontal cosine selects the component aligned
+            with that wall's outward normal.
+
+            pot_s_dir = DNI * max(0, cos(elev) * (-cos(az))) * t_s
+            pot_e_dir = DNI * max(0, cos(elev) *   sin(az) ) * t_e
+            pot_w_dir = DNI * max(0, cos(elev) * (-sin(az))) * t_w
+
+            pot_diffuse = DHI * 0.5 * mean(t_s, t_e, t_w)
+
+        The fixed 0.5 represents a vertical window seeing half the
+        hemisphere; per-facade asymmetry is absorbed by ``c_diff``.
+
+        **Direct-beam obstruction gate (#991).**  When the coordinator
+        carries ``_critical_elev_per_facade[f]`` (a float, not None),
+        the corresponding ``pot_dir_facade`` is zeroed whenever
+        ``sun_elev_deg > critical_elev_f``.  This models a fixed
+        external overhang / neighbouring structure / fixed shading that
+        blocks direct beam above a deterministic geometric threshold.
+        Building-level invariant — applies to all entities, not gated by
+        ``screen_affected_entities``.  Diffuse term is intentionally
+        unaffected: a scalar gate cannot reproduce diffuse's smooth
+        hemisphere-fraction dependence on obstruction geometry.
+
+        Args:
+            entity_id: Used only for screen_config lookup at call sites
+                via ``coordinator.screen_config_for_entity(entity_id)``;
+                this method receives the resolved tuple directly.  Kept
+                in the signature for API symmetry with
+                ``calculate_unit_coefficient``.
+            dni, dhi: Direct-normal and diffuse-horizontal irradiance in
+                W/m^2 (typically from ``resolve_dni_dhi``).
+            sun_elev_deg: Sun elevation in degrees.  <= 0 -> zero output.
+            sun_azimuth_deg: Sun azimuth in degrees, 0=N, 90=E, 180=S, 270=W.
+            screen_config: Per-direction screen presence (S, E, W).
+            correction_percent: 0-100 screen slider position.
+
+        Returns:
+            (pot_s_dir, pot_e_dir, pot_w_dir, pot_diffuse), all >= 0.
+        """
+        if sun_elev_deg <= 0.0:
+            return (0.0, 0.0, 0.0, 0.0)
+
+        t_s, t_e, t_w = self._screen_transmittance_vector(
+            correction_percent, screen_config
+        )
+
+        elev_rad = math.radians(sun_elev_deg)
+        az_rad = math.radians(sun_azimuth_deg)
+        cos_elev = math.cos(elev_rad)
+
+        dni_horiz = max(0.0, dni) * cos_elev
+        pot_s_dir = dni_horiz * max(0.0, -math.cos(az_rad)) * t_s
+        pot_e_dir = dni_horiz * max(0.0, math.sin(az_rad)) * t_e
+        pot_w_dir = dni_horiz * max(0.0, -math.sin(az_rad)) * t_w
+
+        crit = getattr(self.coordinator, "_critical_elev_per_facade", None)
+        if isinstance(crit, dict):
+            crit_s = crit.get("s")
+            crit_e = crit.get("e")
+            crit_w = crit.get("w")
+            if crit_s is not None and sun_elev_deg > crit_s:
+                pot_s_dir = 0.0
+            if crit_e is not None and sun_elev_deg > crit_e:
+                pot_e_dir = 0.0
+            if crit_w is not None and sun_elev_deg > crit_w:
+                pot_w_dir = 0.0
+
+        pot_diffuse = max(0.0, dhi) * 0.5 * (t_s + t_e + t_w) / 3.0
+
+        return (pot_s_dir, pot_e_dir, pot_w_dir, pot_diffuse)
 
     @staticmethod
     def _screen_transmittance_vector(
@@ -316,6 +638,111 @@ class SolarCalculator:
         impact = coeff_s * solar_s + coeff_e * solar_e + coeff_w * solar_w
         return max(0.0, impact)
 
+    def calculate_unit_coefficient_4d(
+        self, entity_id: str, temp_key: str, mode: str
+    ) -> dict[str, float]:
+        """4D shadow read of the per-(entity, regime) solar coefficient (#962).
+
+        Strict-shadow counterpart to :meth:`calculate_unit_coefficient`.
+        Reads ``ModelState.solar_coefficients_4d_per_unit`` (falls back to
+        the coordinator's private ``_solar_coefficients_4d_per_unit`` when
+        the model view is missing — happens on test fixtures that build
+        ad-hoc ``ModelProxy`` without 4D awareness).
+
+        Semantics differ from the 3D variant in one important way: there
+        is NO default-azimuth-decomposition fallback.  4D coefficients
+        fire only when explicitly learned — an unlearned regime returns
+        the zero-vector ``{"s": 0, "e": 0, "w": 0, "diffuse": 0}``.
+        Rationale: 3D has a years-long installed base whose live
+        prediction must keep working through a fresh install (hence the
+        seeded default).  4D is shadow-only; it has no installed base and
+        no consumer relying on a sensible "first-hour" prediction.  A
+        silent default would also confound the shadow-vs-live drift
+        diagnostic by treating untrained regimes as if they had a real
+        coefficient.
+
+        Mode → regime mapping mirrors the 3D method exactly (heating /
+        cooling regimes; OFF / DHW route to heating as a stable fallback,
+        but those modes contribute 0 solar at higher layers anyway).
+        Per-entity solar-scope gate (``is_solar_affected``) is honoured —
+        excluded entities return the zero-vector.
+        """
+        del temp_key  # reserved; coefficients are temperature-blind by design
+
+        # Per-entity solar-scope gate (#962) — same pattern as 3D.
+        is_solar_affected_fn = getattr(self.coordinator, "is_solar_affected", None)
+        if callable(is_solar_affected_fn) and not is_solar_affected_fn(entity_id):
+            return {"s": 0.0, "e": 0.0, "w": 0.0, "diffuse": 0.0}
+
+        regime = "cooling" if mode in (MODE_COOLING, MODE_GUEST_COOLING) else "heating"
+
+        # Prefer the ModelState view; fall back to the coordinator's private
+        # attribute for legacy / test ModelProxy fixtures that don't expose
+        # the 4D dict via the model surface.
+        # TODO: once every test ModelProxy/ModelState construction site
+        # threads ``solar_coefficients_4d_per_unit`` through the model
+        # view, drop the private-attribute fallback.
+        coeffs_4d_map = None
+        try:
+            coeffs_4d_map = self.coordinator.model.solar_coefficients_4d_per_unit
+        except AttributeError:
+            coeffs_4d_map = None
+        if coeffs_4d_map is None:
+            coeffs_4d_map = getattr(
+                self.coordinator, "_solar_coefficients_4d_per_unit", None
+            )
+        if not isinstance(coeffs_4d_map, dict):
+            return {"s": 0.0, "e": 0.0, "w": 0.0, "diffuse": 0.0}
+
+        entity_coeffs = coeffs_4d_map.get(entity_id)
+        if not isinstance(entity_coeffs, dict):
+            return {"s": 0.0, "e": 0.0, "w": 0.0, "diffuse": 0.0}
+
+        regime_coeff = entity_coeffs.get(regime)
+        if not isinstance(regime_coeff, dict):
+            return {"s": 0.0, "e": 0.0, "w": 0.0, "diffuse": 0.0}
+
+        # Fire only when explicitly learned AND at least one non-zero
+        # component.  Empty / freshly-initialised dicts return zero.
+        learned = bool(regime_coeff.get("learned"))
+        any_nonzero = any(
+            regime_coeff.get(k) for k in ("s", "e", "w", "diffuse")
+        )
+        if learned and any_nonzero:
+            return {
+                "s": float(regime_coeff.get("s", 0.0)),
+                "e": float(regime_coeff.get("e", 0.0)),
+                "w": float(regime_coeff.get("w", 0.0)),
+                "diffuse": float(regime_coeff.get("diffuse", 0.0)),
+            }
+        return {"s": 0.0, "e": 0.0, "w": 0.0, "diffuse": 0.0}
+
+    @staticmethod
+    def calculate_unit_solar_impact_4d(
+        potential_4d: tuple[float, float, float, float],
+        unit_coeff_4d: dict[str, float],
+    ) -> float:
+        """4D solar impact for a single unit (#962).
+
+        Dot product over four components ``s + e + w + diffuse``.  Per
+        CLAUDE.md invariant #1: the caller passes the per-facade-
+        attenuated *potential* from :meth:`calculate_unit_potential_4d`
+        (which already includes per-direction screen transmittance).  No
+        extra transmittance factor is applied here — multiplying again
+        would yield the same trans² bug the 3D path was hardened against.
+
+        Components and coefficients are individually non-negative
+        (invariant #4); the ``max(0, ...)`` clamp is defence-in-depth.
+        """
+        pot_s, pot_e, pot_w, pot_diff = potential_4d
+        impact = (
+            unit_coeff_4d.get("s", 0.0) * pot_s
+            + unit_coeff_4d.get("e", 0.0) * pot_e
+            + unit_coeff_4d.get("w", 0.0) * pot_w
+            + unit_coeff_4d.get("diffuse", 0.0) * pot_diff
+        )
+        return max(0.0, impact)
+
     def calculate_unit_coefficient(
         self, entity_id: str, temp_key: str, mode: str
     ) -> dict[str, float]:
@@ -441,81 +868,6 @@ class SolarCalculator:
             final_net = net_demand
 
         return round(applied, 3), round(wasted, 3), round(final_net, 3)
-
-    def normalize_for_learning(self, actual_kwh: float, solar_impact: float, val: str | float) -> float:
-        """Normalize actual energy to 'dark' conditions for learning.
-
-        Args:
-            actual_kwh: Actual measured energy.
-            solar_impact: Estimated solar impact.
-            val: Either mode (str) or temperature (float). If temp, mode is derived.
-
-        This removes the solar effect from the actual reading so we can train the base model.
-        - Heating: Actual was reduced by solar. Dark = Actual + Solar.
-        - Cooling: Actual was increased by solar. Dark = Actual - Solar.
-        - Result is clamped to 0.0.
-        """
-        mode = val
-        if isinstance(val, (int, float)):
-            if val < self.coordinator.balance_point:
-                mode = MODE_HEATING
-            else:
-                mode = MODE_COOLING
-
-        if mode in (MODE_HEATING, MODE_GUEST_HEATING):
-            normalized = actual_kwh + solar_impact
-        elif mode in (MODE_COOLING, MODE_GUEST_COOLING):
-            normalized = actual_kwh - solar_impact
-        else:
-            # MODE_OFF or unknown -> No correction
-            normalized = actual_kwh
-
-        return max(0.0, normalized)
-
-    def distribute_solar_impact(
-        self,
-        total_solar_impact_kw: float,
-        predicted_kwh_breakdown: dict[str, float],
-        actual_kwh_breakdown: dict[str, float] | None = None
-    ) -> dict[str, float]:
-        """Distribute global solar impact across heating units.
-
-        Prioritizes distribution based on predicted consumption. If prediction is zero
-        (e.g., during shoulder seasons), it falls back to actual consumption ratios.
-
-        Args:
-            total_solar_impact_kw: The total solar impact to distribute (in kW).
-            predicted_kwh_breakdown: A dict of {entity_id: predicted_kwh}.
-            actual_kwh_breakdown: An optional dict of {entity_id: actual_kwh} for fallback.
-
-        Returns:
-            A dict of {entity_id: distributed_solar_impact_kw}.
-        """
-        if total_solar_impact_kw < ENERGY_GUARD_THRESHOLD:
-            return {entity_id: 0.0 for entity_id in predicted_kwh_breakdown}
-
-        # 1. Try distribution by predicted consumption
-        total_predicted = sum(predicted_kwh_breakdown.values())
-        if total_predicted > ENERGY_GUARD_THRESHOLD:
-            return {
-                entity_id: (pred_kwh / total_predicted) * total_solar_impact_kw
-                for entity_id, pred_kwh in predicted_kwh_breakdown.items()
-            }
-
-        # 2. Fallback to distribution by actual consumption
-        if actual_kwh_breakdown:
-            total_actual = sum(actual_kwh_breakdown.values())
-            if total_actual > ENERGY_GUARD_THRESHOLD:
-                # Ensure we only distribute to units present in the prediction breakdown
-                # to maintain consistency in keys.
-                return {
-                    entity_id: (actual_kwh_breakdown.get(entity_id, 0.0) / total_actual) * total_solar_impact_kw
-                    for entity_id in predicted_kwh_breakdown
-                }
-
-        # 3. If both are zero, distribute evenly (or return zero)
-        # Returning zero is safer to avoid division by zero.
-        return {entity_id: 0.0 for entity_id in predicted_kwh_breakdown}
 
     def get_approx_sun_pos(self, dt_obj: datetime) -> tuple[float, float]:
         """Get sun position (Elevation, Azimuth) for any datetime.

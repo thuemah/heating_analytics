@@ -1203,7 +1203,7 @@ class TestCarryoverReleaseInPrediction:
 
     def test_state_with_heating_units_release_subtracts(self):
         """With non-zero carryover state and heating-mode demand, release subtracts."""
-        # carryover_state = 1.0, decay = 0.80 → release_available = 0.2
+        # carryover_state = 1.0, decay = 0.50 → release_available = 0.5
         coord = self._make_release_coord(
             {"sensor.h1": MODE_HEATING, "sensor.h2": MODE_HEATING},
             carryover_state=1.0,
@@ -1214,10 +1214,10 @@ class TestCarryoverReleaseInPrediction:
             is_aux_active=False, detailed=False,
         )
         assert result["breakdown"]["carryover_release_kwh"] == pytest.approx(
-            0.2, abs=0.01
+            0.5, abs=0.01
         )
-        # total_kwh: 4.0 - 0.2 = 3.8
-        assert result["total_kwh"] == pytest.approx(3.8, abs=0.01)
+        # total_kwh: 4.0 - 0.5 = 3.5
+        assert result["total_kwh"] == pytest.approx(3.5, abs=0.01)
 
     def test_state_with_only_cooling_units_no_release(self):
         """All-cooling install: release gated out (heating_unit_sum_net == 0)."""
@@ -1258,14 +1258,14 @@ class TestCarryoverReleaseInPrediction:
             temp=15.0, effective_wind=0.0, solar_impact=0.0,
             is_aux_active=False, detailed=True,
         )
-        # Heating unit's net_kwh dropped by 0.2 (release_available); cooling
+        # Heating unit's net_kwh dropped by 0.5 (release_available); cooling
         # unit unchanged — release distribution only touches heating-mode
         # entries in unit_breakdown.
         h_baseline = baseline["unit_breakdown"]["sensor.h"]["net_kwh"]
         c_baseline = baseline["unit_breakdown"]["sensor.c"]["net_kwh"]
         h_with_release = result["unit_breakdown"]["sensor.h"]["net_kwh"]
         c_with_release = result["unit_breakdown"]["sensor.c"]["net_kwh"]
-        assert h_with_release == pytest.approx(h_baseline - 0.2, abs=0.01)
+        assert h_with_release == pytest.approx(h_baseline - 0.5, abs=0.01)
         assert c_with_release == c_baseline  # cooling untouched
 
     def test_carryover_override_used_for_forecast_calls(self):
@@ -1281,9 +1281,9 @@ class TestCarryoverReleaseInPrediction:
             is_aux_active=False, detailed=False,
             carryover_state_override=0.5,
         )
-        # Release from override 0.5 × (1 - 0.80) = 0.10, not from live 1.0
+        # Release from override 0.5 × (1 - 0.50) = 0.25, not from live 1.0
         assert result["breakdown"]["carryover_release_kwh"] == pytest.approx(
-            0.10, abs=0.01
+            0.25, abs=0.01
         )
         # With override = 0.0, release stays at 0 even though live state is 1.0
         result_zero = sm.calculate_total_power(
@@ -1366,7 +1366,7 @@ class TestCarryoverReleaseGateP1Regressions:
             temp=15.0, effective_wind=0.0, solar_impact=0.0,
             is_aux_active=False, detailed=True,
         )
-        # Carryover state is 1.0 → release_available = 0.2 if the gate
+        # Carryover state is 1.0 → release_available = 0.5 if the gate
         # had been the loose ``heating_unit_sum_net``.  Strict gate sees
         # no heating-regime units → release stays 0.
         assert result["breakdown"]["carryover_release_kwh"] == 0.0
@@ -1391,15 +1391,15 @@ class TestCarryoverReleaseGateP1Regressions:
             temp=15.0, effective_wind=0.0, solar_impact=0.0,
             is_aux_active=False, detailed=True,
         )
-        # release_available = 1.0 × 0.20 = 0.20.  heating_only_net = 2.0
-        # (just sensor.h's base).  release_applied = min(0.20, 2.0) = 0.20.
+        # release_available = 1.0 × 0.50 = 0.50.  heating_only_net = 2.0
+        # (just sensor.h's base).  release_applied = min(0.50, 2.0) = 0.50.
         assert result["breakdown"]["carryover_release_kwh"] == pytest.approx(
-            0.20, abs=0.01
+            0.50, abs=0.01
         )
         h_net = result["unit_breakdown"]["sensor.h"]["net_kwh"]
         dhw_net = result["unit_breakdown"]["sensor.dhw"]["net_kwh"]
-        # All 0.20 release goes to the single heating unit.
-        assert h_net == pytest.approx(2.0 - 0.20, abs=0.01)
+        # All 0.50 release goes to the single heating unit.
+        assert h_net == pytest.approx(2.0 - 0.50, abs=0.01)
         # DHW unit unchanged from its pre-release base.
         baseline_coord = TestCarryoverReleaseInPrediction._make_release_coord(
             {"sensor.h": MODE_HEATING, "sensor.dhw": MODE_DHW},
@@ -1419,7 +1419,7 @@ class TestCarryoverReleaseGateP1Regressions:
         The forecast helper calls ``calculate_total_power`` once and
         multiplies by 24.  Without an override, each forecast hour
         would credit ``state × (1 − decay)`` of release — for state=1,
-        decay=0.80, that's 0.20 × 24 = 4.8 kWh subtracted.
+        decay=0.50, that's 0.50 × 24 = 12.0 kWh subtracted.
         Physically integrated over 24h: ``state × (1 − decay²⁴) ≈
         state × 1.0`` = 1.0 kWh.
 
@@ -1434,10 +1434,10 @@ class TestCarryoverReleaseGateP1Regressions:
         override, then verify that result × 24 ≈ physically integrated
         24h release.
         """
-        decay = 0.80
+        decay = 0.50
         carryover_state = 1.0
         # Physics: integrated 24h release from initial state 1.0
-        target_24h_release = carryover_state * (1 - decay ** 24)  # ~0.995
+        target_24h_release = carryover_state * (1 - decay ** 24)  # ~1.000
 
         # Override formula from _calculate_from_daily_forecast.
         daily_factor = (1 - decay ** 24) / (24 * (1 - decay))
@@ -1472,7 +1472,7 @@ class TestCarryoverReleaseGateP1Regressions:
             # no override — uses live state (1.0)
         )
         buggy_daily = res_buggy["breakdown"]["carryover_release_kwh"] * 24
-        # The bug would give ~4.8 kWh — confirms the failure mode the
+        # The bug would give ~12.0 kWh — confirms the failure mode the
         # override fix prevents.
         assert buggy_daily > 4.0, (
             f"bug-mode sanity check failed: buggy daily = {buggy_daily:.4f}; "
@@ -1530,9 +1530,9 @@ class TestSumForecastEnergyCarryoverThreading:
 
         def _spy(item, history, wind_unit, cloud, **kwargs):
             captured_overrides.append(kwargs.get("carryover_state_override"))
-            # Return 9-tuple including wasted (last element).  Wasted=0 means
-            # no charge regardless of k.
-            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0)
+            # Return 10-tuple including wasted (9th) and dni_dhi_meta (10th).
+            # Wasted=0 means no charge regardless of k.
+            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0, None)
 
         helper._process_forecast_item = _spy
         now = dt_util.now()
@@ -1591,7 +1591,7 @@ class TestSumForecastEnergyCarryoverThreading:
         def _spy(item, history, wind_unit, cloud, **kwargs):
             captured.append(kwargs.get("carryover_state_override"))
             # Sustained wasted = 1.0 per forecast hour (sunny day).
-            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 1.0)
+            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 1.0, None)
 
         helper._process_forecast_item = _spy
         now = dt_util.now()
@@ -1633,7 +1633,7 @@ class TestSumForecastEnergyCarryoverThreading:
 
         def _spy(item, history, wind_unit, cloud, **kwargs):
             captured.append(kwargs.get("carryover_state_override"))
-            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0)
+            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0, None)
 
         helper._process_forecast_item = _spy
         now = dt_util.now()
@@ -1768,10 +1768,10 @@ class TestReleaseDistributionEdgeCases:
             temp=15.0, effective_wind=0.0, solar_impact=0.0,
             is_aux_active=False, detailed=True,
         )
-        # Release available = 1.0 × 0.20 = 0.20; heating_only_net = 2.0
-        # (h_normal only).  h_normal absorbs the full 0.20.
+        # Release available = 1.0 × 0.50 = 0.50; heating_only_net = 2.0
+        # (h_normal only).  h_normal absorbs the full 0.50.
         h_normal_net = result["unit_breakdown"]["sensor.h_normal"]["net_kwh"]
-        assert h_normal_net == pytest.approx(2.0 - 0.20, abs=0.01), (
+        assert h_normal_net == pytest.approx(2.0 - 0.50, abs=0.01), (
             "positive-demand heating unit should absorb the full release"
         )
         # h_zero stays at zero — release distribution loop's
@@ -1784,22 +1784,23 @@ class TestReleaseDistributionEdgeCases:
 
 
 class TestProcessForecastItemReturnArity:
-    """Pin the 9-tuple contract on ``_process_forecast_item``.
+    """Pin the 10-tuple contract on ``_process_forecast_item``.
 
-    #899 trajectory threading expanded the return tuple from 8 to 9
-    elements (added ``solar_heating_wasted_kwh``).  Two production call
-    sites destructure this tuple explicitly with ``a, b, c, d, e, f,
-    g, h, i = ...`` — if a future refactor reverts the arity those
-    sites raise ``ValueError`` on the next hourly cycle.  These tests
-    pin the arity so a revert is caught at test time.
+    #899 expanded the return tuple from 8 to 9 elements (added
+    ``solar_heating_wasted_kwh``).  #980 extended it to 10 (added
+    ``dni_dhi_meta`` for midnight-snapshot persistence).  Production
+    call sites destructure this tuple explicitly — if a future refactor
+    reverts the arity those sites raise ``ValueError`` on the next
+    hourly cycle.  These tests pin the arity so a revert is caught at
+    test time.
     """
 
-    def test_return_tuple_has_nine_elements(self):
-        """Direct invocation of _process_forecast_item returns 9 elements.
+    def test_return_tuple_has_ten_elements(self):
+        """Direct invocation of _process_forecast_item returns 10 elements.
 
         Synthesises a minimal valid item; we only check the return
         shape.  All call sites — production and test — must destructure
-        a 9-tuple.
+        a 10-tuple.
         """
         from custom_components.heating_analytics.forecast import ForecastManager
 
@@ -1828,14 +1829,15 @@ class TestProcessForecastItemReturnArity:
             wind_unit="m/s",
             default_cloud=50.0,
         )
-        assert len(result) == 9, (
-            f"_process_forecast_item must return a 9-tuple "
+        assert len(result) == 10, (
+            f"_process_forecast_item must return a 10-tuple "
             f"(predicted, solar_kwh, inertia_val, raw_temp, w_speed, "
             f"w_speed_ms, unit_breakdown, aux_impact_kwh, "
-            f"solar_heating_wasted); got {len(result)} elements.  "
-            f"Production call sites in hourly_processor.py and sensor.py "
-            f"destructure 9 elements explicitly — a revert here will "
-            f"crash live with ValueError on the next hourly cycle."
+            f"solar_heating_wasted, dni_dhi_meta); got {len(result)} "
+            f"elements.  Production call sites in hourly_processor.py "
+            f"and forecast.py destructure 10 elements explicitly — a "
+            f"revert here will crash live with ValueError on the next "
+            f"hourly cycle."
         )
         # Last element should be the heating wasted from breakdown.
         assert result[8] == pytest.approx(0.5)

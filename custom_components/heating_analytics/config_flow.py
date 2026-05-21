@@ -86,6 +86,8 @@ from .const import (
     CONF_HOURLY_LOG_RETENTION_DAYS,
     DEFAULT_HOURLY_LOG_RETENTION_DAYS,
     HOURLY_LOG_RETENTION_OPTIONS,
+    CONF_EXPERIMENTAL_4D_PRIMARY,
+    DEFAULT_EXPERIMENTAL_4D_PRIMARY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -99,7 +101,7 @@ _CONF_DEDICATED_WIND = "use_dedicated_wind_sensor"
 class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Heating Analytics."""
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self):
         self._flow_data: dict[str, Any] = {}
@@ -327,12 +329,17 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         }
         return vol.Schema(schema)
 
-    def _schema_advanced(self, user_input, defaults) -> vol.Schema:
+    def _schema_advanced(self, user_input, defaults, *, include_experimental_4d: bool = False) -> vol.Schema:
         """Schema for toggles and miscellaneous options.
 
         All boolean feature toggles live here. Their corresponding sub-fields
         (sensors, paths, entry selectors, wind tuning) are on the *next* page
         (feature_config) so no dynamic re-render is ever needed.
+
+        ``include_experimental_4d`` adds the ``CONF_EXPERIMENTAL_4D_PRIMARY``
+        toggle.  Only the reconfigure path opts in — the flag is for users
+        who already understand the integration and is deliberately absent
+        from the initial setup wizard.
         """
         g = lambda k, d=None: self._v(user_input, defaults, k, d)
 
@@ -436,6 +443,14 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 min=0.5, max=6.0, step=0.5, unit_of_measurement="h", mode="slider"
             )
         )
+        # Experimental: route the live solar read-path through the 4D shadow
+        # pipeline (#962).  No-op until follow-up read-path wiring lands.
+        # Reconfigure-only — initial setup wizard never exposes this.
+        if include_experimental_4d:
+            schema[vol.Optional(
+                CONF_EXPERIMENTAL_4D_PRIMARY,
+                default=bool(g(CONF_EXPERIMENTAL_4D_PRIMARY, DEFAULT_EXPERIMENTAL_4D_PRIMARY)),
+            )] = selector.BooleanSelector()
         # --- Lower-priority fields at the bottom ---
         schema[vol.Optional("csv_auto_logging", default=g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING))] = selector.BooleanSelector()
         schema[vol.Optional("max_energy_delta", default=g("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA))] = (
@@ -537,7 +552,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 display_extreme = stored_e
 
         max_wind = {WIND_UNIT_KMH: 80.0, WIND_UNIT_KNOTS: 40.0}.get(current_unit, 20.0)
-        max_extreme = {WIND_UNIT_KMH: 120.0, WIND_UNIT_KNOTS: 60.0}.get(current_unit, 30.0)
+        max_extreme = {WIND_UNIT_KMH: 180.0, WIND_UNIT_KNOTS: 90.0}.get(current_unit, 50.0)
 
         schema[vol.Required("wind_gust_factor", default=g("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR))] = (
             selector.NumberSelector(
@@ -690,7 +705,8 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # Explicitly write all boolean keys so that a False value is always
             # present in _flow_data even if HA omits it from user_input.
             for _k in (CONF_DAILY_LEARNING_MODE, _CONF_LOAD_SHIFT, CONF_TRACK_C,
-                       "csv_auto_logging", CONF_ENABLE_LIFETIME_TRACKING, _CONF_DEDICATED_WIND):
+                       "csv_auto_logging", CONF_ENABLE_LIFETIME_TRACKING, _CONF_DEDICATED_WIND,
+                       CONF_EXPERIMENTAL_4D_PRIMARY):
                 self._flow_data[_k] = bool(user_input.get(_k, False))
             # Run aux migration here — CONF_AUX_AFFECTED_ENTITIES is on this page
             # and _flow_data now has the new value regardless of whether the
@@ -716,7 +732,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         return self.async_show_form(
             step_id="reconfigure_advanced",
-            data_schema=self._schema_advanced(None, self._flow_data),
+            data_schema=self._schema_advanced(None, self._flow_data, include_experimental_4d=True),
         )
 
     async def async_step_reconfigure_feature_config(self, user_input=None) -> FlowResult:

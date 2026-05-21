@@ -1,23 +1,13 @@
 import math
-from tests.helpers import CoordinatorModelMixin
 import pytest
-from datetime import datetime, timedelta
+from datetime import timedelta
 from homeassistant.util import dt as dt_util
 from custom_components.heating_analytics.statistics import StatisticsManager
 
-class MockCoordinator(CoordinatorModelMixin):
-    def __init__(self):
-        self.solar_azimuth = 180
-        self.balance_point = 17.0
-        self._hourly_log = []
-        self._correlation_data = {}
-
-@pytest.fixture
-def mock_coordinator():
-    return MockCoordinator()
-
 @pytest.fixture
 def statistics_manager(mock_coordinator):
+    """Statistics manager with pre-configured coordinator for inertia tests."""
+    mock_coordinator.balance_point = 17.0
     return StatisticsManager(mock_coordinator)
 
 def test_calibrate_inertia_not_enough_data(statistics_manager):

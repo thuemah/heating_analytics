@@ -11,6 +11,7 @@ from homeassistant.const import UnitOfSpeed
 from homeassistant.exceptions import HomeAssistantError
 
 from .helpers import convert_speed_to_ms, get_last_year_iso_date
+from .solar import resolve_dni_dhi_for_forecast
 from .explanation import WeatherImpactAnalyzer, ExplanationFormatter
 from .const import (
     CONF_FORECAST_CROSSOVER_DAY,
@@ -41,6 +42,7 @@ from .const import (
     ATTR_WEEK_START_DATE,
     ATTR_WEEK_END_DATE,
     DEFAULT_CLOUD_COVERAGE,
+    SOLAR_BATTERY_DECAY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -161,6 +163,15 @@ class ForecastManager:
                             "bucket": bucket,
                             "solar_factor": solar_factor,
                             "solar_vector": solar_vector,
+                            # 4D inputs (#978).  Stored alongside the
+                            # 3D solar_factor/solar_vector so plan-
+                            # revision sites #3 / #5 can resolve
+                            # native DNI/DHI for the 4D leg without a
+                            # second pass over the forecast source.
+                            "direct_normal_irradiance": f.get("direct_normal_irradiance"),
+                            "diffuse_radiation": f.get("diffuse_radiation"),
+                            "cloud_coverage": f.get("cloud_coverage"),
+                            "condition": f.get("condition"),
                         }
                 except (ValueError, TypeError):
                     pass
@@ -250,7 +261,16 @@ class ForecastManager:
 
         self._update_stable_tdd_today()
 
-        if not self._midnight_forecast_snapshot or self._midnight_forecast_snapshot.get("date") != today_str:
+        # Midnight snapshot capture is gated to the 00:00-00:20 window (matches the
+        # reference-refresh window above). Outside this window we do NOT fall back to
+        # a "first-valid-of-day" capture — a snapshot taken at 07:30 is not a midnight
+        # baseline and would contaminate deviation analysis. Missed days are surfaced
+        # as a warning and ATTR_MIDNIGHT_FORECAST simply isn't published.
+        snapshot_date = self._midnight_forecast_snapshot.get("date") if self._midnight_forecast_snapshot else None
+        needs_capture = snapshot_date != today_str and snapshot_date != f"{today_str}:missed"
+        in_capture_window = now.hour == 0 and now.minute < 20
+
+        if needs_capture and in_capture_window:
             snapshot_data = self._capture_daily_forecast_snapshot()
             full_day_forecast = snapshot_data["kwh"]
 
@@ -268,7 +288,7 @@ class ForecastManager:
                 snapshot_source = "blended"
 
             if 0 < full_day_forecast < 200:
-                self._midnight_forecast_snapshot = {
+                snapshot = {
                     "date": today_str,
                     "kwh": round(full_day_forecast, 2),
                     "unit_estimates": snapshot_data["unit_estimates"],
@@ -278,14 +298,40 @@ class ForecastManager:
                     "primary_entity": snapshot_data.get("primary_entity"),
                     "secondary_entity": snapshot_data.get("secondary_entity"),
                     "crossover_day": snapshot_data.get("crossover_day"),
-                    "hourly_plan": snapshot_data.get("hourly_plan", [])
+                    "hourly_plan": snapshot_data.get("hourly_plan", []),
                 }
+                # #980: persist 4D-leg forecast inputs (DNI/DHI etc.) only when the
+                # 4D path actually ran. Empty list under flag=False or sun-down
+                # days — omit the key entirely so flag=False snapshots are
+                # bit-identical to the pre-#980 shape.
+                inputs_4d = snapshot_data.get("hourly_inputs_4d", [])
+                if inputs_4d:
+                    snapshot["hourly_inputs_4d"] = inputs_4d
+                self._midnight_forecast_snapshot = snapshot
                 _LOGGER.info(f"Captured Midnight Forecast Snapshot: {full_day_forecast:.2f} kWh (Source: {snapshot_source})")
+        elif needs_capture and now.hour >= 1 and self.coordinator.hass.is_running:
+            # Past the 00:00-00:20 window without a successful capture — record a sentinel
+            # so we don't keep retrying (and don't log the warning every minute).
+            _LOGGER.warning(
+                "No midnight forecast snapshot for %s — reference forecast was not available "
+                "during the 00:00-00:20 capture window. ATTR_MIDNIGHT_FORECAST will not be published today.",
+                today_str,
+            )
+            self._midnight_forecast_snapshot = {"date": f"{today_str}:missed"}
 
         if self._midnight_forecast_snapshot and self._midnight_forecast_snapshot.get("date") == today_str:
             self.coordinator.data[ATTR_MIDNIGHT_FORECAST] = self._midnight_forecast_snapshot["kwh"]
             self.coordinator.data[ATTR_MIDNIGHT_UNIT_ESTIMATES] = self._midnight_forecast_snapshot.get("unit_estimates")
             self.coordinator.data[ATTR_MIDNIGHT_UNIT_MODES] = self._midnight_forecast_snapshot.get("unit_modes")
+        else:
+            # Stale (yesterday) snapshot OR missed-day sentinel ({today}:missed) —
+            # drop the previously published values so downstream sensors fall back
+            # to their .get(ATTR, 0.0) defaults instead of carrying yesterday's
+            # budget into today.  Without this, a missed capture day would
+            # silently keep showing the prior day's forecast.
+            self.coordinator.data.pop(ATTR_MIDNIGHT_FORECAST, None)
+            self.coordinator.data.pop(ATTR_MIDNIGHT_UNIT_ESTIMATES, None)
+            self.coordinator.data.pop(ATTR_MIDNIGHT_UNIT_MODES, None)
 
     async def _fetch_and_blend_forecasts(self) -> tuple[list, list, list, list, list, list]:
         """Fetch forecasts from primary and secondary sources and blend them.
@@ -587,7 +633,8 @@ class ForecastManager:
             "primary_entity": primary_entity,
             "secondary_entity": secondary_entity,
             "crossover_day": crossover_day,
-            "hourly_plan": hourly_plan
+            "hourly_plan": hourly_plan,
+            "hourly_inputs_4d": res_main.get("hourly_inputs_4d", []),
         }
 
     def calculate_future_energy(self, start_time: datetime, ignore_aux: bool = False, force_aux: bool = False, screen_override: float | None = None, force_no_wind: bool = False) -> tuple[float, float, dict[str, float]]:
@@ -710,7 +757,7 @@ class ForecastManager:
 
         # 3. Call the internal processing function to get the kWh value
         # We pass a copy of inertia_history because _process_forecast_item modifies it.
-        predicted_kwh, _, _, _, _, _, unit_breakdown, _, _ = self._process_forecast_item(
+        predicted_kwh, _, _, _, _, _, unit_breakdown, _, _, _ = self._process_forecast_item(
             item=forecast_item,
             inertia_history=list(inertia_history),
             wind_unit=weather_wind_unit,
@@ -1012,8 +1059,8 @@ class ForecastManager:
         # Type-guarded against MagicMock test fixtures.
         _state_attr = getattr(self.coordinator, "_solar_carryover_state", 0.0)
         carryover_now = _state_attr if isinstance(_state_attr, (int, float)) else 0.0
-        _decay_attr = getattr(self.coordinator, "solar_battery_decay", 0.80)
-        decay_for_forecast = _decay_attr if isinstance(_decay_attr, (int, float)) else 0.80
+        _decay_attr = getattr(self.coordinator, "solar_battery_decay", SOLAR_BATTERY_DECAY)
+        decay_for_forecast = _decay_attr if isinstance(_decay_attr, (int, float)) else SOLAR_BATTERY_DECAY
         _k_attr = getattr(self.coordinator, "battery_thermal_feedback_k", 0.0)
         k_for_forecast = _k_attr if isinstance(_k_attr, (int, float)) else 0.0
         now_for_forecast = dt_util.now()
@@ -1022,6 +1069,13 @@ class ForecastManager:
         # forecast item's offset (no charge data for hours between now
         # and forecast start, so pure decay is the only physically
         # defensible choice for that gap).
+        # Under ``experimental_4d_primary``: the 4D primitive does not
+        # accept ``carryover_state_override`` and returns
+        # ``solar_heating_wasted_kwh = 0`` / ``carryover_release_kwh = 0``,
+        # so this loop becomes a natural no-op (decay × 0 = 0).  Matches
+        # the live-path semantic where carryover charging is paused
+        # under the flag.  See CLAUDE.md > Solar Model > 4D shadow
+        # learner and #978.
         local_carryover = carryover_now
         current_offset = 0
 
@@ -1048,7 +1102,7 @@ class ForecastManager:
                 current_offset += 1
 
             (predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms,
-             _, _, predicted_wasted) = self._process_forecast_item(
+             _, _, predicted_wasted, _) = self._process_forecast_item(
                 f, local_inertia_history, weather_wind_unit, current_cloud,
                 ignore_aux=ignore_aux,
                 carryover_state_override=local_carryover,
@@ -1098,7 +1152,7 @@ class ForecastManager:
         screen_override: float | None = None,
         force_no_wind: bool = False,
         carryover_state_override: float | None = None,
-    ) -> tuple[float, float, float, float, float, float, dict, float]:
+    ) -> tuple[float, float, float, float, float, float, dict, float, float, dict | None]:
         """Process a single forecast item for energy prediction.
 
         Args:
@@ -1112,7 +1166,12 @@ class ForecastManager:
             force_no_wind: If True, forces effective wind to 0.0.
 
         Returns:
-            (predicted_kwh, solar_kwh, inertia_val, raw_temp, wind_speed_raw, wind_speed_ms, unit_breakdown, aux_impact_kwh)
+            (predicted_kwh, solar_kwh, inertia_val, raw_temp, wind_speed_raw, wind_speed_ms,
+             unit_breakdown, aux_impact_kwh, solar_heating_wasted_kwh, dni_dhi_meta)
+
+            ``dni_dhi_meta`` is a dict capturing the 4D-leg inputs actually fed to
+            ``calculate_total_power_4d`` (see #980), or None when the 4D leg was
+            not invoked (flag off, solar disabled, no usable signal, or no-sun hour).
         """
         raw_temp = float(item.get("temperature", 0.0))
 
@@ -1215,17 +1274,63 @@ class ForecastManager:
             except (TypeError, ValueError):
                 _item_dt = None
 
-        res = self.coordinator.statistics.calculate_total_power(
-            temp=inertia_val,
-            effective_wind=effective_wind,
-            solar_impact=0.0, # Unused
-            is_aux_active=is_aux,
-            unit_modes=None, # Use current coordinator state modes (defaults to internal)
-            override_solar_factor=effective_factor,
-            override_solar_vector=effective_solar_vector,
-            carryover_state_override=carryover_state_override,
-            override_now=_item_dt,
-        )
+        # Resolve forecast-hour DNI/DHI for the 4D leg (#978).  Only
+        # invoked when the flag is on AND the forecast item provides a
+        # usable signal (native DNI/DHI on the weather entity or a
+        # cloud_coverage value the Kasten fallback can consume).
+        _dni_dhi = None
+        _dni_dhi_source = "none"
+        _corr_for_4d = None
+        _dni_resolved = None
+        _dhi_resolved = None
+        if (
+            getattr(self.coordinator, "experimental_4d_primary", False) is True
+            and self.coordinator.solar_enabled
+            and _item_dt is not None
+            and elev is not None
+        ):
+            try:
+                _dni, _dhi, _dni_dhi_source = resolve_dni_dhi_for_forecast(
+                    item,
+                    sun_elev_deg=float(elev),
+                    day_of_year=_item_dt.timetuple().tm_yday,
+                )
+                if _dni_dhi_source not in ("none", "no_sun"):
+                    _dni_dhi = (_dni, _dhi)
+                    _corr_for_4d = correction_percent
+                    _dni_resolved = _dni
+                    _dhi_resolved = _dhi
+            except (TypeError, ValueError):
+                _dni_dhi = None
+
+        if _dni_dhi is not None:
+            # 4D dispatch (#978).  Drops the 3D-only overrides so the 4D
+            # primitive forward-computes its own potential from native
+            # DNI/DHI + the predicted screen position.  Site #1.
+            res = self.coordinator.statistics.calculate_total_power(
+                temp=inertia_val,
+                effective_wind=effective_wind,
+                solar_impact=0.0,
+                is_aux_active=is_aux,
+                unit_modes=None,
+                override_now=_item_dt,
+                override_dni_dhi=_dni_dhi,
+                override_correction_percent=_corr_for_4d,
+            )
+        else:
+            # 3D path (flag off, no usable forecast-hour DNI/DHI signal,
+            # or solar disabled).  Bit-identical to pre-#978 behaviour.
+            res = self.coordinator.statistics.calculate_total_power(
+                temp=inertia_val,
+                effective_wind=effective_wind,
+                solar_impact=0.0, # Unused
+                is_aux_active=is_aux,
+                unit_modes=None, # Use current coordinator state modes (defaults to internal)
+                override_solar_factor=effective_factor,
+                override_solar_vector=effective_solar_vector,
+                carryover_state_override=carryover_state_override,
+                override_now=_item_dt,
+            )
 
         predicted = res["total_kwh"]
         solar_kwh = res["breakdown"]["solar_reduction_kwh"]
@@ -1239,7 +1344,27 @@ class ForecastManager:
         # approach assumed away.
         solar_heating_wasted = res["breakdown"].get("solar_heating_wasted_kwh", 0.0)
 
-        return predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown, aux_impact_kwh, solar_heating_wasted
+        # 4D leg metadata for #980 post-hoc debugging.  Only populated when the 4D
+        # dispatch actually ran (flag on + usable DNI/DHI signal).  Persisted into
+        # the midnight snapshot's ``hourly_inputs_4d`` so a later diagnose pass
+        # can separate forecast-input error from model-coefficient error.
+        dni_dhi_meta = None
+        if _dni_dhi is not None and _item_dt is not None:
+            try:
+                _cloud_meta = float(forecast_cloud) if forecast_cloud is not None else None
+            except (TypeError, ValueError):
+                _cloud_meta = None
+            dni_dhi_meta = {
+                "hour": _item_dt.isoformat(),
+                "dni": round(float(_dni_resolved), 2) if _dni_resolved is not None else None,
+                "dhi": round(float(_dhi_resolved), 2) if _dhi_resolved is not None else None,
+                "dni_dhi_source": _dni_dhi_source,
+                "cloud_coverage": _cloud_meta,
+                "correction_percent": round(float(_corr_for_4d), 1) if _corr_for_4d is not None else None,
+                "sun_elev_deg": round(float(elev), 2) if elev is not None else None,
+            }
+
+        return predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown, aux_impact_kwh, solar_heating_wasted, dni_dhi_meta
 
     def _calculate_from_daily_forecast(
         self,
@@ -1290,49 +1415,192 @@ class ForecastManager:
         if not ignore_aux:
             is_aux = self.coordinator.auxiliary_heating_active
 
-        # calculate_total_power returns Hourly Power (or energy per hour)
-        # We need to multiply by 24 for daily.
-        #
-        # Carry-over reservoir override for daily forecast (#896 follow-up).
-        # The single calculate_total_power call below gets multiplied by
-        # 24.  Without an override every daily forecast would credit
-        # ``state × (1 − decay) × 24`` of release — for state=1 and
-        # decay=0.80 that's 4.8 kWh, vs the physically integrated 24h
-        # release ``state × (1 − decay²⁴) ≈ state × 1.0`` ≈ 1.0 kWh
-        # under the same conditions.  Material under-prediction of
-        # daily-forecast demand.  We solve algebraically: pass an
-        # override that makes ``override × (1 − decay) × 24`` equal to
-        # the integrated 24h release, i.e.
-        #   ``override = state × (1 − decay²⁴) / (24 × (1 − decay))``.
-        # For decay=0.80: factor ≈ 0.207, so the per-call subtraction
-        # is ~0.04 kWh and the × 24 daily total is ~1.0 kWh — matches
-        # physics.  For distant-day forecasts the live state has
-        # already been forward-decayed by the call at the hourly path
-        # if used; here it represents the state at start of day, so
-        # this formula correctly integrates over that day's discharge.
         _state_attr = getattr(self.coordinator, "_solar_carryover_state", 0.0)
         _carryover_state = _state_attr if isinstance(_state_attr, (int, float)) else 0.0
-        _decay_attr = getattr(self.coordinator, "solar_battery_decay", 0.80)
-        _decay = _decay_attr if isinstance(_decay_attr, (int, float)) else 0.80
-        if _carryover_state > 0.0 and 0.0 < _decay < 1.0:
-            _daily_factor = (1 - _decay ** 24) / (24 * (1 - _decay))
-            _carryover_for_daily = _carryover_state * _daily_factor
+        _decay_attr = getattr(self.coordinator, "solar_battery_decay", SOLAR_BATTERY_DECAY)
+        _decay = _decay_attr if isinstance(_decay_attr, (int, float)) else SOLAR_BATTERY_DECAY
+
+        flag_4d = getattr(self.coordinator, "experimental_4d_primary", False) is True
+
+        if flag_4d and self.coordinator.solar_enabled:
+            # 4D daily-forecast path (#978).  Replace the single
+            # ``calculate_total_power × 24`` with 24 hourly 4D calls,
+            # each at hour-midpoint sun position with per-hour
+            # DNI/DHI resolved from the day-level ``cloud_coverage``
+            # via the Kasten leg of ``resolve_dni_dhi_for_forecast``.
+            #
+            # Physics rationale: clear-sky DNI varies by ~3× between
+            # dawn/dusk and noon as a function of sun elevation; a
+            # single day-average call collapses that into nonsense
+            # for the 4D primitive (which reconstructs potential
+            # from DNI/DHI + sun position internally).  The 24-call
+            # loop matches the per-hour evolution the hourly forecast
+            # path already uses in ``_sum_forecast_energy_internal``.
+            #
+            # Daily-forecast input does not carry per-hour
+            # temperature/wind/cloud_coverage variation — those stay
+            # at day-average values across all 24 calls.  Only the
+            # solar inputs (sun position, DNI/DHI, screen prediction)
+            # vary per hour.
+            # Build local midnight for the target date.  A naive datetime
+            # fed to ``dt_util.as_local`` is treated as UTC first and then
+            # converted, which shifts the 24-hour window into the wrong
+            # local day in non-UTC timezones (e.g. UTC-8 starts the loop
+            # at 16:00 the previous local day).  Take ``dt_util.now()``'s
+            # tzinfo as the authoritative local tz, then replace the
+            # date components and zero the time — produces true local
+            # midnight on the target date regardless of timezone.
+            day_start_local = dt_util.now().replace(
+                year=target_date.year,
+                month=target_date.month,
+                day=target_date.day,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            day_of_year = target_date.timetuple().tm_yday
+            current_setting = self.coordinator.solar_correction_percent
+            cloud_cov = DEFAULT_CLOUD_COVERAGE
+            if daily_item.get("cloud_coverage") is not None:
+                cloud_cov = float(daily_item.get("cloud_coverage"))
+            elif daily_item.get("condition") and daily_item.get("condition") in CLOUD_COVERAGE_MAP:
+                cloud_cov = float(CLOUD_COVERAGE_MAP[daily_item.get("condition")])
+            # Per-hour weather_hour for the resolver — re-uses the
+            # day-level fields; the resolver consumes
+            # ``direct_normal_irradiance``, ``diffuse_radiation``,
+            # ``cloud_coverage`` and falls back through Kasten.
+            per_hour_weather_base = {
+                "cloud_coverage": cloud_cov,
+                "condition": daily_item.get("condition"),
+            }
+            # Optional native DNI/DHI on the daily payload — Open-Meteo
+            # daily aggregates do not carry these, but keep the
+            # plumbing symmetric with the hourly path so a non-standard
+            # provider can short-circuit Kasten.
+            if daily_item.get("direct_normal_irradiance") is not None:
+                per_hour_weather_base["direct_normal_irradiance"] = daily_item.get("direct_normal_irradiance")
+            if daily_item.get("diffuse_radiation") is not None:
+                per_hour_weather_base["diffuse_radiation"] = daily_item.get("diffuse_radiation")
+
+            total_kwh_24h = 0.0
+            solar_kwh_24h = 0.0
+            local_carryover = _carryover_state
+            _k_attr = getattr(self.coordinator, "battery_thermal_feedback_k", 0.0)
+            k_for_forecast = _k_attr if isinstance(_k_attr, (int, float)) else 0.0
+
+            for hour_idx in range(24):
+                hour_dt = day_start_local + timedelta(hours=hour_idx)
+                # Hour-midpoint sun position.
+                mid_dt = hour_dt + timedelta(minutes=30)
+                elev, azimuth = self.coordinator.solar.get_approx_sun_pos(mid_dt)
+
+                _dni_dhi = None
+                _corr_for_4d = None
+                if elev is not None and elev > 0:
+                    try:
+                        dni, dhi, source = resolve_dni_dhi_for_forecast(
+                            per_hour_weather_base,
+                            sun_elev_deg=float(elev),
+                            day_of_year=day_of_year,
+                        )
+                        if source not in ("none", "no_sun"):
+                            _dni_dhi = (dni, dhi)
+                            # Screen prediction per hour via solar_optimizer
+                            # (matches site #1 hourly forecast path).
+                            potential_factor = self.coordinator.solar.calculate_solar_factor(
+                                elev, azimuth, cloud_cov,
+                            )
+                            rec_state = self.coordinator.solar_optimizer.get_recommendation_state(
+                                avg_temp, potential_factor,
+                            )
+                            _corr_for_4d = self.coordinator.solar_optimizer.predict_correction_percent(
+                                rec_state, elev, azimuth, current_setting,
+                            )
+                    except (TypeError, ValueError):
+                        _dni_dhi = None
+
+                if _dni_dhi is not None:
+                    res_h = self.coordinator.statistics.calculate_total_power(
+                        temp=avg_temp,
+                        effective_wind=effective_wind,
+                        solar_impact=0.0,
+                        is_aux_active=is_aux,
+                        unit_modes=None,
+                        override_now=hour_dt,
+                        override_dni_dhi=_dni_dhi,
+                        override_correction_percent=_corr_for_4d,
+                    )
+                else:
+                    # Sun below horizon (or resolver returned no signal):
+                    # fall through to a 3D call with zero solar inputs
+                    # for this hour.  Matches the hourly forecast path's
+                    # behaviour for dark hours.
+                    res_h = self.coordinator.statistics.calculate_total_power(
+                        temp=avg_temp,
+                        effective_wind=effective_wind,
+                        solar_impact=0.0,
+                        is_aux_active=is_aux,
+                        unit_modes=None,
+                        override_solar_factor=0.0,
+                        override_solar_vector=(0.0, 0.0, 0.0),
+                        carryover_state_override=local_carryover,
+                        override_now=hour_dt,
+                    )
+
+                total_kwh_24h += res_h["total_kwh"]
+                solar_kwh_24h += res_h["breakdown"].get("solar_reduction_kwh", 0.0)
+                # Per-hour carryover EMA evolution — mirrors the
+                # ``_sum_forecast_energy_internal`` loop arithmetic.
+                wasted = res_h["breakdown"].get("solar_heating_wasted_kwh", 0.0)
+                charge_input = k_for_forecast * wasted if k_for_forecast > 0.0 else 0.0
+                local_carryover = (
+                    local_carryover * _decay + charge_input * (1 - _decay)
+                )
+
+            predicted_24h = total_kwh_24h
+            solar_impact_24h = solar_kwh_24h
         else:
-            _carryover_for_daily = 0.0
+            # Legacy 3D single-call-times-24 path.  Bit-identical to
+            # pre-#978 behaviour.
+            #
+            # Carry-over reservoir override for daily forecast (#896
+            # follow-up).  The single calculate_total_power call below
+            # gets multiplied by 24.  Without an override every daily
+            # forecast would credit ``state × (1 − decay) × 24`` of
+            # release — for state=1 and decay=0.50 that's 12.0 kWh, vs
+            # the physically integrated 24h release
+            # ``state × (1 − decay²⁴) ≈ state × 1.0`` ≈ 1.0 kWh under
+            # the same conditions.  Material under-prediction of
+            # daily-forecast demand.  We solve algebraically: pass an
+            # override that makes ``override × (1 − decay) × 24`` equal
+            # to the integrated 24h release, i.e.
+            #   ``override = state × (1 − decay²⁴) / (24 × (1 − decay))``.
+            # For decay=0.50: factor ≈ 0.0833, so the per-call
+            # subtraction is ~0.042 kWh and the × 24 daily total is
+            # ~1.0 kWh — matches physics.  The 4D path above does not
+            # need this algebra because each of its 24 hourly calls
+            # computes its own release naturally from the per-hour
+            # EMA state.
+            if _carryover_state > 0.0 and 0.0 < _decay < 1.0:
+                _daily_factor = (1 - _decay ** 24) / (24 * (1 - _decay))
+                _carryover_for_daily = _carryover_state * _daily_factor
+            else:
+                _carryover_for_daily = 0.0
 
-        res = self.coordinator.statistics.calculate_total_power(
-            temp=avg_temp,
-            effective_wind=effective_wind,
-            solar_impact=0.0, # Unused
-            is_aux_active=is_aux,
-            unit_modes=None,
-            override_solar_factor=s_factor,
-            override_solar_vector=s_vector,
-            carryover_state_override=_carryover_for_daily,
-        )
+            res = self.coordinator.statistics.calculate_total_power(
+                temp=avg_temp,
+                effective_wind=effective_wind,
+                solar_impact=0.0, # Unused
+                is_aux_active=is_aux,
+                unit_modes=None,
+                override_solar_factor=s_factor,
+                override_solar_vector=s_vector,
+                carryover_state_override=_carryover_for_daily,
+            )
 
-        predicted_24h = res["total_kwh"] * 24.0
-        solar_impact_24h = res["breakdown"]["solar_reduction_kwh"] * 24.0
+            predicted_24h = res["total_kwh"] * 24.0
+            solar_impact_24h = res["breakdown"]["solar_reduction_kwh"] * 24.0
 
         weather_stats = {
             "temp": round(avg_temp, 1),
@@ -1372,6 +1640,10 @@ class ForecastManager:
         count = 0
         unit_totals = {}
         hourly_plan = []
+        # Per-hour 4D-leg inputs (DNI/DHI etc.) captured for snapshot persistence
+        # under ``experimental_4d_primary`` — see #980.  Empty when the flag is off
+        # or no 4D dispatch occurred for any item in the window.
+        hourly_inputs_4d = []
 
         local_history = list(inertia_history)
 
@@ -1389,8 +1661,8 @@ class ForecastManager:
         # — bit-identical to the earlier ``decay^N`` form.
         _state_attr = getattr(self.coordinator, "_solar_carryover_state", 0.0)
         carryover_now = _state_attr if isinstance(_state_attr, (int, float)) else 0.0
-        _decay_attr = getattr(self.coordinator, "solar_battery_decay", 0.80)
-        decay_for_forecast = _decay_attr if isinstance(_decay_attr, (int, float)) else 0.80
+        _decay_attr = getattr(self.coordinator, "solar_battery_decay", SOLAR_BATTERY_DECAY)
+        decay_for_forecast = _decay_attr if isinstance(_decay_attr, (int, float)) else SOLAR_BATTERY_DECAY
         _k_attr = getattr(self.coordinator, "battery_thermal_feedback_k", 0.0)
         k_for_forecast = _k_attr if isinstance(_k_attr, (int, float)) else 0.0
         now_for_forecast = dt_util.now()
@@ -1426,6 +1698,9 @@ class ForecastManager:
                 )
                 # Capture predicted wasted for the trajectory charge step.
                 predicted_wasted = res[8]
+                dni_dhi_meta = res[9]
+                if dni_dhi_meta is not None:
+                    hourly_inputs_4d.append(dni_dhi_meta)
                 # One EMA step to evolve state forward to next hour.
                 charge_input = k_for_forecast * predicted_wasted if k_for_forecast > 0.0 else 0.0
                 local_carryover = (
@@ -1474,7 +1749,8 @@ class ForecastManager:
             "count": count,
             "total_solar": total_solar,
             "unit_totals": unit_totals,
-            "hourly_plan": hourly_plan
+            "hourly_plan": hourly_plan,
+            "hourly_inputs_4d": hourly_inputs_4d,
         }
 
     def sum_forecast_energy(
@@ -1725,16 +2001,58 @@ class ForecastManager:
                 except (TypeError, ValueError):
                     _log_dt = None
 
-            # Scenario A: What the plan SHOULD have been (Forecast Weather, Normal Mode)
-            res_planned = self.coordinator.statistics.calculate_total_power(
-                temp=f_data["temp"],
-                effective_wind=f_data.get("wind", 0.0),
-                solar_impact=0.0,
-                is_aux_active=False,  # Crucial: Plan always assumes Normal mode
-                override_solar_factor=f_data.get("solar_factor", 0.0),
-                override_solar_vector=f_data.get("solar_vector"),
-                override_now=_log_dt,
+            # Resolve forecast-hour DNI/DHI for the 4D legs (#978).
+            # Sun elevation at the logged hour is the same for both
+            # Scenario A (forecast weather) and Scenario B (actual);
+            # only the cloud/irradiance inputs differ.
+            _flag_4d = (
+                getattr(self.coordinator, "experimental_4d_primary", False) is True
             )
+            _sun_elev = None
+            if _flag_4d and _log_dt is not None and self.coordinator.solar_enabled:
+                try:
+                    _sun_elev, _ = self.coordinator.solar.get_approx_sun_pos(_log_dt)
+                except (TypeError, ValueError, AttributeError):
+                    _sun_elev = None
+
+            # Scenario A: What the plan SHOULD have been (Forecast Weather, Normal Mode)
+            # Site #3.  Route 4D when the reference-map row carries
+            # enough signal to resolve a non-trivial (dni, dhi); fall
+            # through to 3D otherwise.
+            _planned_dni_dhi = None
+            _planned_source = "none"
+            if _flag_4d and _sun_elev is not None and _log_dt is not None:
+                try:
+                    _p_dni, _p_dhi, _planned_source = resolve_dni_dhi_for_forecast(
+                        f_data,
+                        sun_elev_deg=float(_sun_elev),
+                        day_of_year=_log_dt.timetuple().tm_yday,
+                    )
+                    if _planned_source not in ("none", "no_sun"):
+                        _planned_dni_dhi = (_p_dni, _p_dhi)
+                except (TypeError, ValueError):
+                    _planned_dni_dhi = None
+
+            if _planned_dni_dhi is not None:
+                res_planned = self.coordinator.statistics.calculate_total_power(
+                    temp=f_data["temp"],
+                    effective_wind=f_data.get("wind", 0.0),
+                    solar_impact=0.0,
+                    is_aux_active=False,
+                    override_now=_log_dt,
+                    override_dni_dhi=_planned_dni_dhi,
+                    override_correction_percent=log.get("correction_percent"),
+                )
+            else:
+                res_planned = self.coordinator.statistics.calculate_total_power(
+                    temp=f_data["temp"],
+                    effective_wind=f_data.get("wind", 0.0),
+                    solar_impact=0.0,
+                    is_aux_active=False,  # Crucial: Plan always assumes Normal mode
+                    override_solar_factor=f_data.get("solar_factor", 0.0),
+                    override_solar_vector=f_data.get("solar_vector"),
+                    override_now=_log_dt,
+                )
             planned_kwh = res_planned["total_kwh"]
 
             # Scenario B: What the model says SHOULD have happened (Actual Weather, Actual Mode)
@@ -1746,15 +2064,57 @@ class ForecastManager:
                     log.get("solar_vector_e", 0.0),
                     log.get("solar_vector_w", 0.0),
                 )
-            res_reality = self.coordinator.statistics.calculate_total_power(
-                temp=log["temp"],
-                effective_wind=log.get("effective_wind", 0.0),
-                solar_impact=0.0,
-                is_aux_active=log.get("auxiliary_active", False),
-                override_solar_factor=log.get("solar_factor", 0.0),
-                override_solar_vector=log_solar_vector,
-                override_now=_log_dt,
-            )
+
+            # Site #4.  Prefer the logged dni/dhi pair (collected by the
+            # 4D shadow learner on the hourly log); fall back to the
+            # Kasten ladder via the logged ``cloud_coverage`` (the actual
+            # field name, not ``cloud_coverage_avg`` — see
+            # ``hourly_processor.py``).
+            _reality_dni_dhi = None
+            _reality_source = "none"
+            if _flag_4d and _sun_elev is not None and _log_dt is not None:
+                _log_dni = log.get("dni")
+                _log_dhi = log.get("dhi")
+                if _log_dni is not None and _log_dhi is not None:
+                    _reality_dni_dhi = (float(_log_dni), float(_log_dhi))
+                    _reality_source = "logged"
+                else:
+                    _log_for_resolver = {
+                        "direct_normal_irradiance": _log_dni,
+                        "diffuse_radiation": _log_dhi,
+                        "cloud_coverage": log.get("cloud_coverage"),
+                    }
+                    try:
+                        _r_dni, _r_dhi, _reality_source = resolve_dni_dhi_for_forecast(
+                            _log_for_resolver,
+                            sun_elev_deg=float(_sun_elev),
+                            day_of_year=_log_dt.timetuple().tm_yday,
+                        )
+                        if _reality_source not in ("none", "no_sun"):
+                            _reality_dni_dhi = (_r_dni, _r_dhi)
+                    except (TypeError, ValueError):
+                        _reality_dni_dhi = None
+
+            if _reality_dni_dhi is not None:
+                res_reality = self.coordinator.statistics.calculate_total_power(
+                    temp=log["temp"],
+                    effective_wind=log.get("effective_wind", 0.0),
+                    solar_impact=0.0,
+                    is_aux_active=log.get("auxiliary_active", False),
+                    override_now=_log_dt,
+                    override_dni_dhi=_reality_dni_dhi,
+                    override_correction_percent=log.get("correction_percent"),
+                )
+            else:
+                res_reality = self.coordinator.statistics.calculate_total_power(
+                    temp=log["temp"],
+                    effective_wind=log.get("effective_wind", 0.0),
+                    solar_impact=0.0,
+                    is_aux_active=log.get("auxiliary_active", False),
+                    override_solar_factor=log.get("solar_factor", 0.0),
+                    override_solar_vector=log_solar_vector,
+                    override_now=_log_dt,
+                )
             reality_adjusted_kwh = res_reality["total_kwh"]
 
             hour_impact = reality_adjusted_kwh - planned_kwh
@@ -1774,16 +2134,56 @@ class ForecastManager:
                 # Current partial hour — top-of-hour timestamp for the
                 # #948/#950 gates.
                 _curr_dt = now.replace(minute=0, second=0, microsecond=0)
-                # Scenario A Rate (Forecast Weather, Normal Mode)
-                res_planned_rate = self.coordinator.statistics.calculate_total_power(
-                    temp=f_data_curr["temp"],
-                    effective_wind=f_data_curr.get("wind", 0.0),
-                    solar_impact=0.0,
-                    is_aux_active=False,
-                    override_solar_factor=f_data_curr.get("solar_factor", 0.0),
-                    override_solar_vector=f_data_curr.get("solar_vector"),
-                    override_now=_curr_dt,
+
+                # Sun elevation for the current top-of-hour, shared
+                # across both partial-hour branches (#978).
+                _flag_4d_curr = (
+                    getattr(self.coordinator, "experimental_4d_primary", False) is True
                 )
+                _sun_elev_curr = None
+                if _flag_4d_curr and self.coordinator.solar_enabled:
+                    try:
+                        _sun_elev_curr, _ = self.coordinator.solar.get_approx_sun_pos(_curr_dt)
+                    except (TypeError, ValueError, AttributeError):
+                        _sun_elev_curr = None
+
+                # Scenario A Rate (Forecast Weather, Normal Mode)
+                # Site #5.  Same shape as site #3: route 4D when the
+                # current-hour forecast row resolves to non-trivial
+                # (dni, dhi).
+                _planned_dni_dhi_curr = None
+                if _flag_4d_curr and _sun_elev_curr is not None:
+                    try:
+                        _pc_dni, _pc_dhi, _pc_src = resolve_dni_dhi_for_forecast(
+                            f_data_curr,
+                            sun_elev_deg=float(_sun_elev_curr),
+                            day_of_year=_curr_dt.timetuple().tm_yday,
+                        )
+                        if _pc_src not in ("none", "no_sun"):
+                            _planned_dni_dhi_curr = (_pc_dni, _pc_dhi)
+                    except (TypeError, ValueError):
+                        _planned_dni_dhi_curr = None
+
+                if _planned_dni_dhi_curr is not None:
+                    res_planned_rate = self.coordinator.statistics.calculate_total_power(
+                        temp=f_data_curr["temp"],
+                        effective_wind=f_data_curr.get("wind", 0.0),
+                        solar_impact=0.0,
+                        is_aux_active=False,
+                        override_now=_curr_dt,
+                        override_dni_dhi=_planned_dni_dhi_curr,
+                        override_correction_percent=self.coordinator.solar_correction_percent,
+                    )
+                else:
+                    res_planned_rate = self.coordinator.statistics.calculate_total_power(
+                        temp=f_data_curr["temp"],
+                        effective_wind=f_data_curr.get("wind", 0.0),
+                        solar_impact=0.0,
+                        is_aux_active=False,
+                        override_solar_factor=f_data_curr.get("solar_factor", 0.0),
+                        override_solar_vector=f_data_curr.get("solar_vector"),
+                        override_now=_curr_dt,
+                    )
                 planned_rate = res_planned_rate["total_kwh"]
 
                 # Scenario B Rate (Actual Weather, Actual Mode)
@@ -1793,15 +2193,28 @@ class ForecastManager:
                     self.coordinator.data.get("solar_vector_e", 0.0),
                     self.coordinator.data.get("solar_vector_w", 0.0),
                 )
-                res_reality_rate = self.coordinator.statistics.calculate_total_power(
-                    temp=current_temp,
-                    effective_wind=self.coordinator.data.get("effective_wind", 0.0),
-                    solar_impact=0.0,
-                    is_aux_active=self.coordinator.auxiliary_heating_active,
-                    override_solar_factor=self.coordinator.data.get("solar_factor", 0.0),
-                    override_solar_vector=live_solar_vector,
-                    override_now=_curr_dt,
-                )
+
+                # Site #6.  Mid-flight hour — pass NO 4D overrides;
+                # let calculate_total_power_4d resolve DNI/DHI from
+                # live coordinator state (mirrors the live tick path).
+                if _flag_4d_curr:
+                    res_reality_rate = self.coordinator.statistics.calculate_total_power(
+                        temp=current_temp,
+                        effective_wind=self.coordinator.data.get("effective_wind", 0.0),
+                        solar_impact=0.0,
+                        is_aux_active=self.coordinator.auxiliary_heating_active,
+                        override_now=_curr_dt,
+                    )
+                else:
+                    res_reality_rate = self.coordinator.statistics.calculate_total_power(
+                        temp=current_temp,
+                        effective_wind=self.coordinator.data.get("effective_wind", 0.0),
+                        solar_impact=0.0,
+                        is_aux_active=self.coordinator.auxiliary_heating_active,
+                        override_solar_factor=self.coordinator.data.get("solar_factor", 0.0),
+                        override_solar_vector=live_solar_vector,
+                        override_now=_curr_dt,
+                    )
                 reality_adjusted_rate = res_reality_rate["total_kwh"]
 
                 # Pro-rate the impact for the partial hour

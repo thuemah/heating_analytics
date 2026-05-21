@@ -253,10 +253,18 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
         now = dt_util.now()
         today = now.date()
 
+        # Pre-fetch the hourly-log -> date map once for the whole period.  Without
+        # this, _get_historical_day -> calculate_modeled_energy re-scans the
+        # reversed hourly_log per day, which blocks the event loop for ~0.7 s on
+        # month-sensor refreshes against year-old dates.
+        prefetch_start = min(start_date, today)
+        prefetch_end = max(end_date, today)
+        pre_fetched_logs = self.coordinator.statistics._get_daily_log_map(prefetch_start, prefetch_end)
+
         while current <= end_date:
             if current < today:
                 # Past: Use daily_history
-                day_data = self._get_historical_day(current)
+                day_data = self._get_historical_day(current, pre_fetched_logs=pre_fetched_logs)
             elif current == today:
                 # Today: Use current actuals (from coordinator.data)
                 day_data = self._get_today_data(current)
@@ -278,14 +286,16 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
         days = []
         current = ly_start
 
+        pre_fetched_logs = self.coordinator.statistics._get_daily_log_map(ly_start, ly_end)
+
         while current <= ly_end:
-            day_data = self._get_historical_day(current)
+            day_data = self._get_historical_day(current, pre_fetched_logs=pre_fetched_logs)
             days.append(day_data)
             current += timedelta(days=1)
 
         return days
 
-    def _get_historical_day(self, date_obj: date) -> dict:
+    def _get_historical_day(self, date_obj: date, pre_fetched_logs: dict | None = None) -> dict:
         """Extract day data from _daily_history and calculate Model value."""
         day_str = date_obj.isoformat()
 
@@ -308,7 +318,7 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
 
             # Use calculate_modeled_energy to get Model value (Base - Solar)
             # This serves as a fallback or for Model Comparison if actuals are missing
-            model_kwh, solar_kwh, _, _, _ = self.coordinator.calculate_modeled_energy(date_obj, date_obj)
+            model_kwh, solar_kwh, _, _, _ = self.coordinator.calculate_modeled_energy(date_obj, date_obj, pre_fetched_logs)
 
             # Use actual kwh if available (Hybrid), otherwise fallback to model
             actual_kwh = entry.get('kwh')

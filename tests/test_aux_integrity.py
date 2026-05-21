@@ -157,8 +157,15 @@ def test_aux_integrity_no_scaling(integrity_coordinator):
         is_aux_active=True
     )
 
-    # Verify Global Integrity
-    assert result["total_kwh"] == 20.0 # 30 - 10
+    # Verify Global Integrity.  Post-#992 c2: ``total_kwh`` is the
+    # per-(scope, mode) partition sum, NOT Track A's
+    # ``max(0, global_base − global_aux_reduction)``.  h3 is out of
+    # ``aux_affected_entities`` so its 10 kWh base flows through to the
+    # total — pre-fix it was silently absorbed by the Track A clamp
+    # whenever ``global_aux_reduction > Σ aux_affected base``, which is
+    # exactly the scenario this test sets up (global aux=10 vs
+    # per-entity sum aux=4).
+    assert result["total_kwh"] == 26.0 # 8 (h1) + 8 (h2) + 10 (h3)
     assert result["global_aux_reduction_kwh"] == 10.0
 
     # Verify NO Scaling (Honest Reporting)
@@ -178,11 +185,16 @@ def test_aux_integrity_no_scaling(integrity_coordinator):
     assert bd["sensor.h3"]["aux_reduction_kwh"] == 0.0
     assert bd["sensor.h3"]["net_kwh"] == 10.0
 
-    # Verify Orphaned Savings
-    # Global (10) - Units (2+2=4) = 6.0 Orphaned
+    # Verify Orphaned Savings.  Still computed as Track A diagnostic
+    # gap (global_aux=10 vs per-entity sum=4) — unchanged.  Post-c2
+    # it no longer drives total_kwh (Track A absorption is gone) but
+    # remains as a reporting surface for the Potential Savings sensor.
     assert result["breakdown"]["aux_reduction_kwh"] == 4.0
     assert result["breakdown"]["orphaned_aux_savings"] == pytest.approx(6.0)
 
-    # Verify Unspecified kWh (Deviation between Track A and Track B)
-    # Global Net (20.0) - Sum Unit Net (8+8+10 = 26.0) = -6.0
-    assert result["breakdown"]["unspecified_kwh"] == pytest.approx(-6.0)
+    # Verify Unspecified kWh.  Post-c2 this is the gap between the
+    # partition aggregate (26.0) and the per-entity net sum (26.0) —
+    # which is ~0 on consistent state, since the partition base is
+    # built directly from per-entity net_after_aux values.  Pre-c2 it
+    # was −6 because Track A under-counted by absorbing h3's base.
+    assert result["breakdown"]["unspecified_kwh"] == pytest.approx(0.0)

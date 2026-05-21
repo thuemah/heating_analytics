@@ -4,46 +4,29 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from custom_components.heating_analytics.forecast import ForecastManager
-from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 
 # Test fixture only — production runtime uses an exponential kernel from
 # CONF_THERMAL_INERTIA via generate_exponential_kernel.  These 4 weights
 # are an arbitrary mock value satisfying the weighted-average shape.
 _INERTIA_WEIGHTS_FIXTURE = (0.20, 0.30, 0.30, 0.20)
 
-@pytest.fixture
-def mock_coordinator():
-    """Mock the coordinator."""
-    coordinator = MagicMock(spec=HeatingDataCoordinator)
-    coordinator.hass = MagicMock()
-    coordinator.hass.config.time_zone = "UTC"
-    coordinator.weather_entity = "weather.test"
-    coordinator.inertia_weights = _INERTIA_WEIGHTS_FIXTURE
-    coordinator.entry = MagicMock()
-    coordinator.entry.data = {}
-    coordinator.data = {}
-
-    # Mock statistics manager
-    coordinator.statistics = MagicMock()
-    # Mock the _get_daily_log_map method to behave like the real one (logic-wise)
-    # or just spy on it to see what arguments it gets called with.
-    # Here we spy on it to verify the incorrect range call.
-
-    # We also need calculate_modeled_energy to return something so the method doesn't crash
-    coordinator.calculate_modeled_energy = MagicMock(return_value=(10.0, 0.0, 5.0, 5.0, 10.0))
-
-    # Mock inertia helper
-    coordinator._get_inertia_list = MagicMock(return_value=[])
-    coordinator._calculate_inertia_temp = MagicMock(return_value=5.0)
-
-    # Mock wind bucket
-    coordinator._get_wind_bucket = MagicMock(return_value="normal")
-
-    return coordinator
-
 @patch("custom_components.heating_analytics.forecast.dt_util.now")
 def test_calculate_week_ahead_stats_boundary_failure(mock_now, mock_coordinator):
     """Test that calculate_week_ahead_stats fails to fetch correct range on Week 53 boundary."""
+    # Specialized setup for this test
+    mock_coordinator.hass.config.time_zone = "UTC"
+    mock_coordinator.weather_entity = "weather.test"
+    mock_coordinator.inertia_weights = _INERTIA_WEIGHTS_FIXTURE
+    
+    # We also need calculate_modeled_energy to return something so the method doesn't crash
+    mock_coordinator.calculate_modeled_energy = MagicMock(return_value=(10.0, 0.0, 5.0, 5.0, 10.0))
+
+    # Mock inertia helper
+    mock_coordinator._get_inertia_list = MagicMock(return_value=[])
+    mock_coordinator._calculate_inertia_temp = MagicMock(return_value=5.0)
+
+    # Mock wind bucket
+    mock_coordinator._get_wind_bucket = MagicMock(return_value="normal")
 
     # Setup: Sunday, Dec 27, 2020 (Week 52, Day 7)
     # Next day is Monday, Dec 28, 2020 (Week 53, Day 1)

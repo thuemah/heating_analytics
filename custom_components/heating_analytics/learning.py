@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import statistics
+from types import SimpleNamespace
 from typing import Callable
 
 from .const import (
@@ -34,6 +35,12 @@ from .const import (
     SOLAR_LEARNING_MIN_BASE,
     SOLAR_SHUTDOWN_MIN_BASE,
     SOLAR_SHUTDOWN_MIN_MAGNITUDE,
+    OBSTRUCTION_FIT_MIN_ELEV_DEG,
+    OBSTRUCTION_FIT_MAX_ELEV_DEG,
+    OBSTRUCTION_FIT_STEP_DEG,
+    OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE,
+    OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD,
+    OBSTRUCTION_FIT_DOMINANCE_RATIO,
     TOBIT_CONV_TOL,
     TOBIT_MAX_ITER,
     TOBIT_MIN_NEFF,
@@ -47,6 +54,7 @@ from .const import (
     HARD_OUTLIER_CAP_FACTOR,
     HARD_OUTLIER_SANITY_MULTIPLIER,
 )
+from .helpers import solve_gauss_jordan
 from .observation import HourlyObservation, ModelState, LearningConfig
 from .solar import SolarCalculator
 
@@ -395,6 +403,230 @@ class LearningManager:
                 
         return is_outlier
 
+    @staticmethod
+    def _compute_4d_normalization_delta(
+        obs,
+        config,
+        solar_coefficients_4d_per_unit: dict | None,
+    ) -> float | None:
+        """Pre-compute the 4D solar normalization delta for this hour (#962).
+
+        Mirrors the per-entity saturation that
+        ``calculate_total_power`` performs (and that
+        ``hourly_processor`` consumes via
+        ``solar_heating_applied_kwh − solar_cooling_applied_kwh`` to
+        produce the canonical 3D ``solar_normalization_delta``).
+
+        Returns the signed sum
+
+            Σ_(heating) min(c_4d · pot_4d, base_e) − Σ_(cooling) c_4d · pot_4d
+
+        across qualifying entities, where ``base_e`` is
+        ``obs.unit_expected_base[entity_id]`` (per-entity dark-sky base
+        prediction).  Heating-mode saturation prevents 4D-solar
+        overshoot on a single entity from inflating the global delta
+        beyond what the entity's actual base could absorb; cooling-mode
+        is additive (matches ``calculate_saturation`` semantics).
+        Returns ``None`` when the 4D path is not exercisable
+        (missing state, sun below horizon, DNI/DHI unresolvable, no
+        qualifying entities).  The caller decides what to substitute
+        when None — under ``experimental_4d_primary=True``, the read
+        site should fall back to ``obs.solar_normalization_delta`` (3D)
+        so the global base path always has a delta to consume.
+
+        Pre-#992 c3 this returned the RAW signed sum without per-entity
+        saturation.  On installs running with ``experimental_4d_primary
+        = True``, a single south-facing entity with strong 4D potential
+        could push the delta past its own base; the inflated delta then
+        replaced the 3D-saturated value at ``learning.py:701``, biasing
+        the base-EMA target upward (``normalized_actual = max(0,
+        total_energy_kwh + solar_normalization_delta)``) on every sunny
+        hour.  See issue #992 violation 4.
+
+        Outlier filtering and Tobit / NLMS gating are intentionally
+        NOT replicated here — those are learner-internal state
+        machines.  This helper is the read-side accumulation only.
+        """
+        if (
+            solar_coefficients_4d_per_unit is None
+            or obs is None
+            or config is None
+            or config.solar_calculator is None
+            or getattr(obs, "timestamp", None) is None
+            or not config.solar_enabled
+        ):
+            return None
+
+        from datetime import timedelta as _td
+        from .solar import resolve_dni_dhi
+
+        try:
+            mid_dt = obs.timestamp + _td(minutes=30)
+            sun_elev, sun_az = config.solar_calculator.get_approx_sun_pos(mid_dt)
+        except Exception:  # pragma: no cover — defensive against mocks
+            return None
+        if not (sun_elev and sun_elev > 0):
+            return None
+
+        try:
+            day_of_year = obs.timestamp.timetuple().tm_yday
+            dni, dhi, _src = resolve_dni_dhi(
+                getattr(obs, "dni_avg", None),
+                getattr(obs, "dhi_avg", None),
+                getattr(obs, "ghi_avg", None),
+                getattr(obs, "cloud_avg", None),
+                sun_elev,
+                day_of_year,
+            )
+        except Exception:  # pragma: no cover
+            return None
+        if not (dni or dhi):
+            return None
+
+        screen_config = config.screen_config
+        screen_affected = config.screen_affected_entities
+        solar_affected = config.solar_affected_entities
+        correction_percent = obs.correction_percent
+        unit_modes = obs.unit_modes or {}
+        hourly_delta_per_unit = obs.unit_breakdown or {}
+        # Per-entity dark-sky base prediction for saturation gate (#992
+        # c3).  When absent (e.g. cold-start before per-entity buckets
+        # populated), default to 0 — the heating-side ``min(predicted,
+        # base=0) = 0`` then correctly contributes nothing, matching
+        # the 3D path where empty buckets also produce no solar effect.
+        unit_expected_base = getattr(obs, "unit_expected_base", None) or {}
+
+        delta_4d = 0.0
+        any_qualified = False
+        for entity_id in config.energy_sensors:
+            unit_mode = unit_modes.get(entity_id, MODE_HEATING)
+            if unit_mode in (MODE_OFF, MODE_GUEST_HEATING, MODE_GUEST_COOLING):
+                continue
+            # Match _process_per_unit_learning: skip entity if sensor
+            # was offline this hour (matches actual_unit assignment
+            # logic; DHW is treated as actual=0 there, so DHW is
+            # NOT skipped here — but DHW's regime is None anyway).
+            if unit_mode != MODE_DHW and entity_id not in hourly_delta_per_unit:
+                continue
+            regime_4d = _solar_coeff_regime(unit_mode)
+            if regime_4d is None:
+                continue
+            if solar_affected is not None and entity_id not in solar_affected:
+                continue
+
+            entity_screen_config = (
+                screen_config
+                if screen_affected is None or entity_id in screen_affected
+                else (False, False, False)
+            )
+            try:
+                p4d = config.solar_calculator.calculate_unit_potential_4d(
+                    entity_id, dni, dhi, sun_elev, sun_az,
+                    entity_screen_config, correction_percent,
+                )
+            except Exception:  # pragma: no cover
+                continue
+
+            entity_coeffs_4d = solar_coefficients_4d_per_unit.get(entity_id, {}) or {}
+            if not isinstance(entity_coeffs_4d, dict):
+                continue
+            regime_coeffs_4d = entity_coeffs_4d.get(regime_4d, {}) or {}
+            if not isinstance(regime_coeffs_4d, dict):
+                continue
+            c_s = float(regime_coeffs_4d.get("s", 0.0))
+            c_e = float(regime_coeffs_4d.get("e", 0.0))
+            c_w = float(regime_coeffs_4d.get("w", 0.0))
+            c_d = float(regime_coeffs_4d.get("diffuse", 0.0))
+            try:
+                p_s, p_e, p_w, p_d = p4d
+            except Exception:  # pragma: no cover
+                continue
+            predicted_4d = c_s * p_s + c_e * p_e + c_w * p_w + c_d * p_d
+            # Per-entity saturation matching 3D / calculate_saturation.
+            if regime_4d == "heating":
+                entity_base = float(unit_expected_base.get(entity_id, 0.0))
+                applied_4d = max(0.0, min(predicted_4d, entity_base))
+                delta_4d += applied_4d
+            else:
+                # Cooling: additive, no clamp (matches MODE_COOLING
+                # branch of ``solar.calculate_saturation``).
+                delta_4d -= max(0.0, predicted_4d)
+            any_qualified = True
+
+        if not any_qualified:
+            return None
+        return delta_4d
+
+    @staticmethod
+    def _compute_4d_solar_factor_for_snr(obs, config) -> float | None:
+        """Compute the 4D-anchored solar_factor for SNR weighting (#981).
+
+        SNR weighting on the global base bucket uses ``obs.solar_factor``,
+        which is Kasten-from-cloud_coverage.  When 4D is promoted to the
+        live read-path, cloud_coverage can disagree with native DNI/DHI on
+        broken-cloud hours — Kasten-misclassified clear hours then get
+        over-weighted into the EMA and pull the bucket down.  This helper
+        rebuilds solar_factor with the same DNI/DHI signal the 4D read-
+        path consumes, by passing a ladder-derived cloud-transmission
+        override into ``calculate_solar_factor``.
+
+        Returns ``None`` when the 4D path is not exercisable for this
+        hour; the caller falls back to ``obs.solar_factor`` (3D).  On the
+        ``kasten_synthetic`` ladder branch the result is bit-identical to
+        the 3D path by construction.
+        """
+        if (
+            obs is None
+            or config is None
+            or config.solar_calculator is None
+            or getattr(obs, "timestamp", None) is None
+            or not config.solar_enabled
+        ):
+            return None
+
+        from datetime import timedelta as _td
+        from .solar import resolve_dni_dhi, _eccentricity
+
+        try:
+            mid_dt = obs.timestamp + _td(minutes=30)
+            sun_elev, sun_az = config.solar_calculator.get_approx_sun_pos(mid_dt)
+        except Exception:  # pragma: no cover — defensive against mocks
+            return None
+        if not (sun_elev and sun_elev > 0):
+            return 0.0
+
+        try:
+            day_of_year = obs.timestamp.timetuple().tm_yday
+            dni, dhi, _src = resolve_dni_dhi(
+                getattr(obs, "dni_avg", None),
+                getattr(obs, "dhi_avg", None),
+                getattr(obs, "ghi_avg", None),
+                getattr(obs, "cloud_avg", None),
+                sun_elev,
+                day_of_year,
+            )
+        except Exception:  # pragma: no cover
+            return None
+        if not (dni or dhi):
+            return None
+
+        sin_elev = math.sin(math.radians(sun_elev))
+        if sin_elev <= 0:
+            return 0.0
+        air_mass = 1.0 / sin_elev
+        ghi_clear = 1367.0 * _eccentricity(day_of_year) * sin_elev * (0.7 ** air_mass)
+        if ghi_clear <= 0:
+            return None
+        cloud_trans_4d = max(0.0, min(1.0, (dni * sin_elev + dhi) / ghi_clear))
+
+        try:
+            return config.solar_calculator.calculate_solar_factor(
+                sun_elev, sun_az, 0.0,
+                cloud_attenuation_override=cloud_trans_4d,
+            )
+        except Exception:  # pragma: no cover
+            return None
+
     def process_learning(
         self,
         obs: HourlyObservation | None = None,
@@ -460,6 +692,15 @@ class LearningManager:
         learning_buffer_aux_per_unit = model.learning_buffer_aux_per_unit
         solar_coefficients_per_unit = model.solar_coefficients_per_unit
         learning_buffer_solar_per_unit = model.learning_buffer_solar_per_unit
+        # 4D shadow learner state (#954).  Optional — None on legacy
+        # ModelState construction sites; the 4D learner is a no-op when
+        # either dict is None.
+        solar_coefficients_4d_per_unit = getattr(
+            model, "solar_coefficients_4d_per_unit", None
+        )
+        learning_buffer_solar_4d_per_unit = getattr(
+            model, "learning_buffer_solar_4d_per_unit", None
+        )
 
         # From LearningConfig
         learning_enabled = config.learning_enabled
@@ -474,6 +715,19 @@ class LearningManager:
         has_guest_activity = config.has_guest_activity
         per_unit_learning_enabled = config.per_unit_learning_enabled
         unit_min_base = config.unit_min_base  # #871: per-unit threshold overrides
+
+        # Experimental 4D primary read-path (#962): when the flag is on,
+        # the global base, per-#930 dark-equivalent lift, and aux paths
+        # all consume the 4D-derived delta in place of the 3D one.
+        # Falls back to the 3D delta when the 4D path is not
+        # exercisable for this hour (missing state, sun below horizon,
+        # etc.) so the global base block always has a delta to consume.
+        if getattr(config, "experimental_4d_primary", False):
+            delta_4d_pre = self._compute_4d_normalization_delta(
+                obs, config, solar_coefficients_4d_per_unit,
+            )
+            if delta_4d_pre is not None:
+                solar_normalization_delta = delta_4d_pre
 
         # --- Original logic (unchanged) ---
 
@@ -709,8 +963,17 @@ class LearningManager:
                     else:
                         base_target = total_energy_kwh
 
+                    # #981: anchor SNR weighting in 4D DNI/DHI when 4D is
+                    # the live read-path consumer, so the base bucket
+                    # doesn't get pulled down by Kasten-misclassified
+                    # clear hours.
+                    sf_for_snr = solar_factor
+                    if getattr(config, "experimental_4d_primary", False):
+                        sf_4d = self._compute_4d_solar_factor_for_snr(obs, config)
+                        if sf_4d is not None:
+                            sf_for_snr = sf_4d
                     snr_w = compute_snr_weight(
-                        solar_factor,
+                        sf_for_snr,
                         solar_dominant_entities,
                         total_units=count_active_learnable_units(
                             energy_sensors,
@@ -753,6 +1016,15 @@ class LearningManager:
 
                     else:
                         # EMA Update
+                        # #967: inline EMA step.  ``helpers.compute_base_ema_step``
+                        # is the named source-of-truth this expression matches;
+                        # diagnostics already routes through it.  Migration of
+                        # the live writer is deferred until 4D-primary
+                        # observation has stabilised (refactor here during
+                        # the observation window would confound attribution
+                        # of any deviation drift).  When migrating, the
+                        # round(_, 5) post-step clamp stays caller-side
+                        # per the helper's contract.
                         new_base_prediction = base_expected_kwh + base_effective_rate * (base_target - base_expected_kwh)
                         if temp_key not in correlation_data:
                             correlation_data[temp_key] = {}
@@ -762,8 +1034,9 @@ class LearningManager:
 
         # Update Per-Unit Models (Both Normal and Aux modes)
         # We run this even in cooldown (for non-affected units)
+        per_unit_result: dict = {}
         if should_run_per_unit:
-            self._process_per_unit_learning(
+            per_unit_result = self._process_per_unit_learning(
                 temp_key, wind_bucket, avg_temp,
                 avg_solar_vector, # Pass 3D vector for per-unit learning
                 total_energy_kwh, base_expected_kwh,
@@ -804,6 +1077,9 @@ class LearningManager:
                 shadow_learning_buffer_solar_per_unit=getattr(
                     model, "shadow_learning_buffer_solar_per_unit", None
                 ),
+                solar_coefficients_4d_per_unit=solar_coefficients_4d_per_unit,
+                learning_buffer_solar_4d_per_unit=learning_buffer_solar_4d_per_unit,
+                obs=obs,
             )
 
         return {
@@ -814,6 +1090,7 @@ class LearningManager:
             "aux_model_before": aux_model_before,
             "aux_model_after": aux_model_after,
             "learning_status": learning_status,
+            **per_unit_result,
         }
 
     def _process_learning_legacy(self, **kwargs) -> dict:
@@ -928,8 +1205,97 @@ class LearningManager:
         tobit_sufficient_stats: dict | None = None,
         nlms_shadow_coefficients: dict | None = None,
         shadow_learning_buffer_solar_per_unit: dict | None = None,
+        solar_coefficients_4d_per_unit: dict | None = None,
+        learning_buffer_solar_4d_per_unit: dict | None = None,
+        obs: "HourlyObservation | None" = None,
     ):
         """Process learning for individual units."""
+        # --- 4D shadow learner per-hour preparation (#954) ---
+        # Compute hour-midpoint sun position + DNI/DHI ONCE outside the
+        # per-entity loop (these are entity-independent for this hour).
+        # The per-entity 4D potential lives inside the loop because
+        # screen_config narrows per entity.  When either 4D dict is None
+        # (legacy path / test fixtures that didn't set them up), or
+        # the obs lacks a timestamp, all 4D work is skipped — this is
+        # the strict-shadow opt-in semantic.
+        shadow_4d_enabled = (
+            solar_coefficients_4d_per_unit is not None
+            and learning_buffer_solar_4d_per_unit is not None
+            and obs is not None
+            and getattr(obs, "timestamp", None) is not None
+            and solar_calculator is not None
+        )
+        # Read-path arbitration for dead-zone (#981).  Whichever solar pipeline
+        # is the live read-path consumer needs the dead-zone safety net; the
+        # other path is shadow.  Pre-promotion (flag off) → 3D is live, 4D is
+        # shadow.  Post-promotion (flag on) → 4D is live, 3D is shadow.  The
+        # ``is_shadow_path`` parameter on ``_learn_unit_solar_coefficient``
+        # already gates the dead-zone block; we just need to thread the flag
+        # to the two call sites below.
+        _flag_4d_primary = bool(
+            getattr(
+                getattr(solar_calculator, "coordinator", None),
+                "experimental_4d_primary",
+                False,
+            )
+        )
+        hour_dni_4d = 0.0
+        hour_dhi_4d = 0.0
+        hour_elev_4d = 0.0
+        hour_az_4d = 0.0
+        if shadow_4d_enabled:
+            try:
+                from datetime import timedelta as _td
+                mid_dt = obs.timestamp + _td(minutes=30)
+                hour_elev_4d, hour_az_4d = solar_calculator.get_approx_sun_pos(mid_dt)
+                if hour_elev_4d > 0:
+                    from .solar import resolve_dni_dhi
+                    day_of_year = obs.timestamp.timetuple().tm_yday
+                    dni_v, dhi_v, _src = resolve_dni_dhi(
+                        getattr(obs, "dni_avg", None),
+                        getattr(obs, "dhi_avg", None),
+                        getattr(obs, "ghi_avg", None),
+                        getattr(obs, "cloud_avg", None),
+                        hour_elev_4d,
+                        day_of_year,
+                    )
+                    hour_dni_4d = dni_v
+                    hour_dhi_4d = dhi_v
+                else:
+                    shadow_4d_enabled = False
+            except Exception:  # pragma: no cover - defensive against mocks
+                shadow_4d_enabled = False
+
+        # 4D shadow per-hour aggregates (#954 commit 9).  Accumulated
+        # across qualifying entities and surfaced via the return dict
+        # so the hourly_processor can log them to ``hourly_log``.
+        # CAVEAT: unlike the live 3D ``solar_impact_kwh`` (which is
+        # saturation-clipped via ``applied = min(c·potential, base)``
+        # inside ``statistics.calculate_total_power``), these 4D values
+        # are RAW: ``Σ c_4d · pot_4d`` per entity, no saturation cap.
+        # A parallel saturation-aware 4D ``calculate_total_power`` would
+        # double the implementation surface and is not needed for the
+        # bucket-drift comparison Commit 10 builds — magnitudes will
+        # diverge from 3D in saturated hours by design.
+        # ``solar_normalization_delta_4d`` carries the same caveat.
+        # Only populated when the 4D shadow path is enabled; if disabled
+        # the keys are omitted from the return dict (the hourly_processor
+        # gates on ``dict.get(...) is not None``).
+        total_4d_impact = 0.0
+        delta_4d = 0.0
+        # ``shadow_4d_fired`` flips True the first time an entity in the
+        # per-unit loop actually invokes the 4D learner.  Gating the
+        # result-dict emission on this (rather than the always-truthy
+        # ``solar_coefficients_4d_per_unit is not None``) keeps the log
+        # fields ABSENT on hours where no entity exercised the 4D path
+        # (below-horizon hours, DNI/DHI-unresolvable hours, hours where
+        # every entity was outlier-suppressed, etc.).  Required by the
+        # diagnose_solar.base_model_4d_shadow consumer, which uses
+        # field-absence as the "no 4D-tagged hours" signal — see the
+        # ``entry.get("solar_normalization_delta_4d") is None`` check in
+        # ``_compute_base_model_4d_shadow_report``.
+        shadow_4d_fired = False
+
         for entity_id in energy_sensors:
             unit_mode = unit_modes.get(entity_id, MODE_HEATING)
             if unit_mode in (MODE_OFF, MODE_GUEST_HEATING, MODE_GUEST_COOLING):
@@ -1167,13 +1533,94 @@ class LearningManager:
                     )
                 elif not tobit_applied and not is_outlier:
                     # Tobit cold-start / disabled / not allow-listed —
-                    # NLMS is the live writer (current behaviour).
+                    # NLMS is the live writer (current behaviour).  Under
+                    # ``experimental_4d_primary``, 3D becomes shadow and
+                    # the dead-zone net moves to the 4D call below (#981).
                     self._learn_unit_solar_coefficient(
                         entity_id, temp_key,
                         expected_unit_base, actual_unit, (potential_s, potential_e, potential_w),
                         learning_rate, solar_coefficients_per_unit, learning_buffer_solar_per_unit,
                         avg_temp, balance_point,
-                        unit_mode
+                        unit_mode,
+                        is_shadow_path=_flag_4d_primary,
+                    )
+
+                # --- 4D shadow learner (#954) ---
+                # Runs alongside the 3D NLMS / Tobit / shadow paths on
+                # any qualifying, non-outlier hour.  Strict shadow —
+                # writes only to ``solar_coefficients_4d_per_unit``.
+                if shadow_4d_enabled and not is_outlier:
+                    shadow_4d_fired = True
+                    potential_4d = solar_calculator.calculate_unit_potential_4d(
+                        entity_id,
+                        hour_dni_4d,
+                        hour_dhi_4d,
+                        hour_elev_4d,
+                        hour_az_4d,
+                        entity_screen_config,
+                        correction_percent,
+                    )
+                    # Accumulate 4D shadow predicted impact BEFORE
+                    # the learning step so the logged value reflects
+                    # coefficients at the start of the hour — matches
+                    # the live 3D ``solar_impact_kwh`` temporal
+                    # convention.  Per-entity saturation matches 3D /
+                    # ``solar.calculate_saturation`` (#992 commit 4):
+                    # heating clamps to ``expected_unit_base``,
+                    # cooling is additive without clamp.  Both written
+                    # values (``solar_impact_4d_kwh`` and
+                    # ``solar_normalization_delta_4d``) now mirror the
+                    # 3D pipeline's saturation semantics — pre-c4 they
+                    # were raw c·p sums that diverged from 3D by the
+                    # entity-base censoring gap on every saturated hour.
+                    regime_4d = _solar_coeff_regime(unit_mode)
+                    if regime_4d is not None:
+                        entity_coeffs_4d = (
+                            solar_coefficients_4d_per_unit.get(entity_id, {})
+                            if solar_coefficients_4d_per_unit is not None
+                            else {}
+                        )
+                        regime_coeffs_4d = (
+                            entity_coeffs_4d.get(regime_4d, {})
+                            if isinstance(entity_coeffs_4d, dict)
+                            else {}
+                        )
+                        c4d_s = float(regime_coeffs_4d.get("s", 0.0))
+                        c4d_e = float(regime_coeffs_4d.get("e", 0.0))
+                        c4d_w = float(regime_coeffs_4d.get("w", 0.0))
+                        c4d_d = float(regime_coeffs_4d.get("diffuse", 0.0))
+                        p4d_s, p4d_e, p4d_w, p4d_d = potential_4d
+                        predicted_4d = (
+                            c4d_s * p4d_s
+                            + c4d_e * p4d_e
+                            + c4d_w * p4d_w
+                            + c4d_d * p4d_d
+                        )
+                        if regime_4d == "heating":
+                            applied_4d = max(0.0, min(predicted_4d, expected_unit_base))
+                            total_4d_impact += applied_4d
+                            delta_4d += applied_4d
+                        else:
+                            applied_4d = max(0.0, predicted_4d)
+                            total_4d_impact += applied_4d
+                            delta_4d -= applied_4d
+                    self._learn_unit_solar_coefficient(
+                        entity_id=entity_id,
+                        temp_key=temp_key,
+                        expected_unit_base=expected_unit_base,
+                        actual_unit=actual_unit,
+                        avg_solar_vector=potential_4d,
+                        learning_rate=learning_rate,
+                        solar_coefficients_per_unit=solar_coefficients_4d_per_unit,
+                        learning_buffer_solar_per_unit=learning_buffer_solar_4d_per_unit,
+                        avg_temp=avg_temp,
+                        balance_point=balance_point,
+                        unit_mode=unit_mode,
+                        components=("s", "e", "w", "diffuse"),
+                        # Read-path arbitration (#981): 4D is shadow until
+                        # ``experimental_4d_primary`` flips, then it becomes
+                        # the live writer and inherits the dead-zone net.
+                        is_shadow_path=not _flag_4d_primary,
                     )
             elif (
                 # Inequality learning for shutdown hours.
@@ -1230,6 +1677,25 @@ class LearningManager:
                         battery_filtered_potential=battery_filtered_potential,
                         solar_coefficients_per_unit=solar_coefficients_per_unit,
                     )
+
+                    # 4D shadow inequality (#954 commit 7).  Same gating
+                    # as the 3D path (heating regime, screen_affected,
+                    # not an outlier).  Strictly one-sided — invariant #5.
+                    if (
+                        solar_coefficients_4d_per_unit is not None
+                        and obs is not None
+                    ):
+                        battery_4d = getattr(
+                            obs, "battery_filtered_potential_4d",
+                            (0.0, 0.0, 0.0, 0.0),
+                        )
+                        self._update_unit_solar_inequality(
+                            entity_id=entity_id,
+                            expected_unit_base=expected_unit_base,
+                            battery_filtered_potential=battery_4d,
+                            solar_coefficients_per_unit=solar_coefficients_4d_per_unit,
+                            components=("s", "e", "w", "diffuse"),
+                        )
 
             # Step 2: Calculate Solar Impact using (possibly updated) coefficients
             # Use potential vector (not effective) because the coefficient already
@@ -1314,8 +1780,27 @@ class LearningManager:
                 else:
                     headroom_multiplier = 1.0
 
+                # #985: anchor per-unit SNR in 4D DNI/DHI when 4D is the
+                # live read-path consumer, mirroring the global base fix
+                # from #28e0125.  Per-unit base coefficients suffer the
+                # same Kasten-misclassification failure mode as the global
+                # base — see the 2026-05-17 production log captured in
+                # #985 for the mitsubishi_vp_2 case study.  The helper
+                # takes a config-shaped object; ``_process_per_unit_learning``
+                # receives flat-unpacked params instead of ``config``, so
+                # we shim the three attrs the helper actually reads.
+                sf_for_snr = solar_factor
+                if _flag_4d_primary:
+                    _config_shim = SimpleNamespace(
+                        solar_calculator=solar_calculator,
+                        solar_enabled=solar_enabled,
+                        experimental_4d_primary=True,
+                    )
+                    sf_4d = self._compute_4d_solar_factor_for_snr(obs, _config_shim)
+                    if sf_4d is not None:
+                        sf_for_snr = sf_4d
                 snr_w = compute_snr_weight(
-                    solar_factor,
+                    sf_for_snr,
                     solar_dominant_entities,
                     total_units=count_active_learnable_units(
                         energy_sensors,
@@ -1340,6 +1825,23 @@ class LearningManager:
                     learning_buffer_per_unit, correlation_data_per_unit, observation_counts,
                     rate_multiplier=rate_multiplier,
                 )
+
+        # Surface 4D shadow per-hour aggregates (#954 commit 9) only when
+        # the 4D shadow path ACTUALLY fired for at least one entity in
+        # this hour.  ``shadow_4d_fired`` is set inside the per-entity
+        # 4D-learner branch above; gating on it (rather than the
+        # always-truthy ``solar_coefficients_4d_per_unit is not None``,
+        # since the coordinator initialises the dict to ``{}``) keeps
+        # the keys absent on below-horizon / DNI-DHI-unresolved / all-
+        # outlier hours.  The hourly_processor gates with
+        # ``dict.get(...) is not None``, and
+        # diagnose_solar.base_model_4d_shadow uses field-absence as the
+        # "no 4D-tagged hours" signal.
+        result: dict = {}
+        if shadow_4d_fired:
+            result["solar_impact_4d_kwh"] = total_4d_impact
+            result["solar_normalization_delta_4d"] = delta_4d
+        return result
 
     @staticmethod
     def _seed_shadow_from_main_if_empty(
@@ -1377,27 +1879,57 @@ class LearningManager:
         temp_key: str,
         expected_unit_base: float,
         actual_unit: float,
-        avg_solar_vector: tuple[float, float, float],
+        avg_solar_vector: tuple[float, ...],
         learning_rate: float,
-        solar_coefficients_per_unit: dict,
-        learning_buffer_solar_per_unit: dict,
+        solar_coefficients_per_unit: dict | None,
+        learning_buffer_solar_per_unit: dict | None,
         avg_temp: float,
         balance_point: float,
         unit_mode: str,
         *,
+        components: tuple[str, ...] = ("s", "e", "w"),
         is_shadow_path: bool = False,
     ):
-        """Update 3D solar coefficient (S, E, W) for one (entity, mode) slot.
+        """Update solar coefficient for one (entity, mode) slot.
 
         Mode-stratified per #868: heating-mode hours update
         ``solar_coefficients_per_unit[entity]["heating"]``; cooling-mode
         hours update ``["cooling"]``.  Each regime absorbs its own
         ``E[1/COP]`` and converges to a physically distinct value.
         OFF/DHW/unknown modes return early — no solar learning signal.
+
+        Dimension-agnostic via ``components``.  Default ``("s","e","w")``
+        is the live 3D solar coefficient — pre-existing callers see
+        bit-identical behaviour.  The 4D shadow path (#954) passes
+        ``("s","e","w","diffuse")`` along with a 4-tuple solar/potential
+        vector and the 4D coefficient / buffer dicts.  The parameter is
+        still named ``avg_solar_vector`` for backwards-compat with all
+        positional 3D callers; for the 4D path it carries the per-hour
+        potential vector with the diffuse component appended.
+
+        Dimension-specific behaviour preserved verbatim:
+
+        * magnitude gate — Euclidean ``sqrt(Σ vec_k²) ≤ 0.01`` for
+          ``n_dim == 3``; L1 ``Σ vec_k ≤ 0.01`` for ``n_dim ≥ 4``
+        * cold-start buffer threshold — ``LEARNING_BUFFER_THRESHOLD``
+          for ``n_dim == 3``; ``max(THRESHOLD, n_dim + 1)`` otherwise
+        * cold-start LS — 3×3 Gram + Gauss-Jordan with the
+          ``|det| > 1e-6`` trigger for the 1D collinear fallback at
+          ``n_dim == 3``; ``_solve_4x4_normal_equations`` at
+          ``n_dim == 4`` (no fallback — collinear sun lets the buffer
+          keep collecting); generic ``A=XᵀX`` solve at ``n_dim ≥ 5``
+        * dead-zone reset — runs only when ``n_dim == 3`` because the
+          4D shadow path has no read-path consumer yet (no stuck
+          coefficient blocking base recovery to recover from)
         """
+        if solar_coefficients_per_unit is None or learning_buffer_solar_per_unit is None:
+            return
+
         regime = _solar_coeff_regime(unit_mode)
         if regime is None:
             return
+
+        n_dim = len(components)
 
         actual_impact = 0.0
         if regime == "heating":
@@ -1411,9 +1943,14 @@ class LearningManager:
         raw_impact = actual_impact
         actual_impact = max(0.0, actual_impact)
 
-        solar_s, solar_e, solar_w = avg_solar_vector
-        vector_magnitude = (solar_s**2 + solar_e**2 + solar_w**2) ** 0.5
-
+        vec = tuple(float(v) for v in avg_solar_vector)
+        # Magnitude gate dispatched by dimension to preserve bit-identity
+        # with the prior split implementations (3D used Euclidean norm;
+        # 4D used L1 sum).
+        if n_dim == 3:
+            vector_magnitude = (vec[0] ** 2 + vec[1] ** 2 + vec[2] ** 2) ** 0.5
+        else:
+            vector_magnitude = sum(vec)
         if vector_magnitude <= 0.01:
             return
 
@@ -1424,7 +1961,7 @@ class LearningManager:
         if isinstance(entity_coeffs, dict):
             regime_coeff = entity_coeffs.get(regime)
             if isinstance(regime_coeff, dict) and any(
-                regime_coeff.get(k) for k in ("s", "e", "w")
+                regime_coeff.get(k) for k in components
             ):
                 current_coeff = regime_coeff
 
@@ -1449,6 +1986,15 @@ class LearningManager:
         # effect — clearing the buffer — operates on the shadow's
         # private buffer dict, so the shared counter just becomes
         # noise rather than a footgun).  Cleaner to short-circuit.
+        # #981: dead-zone is dimension-agnostic — it protects whichever
+        # pipeline is the live read-path writer.  Callers in
+        # ``_process_per_unit_learning`` thread ``experimental_4d_primary``
+        # into ``is_shadow_path`` so the live path (3D pre-promotion,
+        # 4D post-promotion) participates and the shadow does not.
+        # The trigger condition (``actual_impact == 0.0`` AND
+        # ``raw_impact < 0.0``) measures consumption signal and is
+        # itself dimension-agnostic; only one of the two pipelines is
+        # live at a time, so the shared counter has no aliasing.
         dead_key = (entity_id, regime)
         if not is_shadow_path:
             if (
@@ -1461,7 +2007,7 @@ class LearningManager:
                 if count >= SOLAR_DEAD_ZONE_THRESHOLD:
                     # Reset only this regime — preserve the other one.
                     if isinstance(entity_coeffs, dict):
-                        entity_coeffs[regime] = {"s": 0.0, "e": 0.0, "w": 0.0}
+                        entity_coeffs[regime] = {c: 0.0 for c in components}
                     # Clear regime buffer so cold-start begins fresh
                     buf_entry = learning_buffer_solar_per_unit.get(entity_id)
                     if isinstance(buf_entry, dict):
@@ -1478,6 +2024,15 @@ class LearningManager:
                 # Any non-zero impact resets the counter
                 self._dead_zone_counts.pop(dead_key, None)
 
+        # Cold-start buffer threshold — 3D uses LEARNING_BUFFER_THRESHOLD
+        # (4); higher-dim paths need at least n_dim + 1 samples for an
+        # identifiable LS fit (matches the prior 4D ``max(THRESHOLD, 5)``
+        # gate at n_dim == 4).
+        if n_dim == 3:
+            buffer_threshold = LEARNING_BUFFER_THRESHOLD
+        else:
+            buffer_threshold = max(LEARNING_BUFFER_THRESHOLD, n_dim + 1)
+
         # --- Buffered Learning Logic (Cold Start) ---
         if current_coeff is None:
             buf_entry = learning_buffer_solar_per_unit.setdefault(entity_id, {})
@@ -1486,114 +2041,108 @@ class LearningManager:
                 buf_entry = {"heating": [], "cooling": []}
                 learning_buffer_solar_per_unit[entity_id] = buf_entry
             buffer_list = buf_entry.setdefault(regime, [])
-            # Store tuple of (s, e, w, impact)
-            buffer_list.append((solar_s, solar_e, solar_w, actual_impact))
+            # Append (vec_0, ..., vec_{n-1}, actual_impact) as (n_dim+1)-tuple.
+            buffer_list.append(tuple(vec) + (actual_impact,))
 
-            # Need enough data for 3D least squares
-            if len(buffer_list) >= LEARNING_BUFFER_THRESHOLD:
+            if len(buffer_list) >= buffer_threshold:
                 # Guard: if all impact values are zero, the base model is too
                 # low to produce signal (dead zone during cold-start).  Discard
                 # the buffer and keep collecting — the default coefficient
-                # (0.35) provides solar normalization for the base model via
+                # provides solar normalization for the base model via
                 # calculate_unit_coefficient, which will gradually raise the
                 # base model until actual_impact becomes positive.
-                if all(item[3] == 0.0 for item in buffer_list):
+                if all(item[n_dim] == 0.0 for item in buffer_list):
                     buffer_list.clear()
-                    _LOGGER.debug(
-                        "Solar cold-start buffer discarded for %s: all %d "
-                        "samples had zero impact (base model recovering)",
-                        entity_id, LEARNING_BUFFER_THRESHOLD,
-                    )
+                    if n_dim == 3:
+                        _LOGGER.debug(
+                            "Solar cold-start buffer discarded for %s: all %d "
+                            "samples had zero impact (base model recovering)",
+                            entity_id, buffer_threshold,
+                        )
                     return
 
-                # Solve 3x3 normal equations (Gram matrix A, moment vector b)
-                # A = [[ss, se, sw], [se, ee, ew], [sw, ew, ww]]
-                # b = [sI, eI, wI]
-                # Note: sum_ew is always ~0 because E and W have disjoint support.
-                sum_s2 = sum(item[0]**2 for item in buffer_list)
-                sum_e2 = sum(item[1]**2 for item in buffer_list)
-                sum_w2 = sum(item[2]**2 for item in buffer_list)
-                sum_se = sum(item[0] * item[1] for item in buffer_list)
-                sum_sw = sum(item[0] * item[2] for item in buffer_list)
-                sum_ew = sum(item[1] * item[2] for item in buffer_list)
-                sum_s_I = sum(item[0] * item[3] for item in buffer_list)
-                sum_e_I = sum(item[1] * item[3] for item in buffer_list)
-                sum_w_I = sum(item[2] * item[3] for item in buffer_list)
-
-                # 3x3 determinant via cofactor expansion along first row
-                determinant = (
-                    sum_s2 * (sum_e2 * sum_w2 - sum_ew**2)
-                    - sum_se * (sum_se * sum_w2 - sum_ew * sum_sw)
-                    + sum_sw * (sum_se * sum_ew - sum_e2 * sum_sw)
-                )
-
-                # Full 3D solution when sun angles are diverse enough
-                if abs(determinant) > 1e-6:
-                    # Cramer's rule: replace each column with b and compute determinant
-                    det_s = (
-                        sum_s_I * (sum_e2 * sum_w2 - sum_ew**2)
-                        - sum_se * (sum_e_I * sum_w2 - sum_ew * sum_w_I)
-                        + sum_sw * (sum_e_I * sum_ew - sum_e2 * sum_w_I)
+                # Cold-start LS dispatched by dimension to preserve bit-
+                # identity with the prior split implementations.
+                new_coeff: dict[str, float] | None = None
+                if n_dim == 3:
+                    new_coeff = self._cold_start_solar_ls_3d(buffer_list)
+                    if new_coeff is None:
+                        _LOGGER.debug(
+                            "Buffered Unit Solar [Collecting]: %s -> degenerate, skipping.",
+                            entity_id,
+                        )
+                        return
+                    _LOGGER.info(
+                        "Buffered Unit Solar Learning [Jump Start]: %s [%s] -> %s "
+                        "(3D Least Squares, %d samples, damping=%s)",
+                        entity_id, regime, new_coeff, len(buffer_list),
+                        COLD_START_SOLAR_DAMPING,
                     )
-                    det_e = (
-                        sum_s2 * (sum_e_I * sum_w2 - sum_ew * sum_w_I)
-                        - sum_s_I * (sum_se * sum_w2 - sum_ew * sum_sw)
-                        + sum_sw * (sum_se * sum_w_I - sum_e_I * sum_sw)
-                    )
-                    det_w = (
-                        sum_s2 * (sum_e2 * sum_w_I - sum_ew * sum_e_I)
-                        - sum_se * (sum_se * sum_w_I - sum_e_I * sum_sw)
-                        + sum_s_I * (sum_se * sum_ew - sum_e2 * sum_sw)
-                    )
-
-                    new_coeff_s = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, det_s / determinant))
-                    new_coeff_e = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, det_e / determinant))
-                    new_coeff_w = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, det_w / determinant))
-
+                elif n_dim == 4:
+                    X_rows = [tuple(it[:n_dim]) for it in buffer_list]
+                    y_vals = [it[n_dim] for it in buffer_list]
+                    solution = self._solve_4x4_normal_equations(X_rows, y_vals)
+                    if solution is None:
+                        # Singular matrix (collinear sun, or one component
+                        # identically zero).  Don't fall back to 1D — let
+                        # the buffer keep collecting until sun-diversity
+                        # makes the system solvable.  Keep the buffer.
+                        _LOGGER.debug(
+                            "4D shadow cold-start: singular LS for %s [%s], "
+                            "keeping buffer (n=%d)",
+                            entity_id, regime, len(buffer_list),
+                        )
+                        return
                     new_coeff = {
-                        "s": new_coeff_s * COLD_START_SOLAR_DAMPING,
-                        "e": new_coeff_e * COLD_START_SOLAR_DAMPING,
-                        "w": new_coeff_w * COLD_START_SOLAR_DAMPING,
+                        components[k]: max(
+                            -SOLAR_COEFF_CAP,
+                            min(SOLAR_COEFF_CAP, solution[k]),
+                        )
+                        * COLD_START_SOLAR_DAMPING
+                        for k in range(n_dim)
                     }
-                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start]: {entity_id} [{regime}] -> {new_coeff} (3D Least Squares, {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
+                    _LOGGER.info(
+                        "4D shadow cold-start jump start: %s [%s] -> %s "
+                        "(4x4 LS, n=%d, damping=%.2f)",
+                        entity_id, regime, new_coeff, len(buffer_list),
+                        COLD_START_SOLAR_DAMPING,
+                    )
                 else:
-                    # Collinear fallback: sun observed from a narrow angle range (e.g. winter).
-                    # Project all observations onto the dominant direction and solve 1D LS,
-                    # then decompose back. NLMS updates will refine all components over time.
-                    dir_s = sum(item[0] for item in buffer_list)
-                    dir_e = sum(item[1] for item in buffer_list)
-                    dir_w = sum(item[2] for item in buffer_list)
-                    dir_norm = (dir_s**2 + dir_e**2 + dir_w**2) ** 0.5
-
-                    if dir_norm < 1e-6:
-                        _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> zero-magnitude vectors, skipping.")
+                    # Generic n_dim — build A = XᵀX, b = Xᵀy, solve via
+                    # helpers.solve_gauss_jordan.  No 1D fallback.
+                    A_mat = [[0.0] * n_dim for _ in range(n_dim)]
+                    b_vec = [0.0] * n_dim
+                    for item in buffer_list:
+                        impact = item[n_dim]
+                        for i in range(n_dim):
+                            xi = item[i]
+                            for j in range(n_dim):
+                                A_mat[i][j] += xi * item[j]
+                            b_vec[i] += xi * impact
+                    sol = solve_gauss_jordan(A_mat, b_vec)
+                    if sol is None:
                         return
-
-                    d_s = dir_s / dir_norm
-                    d_e = dir_e / dir_norm
-                    d_w = dir_w / dir_norm
-
-                    sum_proj_I = sum((item[0] * d_s + item[1] * d_e + item[2] * d_w) * item[3] for item in buffer_list)
-                    sum_proj2 = sum((item[0] * d_s + item[1] * d_e + item[2] * d_w) ** 2 for item in buffer_list)
-
-                    if sum_proj2 < 1e-6:
-                        _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> degenerate projection, skipping.")
-                        return
-
-                    c_scalar = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, sum_proj_I / sum_proj2))
                     new_coeff = {
-                        "s": c_scalar * d_s * COLD_START_SOLAR_DAMPING,
-                        "e": c_scalar * d_e * COLD_START_SOLAR_DAMPING,
-                        "w": c_scalar * d_w * COLD_START_SOLAR_DAMPING,
+                        components[k]: max(
+                            -SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, sol[k])
+                        )
+                        * COLD_START_SOLAR_DAMPING
+                        for k in range(n_dim)
                     }
-                    _LOGGER.info(f"Buffered Unit Solar Learning [Jump Start 1D]: {entity_id} [{regime}] -> {new_coeff} (collinear fallback, dir=({d_s:.2f},{d_e:.2f},{d_w:.2f}), {len(buffer_list)} samples, damping={COLD_START_SOLAR_DAMPING})")
 
                 self._update_unit_solar_coefficient(
-                    entity_id, new_coeff, solar_coefficients_per_unit, regime
+                    entity_id,
+                    new_coeff,
+                    solar_coefficients_per_unit,
+                    regime,
+                    components=components,
                 )
                 buffer_list.clear()
             else:
-                 _LOGGER.debug(f"Buffered Unit Solar [Collecting]: {entity_id} -> Sample {len(buffer_list)}/{LEARNING_BUFFER_THRESHOLD} ({actual_impact:.3f} kW)")
+                _LOGGER.debug(
+                    "Buffered Unit Solar [Collecting]: %s -> Sample %d/%d (%.3f kW)",
+                    entity_id, len(buffer_list), buffer_threshold, actual_impact,
+                )
 
         else:
             # Post-Jump Start: Normalized LMS (NLMS) (#809 A3)
@@ -1604,32 +2153,119 @@ class LearningManager:
             # Epsilon acts as L2 regularization — when solar power is low,
             # the effective step shrinks, preventing noise-chasing on
             # poorly-constrained components.
-            coeff_s = current_coeff.get("s", 0.0)
-            coeff_e = current_coeff.get("e", 0.0)
-            coeff_w = current_coeff.get("w", 0.0)
+            coeffs = [
+                float(current_coeff.get(components[k], 0.0)) for k in range(n_dim)
+            ]
 
-            predicted_impact = coeff_s * solar_s + coeff_e * solar_e + coeff_w * solar_w
+            predicted_impact = 0.0
+            input_power = 0.0
+            for k in range(n_dim):
+                predicted_impact += coeffs[k] * vec[k]
+                input_power += vec[k] ** 2
             error = actual_impact - predicted_impact
-
-            # NLMS: normalize step by input power + regularization
-            input_power = solar_s ** 2 + solar_e ** 2 + solar_w ** 2
             step = NLMS_STEP_SIZE * error / (input_power + NLMS_REGULARIZATION)
 
-            new_coeff_s = coeff_s + step * solar_s
-            new_coeff_e = coeff_e + step * solar_e
-            new_coeff_w = coeff_w + step * solar_w
-
-            # Clamp for safety
-            new_coeff_s = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_s))
-            new_coeff_e = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_e))
-            new_coeff_w = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, new_coeff_w))
-
-            new_coeff = {"s": new_coeff_s, "e": new_coeff_e, "w": new_coeff_w}
+            new_coeff = {
+                components[k]: max(
+                    -SOLAR_COEFF_CAP,
+                    min(SOLAR_COEFF_CAP, coeffs[k] + step * vec[k]),
+                )
+                for k in range(n_dim)
+            }
 
             _LOGGER.debug(f"Per-Unit Solar Learning [NLMS]: {entity_id} [{regime}] -> {new_coeff} (was {current_coeff})")
             self._update_unit_solar_coefficient(
-                entity_id, new_coeff, solar_coefficients_per_unit, regime
+                entity_id,
+                new_coeff,
+                solar_coefficients_per_unit,
+                regime,
+                components=components,
             )
+
+    @staticmethod
+    def _cold_start_solar_ls_3d(
+        buffer_list: list[tuple[float, float, float, float]],
+    ) -> dict[str, float] | None:
+        """3D cold-start LS with 1D collinear fallback (preserved verbatim).
+
+        Returns the damped coefficient dict ``{"s","e","w"}`` on success,
+        or ``None`` when both joint LS and the 1D fallback are degenerate
+        (the caller keeps the buffer so cold-start retries on the next
+        qualifying hour).  Bit-identical to the inline pre-unification
+        block — extracted here so the unified ``_learn_unit_solar_coefficient``
+        body stays readable.
+        """
+        sum_s2 = sum(item[0] ** 2 for item in buffer_list)
+        sum_e2 = sum(item[1] ** 2 for item in buffer_list)
+        sum_w2 = sum(item[2] ** 2 for item in buffer_list)
+        sum_se = sum(item[0] * item[1] for item in buffer_list)
+        sum_sw = sum(item[0] * item[2] for item in buffer_list)
+        sum_ew = sum(item[1] * item[2] for item in buffer_list)
+        sum_s_I = sum(item[0] * item[3] for item in buffer_list)
+        sum_e_I = sum(item[1] * item[3] for item in buffer_list)
+        sum_w_I = sum(item[2] * item[3] for item in buffer_list)
+
+        determinant = (
+            sum_s2 * (sum_e2 * sum_w2 - sum_ew ** 2)
+            - sum_se * (sum_se * sum_w2 - sum_ew * sum_sw)
+            + sum_sw * (sum_se * sum_ew - sum_e2 * sum_sw)
+        )
+
+        # Full 3D solution when sun angles are diverse enough.  Trigger
+        # `|det| > 1e-6` is preserved so the boundary between joint LS
+        # and the 1D collinear fallback is unchanged.
+        sol = None
+        if abs(determinant) > 1e-6:
+            A_mat = [
+                [sum_s2, sum_se, sum_sw],
+                [sum_se, sum_e2, sum_ew],
+                [sum_sw, sum_ew, sum_w2],
+            ]
+            b_vec = [sum_s_I, sum_e_I, sum_w_I]
+            sol = solve_gauss_jordan(A_mat, b_vec)
+
+        if sol is not None:
+            new_coeff_s = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, sol[0]))
+            new_coeff_e = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, sol[1]))
+            new_coeff_w = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, sol[2]))
+            return {
+                "s": new_coeff_s * COLD_START_SOLAR_DAMPING,
+                "e": new_coeff_e * COLD_START_SOLAR_DAMPING,
+                "w": new_coeff_w * COLD_START_SOLAR_DAMPING,
+            }
+
+        # Collinear fallback: sun observed from a narrow angle range
+        # (e.g. winter).  Project all observations onto the dominant
+        # direction and solve 1D LS, then decompose back.  NLMS updates
+        # will refine all components over time.
+        dir_s = sum(item[0] for item in buffer_list)
+        dir_e = sum(item[1] for item in buffer_list)
+        dir_w = sum(item[2] for item in buffer_list)
+        dir_norm = (dir_s ** 2 + dir_e ** 2 + dir_w ** 2) ** 0.5
+        if dir_norm < 1e-6:
+            return None
+
+        d_s = dir_s / dir_norm
+        d_e = dir_e / dir_norm
+        d_w = dir_w / dir_norm
+
+        sum_proj_I = sum(
+            (item[0] * d_s + item[1] * d_e + item[2] * d_w) * item[3]
+            for item in buffer_list
+        )
+        sum_proj2 = sum(
+            (item[0] * d_s + item[1] * d_e + item[2] * d_w) ** 2
+            for item in buffer_list
+        )
+        if sum_proj2 < 1e-6:
+            return None
+
+        c_scalar = max(-SOLAR_COEFF_CAP, min(SOLAR_COEFF_CAP, sum_proj_I / sum_proj2))
+        return {
+            "s": c_scalar * d_s * COLD_START_SOLAR_DAMPING,
+            "e": c_scalar * d_e * COLD_START_SOLAR_DAMPING,
+            "w": c_scalar * d_w * COLD_START_SOLAR_DAMPING,
+        }
 
     def _learn_unit_model(
         self,
@@ -1809,6 +2445,8 @@ class LearningManager:
         value: dict[str, float],
         solar_coefficients_per_unit: dict,
         regime: str,
+        *,
+        components: tuple[str, ...] = ("s", "e", "w"),
     ) -> None:
         """Update the solar coefficient for one (entity, regime) slot.
 
@@ -1817,12 +2455,22 @@ class LearningManager:
         an entity creates both regimes as zero-vectors so subsequent
         reads on the unwritten regime return a stable shape.
 
-        All three components (south, east, west) are clamped to >= 0
-        (invariant #4): each represents solar gain through windows
-        facing one cardinal direction, and a window can only receive
-        gain.  Heating and cooling regimes share this clamp but
-        converge to different absolute values (each absorbs its own
-        ``E[1/COP]``).
+        All components are non-negative-clamped (invariant #4): each
+        represents solar gain through windows facing one cardinal
+        direction, and a window can only receive gain.  Heating and
+        cooling regimes share this clamp but converge to different
+        absolute values (each absorbs its own ``E[1/COP]``).
+        ``SOLAR_COEFF_CAP`` is applied upstream by the live learners
+        (NLMS cold-start, inequality CAP clamp, batch-fit, apply-
+        implied) before the value reaches this gate.
+
+        ``components`` selects which keys to write through the gate.
+        The 3D callers (NLMS, inequality, cold-start, batch-fit,
+        apply-implied) pass the default 3-tuple and observe bit-
+        identical pre-#954 behaviour.  The 4D shadow learner (#954)
+        passes ``("s", "e", "w", "diffuse")`` and gets the diffuse
+        component clamped identically.  All entries in ``components``
+        must be present in ``value`` (default 0.0 if missing).
 
         Stamps ``learned: True`` on the written regime (#921) so the
         cooling cold-start gate (``_is_cooling_solar_cold_start``) can
@@ -1847,20 +2495,21 @@ class LearningManager:
                 entry["heating"] = {"s": 0.0, "e": 0.0, "w": 0.0}
             if "cooling" not in entry or not isinstance(entry["cooling"], dict):
                 entry["cooling"] = {"s": 0.0, "e": 0.0, "w": 0.0}
-        entry[regime] = {
-            "s": round(max(0.0, value.get("s", 0.0)), 5),
-            "e": round(max(0.0, value.get("e", 0.0)), 5),
-            "w": round(max(0.0, value.get("w", 0.0)), 5),
-            "learned": True,
+        new_regime: dict = {
+            comp: round(max(0.0, value.get(comp, 0.0)), 5)
+            for comp in components
         }
+        new_regime["learned"] = True
+        entry[regime] = new_regime
 
     def _update_unit_solar_inequality(
         self,
         entity_id: str,
         expected_unit_base: float,
-        battery_filtered_potential: tuple[float, float, float],
-        solar_coefficients_per_unit: dict,
+        battery_filtered_potential: tuple[float, ...],
+        solar_coefficients_per_unit: dict | None,
         *,
+        components: tuple[str, ...] = ("s", "e", "w"),
         margin: float = INEQUALITY_MARGIN,
         step_size: float = INEQUALITY_STEP_SIZE,
     ) -> str:
@@ -1884,6 +2533,13 @@ class LearningManager:
         (the room overheated over hours), and the battery EMA matches that
         timescale (decay 0.80, half-life ~3.1h).
 
+        Dimension-agnostic via ``components`` — defaults to the 3D solar
+        coefficient ``("s", "e", "w")``; the 4D shadow path passes
+        ``("s", "e", "w", "diffuse")`` along with the matching 4-tuple
+        ``battery_filtered_potential`` and the 4D coefficient dict.  The
+        4D variant is strict shadow (no live read-path consumer); both
+        share the same one-sided, heating-only semantics (invariant #5).
+
         Parameters
         ----------
         entity_id:
@@ -1892,10 +2548,16 @@ class LearningManager:
             Current per-unit bucket value (kWh).  Gates the update via
             ``SOLAR_SHUTDOWN_MIN_BASE`` at the call site.
         battery_filtered_potential:
-            3-tuple ``(pot_s, pot_e, pot_w)`` from the coordinator's
-            ``_potential_battery_s/e/w`` (live) or local replay state.
+            Per-direction battery EMA — ``(pot_s, pot_e, pot_w)`` for 3D
+            or ``(pot_s, pot_e, pot_w, pot_d)`` for 4D.  Length must match
+            ``len(components)``.
         solar_coefficients_per_unit:
-            Current coefficients; mutated in place.
+            Current coefficients; mutated in place.  ``None`` returns
+            ``"shadow_disabled"`` (for the 4D shadow path when the
+            container hasn't been initialised yet).
+        components:
+            Dimension and key labels for the coefficient slot.  Default
+            ``("s", "e", "w")`` preserves all pre-existing 3D call sites.
         margin:
             Conservative factor on the constraint (default 0.9).  Requires
             ``coeff·potential ≥ 0.9 · base`` rather than strict ``≥ base``.
@@ -1910,10 +2572,15 @@ class LearningManager:
         -------
         One of: ``"updated"`` (constraint violated, update applied),
         ``"non_binding"`` (constraint satisfied, no update),
-        ``"zero_magnitude"`` (battery-filtered potential too small).
+        ``"zero_magnitude"`` (battery-filtered potential too small),
+        ``"shadow_disabled"`` (coefficient container is None — 4D shadow
+        path before the container is initialised).
         """
-        pot_s, pot_e, pot_w = battery_filtered_potential
-        mag_total = pot_s + pot_e + pot_w  # all non-negative by construction
+        if solar_coefficients_per_unit is None:
+            return "shadow_disabled"
+
+        n_dim = len(components)
+        mag_total = sum(battery_filtered_potential)  # all non-negative by construction
         if mag_total <= 0.01:
             # Battery not yet populated, or very low sun — inequality has
             # no direction to learn against.  Skip rather than update.
@@ -1928,14 +2595,15 @@ class LearningManager:
             heating_coeff = entity_coeffs.get("heating") or {}
         else:
             heating_coeff = {}
-        coeff_s = float(heating_coeff.get("s", 0.0))
-        coeff_e = float(heating_coeff.get("e", 0.0))
-        coeff_w = float(heating_coeff.get("w", 0.0))
+        coeffs = [float(heating_coeff.get(components[k], 0.0)) for k in range(n_dim)]
 
-        predicted_impact = coeff_s * pot_s + coeff_e * pot_e + coeff_w * pot_w
+        predicted_impact = 0.0
+        for k in range(n_dim):
+            predicted_impact += coeffs[k] * battery_filtered_potential[k]
         constraint_target = margin * expected_unit_base
 
         if predicted_impact >= constraint_target:
+            # One-sided (invariant #5): never lower coefficients.
             return "non_binding"
 
         # Constraint violated — distribute the deficit proportional to the
@@ -1944,22 +2612,59 @@ class LearningManager:
         # history across hours, so a direction with recent activity still
         # gets updated when its own pot component is above zero).
         deficit = constraint_target - predicted_impact
-        new_s = coeff_s + step_size * deficit * (pot_s / mag_total)
-        new_e = coeff_e + step_size * deficit * (pot_e / mag_total)
-        new_w = coeff_w + step_size * deficit * (pot_w / mag_total)
-
-        # Apply non-negative + CAP clamps consistent with NLMS path.
-        new_s = max(0.0, min(SOLAR_COEFF_CAP, new_s))
-        new_e = max(0.0, min(SOLAR_COEFF_CAP, new_e))
-        new_w = max(0.0, min(SOLAR_COEFF_CAP, new_w))
+        new_value: dict[str, float] = {}
+        for k in range(n_dim):
+            updated = coeffs[k] + step_size * deficit * (
+                battery_filtered_potential[k] / mag_total
+            )
+            # Non-negative + CAP clamps consistent with NLMS path.
+            new_value[components[k]] = max(0.0, min(SOLAR_COEFF_CAP, updated))
 
         self._update_unit_solar_coefficient(
             entity_id,
-            {"s": new_s, "e": new_e, "w": new_w},
+            new_value,
             solar_coefficients_per_unit,
             "heating",
+            components=components,
         )
         return "updated"
+
+    # ------------------------------------------------------------------
+    # 4D shadow learner (#954)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _solve_4x4_normal_equations(
+        X_rows: list[tuple[float, float, float, float]],
+        y_vals: list[float],
+    ) -> tuple[float, float, float, float] | None:
+        """Solve A x = b for a 4-variable LS problem via Gauss-Jordan.
+
+        ``X_rows`` are samples [(s, e, w, d), ...] and ``y_vals`` are
+        the corresponding scalar targets.  Builds the 4x4 normal matrix
+        ``A = X^T X`` and vector ``b = X^T y``, then solves with
+        partial-pivot Gauss-Jordan.  Returns ``None`` when the matrix
+        is singular (``abs(pivot) < 1e-10`` on any step) so the caller
+        can fall through without writing a non-physical coefficient.
+
+        Pure Python — the codebase has no numpy dependency.
+        """
+        if len(X_rows) < 4 or len(X_rows) != len(y_vals):
+            return None
+
+        # Build the 4×4 normal matrix A = XᵀX and target b = Xᵀy.
+        A = [[0.0] * 4 for _ in range(4)]
+        b = [0.0] * 4
+        for row, y in zip(X_rows, y_vals):
+            for i in range(4):
+                xi = row[i]
+                for j in range(4):
+                    A[i][j] += xi * row[j]
+                b[i] += xi * y
+
+        sol = solve_gauss_jordan(A, b, pivot_eps=1e-10)
+        if sol is None:
+            return None
+        return (sol[0], sol[1], sol[2], sol[3])
 
     def _increment_observation_count(self, entity_id, temp_key, wind_bucket, observation_counts):
         """Increment observation count."""
@@ -2058,6 +2763,10 @@ class LearningManager:
                     target = dark_target
                 else:
                     target = actual_kwh
+                # #967: inline EMA step.  ``helpers.compute_base_ema_step`` is the
+                # named source-of-truth; this retrain path will be migrated in the
+                # same pass as ``process_learning`` once 4D-primary observation
+                # has stabilised.
                 new_pred = current_pred + effective_rate * (target - current_pred)
             else:
                 # Cold start: first non-zero sample seeds the bucket.
@@ -2171,9 +2880,24 @@ class LearningManager:
         for h in range(24):
             log_entry = log_by_hour.get(h, {})
             h_temp_key = log_entry.get("temp_key")
-            h_wind_bucket = log_entry.get("wind_bucket")
-            if h_temp_key is None or h_wind_bucket is None:
+            if h_temp_key is None:
                 continue
+            # Re-bucketize live; stored wind_bucket is a cache of the
+            # threshold at write-time.  See retrain.py:422 for rationale.
+            # Fall back to the stored label when ``effective_wind`` is
+            # missing (very old logs / partial imports).
+            eff_w = log_entry.get("effective_wind")
+            if isinstance(eff_w, (int, float)):
+                if eff_w >= extreme_wind_threshold:
+                    h_wind_bucket = "extreme_wind"
+                elif eff_w >= wind_threshold:
+                    h_wind_bucket = "high_wind"
+                else:
+                    h_wind_bucket = "normal"
+            else:
+                h_wind_bucket = log_entry.get("wind_bucket")
+                if h_wind_bucket is None:
+                    continue
 
             weight = norm_weights[h]
 
@@ -2210,7 +2934,15 @@ class LearningManager:
             # hour — otherwise a nonzero delta would be applied against
             # direct_kwh=0 and leak into the total, inflating smear-only
             # (pure Track C) buckets.
-            solar_delta = log_entry.get("solar_normalization_delta", 0.0)
+            # #968: aggregation paths prefer the 4D delta whenever the log
+            # entry carries it, falling back to 3D otherwise — independent
+            # of ``experimental_4d_primary``.  The live read-path stays
+            # flag-gated; this consumer of historical hourly_log entries
+            # uses the best available signal per hour.
+            solar_delta = log_entry.get(
+                "solar_normalization_delta_4d",
+                log_entry.get("solar_normalization_delta", 0.0),
+            )
             if solar_delta and has_direct:
                 direct_kwh = max(0.0, direct_kwh + solar_delta)
 
@@ -2253,7 +2985,13 @@ class LearningManager:
         strategies: dict,
         model: "ModelState",
         learning_rate: float,
-    ) -> None:
+        *,
+        target_entity: str | None = None,
+        dry_run: bool = False,
+        reset_first: bool = False,
+        wind_threshold: float | None = None,
+        extreme_wind_threshold: float | None = None,
+    ) -> dict | None:
         """Replay per-unit correlation models from hourly log entries.
 
         Each DirectMeter sensor's actual kWh is written to its per-unit
@@ -2261,25 +2999,85 @@ class LearningManager:
         ``isolate_sensor`` subtraction works after ``retrain_from_history(reset_first=True)``.
         WeightedSmear sensors are skipped.
 
+        ``target_entity`` restricts the replay to a single DirectMeter
+        sensor (used by the ``retrain_unit_from_history`` service).
+        Default ``None`` preserves the original whole-installation behaviour.
+
+        ``dry_run`` routes writes through deep copies and returns a
+        diagnostic ``{"diff_summary", "buckets_changed", "entries_processed"}``
+        without mutating ``model``.  Only meaningful with ``target_entity``
+        set (the diff is computed for that entity's buckets).
+
+        ``reset_first`` (only honoured when ``target_entity`` is set) clears
+        the target entity's slice of ``correlation_per_unit`` and
+        ``buffer_per_unit`` BEFORE the replay loop.  Cleared on the
+        deep-copies in dry-run mode and on live state otherwise, so the
+        reported diff matches what a real reset-then-replay would produce.
+
         Moved from coordinator.py (#784) — pure model-writing logic.
         """
+        from copy import deepcopy
+
         from .observation import DirectMeter
 
         direct_sensors = [
             s for s in strategies.values()
             if isinstance(s, DirectMeter)
         ]
+        if target_entity is not None:
+            direct_sensors = [s for s in direct_sensors if s.sensor_id == target_entity]
+            if not direct_sensors:
+                return {
+                    "diff_summary": {},
+                    "buckets_changed": 0,
+                    "entries_processed": 0,
+                }
         if not direct_sensors:
-            return
+            return None
 
-        correlation_per_unit = model.correlation_data_per_unit
-        buffer_per_unit = model.learning_buffer_per_unit
+        # Snapshot for diff diagnostic when we're reporting on a target
+        # entity.  In dry-run we additionally route writes through copies
+        # so model state is untouched.
+        if target_entity is not None:
+            before_snapshot = deepcopy(model.correlation_data_per_unit.get(target_entity, {}))
+        else:
+            before_snapshot = None
+        if dry_run:
+            correlation_per_unit = deepcopy(model.correlation_data_per_unit)
+            buffer_per_unit = deepcopy(model.learning_buffer_per_unit)
+        else:
+            correlation_per_unit = model.correlation_data_per_unit
+            buffer_per_unit = model.learning_buffer_per_unit
+
+        if reset_first and target_entity is not None:
+            correlation_per_unit.pop(target_entity, None)
+            buffer_per_unit.pop(target_entity, None)
 
         for log_entry in day_entries:
             h_temp_key = log_entry.get("temp_key")
-            h_wind_bucket = log_entry.get("wind_bucket")
-            if h_temp_key is None or h_wind_bucket is None:
+            if h_temp_key is None:
                 continue
+            # Re-bucketize live from stored effective_wind when thresholds
+            # are supplied and the entry carries ``effective_wind``;
+            # otherwise fall back to the stored label (legacy callers in
+            # tests; very old logs without ``effective_wind``).
+            # See retrain.py:422 for rationale.
+            eff_w = log_entry.get("effective_wind")
+            if (
+                wind_threshold is not None
+                and extreme_wind_threshold is not None
+                and isinstance(eff_w, (int, float))
+            ):
+                if eff_w >= extreme_wind_threshold:
+                    h_wind_bucket = "extreme_wind"
+                elif eff_w >= wind_threshold:
+                    h_wind_bucket = "high_wind"
+                else:
+                    h_wind_bucket = "normal"
+            else:
+                h_wind_bucket = log_entry.get("wind_bucket")
+                if h_wind_bucket is None:
+                    continue
             breakdown = log_entry.get("unit_breakdown", {})
             # Per #885: route cooling-mode samples to the dedicated
             # "cooling" wind-bucket, mirroring live-write semantics in
@@ -2318,6 +3116,35 @@ class LearningManager:
                 else:
                     new_val = cur + learning_rate * (unit_kwh - cur)
                     correlation_per_unit[sid][h_temp_key][effective_bucket] = round(new_val, 5)
+
+        if target_entity is None:
+            return None
+
+        # Build diff diagnostic for the targeted entity.
+        sid = target_entity
+        before_buckets = before_snapshot or {}
+        after_buckets = correlation_per_unit.get(sid, {})
+        diffs: list[tuple[str, float, float, float]] = []
+        all_temp_keys = set(before_buckets) | set(after_buckets)
+        for tk in all_temp_keys:
+            before_wb = before_buckets.get(tk, {}) or {}
+            after_wb = after_buckets.get(tk, {}) or {}
+            for wb in set(before_wb) | set(after_wb):
+                before_v = float(before_wb.get(wb, 0.0))
+                after_v = float(after_wb.get(wb, 0.0))
+                if before_v != after_v:
+                    diffs.append((f"{tk}/{wb}", before_v, after_v, after_v - before_v))
+        diffs.sort(key=lambda x: abs(x[3]), reverse=True)
+        capped = diffs[:200]
+        diff_summary = {
+            key: {"before": b, "after": a, "delta": d}
+            for key, b, a, d in capped
+        }
+        return {
+            "diff_summary": diff_summary,
+            "buckets_changed": len(diffs),
+            "entries_processed": len(day_entries),
+        }
 
     # -------------------------------------------------------------------------
     # Retrain-time helpers (NLMS replay + on-the-fly solar_normalization_delta)
@@ -2437,6 +3264,8 @@ class LearningManager:
         unit_min_base: dict[str, float] | None = None,
         screen_affected_entities: frozenset[str] | None = None,
         solar_affected_entities: frozenset[str] | None = None,
+        wind_threshold: float | None = None,
+        extreme_wind_threshold: float | None = None,
     ):
         """Re-run NLMS solar coefficient learning over historical entries.
 
@@ -2548,10 +3377,27 @@ class LearningManager:
                 diag["entry_skipped_low_magnitude"] += 1
                 continue
             temp_key = entry.get("temp_key")
-            wind_bucket = entry.get("wind_bucket", "normal")
             if temp_key is None:
                 diag["entry_skipped_missing_temp_key"] += 1
                 continue
+            # Re-bucketize live when thresholds supplied and the entry
+            # carries ``effective_wind``; fall back to the stored label
+            # otherwise (legacy callers; very old logs).
+            # See retrain.py:422 for rationale.
+            eff_w = entry.get("effective_wind")
+            if (
+                wind_threshold is not None
+                and extreme_wind_threshold is not None
+                and isinstance(eff_w, (int, float))
+            ):
+                if eff_w >= extreme_wind_threshold:
+                    wind_bucket = "extreme_wind"
+                elif eff_w >= wind_threshold:
+                    wind_bucket = "high_wind"
+                else:
+                    wind_bucket = "normal"
+            else:
+                wind_bucket = entry.get("wind_bucket", "normal")
             unit_modes = entry.get("unit_modes", {}) or {}
             unit_breakdown = entry.get("unit_breakdown", {}) or {}
             shutdown_entities = set(entry.get("solar_dominant_entities", []) or [])
@@ -2754,7 +3600,7 @@ class LearningManager:
         dropping right-censored samples (HP fully off because the
         room got warm).  Tobit's Mills-ratio likelihood term
         recovers slope information from the censoring point itself.
-        See ``_solve_tobit_3d`` for the solver and #904 for the
+        See ``_solve_tobit`` for the solver and #904 for the
         stage-1 evidence motivating the swap from LS to Tobit.
 
         Per (entity, regime): heating-mode hours fit the heating regime
@@ -2797,7 +3643,7 @@ class LearningManager:
           ``value = base − actual``.
 
         Algorithm:
-        - Tobit MLE via ``_solve_tobit_3d``: projected-Newton on
+        - Tobit MLE via ``_solve_tobit``: projected-Newton on
           ``(c_S, c_E, c_W, log σ)`` with active-set non-negativity
           (invariant #4), trust-region clip on Mills-ratio q, warm-
           start from 3×3 LS on uncensored rows.
@@ -2950,7 +3796,9 @@ class LearningManager:
                     entity_results[regime] = regime_diag
                     continue
 
-                fit = LearningManager._solve_tobit_3d(samples, censored_mask)
+                fit = LearningManager._solve_tobit(
+                    samples, censored_mask, components=("s", "e", "w")
+                )
                 if fit is None:
                     regime_diag["skip_reason"] = "warm_start_failed"
                     regime_diag["coefficient_after"] = regime_diag[
@@ -3333,15 +4181,31 @@ class LearningManager:
                 continue
 
             if for_tobit:
+                # Shutdown rows under Tobit: do NOT drop.  ``actual = 0``
+                # gives ``actual_impact = base``, which naturally clears
+                # the saturation gate downstream, and the row is emitted
+                # with ``value = saturation_threshold`` and
+                # ``censored_mask = True``.  Tobit's Mills-ratio handles
+                # the right-censoring at this boundary mathematically —
+                # the lower-bound information ("c·s must be at least
+                # base, else log-likelihood is penalised") is exactly
+                # what shutdown hours carry.  Dropping them discards
+                # signal Tobit was designed to extract.
+                # Counter retained for diagnostics (the row is kept,
+                # not dropped, so it does not contribute to total
+                # rejections — separate key).
                 if self._is_entity_shutdown_under_current_rules(
                     entity_id=entity_id,
                     entry=entry,
                     pot_tuple=(pot_s, pot_e, pot_w),
                     unit_min_base=unit_threshold,
                 ):
-                    drop_counts["shutdown"] += 1
-                    continue
+                    drop_counts["shutdown_kept_censored"] = (
+                        drop_counts.get("shutdown_kept_censored", 0) + 1
+                    )
             elif not match_diagnose:
+                # LS path: cannot model censoring, so shutdown rows
+                # remain dropped to avoid coefficient inflation.
                 shutdown_entities = set(
                     entry.get("solar_dominant_entities", []) or []
                 )
@@ -3358,7 +4222,23 @@ class LearningManager:
                 drop_counts["low_magnitude"] += 1
                 continue
 
-            wind_bucket = entry.get("wind_bucket", "normal")
+            # Re-bucketize live against current thresholds when the
+            # coordinator exposes them; stored label is a cache of
+            # write-time thresholds (see retrain.py:422).  isinstance(..., (int, float))
+            # filters out MagicMock auto-attrs from test stubs that
+            # never set explicit thresholds.
+            wt = getattr(coordinator, "wind_threshold", None)
+            ewt = getattr(coordinator, "extreme_wind_threshold", None)
+            if isinstance(wt, (int, float)) and isinstance(ewt, (int, float)):
+                eff_w = entry.get("effective_wind", 0.0) or 0.0
+                if eff_w >= ewt:
+                    wind_bucket = "extreme_wind"
+                elif eff_w >= wt:
+                    wind_bucket = "high_wind"
+                else:
+                    wind_bucket = "normal"
+            else:
+                wind_bucket = entry.get("wind_bucket", "normal")
             effective_bucket = (
                 COOLING_WIND_BUCKET if regime == "cooling" else wind_bucket
             )
@@ -3499,14 +4379,12 @@ class LearningManager:
     def _solve_batch_fit_normal_equations(
         samples: list[tuple[float, float, float, float]],
     ) -> dict[str, float] | None:
-        """Joint 3×3 LS via Cramer's rule, with collinear 1D fallback.
+        """Joint 3×3 LS via Gauss-Jordan, with collinear 1D fallback.
 
-        Same arithmetic as the cold-start solver in
-        ``_learn_unit_solar_coefficient`` lines 985-1085 — extracted
-        here without the cold-start damping (the caller damps).
-        Returns a coefficient dict, or ``None`` if the fit cannot be
-        produced (degenerate Gram matrix and zero-magnitude direction
-        sum).
+        Mirrors the cold-start solver in ``_learn_unit_solar_coefficient``
+        without the cold-start damping (the caller damps).  Returns a
+        coefficient dict, or ``None`` if the fit cannot be produced
+        (degenerate Gram matrix and zero-magnitude direction sum).
         """
         if not samples:
             return None
@@ -3526,27 +4404,19 @@ class LearningManager:
             + sum_sw * (sum_se * sum_ew - sum_e2 * sum_sw)
         )
 
+        # Trigger `|det| > 1e-6` is preserved so the boundary between
+        # joint LS and the 1D collinear fallback is unchanged.
         if abs(determinant) > 1e-6:
-            det_s = (
-                sum_s_I * (sum_e2 * sum_w2 - sum_ew ** 2)
-                - sum_se * (sum_e_I * sum_w2 - sum_ew * sum_w_I)
-                + sum_sw * (sum_e_I * sum_ew - sum_e2 * sum_w_I)
+            sol = solve_gauss_jordan(
+                [
+                    [sum_s2, sum_se, sum_sw],
+                    [sum_se, sum_e2, sum_ew],
+                    [sum_sw, sum_ew, sum_w2],
+                ],
+                [sum_s_I, sum_e_I, sum_w_I],
             )
-            det_e = (
-                sum_s2 * (sum_e_I * sum_w2 - sum_ew * sum_w_I)
-                - sum_s_I * (sum_se * sum_w2 - sum_ew * sum_sw)
-                + sum_sw * (sum_se * sum_w_I - sum_e_I * sum_sw)
-            )
-            det_w = (
-                sum_s2 * (sum_e2 * sum_w_I - sum_ew * sum_e_I)
-                - sum_se * (sum_se * sum_w_I - sum_e_I * sum_sw)
-                + sum_s_I * (sum_se * sum_ew - sum_e2 * sum_sw)
-            )
-            return {
-                "s": det_s / determinant,
-                "e": det_e / determinant,
-                "w": det_w / determinant,
-            }
+            if sol is not None:
+                return {"s": sol[0], "e": sol[1], "w": sol[2]}
 
         # Collinear fallback: project onto dominant direction.
         dir_s = sum(s[0] for s in samples)
@@ -3616,21 +4486,22 @@ class LearningManager:
         return (pdf / surv, surv)
 
     @staticmethod
-    def _solve_tobit_3d(
-        samples: list[tuple[float, float, float, float]],
+    def _solve_tobit(
+        samples: list[tuple[float, ...]],
         censored_mask: list[bool],
         *,
+        components: tuple[str, ...],
         coeff_init: dict[str, float] | None = None,
         sigma_init: float | None = None,
         max_iter: int = TOBIT_MAX_ITER,
         tol: float = TOBIT_CONV_TOL,
         q_clip: float = TOBIT_Q_CLIP,
     ) -> dict | None:
-        """Type-I right-censored Gaussian regression MLE (3D solar coeff).
+        """Type-I right-censored Gaussian regression MLE (dimension-agnostic).
 
         Maximises the Tobit log-likelihood for solar-coefficient learning
         with saturation-clipped (HP-fully-off) samples treated as
-        right-censored data, jointly over ``(c_S, c_E, c_W, log σ)``:
+        right-censored data, jointly over ``(c_0, ..., c_{n-1}, log σ)``:
 
             ℓ(c, σ) = Σ_U [ −log σ − ½((y_i − c·s_i)/σ)² ]
                     + Σ_C log( 1 − Φ((T_i − c·s_i)/σ) )                    (+ const)
@@ -3642,21 +4513,31 @@ class LearningManager:
         feasible start.  Non-negativity (invariant #4) is enforced via
         an active-set projected Newton step.
 
+        Dimension and output keys are driven by ``components`` —
+        ``("s", "e", "w")`` for the 3D solar coefficient, or
+        ``("s", "e", "w", "diffuse")`` for the 4D shadow potential.
+        The Newton loop, gradient/Hessian build, and active-set logic
+        are fully dimension-agnostic; the warm-start LS dispatches by
+        ``len(components)`` to preserve bit-identity with the prior
+        ``_solve_tobit_3d`` (which used the 1D-collinear-fallback
+        :meth:`_solve_batch_fit_normal_equations` path) and
+        ``_solve_tobit_4d`` (which used :meth:`_solve_4x4_normal_equations`).
+
         Sample format
         -------------
-        ``samples[i] = (s_i, e_i, w_i, value_i)`` parallel to
+        ``samples[i] = (c_0_i, ..., c_{n-1}_i, value_i)`` — an
+        ``(n+1)``-tuple where ``n = len(components)``.  Parallel to
         ``censored_mask[i]``.  When ``censored_mask[i] = True``,
         ``value_i`` is the censoring threshold ``T_i`` (NOT the observed
         ``actual_impact``); when ``False``, it is the observed
-        ``y_i = base − actual``.  Caller responsibility — keeps the
-        solver independent of how saturation is detected.
+        ``y_i = base − actual``.
 
         Returns
         -------
-        ``{"s", "e", "w", "sigma", "iterations", "converged",
-        "log_likelihood", "n_uncensored", "n_censored", "n_eff"}`` on
-        success, or ``None`` when the warm-start LS has too few rows
-        to form an initial estimate.  ``n_eff = |U| + Σ_C λ(q)(λ(q)−q)``
+        ``{components[0]: c0, ..., "sigma", "iterations", "converged",
+        "failure_reason", "log_likelihood", "n_uncensored", "n_censored",
+        "n_eff"}`` on success, or ``None`` when the warm-start LS has too
+        few rows to form an initial estimate.  ``n_eff = |U| + Σ_C λ(q)(λ(q)−q)``
         is the censoring-weighted effective sample size.
 
         ``q_clip`` floor on ``q = (T − c·s)/σ`` inside the trust region
@@ -3666,6 +4547,7 @@ class LearningManager:
         the limit value into the Newton step produces a pathological
         zero contribution that destabilises the active-set logic).
         """
+        n_dim = len(components)
         n = len(samples)
         if n != len(censored_mask) or n == 0:
             return None
@@ -3677,11 +4559,11 @@ class LearningManager:
             samples[i] for i in range(n) if not censored_mask[i]
         ]
         n_unc = len(uncensored_samples)
-        if n_unc < 3:
-            # σ identifiability requires at least 3 uncensored to seed
-            # the LS direction in 3D.  Below that we cannot warm-start
-            # and the caller's gate (TOBIT_MIN_UNCENSORED = 20) should
-            # already have rejected; defensive return.
+        if n_unc < n_dim:
+            # σ identifiability requires at least n_dim uncensored rows
+            # to seed the LS direction (one per unknown).  Defensive —
+            # caller's gate (TOBIT_MIN_UNCENSORED = 20) should already
+            # have rejected.
             return None
 
         # Always run the LS fit on uncensored rows.  Two uses below:
@@ -3690,23 +4572,52 @@ class LearningManager:
         # the LS residual still seeds σ — see the σ-init block.
         # If LS is degenerate (collinear samples in the uncensored
         # subset), fall back to the warm-start path.
-        ls_fit = LearningManager._solve_batch_fit_normal_equations(
-            uncensored_samples
-        )
+        #
+        # Dispatch by dimension to preserve bit-identity with the prior
+        # split solvers: 3D used _solve_batch_fit_normal_equations
+        # (with a 1D collinear fallback for narrow-angle winter sun);
+        # 4D used _solve_4x4_normal_equations (no fallback — returns
+        # None on singular Gram matrix, letting the caller route to
+        # warm_start_failed).
+        if n_dim == 3:
+            ls_fit_dict = LearningManager._solve_batch_fit_normal_equations(
+                uncensored_samples
+            )
+            if ls_fit_dict is None:
+                ls_solution = None
+            else:
+                ls_solution = tuple(
+                    float(ls_fit_dict[components[k]]) for k in range(n_dim)
+                )
+        elif n_dim == 4:
+            X_rows = [tuple(s[:n_dim]) for s in uncensored_samples]
+            y_vals = [s[n_dim] for s in uncensored_samples]
+            ls_solution = LearningManager._solve_4x4_normal_equations(
+                X_rows, y_vals
+            )
+        else:
+            # Generic n_dim — build A = XᵀX, b = Xᵀy, solve via
+            # helpers.solve_gauss_jordan.  No collinear fallback.
+            A_mat = [[0.0] * n_dim for _ in range(n_dim)]
+            b_vec = [0.0] * n_dim
+            for row in uncensored_samples:
+                y_i = row[n_dim]
+                for i in range(n_dim):
+                    xi = row[i]
+                    for j in range(n_dim):
+                        A_mat[i][j] += xi * row[j]
+                    b_vec[i] += xi * y_i
+            sol = solve_gauss_jordan(A_mat, b_vec, pivot_eps=1e-10)
+            ls_solution = None if sol is None else tuple(sol)
 
         if coeff_init is None:
-            if ls_fit is None:
+            if ls_solution is None:
                 return None
-            c = [
-                max(0.0, float(ls_fit["s"])),
-                max(0.0, float(ls_fit["e"])),
-                max(0.0, float(ls_fit["w"])),
-            ]
+            c = [max(0.0, float(ls_solution[k])) for k in range(n_dim)]
         else:
             c = [
-                max(0.0, float(coeff_init.get("s", 0.0))),
-                max(0.0, float(coeff_init.get("e", 0.0))),
-                max(0.0, float(coeff_init.get("w", 0.0))),
+                max(0.0, float(coeff_init.get(components[k], 0.0)))
+                for k in range(n_dim)
             ]
 
         # σ initialisation: seed σ from the LS-fit residuals (which
@@ -3735,19 +4646,21 @@ class LearningManager:
         # warm-start residuals — preserves pre-fix behaviour for the
         # corner case where LS itself cannot be computed.
         if sigma_init is None:
-            if ls_fit is not None:
+            if ls_solution is not None:
                 sse = 0.0
-                for s_i, e_i, w_i, y_i in uncensored_samples:
-                    pred = (
-                        ls_fit["s"] * s_i
-                        + ls_fit["e"] * e_i
-                        + ls_fit["w"] * w_i
-                    )
+                for row in uncensored_samples:
+                    y_i = row[n_dim]
+                    pred = 0.0
+                    for k in range(n_dim):
+                        pred += ls_solution[k] * row[k]
                     sse += (y_i - pred) ** 2
             else:
                 sse = 0.0
-                for s_i, e_i, w_i, y_i in uncensored_samples:
-                    pred = c[0] * s_i + c[1] * e_i + c[2] * w_i
+                for row in uncensored_samples:
+                    y_i = row[n_dim]
+                    pred = 0.0
+                    for k in range(n_dim):
+                        pred += c[k] * row[k]
                     sse += (y_i - pred) ** 2
             sigma = max(1e-3, (sse / max(1, n_unc)) ** 0.5)
         else:
@@ -3759,8 +4672,11 @@ class LearningManager:
             ll = 0.0
             log_2pi = math.log(2.0 * math.pi)
             for i in range(n):
-                s_i, e_i, w_i, val = samples[i]
-                pred = c_vec[0] * s_i + c_vec[1] * e_i + c_vec[2] * w_i
+                row = samples[i]
+                val = row[n_dim]
+                pred = 0.0
+                for k in range(n_dim):
+                    pred += c_vec[k] * row[k]
                 if censored_mask[i]:
                     q_i = (val - pred) / sig
                     if q_i < q_clip:
@@ -3783,6 +4699,9 @@ class LearningManager:
 
         ll_curr = _loglik(c, gamma)
 
+        n_total = n_dim + 1   # c-components + γ
+        gamma_idx = n_dim
+
         converged = False
         failure_reason: str | None = None
         last_iter = 0
@@ -3790,15 +4709,18 @@ class LearningManager:
             last_iter = it + 1
             sigma = math.exp(gamma)
 
-            # Build gradient g (4-vec) and Hessian H (4×4) over (c, γ).
-            # Index convention: 0..2 = c_S, c_E, c_W; 3 = γ.
-            g = [0.0, 0.0, 0.0, 0.0]
-            H = [[0.0] * 4 for _ in range(4)]
+            # Build gradient g (n_total-vec) and Hessian H (n_total×n_total).
+            # Index convention: 0..n_dim-1 = c-components; n_dim = γ.
+            g = [0.0] * n_total
+            H = [[0.0] * n_total for _ in range(n_total)]
 
             for i in range(n):
-                s_i, e_i, w_i, val = samples[i]
-                pred = c[0] * s_i + c[1] * e_i + c[2] * w_i
-                vec = (s_i, e_i, w_i)
+                row = samples[i]
+                val = row[n_dim]
+                pred = 0.0
+                for k in range(n_dim):
+                    pred += c[k] * row[k]
+                vec = row[:n_dim]
                 if censored_mask[i]:
                     q_i = (val - pred) / sigma
                     if q_i < q_clip:
@@ -3807,53 +4729,53 @@ class LearningManager:
                     weight = lam * (lam - q_i)  # ≥ 0 (Greene §17.3)
                     # ∂ℓ/∂c_k = (s_ik / σ) · λ(q)
                     coef_grad = lam / sigma
-                    for k in range(3):
+                    for k in range(n_dim):
                         g[k] += coef_grad * vec[k]
                     # ∂ℓ/∂γ = q · λ(q)
-                    g[3] += q_i * lam
+                    g[gamma_idx] += q_i * lam
                     # H_cc block: −(1/σ²) · weight · s_ik s_il
                     inv_sig2 = 1.0 / (sigma * sigma)
-                    for k in range(3):
-                        for l in range(3):
+                    for k in range(n_dim):
+                        for l in range(n_dim):
                             H[k][l] -= inv_sig2 * weight * vec[k] * vec[l]
                     # H_cγ:  −(1/σ) · λ(q) · [1 + q·(λ(q) − q)]
                     cross = -(lam / sigma) * (1.0 + q_i * (lam - q_i))
-                    for k in range(3):
-                        H[k][3] += cross * vec[k]
-                        H[3][k] += cross * vec[k]
+                    for k in range(n_dim):
+                        H[k][gamma_idx] += cross * vec[k]
+                        H[gamma_idx][k] += cross * vec[k]
                     # H_γγ: −q · λ(q) · [1 + q·(λ(q) − q)]
-                    H[3][3] -= q_i * lam * (1.0 + q_i * (lam - q_i))
+                    H[gamma_idx][gamma_idx] -= q_i * lam * (1.0 + q_i * (lam - q_i))
                 else:
                     r_i = (val - pred) / sigma
                     # ∂ℓ/∂c_k = (s_ik / σ) · r_i
                     coef_grad = r_i / sigma
-                    for k in range(3):
+                    for k in range(n_dim):
                         g[k] += coef_grad * vec[k]
                     # ∂ℓ/∂γ = −1 + r²
-                    g[3] += -1.0 + r_i * r_i
+                    g[gamma_idx] += -1.0 + r_i * r_i
                     # H_cc: −s_ik s_il / σ²
                     inv_sig2 = 1.0 / (sigma * sigma)
-                    for k in range(3):
-                        for l in range(3):
+                    for k in range(n_dim):
+                        for l in range(n_dim):
                             H[k][l] -= inv_sig2 * vec[k] * vec[l]
                     # H_cγ: −2 r · s_ik / σ
                     cross = -2.0 * r_i / sigma
-                    for k in range(3):
-                        H[k][3] += cross * vec[k]
-                        H[3][k] += cross * vec[k]
+                    for k in range(n_dim):
+                        H[k][gamma_idx] += cross * vec[k]
+                        H[gamma_idx][k] += cross * vec[k]
                     # H_γγ: −2 r²
-                    H[3][3] -= 2.0 * r_i * r_i
+                    H[gamma_idx][gamma_idx] -= 2.0 * r_i * r_i
 
             # Active-set projection: a c-component pinned at zero with
             # gradient pushing further negative stays at zero (KKT).
             # γ is always free.  Free indices participate in the reduced
             # Newton solve; pinned components contribute zero step.
-            free = [True, True, True, True]
-            for k in range(3):
+            free = [True] * n_total
+            for k in range(n_dim):
                 if c[k] <= 0.0 and g[k] < 0.0:
                     free[k] = False
 
-            free_idx = [k for k in range(4) if free[k]]
+            free_idx = [k for k in range(n_total) if free[k]]
             m = len(free_idx)
             if m == 0:
                 converged = True
@@ -3877,56 +4799,28 @@ class LearningManager:
 
             # Solve reduced system: −H[free, free] · Δ = g[free]
             # We negate H so the matrix is positive-definite at maximum
-            # (negative-definite Hessian → minus is PD), then Gauss-elim.
+            # (negative-definite Hessian → minus is PD).  Tikhonov ridge
+            # on the diagonal guards against rank-deficient Newton at the
+            # boundary (e.g. when a c-comp pinned at 0 leaves the
+            # remaining vector collinear).
             A = [[-H[free_idx[r]][free_idx[col]] for col in range(m)]
                  for r in range(m)]
             b = [g[free_idx[r]] for r in range(m)]
-            # Tikhonov regulariser on the diagonal — guards against
-            # rank-deficient Newton at the boundary (e.g. when a c-comp
-            # pinned at 0 leaves the remaining 3-vector collinear).
-            for r in range(m):
-                A[r][r] += 1e-9
-
-            # Gauss-Jordan with partial pivoting.
-            singular = False
-            for r in range(m):
-                pivot_row = max(range(r, m), key=lambda x: abs(A[x][r]))
-                if abs(A[pivot_row][r]) < 1e-12:
-                    # Singular reduced Hessian — Newton step is undefined.
-                    # Olsen 1978's global concavity guarantees this should
-                    # not happen on data with non-zero solar variance, but
-                    # collinear sample windows or boundary-rank-deficient
-                    # active sets can still trip this in practice.  Bail
-                    # out as a solver FAILURE — ``converged = False``
-                    # must propagate so callers route to
-                    # ``did_not_converge``, NOT apply the last iterate.
-                    # Setting ``converged = True`` here (the pre-fix
-                    # behaviour) would silently write a coefficient that
-                    # has no Newton-step support.
-                    singular = True
-                    failure_reason = "singular_step"
-                    break
-                if pivot_row != r:
-                    A[r], A[pivot_row] = A[pivot_row], A[r]
-                    b[r], b[pivot_row] = b[pivot_row], b[r]
-                pivot = A[r][r]
-                for col in range(r, m):
-                    A[r][col] /= pivot
-                b[r] /= pivot
-                for r2 in range(m):
-                    if r2 != r and abs(A[r2][r]) > 0.0:
-                        factor = A[r2][r]
-                        for col in range(r, m):
-                            A[r2][col] -= factor * A[r][col]
-                        b[r2] -= factor * b[r]
-            if singular:
-                # converged stays False (initialised at top of solver);
-                # caller will route to did_not_converge.
+            sol = solve_gauss_jordan(A, b, ridge=1e-9, pivot_eps=1e-12)
+            if sol is None:
+                # Singular reduced Hessian — Newton step is undefined.
+                # Olsen 1978's global concavity guarantees this should
+                # not happen on data with non-zero solar variance, but
+                # collinear sample windows or boundary-rank-deficient
+                # active sets can still trip this in practice.  Bail
+                # out as a solver FAILURE — ``converged = False``
+                # propagates so callers route to ``did_not_converge``.
+                failure_reason = "singular_step"
                 break
 
-            delta = [0.0, 0.0, 0.0, 0.0]
+            delta = [0.0] * n_total
             for j, k in enumerate(free_idx):
-                delta[k] = b[j]
+                delta[k] = sol[j]
 
             # Backtracking line search.  Try full Newton, halve up to
             # 10 times if the projected step doesn't improve ℓ.  The
@@ -3938,9 +4832,9 @@ class LearningManager:
             gamma_new = gamma
             for _ls in range(10):
                 c_new = [
-                    max(0.0, c[k] + alpha * delta[k]) for k in range(3)
+                    max(0.0, c[k] + alpha * delta[k]) for k in range(n_dim)
                 ]
-                gamma_new = gamma + alpha * delta[3]
+                gamma_new = gamma + alpha * delta[gamma_idx]
                 # Bound γ to keep σ in a sane numerical range.
                 if gamma_new < -10.0:
                     gamma_new = -10.0
@@ -3963,8 +4857,8 @@ class LearningManager:
                 break
 
             step_norm = max(
-                abs(c_new[k] - c[k]) for k in range(3)
-            ) if delta[:3] else 0.0
+                abs(c_new[k] - c[k]) for k in range(n_dim)
+            ) if delta[:n_dim] else 0.0
             step_norm = max(step_norm, abs(gamma_new - gamma))
 
             c = c_new
@@ -3985,27 +4879,757 @@ class LearningManager:
             if not censored_mask[i]:
                 continue
             n_cens += 1
-            s_i, e_i, w_i, val = samples[i]
-            pred = c[0] * s_i + c[1] * e_i + c[2] * w_i
+            row = samples[i]
+            val = row[n_dim]
+            pred = 0.0
+            for k in range(n_dim):
+                pred += c[k] * row[k]
             q_i = (val - pred) / sigma
             if q_i < q_clip:
                 q_i = q_clip
             lam, _ = LearningManager._tobit_mills(q_i)
             n_eff += lam * (lam - q_i)
 
-        return {
-            "s": c[0],
-            "e": c[1],
-            "w": c[2],
-            "sigma": sigma,
-            "iterations": last_iter,
-            "converged": converged,
-            "failure_reason": failure_reason,
-            "log_likelihood": ll_curr,
-            "n_uncensored": n_unc,
-            "n_censored": n_cens,
-            "n_eff": n_eff,
+        result: dict = {components[k]: c[k] for k in range(n_dim)}
+        result["sigma"] = sigma
+        result["iterations"] = last_iter
+        result["converged"] = converged
+        result["failure_reason"] = failure_reason
+        result["log_likelihood"] = ll_curr
+        result["n_uncensored"] = n_unc
+        result["n_censored"] = n_cens
+        result["n_eff"] = n_eff
+        return result
+
+
+    def _collect_batch_fit_samples_4d(
+        self,
+        *,
+        entity_id: str,
+        regime: str,
+        hourly_log: list[dict],
+        coordinator,
+        screen_affected_entities: frozenset[str] | None,
+    ) -> tuple[list[tuple[float, float, float, float, float]], list[bool], dict[str, int]]:
+        """Collect 4D Tobit samples from the hourly log (#954).
+
+        Parallel to :meth:`_collect_batch_fit_samples` but computes the
+        4D potential vector via the f41ffd8 pipeline:
+
+            1. Resolve (DNI, DHI) from per-row GHI / native /
+               cloud_coverage using ``resolve_dni_dhi``.
+            2. Compute hour-midpoint sun position
+               (``timestamp + 30 minutes``) via
+               ``solar.get_approx_sun_pos``.  Skip if sun is below the
+               horizon.
+            3. Call
+               ``solar.calculate_unit_potential_4d(entity_id, dni, dhi,
+               sun_elev, sun_az, screen_config_for_entity,
+               correction_percent)``.
+            4. Magnitude gate: skip when
+               ``sum(potential_4d) < 0.01`` (matches f41ffd8 live-NLMS
+               gate).
+
+        Gate filters (same as 3D): modulating regime, no aux, not
+        shutdown, ``expected_unit_base > 0``, ``actual_impact > 0``.
+        Saturated rows kept as right-censored with
+        ``value = BATCH_FIT_SATURATION_RATIO × base``; unsaturated
+        rows kept with ``value = base − actual`` (heating) or
+        ``actual − base`` (cooling).
+
+        Returns ``(samples, censored_mask, drop_counts)`` parallel to
+        the 3D version.  ``drop_counts`` reuses the 3D keys plus
+        ``no_dni_dhi`` and ``sun_below_horizon`` for 4D-specific gates.
+        """
+        from datetime import timedelta as _td
+        from datetime import datetime as _dt
+        from .solar import resolve_dni_dhi
+
+        samples: list[tuple[float, float, float, float, float]] = []
+        censored_mask: list[bool] = []
+        drop_counts: dict[str, int] = {
+            "wrong_mode": 0,
+            "auxiliary_active": 0,
+            "shutdown": 0,
+            "missing_timestamp": 0,
+            "sun_below_horizon": 0,
+            "no_dni_dhi": 0,
+            "low_magnitude": 0,
+            "missing_temp_key": 0,
+            "below_min_base": 0,
+            "non_positive_impact": 0,
+            "censored": 0,
         }
+        target_mode = MODE_HEATING if regime == "heating" else MODE_COOLING
+        correlation_per_unit = coordinator.model.correlation_data_per_unit
+
+        scr_fn = getattr(coordinator, "screen_config_for_entity", None)
+        if scr_fn is not None:
+            screen_cfg_for_entity = scr_fn(entity_id)
+        else:
+            screen_cfg_for_entity = getattr(coordinator, "screen_config", None)
+        solar = getattr(coordinator, "solar", None)
+        if solar is None:
+            return [], [], drop_counts
+
+        for entry in hourly_log:
+            unit_modes = entry.get("unit_modes", {}) or {}
+            entry_mode = unit_modes.get(entity_id, MODE_HEATING)
+            if entry_mode != target_mode:
+                drop_counts["wrong_mode"] += 1
+                continue
+            if entry.get("auxiliary_active", False):
+                drop_counts["auxiliary_active"] += 1
+                continue
+            # Shutdown rows under 4D Tobit: do NOT drop.  Same rationale
+            # as the 3D collector — actual = 0 gives actual_impact = base,
+            # the row clears the saturation gate downstream and is
+            # emitted with censored_mask = True.  Tobit's Mills-ratio
+            # extracts the lower-bound information that dropping these
+            # rows would discard.  Counter retained for diagnostics
+            # under a separate key (the row is kept, not dropped).
+            shutdown_entities = set(
+                entry.get("solar_dominant_entities", []) or []
+            )
+            if entity_id in shutdown_entities:
+                drop_counts["shutdown_kept_censored"] = (
+                    drop_counts.get("shutdown_kept_censored", 0) + 1
+                )
+
+            ts_raw = entry.get("timestamp")
+            if not isinstance(ts_raw, str):
+                drop_counts["missing_timestamp"] += 1
+                continue
+            try:
+                ts_dt = _dt.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                drop_counts["missing_timestamp"] += 1
+                continue
+            mid_dt = ts_dt + _td(minutes=30)
+            try:
+                sun_elev, sun_az = solar.get_approx_sun_pos(mid_dt)
+            except Exception:
+                drop_counts["sun_below_horizon"] += 1
+                continue
+            if sun_elev <= 0.0:
+                drop_counts["sun_below_horizon"] += 1
+                continue
+
+            day_of_year = ts_dt.timetuple().tm_yday
+            try:
+                dni_v, dhi_v, _src = resolve_dni_dhi(
+                    entry.get("dni"),
+                    entry.get("dhi"),
+                    entry.get("ghi_wm2"),
+                    entry.get("cloud_coverage"),
+                    sun_elev,
+                    day_of_year,
+                )
+            except Exception:
+                drop_counts["no_dni_dhi"] += 1
+                continue
+            if dni_v is None and dhi_v is None:
+                drop_counts["no_dni_dhi"] += 1
+                continue
+            if (dni_v or 0.0) <= 0.0 and (dhi_v or 0.0) <= 0.0:
+                drop_counts["no_dni_dhi"] += 1
+                continue
+
+            correction_percent = float(entry.get("correction_percent", 100.0))
+            try:
+                potential_4d = solar.calculate_unit_potential_4d(
+                    entity_id,
+                    dni_v or 0.0,
+                    dhi_v or 0.0,
+                    sun_elev,
+                    sun_az,
+                    screen_cfg_for_entity,
+                    correction_percent,
+                )
+            except Exception:
+                drop_counts["low_magnitude"] += 1
+                continue
+            pot_s, pot_e, pot_w, pot_d = potential_4d
+            if pot_s + pot_e + pot_w + pot_d < 0.01:
+                drop_counts["low_magnitude"] += 1
+                continue
+
+            temp_key = entry.get("temp_key")
+            if temp_key is None:
+                drop_counts["missing_temp_key"] += 1
+                continue
+
+            # Re-bucketize live against current thresholds when the
+            # coordinator exposes them AND the entry carries
+            # ``effective_wind``; stored label is a cache of write-time
+            # thresholds (see retrain.py:422).  Fall back to stored
+            # label for legacy entries / test stubs.
+            wt = getattr(coordinator, "wind_threshold", None)
+            ewt = getattr(coordinator, "extreme_wind_threshold", None)
+            eff_w = entry.get("effective_wind")
+            if (
+                isinstance(wt, (int, float))
+                and isinstance(ewt, (int, float))
+                and isinstance(eff_w, (int, float))
+            ):
+                if eff_w >= ewt:
+                    wind_bucket = "extreme_wind"
+                elif eff_w >= wt:
+                    wind_bucket = "high_wind"
+                else:
+                    wind_bucket = "normal"
+            else:
+                wind_bucket = entry.get("wind_bucket", "normal")
+            effective_bucket = (
+                COOLING_WIND_BUCKET if regime == "cooling" else wind_bucket
+            )
+            unit_buckets = correlation_per_unit.get(entity_id, {}).get(
+                temp_key, {}
+            )
+            expected_base = (
+                unit_buckets.get(effective_bucket, 0.0) if unit_buckets else 0.0
+            )
+            if expected_base <= 0.0:
+                drop_counts["below_min_base"] += 1
+                continue
+
+            actual = (entry.get("unit_breakdown", {}) or {}).get(entity_id, 0.0)
+            if regime == "heating":
+                actual_impact = expected_base - actual
+            else:
+                actual_impact = actual - expected_base
+            if actual_impact <= 0.0:
+                drop_counts["non_positive_impact"] += 1
+                continue
+
+            saturation_threshold = BATCH_FIT_SATURATION_RATIO * expected_base
+            is_saturated = (
+                regime == "heating" and actual_impact >= saturation_threshold
+            )
+            if is_saturated:
+                samples.append((pot_s, pot_e, pot_w, pot_d, saturation_threshold))
+                censored_mask.append(True)
+                drop_counts["censored"] += 1
+            else:
+                samples.append((pot_s, pot_e, pot_w, pot_d, actual_impact))
+                censored_mask.append(False)
+
+        return samples, censored_mask, drop_counts
+
+    def batch_fit_solar_coefficients_4d(
+        self,
+        hourly_log: list[dict],
+        solar_coefficients_4d_per_unit: dict,
+        energy_sensors: list[str],
+        coordinator,
+        *,
+        entity_id_filter: str | None = None,
+        unit_min_base: dict[str, float] | None = None,
+        screen_affected_entities: frozenset[str] | None = None,
+        days_back: int | None = None,
+        dry_run: bool = False,
+        seed_live_window: bool = False,
+    ) -> dict:
+        """Batch Tobit MLE fit on the 4D shadow potential (#954).
+
+        Parallels :meth:`batch_fit_solar_coefficients` (3D) with the
+        4D potential pipeline from commit f41ffd8.  Writes only to
+        ``solar_coefficients_4d_per_unit`` — strict shadow, no
+        production read-path consumer yet.
+
+        ``seed_live_window`` is accepted for parity with the 3D
+        signature but is currently a no-op for 4D (the 4D path has no
+        live Tobit sliding window; #954 stage 2+ would introduce
+        one).  Kept in the signature so the service-handler call site
+        is symmetric with the 3D one.
+
+        Returns the same diagnostic shape as the 3D version, with
+        ``coefficient_before / coefficient_after`` carrying the 4-key
+        ``{s, e, w, diffuse}`` dicts.
+        """
+        from .observation import WeightedSmear
+
+        filtered_log = _filter_log_by_days_back(hourly_log, days_back)
+        strategies = getattr(coordinator, "_unit_strategies", {}) or {}
+
+        results: dict[str, dict] = {}
+        target_entities = (
+            [entity_id_filter] if entity_id_filter else list(energy_sensors)
+        )
+
+        solar_affected = getattr(coordinator, "_solar_affected_set", None)
+        if not isinstance(solar_affected, (frozenset, set)):
+            solar_affected = None
+
+        for entity_id in target_entities:
+            if entity_id not in energy_sensors:
+                results[entity_id] = {"skip_reason": "unknown_entity"}
+                continue
+            if solar_affected is not None and entity_id not in solar_affected:
+                results[entity_id] = {"skip_reason": "excluded_from_solar"}
+                continue
+            strategy = strategies.get(entity_id)
+            if isinstance(strategy, WeightedSmear) and strategy.use_synthetic:
+                results[entity_id] = {"skip_reason": "weighted_smear_excluded"}
+                continue
+
+            entity_results: dict[str, dict] = {}
+            for regime in ("heating", "cooling"):
+                samples, censored_mask, drop_counts = (
+                    self._collect_batch_fit_samples_4d(
+                        entity_id=entity_id,
+                        regime=regime,
+                        hourly_log=filtered_log,
+                        coordinator=coordinator,
+                        screen_affected_entities=screen_affected_entities,
+                    )
+                )
+                n_unc = sum(1 for m in censored_mask if not m)
+                n_cens = len(samples) - n_unc
+                regime_diag: dict = {
+                    "sample_count": len(samples),
+                    "drop_counts": drop_counts,
+                }
+
+                entity_entry = solar_coefficients_4d_per_unit.get(entity_id)
+                if isinstance(entity_entry, dict):
+                    current_dict = entity_entry.get(regime) or {}
+                else:
+                    current_dict = {}
+                current = {
+                    "s": float(current_dict.get("s", 0.0)),
+                    "e": float(current_dict.get("e", 0.0)),
+                    "w": float(current_dict.get("w", 0.0)),
+                    "diffuse": float(current_dict.get("diffuse", 0.0)),
+                }
+                regime_diag["coefficient_before"] = {
+                    k: round(v, 5) for k, v in current.items()
+                }
+
+                if n_unc < TOBIT_MIN_UNCENSORED:
+                    regime_diag["skip_reason"] = "insufficient_uncensored"
+                    regime_diag["coefficient_after"] = regime_diag[
+                        "coefficient_before"
+                    ]
+                    regime_diag["tobit_diagnostics"] = {
+                        "n_uncensored": n_unc,
+                        "n_censored": n_cens,
+                        "censored_fraction": (
+                            round(n_cens / len(samples), 3)
+                            if samples
+                            else 0.0
+                        ),
+                    }
+                    entity_results[regime] = regime_diag
+                    continue
+
+                fit = LearningManager._solve_tobit(
+                    samples,
+                    censored_mask,
+                    components=("s", "e", "w", "diffuse"),
+                )
+                if fit is None:
+                    regime_diag["skip_reason"] = "warm_start_failed"
+                    regime_diag["coefficient_after"] = regime_diag[
+                        "coefficient_before"
+                    ]
+                    entity_results[regime] = regime_diag
+                    continue
+
+                tobit_diag = {
+                    "iterations": fit["iterations"],
+                    "converged": bool(fit["converged"]),
+                    "failure_reason": fit.get("failure_reason"),
+                    "sigma": round(fit["sigma"], 5),
+                    "log_likelihood": round(fit["log_likelihood"], 4),
+                    "n_uncensored": fit["n_uncensored"],
+                    "n_censored": fit["n_censored"],
+                    "censored_fraction": (
+                        round(n_cens / len(samples), 3) if samples else 0.0
+                    ),
+                    "n_eff": round(fit["n_eff"], 2),
+                }
+                regime_diag["tobit_diagnostics"] = tobit_diag
+
+                if fit["n_eff"] < TOBIT_MIN_NEFF:
+                    regime_diag["skip_reason"] = (
+                        "insufficient_effective_samples"
+                    )
+                    regime_diag["coefficient_after"] = regime_diag[
+                        "coefficient_before"
+                    ]
+                    entity_results[regime] = regime_diag
+                    continue
+
+                if not fit["converged"]:
+                    regime_diag["skip_reason"] = "did_not_converge"
+                    regime_diag["coefficient_after"] = regime_diag[
+                        "coefficient_before"
+                    ]
+                    entity_results[regime] = regime_diag
+                    continue
+
+                clamped = {
+                    "s": max(0.0, min(SOLAR_COEFF_CAP, float(fit["s"]))),
+                    "e": max(0.0, min(SOLAR_COEFF_CAP, float(fit["e"]))),
+                    "w": max(0.0, min(SOLAR_COEFF_CAP, float(fit["w"]))),
+                    "diffuse": max(
+                        0.0, min(SOLAR_COEFF_CAP, float(fit["diffuse"]))
+                    ),
+                }
+
+                # ``learned`` flag drives the no-prior detection: a
+                # regime entry written by a prior batch / NLMS run
+                # carries learned=True even when components have
+                # decayed toward 0.  Falling back to "any component
+                # > 1e-6" misclassifies a converged-near-zero diffuse
+                # as no-prior and overwrites without damping.
+                has_prior = bool(current_dict.get("learned", False)) or any(
+                    current[k] > 1e-6 for k in ("s", "e", "w", "diffuse")
+                )
+                if has_prior:
+                    blended = {
+                        k: round(
+                            BATCH_FIT_DAMPING * clamped[k]
+                            + (1.0 - BATCH_FIT_DAMPING) * current[k],
+                            5,
+                        )
+                        for k in ("s", "e", "w", "diffuse")
+                    }
+                    damping_applied = BATCH_FIT_DAMPING
+                else:
+                    blended = {
+                        k: round(clamped[k], 5)
+                        for k in ("s", "e", "w", "diffuse")
+                    }
+                    damping_applied = 1.0
+
+                regime_diag["coefficient_after"] = blended
+                regime_diag["damping_applied"] = damping_applied
+
+                if dry_run:
+                    regime_diag["applied"] = False
+                    regime_diag["dry_run"] = True
+                else:
+                    self._update_unit_solar_coefficient(
+                        entity_id,
+                        blended,
+                        solar_coefficients_4d_per_unit,
+                        regime,
+                        components=("s", "e", "w", "diffuse"),
+                    )
+                    regime_diag["applied"] = True
+                    if seed_live_window:
+                        # No live 4D Tobit window yet — flag the
+                        # request for diagnostics but no-op.  Stage 3+
+                        # of #954 would introduce a live sliding
+                        # window analogous to the 3D one.
+                        regime_diag["seeded_live_window"] = False
+                        regime_diag["seed_skip_reason"] = (
+                            "no_live_window_4d"
+                        )
+                entity_results[regime] = regime_diag
+
+            results[entity_id] = entity_results
+
+        return results
+
+    def fit_solar_obstruction(
+        self,
+        hourly_log: list[dict],
+        coordinator,
+        *,
+        dry_run: bool = False,
+    ) -> dict:
+        """Per-facade direct-beam obstruction critical_elev fit (#991).
+
+        For each facade (S, E, W) independently, find the sun elevation
+        above which the direct-beam component should be zeroed.  The fit
+        operates on the modulating-regime hourly log: per dominance-
+        filtered sample, brute-force search over candidate cutoffs
+        ``[OBSTRUCTION_FIT_MIN_ELEV_DEG, OBSTRUCTION_FIT_MAX_ELEV_DEG]``
+        at 1° resolution.  SSE-ratio gate
+        (``1 − SSE_best/SSE_flat > OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD``)
+        plus ``OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE`` samples on each
+        side of the candidate cutoff are required for ``learned=True``.
+
+        Samples are computed with the EXISTING per-entity 4D coefficients
+        held fixed.  The fit does not refit coefficients — that is the
+        ``batch_fit_solar_4d`` service's job, recommended as a follow-up
+        once obstruction lands.
+
+        Potentials are reconstructed inline (not via
+        ``calculate_unit_potential_4d``) so the existing gate state does
+        not contaminate the fit input.  Saturated hours are excluded
+        (no slope information).  Heating-mode only — cooling shutdown
+        semantics differ and remain out of scope.
+
+        Args:
+            hourly_log: Coordinator's hourly log (full history; the fit
+                consumes all uncensored modulating-regime entries).
+            coordinator: For ``solar`` (sun-pos + transmittance),
+                ``_solar_coefficients_4d_per_unit`` (existing coeffs),
+                ``screen_config_for_entity``, ``_solar_affected_set``,
+                ``energy_sensors``, ``_critical_elev_per_facade``
+                (written on success unless ``dry_run``).
+            dry_run: When True, run the analysis but write nothing.
+
+        Returns:
+            Per-facade dict::
+
+                {
+                    "s": {
+                        "learned": bool,
+                        "critical_elev_before": float | None,
+                        "critical_elev_after": float | None,
+                        "best_critical_elev": float,
+                        "sse_improvement_ratio": float,
+                        "sse_flat": float,
+                        "sse_best": float,
+                        "n_samples": int,
+                        "n_below_best": int,
+                        "n_above_best": int,
+                        "skip_reason": str | None,
+                    },
+                    "e": {...},
+                    "w": {...},
+                    "dry_run": bool,
+                }
+        """
+        from datetime import datetime as _dt, timedelta as _td
+        from .solar import resolve_dni_dhi
+
+        solar = getattr(coordinator, "solar", None)
+        coeffs_4d_per_unit = getattr(coordinator, "_solar_coefficients_4d_per_unit", {}) or {}
+        energy_sensors = getattr(coordinator, "energy_sensors", None) or []
+        solar_affected = getattr(coordinator, "_solar_affected_set", None)
+        if not isinstance(solar_affected, (frozenset, set)):
+            solar_affected = None
+        scr_fn = getattr(coordinator, "screen_config_for_entity", None)
+        crit_state = getattr(coordinator, "_critical_elev_per_facade", None) or {
+            "s": None, "e": None, "w": None,
+        }
+
+        # Per-facade sample lists: each entry (sun_elev, pot_facade,
+        # baseline_residual) where baseline_residual = actual_impact
+        # minus contributions from the OTHER three components (the two
+        # other facades + diffuse) using existing entity coefficients.
+        # The fit varies only the facade-under-test's contribution.
+        facade_samples: dict[str, list[tuple[float, float, float]]] = {
+            "s": [], "e": [], "w": [],
+        }
+
+        if solar is None:
+            return {
+                "s": {"learned": False, "skip_reason": "no_solar_calculator"},
+                "e": {"learned": False, "skip_reason": "no_solar_calculator"},
+                "w": {"learned": False, "skip_reason": "no_solar_calculator"},
+                "dry_run": dry_run,
+            }
+
+        for entry in hourly_log:
+            if entry.get("auxiliary_active", False):
+                continue
+            unit_modes = entry.get("unit_modes", {}) or {}
+            shutdown_entities = set(entry.get("solar_dominant_entities", []) or [])
+
+            ts_raw = entry.get("timestamp")
+            if not isinstance(ts_raw, str):
+                continue
+            try:
+                ts_dt = _dt.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+            mid_dt = ts_dt + _td(minutes=30)
+            try:
+                sun_elev, sun_az = solar.get_approx_sun_pos(mid_dt)
+            except Exception:
+                continue
+            if sun_elev <= 0.0:
+                continue
+
+            day_of_year = ts_dt.timetuple().tm_yday
+            try:
+                dni_v, dhi_v, _src = resolve_dni_dhi(
+                    entry.get("dni"),
+                    entry.get("dhi"),
+                    entry.get("ghi_wm2"),
+                    entry.get("cloud_coverage"),
+                    sun_elev,
+                    day_of_year,
+                )
+            except Exception:
+                continue
+            if (dni_v or 0.0) <= 0.0 and (dhi_v or 0.0) <= 0.0:
+                continue
+            dni_v = dni_v or 0.0
+            dhi_v = dhi_v or 0.0
+
+            correction_percent = float(entry.get("correction_percent", 100.0))
+            elev_rad = math.radians(sun_elev)
+            az_rad = math.radians(sun_az)
+            cos_elev = math.cos(elev_rad)
+            dni_horiz = max(0.0, dni_v) * cos_elev
+
+            unit_breakdown = entry.get("unit_breakdown", {}) or {}
+            unit_expected_base = entry.get("unit_expected_base", {}) or {}
+
+            for entity_id in energy_sensors:
+                if entity_id in shutdown_entities:
+                    continue
+                if solar_affected is not None and entity_id not in solar_affected:
+                    continue
+                if unit_modes.get(entity_id, MODE_HEATING) != MODE_HEATING:
+                    continue
+                if entity_id not in unit_breakdown:
+                    continue
+
+                entity_coeffs = coeffs_4d_per_unit.get(entity_id, {}) or {}
+                regime_coeffs = entity_coeffs.get("heating", {}) or {}
+                if not regime_coeffs.get("learned"):
+                    continue
+                c_s = float(regime_coeffs.get("s", 0.0))
+                c_e = float(regime_coeffs.get("e", 0.0))
+                c_w = float(regime_coeffs.get("w", 0.0))
+                c_d = float(regime_coeffs.get("diffuse", 0.0))
+
+                expected_base = float(unit_expected_base.get(entity_id, 0.0) or 0.0)
+                if expected_base <= 0.0:
+                    continue
+                actual = float(unit_breakdown.get(entity_id, 0.0) or 0.0)
+                actual_impact = expected_base - actual
+                if actual_impact <= 0.0:
+                    continue
+                if actual_impact >= BATCH_FIT_SATURATION_RATIO * expected_base:
+                    continue  # saturated — no slope info for the fit
+
+                if scr_fn is not None:
+                    entity_screen = scr_fn(entity_id)
+                else:
+                    entity_screen = getattr(coordinator, "screen_config", None)
+                t_s, t_e, t_w = solar._screen_transmittance_vector(
+                    correction_percent, entity_screen
+                )
+                # Ungated facade potentials (raw geometry, no obstruction gate
+                # — the fit will impose candidate gates downstream).
+                pot_s = dni_horiz * max(0.0, -math.cos(az_rad)) * t_s
+                pot_e = dni_horiz * max(0.0, math.sin(az_rad)) * t_e
+                pot_w = dni_horiz * max(0.0, -math.sin(az_rad)) * t_w
+                pot_d = max(0.0, dhi_v) * 0.5 * (t_s + t_e + t_w) / 3.0
+
+                pot_sum = pot_s + pot_e + pot_w + pot_d
+                if pot_sum <= 0.0:
+                    continue
+
+                # Per-facade dominance filter: only include this sample
+                # for facade f if pot_f / Σpot > dominance ratio.
+                for facade, pot_f, c_f, others_pred in (
+                    ("s", pot_s, c_s, c_e * pot_e + c_w * pot_w + c_d * pot_d),
+                    ("e", pot_e, c_e, c_s * pot_s + c_w * pot_w + c_d * pot_d),
+                    ("w", pot_w, c_w, c_s * pot_s + c_e * pot_e + c_d * pot_d),
+                ):
+                    if pot_sum > 0.0 and (pot_f / pot_sum) > OBSTRUCTION_FIT_DOMINANCE_RATIO:
+                        baseline_residual = actual_impact - others_pred
+                        # Per-entity contribution to the facade's fit:
+                        # (sun_elev, c_f · pot_f, baseline_residual).
+                        # Predicted_under_gate = baseline_residual_pred
+                        # = (gate_active ? 0 : c_f · pot_f).
+                        # We store c_f · pot_f as the facade prediction.
+                        facade_samples[facade].append(
+                            (sun_elev, c_f * pot_f, baseline_residual)
+                        )
+
+        # Per-facade fit
+        n_steps = int(
+            (OBSTRUCTION_FIT_MAX_ELEV_DEG - OBSTRUCTION_FIT_MIN_ELEV_DEG)
+            / OBSTRUCTION_FIT_STEP_DEG
+        ) + 1
+
+        result: dict = {"dry_run": dry_run}
+        for facade in ("s", "e", "w"):
+            samples = facade_samples[facade]
+            facade_result = {
+                "learned": False,
+                "critical_elev_before": crit_state.get(facade),
+                "critical_elev_after": crit_state.get(facade),
+                "best_critical_elev": None,
+                "sse_improvement_ratio": 0.0,
+                "sse_flat": None,
+                "sse_best": None,
+                "n_samples": len(samples),
+                "n_below_best": 0,
+                "n_above_best": 0,
+                "skip_reason": None,
+            }
+            if len(samples) < 2 * OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE:
+                facade_result["skip_reason"] = "insufficient_samples"
+                result[facade] = facade_result
+                continue
+
+            # SSE under no gate: predicted = baseline_residual_pred + c_f · pot_f.
+            # baseline = actual_impact, prediction = others_pred + c_f · pot_f.
+            # We stored baseline_residual = actual_impact − others_pred,
+            # so residual_flat = baseline_residual − c_f · pot_f.
+            sse_flat = sum(
+                (br - cf_pot) ** 2 for (_elev, cf_pot, br) in samples
+            )
+            if sse_flat <= 0.0:
+                facade_result["skip_reason"] = "zero_residual_flat"
+                result[facade] = facade_result
+                continue
+
+            best_sse = sse_flat
+            best_crit = None
+            best_below = 0
+            best_above = 0
+            for i in range(n_steps):
+                crit = OBSTRUCTION_FIT_MIN_ELEV_DEG + i * OBSTRUCTION_FIT_STEP_DEG
+                sse = 0.0
+                n_below = 0
+                n_above = 0
+                for (elev, cf_pot, br) in samples:
+                    if elev > crit:
+                        # Gate active: facade contribution zeroed.
+                        residual = br - 0.0
+                        n_above += 1
+                    else:
+                        residual = br - cf_pot
+                        n_below += 1
+                    sse += residual * residual
+                if (
+                    sse < best_sse
+                    and n_below >= OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE
+                    and n_above >= OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE
+                ):
+                    best_sse = sse
+                    best_crit = crit
+                    best_below = n_below
+                    best_above = n_above
+
+            facade_result["sse_flat"] = sse_flat
+            if best_crit is None:
+                facade_result["skip_reason"] = "no_candidate_passed_sample_floor"
+                result[facade] = facade_result
+                continue
+
+            improvement = 1.0 - best_sse / sse_flat
+            facade_result["best_critical_elev"] = best_crit
+            facade_result["sse_best"] = best_sse
+            facade_result["sse_improvement_ratio"] = improvement
+            facade_result["n_below_best"] = best_below
+            facade_result["n_above_best"] = best_above
+
+            if improvement > OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD:
+                facade_result["learned"] = True
+                if not dry_run:
+                    crit_state[facade] = best_crit
+                    facade_result["critical_elev_after"] = best_crit
+            else:
+                facade_result["skip_reason"] = "below_sse_threshold"
+
+            result[facade] = facade_result
+
+        return result
 
     def compute_implied_for_apply(
         self,
@@ -4099,34 +5723,100 @@ class LearningManager:
             "windows": [None] * n_windows,
         }
 
-        if len(samples) < APPLY_IMPLIED_MIN_QUALIFYING_HOURS:
-            return result
+        # 3D pass: gated on its own sample threshold.  Sparse 3D must not
+        # short-circuit the 4D pass below — Track C / MPC installs often
+        # have no usable ``unit_expected_breakdown`` for the 3D collector
+        # while the 4D Tobit collector still finds plenty of samples.
+        if len(samples) >= APPLY_IMPLIED_MIN_QUALIFYING_HOURS:
+            implied = self._solve_batch_fit_normal_equations(samples)
+            if implied is not None:
+                result["implied"] = {k: round(v, 4) for k, v in implied.items()}
 
-        # 30-day implied: full LS over all samples.
-        implied = self._solve_batch_fit_normal_equations(samples)
-        if implied is not None:
-            result["implied"] = {k: round(v, 4) for k, v in implied.items()}
+            # Stability windows: split chronologically into ``n_windows``
+            # equal chunks and fit each.  ``samples`` is already in log
+            # order from ``_collect_batch_fit_samples``.  Per-window
+            # min-samples is half the global threshold so a sparse late
+            # window still produces SOMETHING for the stability check
+            # (or None if completely empty).
+            per_window_min = max(8, APPLY_IMPLIED_MIN_QUALIFYING_HOURS // n_windows)
+            chunk_size = max(1, len(samples) // n_windows)
+            for i in range(n_windows):
+                start = i * chunk_size
+                end = start + chunk_size if i < n_windows - 1 else len(samples)
+                chunk = samples[start:end]
+                if len(chunk) < per_window_min:
+                    continue
+                window_fit = self._solve_batch_fit_normal_equations(chunk)
+                if window_fit is not None:
+                    result["windows"][i] = {
+                        "coefficient": {k: round(v, 4) for k, v in window_fit.items()},
+                        "qualifying_hours": len(chunk),
+                    }
 
-        # Stability windows: split chronologically into ``n_windows``
-        # equal chunks and fit each.  ``samples`` is already in log
-        # order from ``_collect_batch_fit_samples``.  Per-window
-        # min-samples is half the global threshold so a sparse late
-        # window still produces SOMETHING for the stability check
-        # (or None if completely empty).
-        per_window_min = max(8, APPLY_IMPLIED_MIN_QUALIFYING_HOURS // n_windows)
-        chunk_size = max(1, len(samples) // n_windows)
-        for i in range(n_windows):
-            start = i * chunk_size
-            end = start + chunk_size if i < n_windows - 1 else len(samples)
-            chunk = samples[start:end]
-            if len(chunk) < per_window_min:
-                continue
-            window_fit = self._solve_batch_fit_normal_equations(chunk)
-            if window_fit is not None:
-                result["windows"][i] = {
-                    "coefficient": {k: round(v, 4) for k, v in window_fit.items()},
-                    "qualifying_hours": len(chunk),
+        # --- 4D Tobit MLE pass (#969 slim).  Strict parallel to the 3D
+        # path above using ``_collect_batch_fit_samples_4d`` and
+        # ``_solve_tobit`` with 4 components.  Diagnose does not surface
+        # a 4D implied today, so there is no ``match_diagnose`` analogue
+        # to thread — the 4D collector's default filter set is correct.
+        # Per-window 4D fits reuse the same Tobit solver for stability
+        # assessment (solver-symmetric semantics).
+        samples_4d, censored_mask_4d, drop_counts_4d = (
+            self._collect_batch_fit_samples_4d(
+                entity_id=entity_id,
+                regime=regime,
+                hourly_log=filtered_log,
+                coordinator=coordinator,
+                screen_affected_entities=screen_affected_entities,
+            )
+        )
+        result["sample_count_4d"] = len(samples_4d)
+        result["drop_counts_4d"] = drop_counts_4d
+        result["implied_4d"] = None
+        result["windows_4d"] = [None] * n_windows
+
+        n_unc_total_4d = sum(1 for m in censored_mask_4d if not m)
+        if n_unc_total_4d >= TOBIT_MIN_UNCENSORED:
+            fit_4d = self._solve_tobit(
+                samples_4d,
+                censored_mask_4d,
+                components=("s", "e", "w", "diffuse"),
+            )
+            if fit_4d is not None and fit_4d.get("converged"):
+                result["implied_4d"] = {
+                    k: round(float(fit_4d[k]), 4)
+                    for k in ("s", "e", "w", "diffuse")
                 }
+
+            # Per-window 4D Tobit fits.  Same chunking scheme as 3D
+            # above.  Skip chunks below the uncensored-row threshold.
+            chunk_size_4d = max(1, len(samples_4d) // n_windows)
+            for i in range(n_windows):
+                start = i * chunk_size_4d
+                end = (
+                    start + chunk_size_4d
+                    if i < n_windows - 1
+                    else len(samples_4d)
+                )
+                chunk_samples = samples_4d[start:end]
+                chunk_mask = censored_mask_4d[start:end]
+                chunk_n_unc = sum(1 for m in chunk_mask if not m)
+                if chunk_n_unc < TOBIT_MIN_UNCENSORED:
+                    continue
+                window_fit_4d = self._solve_tobit(
+                    chunk_samples,
+                    chunk_mask,
+                    components=("s", "e", "w", "diffuse"),
+                )
+                if window_fit_4d is not None and window_fit_4d.get(
+                    "converged"
+                ):
+                    result["windows_4d"][i] = {
+                        "coefficient": {
+                            k: round(float(window_fit_4d[k]), 4)
+                            for k in ("s", "e", "w", "diffuse")
+                        },
+                        "qualifying_hours": len(chunk_samples),
+                    }
         return result
 
     @staticmethod
@@ -4135,6 +5825,7 @@ class LearningManager:
         *,
         max_spread: float | None = None,
         near_zero: float | None = None,
+        directions: tuple[str, ...] = ("s", "e", "w"),
     ) -> dict[str, dict]:
         """Per-direction stability assessment for ``apply_implied_coefficient``.
 
@@ -4162,7 +5853,7 @@ class LearningManager:
             near_zero = APPLY_IMPLIED_NEAR_ZERO
 
         result: dict[str, dict] = {}
-        for d in ("s", "e", "w"):
+        for d in directions:
             values = [
                 w["coefficient"].get(d, 0.0)
                 for w in windows
@@ -4227,7 +5918,7 @@ class LearningManager:
 
         Append the new (s, e, w, value, censored) sample to the running
         window, trim to ``TOBIT_RUNNING_WINDOW``, run one full Newton
-        iteration of ``_solve_tobit_3d`` over the current window, and
+        iteration of ``_solve_tobit`` over the current window, and
         write the resulting coefficient to ``solar_coefficients_per_unit``.
 
         The "running" aspect is a sliding window of recent raw samples
@@ -4363,9 +6054,10 @@ class LearningManager:
         ):
             coeff_init = regime_coeff
 
-        fit = LearningManager._solve_tobit_3d(
+        fit = LearningManager._solve_tobit(
             samples_4tup,
             censored_mask,
+            components=("s", "e", "w"),
             coeff_init=coeff_init,
         )
 
@@ -4384,7 +6076,7 @@ class LearningManager:
         # well-behaved convergence basin determined by the data
         # (not by the prior), and converges reliably (~4 iterations
         # to truth) on any input the original Newton would have
-        # rejected.  The σ-init fix in ``_solve_tobit_3d`` (LS-
+        # rejected.  The σ-init fix in ``_solve_tobit`` (LS-
         # residual seed instead of biased-c seed) does NOT widen the
         # basin — verified by pre-fix vs post-fix sweep showing
         # identical basin boundaries; it only extends Newton's
@@ -4408,9 +6100,10 @@ class LearningManager:
                 "retrying with LS warm-start",
                 entity_id, regime,
             )
-            fit = LearningManager._solve_tobit_3d(
+            fit = LearningManager._solve_tobit(
                 samples_4tup,
                 censored_mask,
+                components=("s", "e", "w"),
                 coeff_init=None,
             )
 
@@ -4736,7 +6429,9 @@ class LearningManager:
             result["skip_reason"] = "insufficient_uncensored"
             return result
 
-        fit = LearningManager._solve_tobit_3d(samples, censored_mask)
+        fit = LearningManager._solve_tobit(
+            samples, censored_mask, components=("s", "e", "w")
+        )
         if fit is None:
             result["skip_reason"] = "warm_start_failed"
             return result

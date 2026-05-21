@@ -95,8 +95,8 @@ class TestMigrateSolarAffected:
     """async_migrate_solar_affected: removed → reset, survivors → preserved."""
 
     @pytest.mark.asyncio
-    async def test_removal_triggers_reset(self):
-        coord = MagicMock(spec=HeatingDataCoordinator)
+    async def test_removal_triggers_reset(self, mock_coordinator):
+        coord = mock_coordinator
         coord._solar_affected_set = frozenset(["sensor.a", "sensor.b", "sensor.c"])
         coord.async_reset_solar_learning_data = AsyncMock(return_value={"status": "reset"})
 
@@ -113,8 +113,8 @@ class TestMigrateSolarAffected:
         assert coord._solar_affected_set == frozenset(["sensor.a"])
 
     @pytest.mark.asyncio
-    async def test_no_removal_no_reset(self):
-        coord = MagicMock(spec=HeatingDataCoordinator)
+    async def test_no_removal_no_reset(self, mock_coordinator):
+        coord = mock_coordinator
         coord._solar_affected_set = frozenset(["sensor.a", "sensor.b"])
         coord.async_reset_solar_learning_data = AsyncMock()
 
@@ -126,9 +126,9 @@ class TestMigrateSolarAffected:
         assert coord._solar_affected_set == frozenset(["sensor.a", "sensor.b"])
 
     @pytest.mark.asyncio
-    async def test_addition_no_reset(self):
+    async def test_addition_no_reset(self, mock_coordinator):
         """Adding a new entity does not trigger reset on existing entities."""
-        coord = MagicMock(spec=HeatingDataCoordinator)
+        coord = mock_coordinator
         coord._solar_affected_set = frozenset(["sensor.a"])
         coord.async_reset_solar_learning_data = AsyncMock()
 
@@ -214,14 +214,14 @@ class TestScreenStratifiedConfoundGate:
 class TestIsSolarAffected:
     """The coordinator helper itself."""
 
-    def test_membership(self):
-        coord = MagicMock(spec=HeatingDataCoordinator)
+    def test_membership(self, mock_coordinator):
+        coord = mock_coordinator
         coord._solar_affected_set = frozenset(["sensor.a", "sensor.b"])
         assert HeatingDataCoordinator.is_solar_affected(coord, "sensor.a") is True
         assert HeatingDataCoordinator.is_solar_affected(coord, "sensor.b") is True
         assert HeatingDataCoordinator.is_solar_affected(coord, "sensor.c") is False
 
-    def test_empty_set_excludes_all(self):
-        coord = MagicMock(spec=HeatingDataCoordinator)
+    def test_empty_set_excludes_all(self, mock_coordinator):
+        coord = mock_coordinator
         coord._solar_affected_set = frozenset()
         assert HeatingDataCoordinator.is_solar_affected(coord, "sensor.x") is False

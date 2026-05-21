@@ -420,7 +420,24 @@ class RetrainEngine:
                     actual_kwh_filtered = max(0.0, actual_kwh - excluded_entry_kwh)
 
                     temp = entry.get("temp", 0.0)
-                    wind_bucket = entry.get("wind_bucket", "normal")
+                    # Re-bucketize from stored effective_wind against the
+                    # current threshold rather than honoring the stored
+                    # ``wind_bucket`` label.  The label is a cache from the
+                    # threshold in effect at log-write time; honoring it
+                    # makes retrain non-idempotent under threshold changes
+                    # — e.g. raising ``extreme_wind_threshold`` would not
+                    # empty extreme buckets on replay because labels stay
+                    # stamped.  Matches the daily Track B path's live
+                    # re-bucketization (retrain.py:260).
+                    # Fall back to the stored label when ``effective_wind``
+                    # is missing (very old logs / partial CSV imports) —
+                    # otherwise legacy high/extreme samples would silently
+                    # collapse to ``normal``.
+                    eff_w = entry.get("effective_wind")
+                    if isinstance(eff_w, (int, float)):
+                        wind_bucket = self.coordinator._get_wind_bucket(eff_w)
+                    else:
+                        wind_bucket = entry.get("wind_bucket", "normal")
                     is_aux = entry.get("auxiliary_active", False)
 
                     if len(temp_history_local) >= 4:
@@ -441,7 +458,16 @@ class RetrainEngine:
                     # aux path still reads ``solar_normalization_delta``
                     # (pulled from the stored entry) so aux-active hours
                     # overlapping with sun are attributed correctly.
-                    delta = entry.get("solar_normalization_delta", 0.0)
+                    #
+                    # #968: prefer the 4D delta whenever the entry carries
+                    # it, falling back to 3D otherwise.  Independent of
+                    # ``experimental_4d_primary`` — aggregation paths
+                    # consume the best available signal regardless of the
+                    # live read-path flag.
+                    delta = entry.get(
+                        "solar_normalization_delta_4d",
+                        entry.get("solar_normalization_delta", 0.0),
+                    )
 
                     # Active-units count proxy for retrain: use the
                     # entry's unit_breakdown (units with non-zero
@@ -546,4 +572,101 @@ class RetrainEngine:
                 "solar_replay_diagnostics": solar_replay_diagnostics,
                 "em_passes": em_passes,
             }
+
+    async def retrain_unit_from_history(
+        self,
+        entity_id: str,
+        reset_first: bool = False,
+        dry_run: bool = False,
+        days_back: int | None = None,
+    ) -> dict:
+        """Targeted per-unit base-coefficient retrain from the hourly log.
+
+        Scope: per-unit ``correlation_data_per_unit[entity_id]`` only.
+        Aux and solar per-unit state are untouched — those have dedicated
+        services.  ``reset_first=False`` (default, nudge) leaves existing
+        buckets in place and applies replay on top; ``reset_first=True``
+        wipes this entity's slice before replay.  ``dry_run=True`` reports
+        what would change without writing.
+        """
+        coord = self.coordinator
+        if entity_id not in coord.energy_sensors:
+            return {
+                "status": "unknown_entity",
+                "entries_processed": 0,
+                "buckets_modified": 0,
+                "dry_run": bool(dry_run),
+                "diff_summary": {},
+            }
+
+        if days_back is not None:
+            cutoff_str = (dt_util.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            entries = [
+                e for e in coord._hourly_log
+                if e.get("timestamp", "") >= cutoff_str
+            ]
+        else:
+            entries = list(coord._hourly_log)
+
+        entries = [
+            e for e in entries
+            if (e.get("unit_breakdown") or {}).get(entity_id, 0.0) > 0.0
+        ]
+
+        if not entries:
+            return {
+                "status": "no_data",
+                "entries_processed": 0,
+                "buckets_modified": 0,
+                "dry_run": bool(dry_run),
+                "diff_summary": {},
+            }
+
+        # ``reset_first`` is honoured inside ``replay_per_unit_models``
+        # regardless of dry_run mode — the function clears the target
+        # entity's slice on the deep-copies in dry-run and on live state
+        # otherwise.  Previously the pop ran ONLY on live state, which
+        # made dry-run + reset_first silently report nudge diffs.
+        if reset_first and not dry_run:
+            _LOGGER.info(
+                "retrain_unit_from_history: clearing per-unit base state for %s",
+                entity_id,
+            )
+
+        diagnostic = coord.learning.replay_per_unit_models(
+            day_entries=entries,
+            strategies=coord._unit_strategies,
+            model=coord.get_model_state(),
+            learning_rate=coord.learning_rate,
+            target_entity=entity_id,
+            dry_run=dry_run,
+            reset_first=reset_first,
+            wind_threshold=coord.wind_threshold,
+            extreme_wind_threshold=coord.extreme_wind_threshold,
+        ) or {}
+
+        if not dry_run:
+            await coord._async_save_data(force=True)
+
+        _LOGGER.info(
+            "retrain_unit_from_history: entity=%s reset_first=%s dry_run=%s "
+            "entries=%d buckets_changed=%d days_back=%s",
+            entity_id,
+            reset_first,
+            dry_run,
+            diagnostic.get("entries_processed", 0),
+            diagnostic.get("buckets_changed", 0),
+            days_back,
+        )
+
+        return {
+            "status": "ok",
+            "entity_id": entity_id,
+            "reset_first": bool(reset_first),
+            "dry_run": bool(dry_run),
+            "days_back": days_back,
+            "entries_processed": diagnostic.get("entries_processed", 0),
+            "buckets_modified": diagnostic.get("buckets_changed", 0),
+            "diff_summary": diagnostic.get("diff_summary", {}),
+        }
 

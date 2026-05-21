@@ -123,6 +123,18 @@ class HourlyProcessor:
         hc = self.coordinator._collector.humidity_count
         avg_humidity = round(self.coordinator._collector.humidity_sum / hc, 1) if hc > 0 else None
 
+        # Raw irradiance averages for the 4D shadow learner (#954).
+        # Each None when the corresponding sensor wasn't sampled this hour.
+        col = self.coordinator._collector
+        dni_avg = (col.dni_sum / col.dni_count) if col.dni_count > 0 else None
+        dhi_avg = (col.dhi_sum / col.dhi_count) if col.dhi_count > 0 else None
+        ghi_avg = (col.ghi_sum / col.ghi_count) if col.ghi_count > 0 else None
+        cloud_avg = (
+            col.cloud_coverage_sum / col.cloud_coverage_count
+            if col.cloud_coverage_count > 0
+            else None
+        )
+
         timestamp = self.coordinator._collector.start_time if self.coordinator._collector.start_time else current_time
         return HourlyObservation(
             timestamp=timestamp,
@@ -184,6 +196,16 @@ class HourlyProcessor:
                 self.coordinator._potential_battery_s,
                 self.coordinator._potential_battery_e,
                 self.coordinator._potential_battery_w,
+            ),
+            dni_avg=dni_avg,
+            dhi_avg=dhi_avg,
+            ghi_avg=ghi_avg,
+            cloud_avg=cloud_avg,
+            battery_filtered_potential_4d=(
+                getattr(self.coordinator, "_potential_battery_4d_s", 0.0),
+                getattr(self.coordinator, "_potential_battery_4d_e", 0.0),
+                getattr(self.coordinator, "_potential_battery_4d_w", 0.0),
+                getattr(self.coordinator, "_potential_battery_4d_diffuse", 0.0),
             ),
         )
 
@@ -379,9 +401,9 @@ class HourlyProcessor:
         # Helper to process an item
         def _get_f_kwh(item, ignore_aux=False):
             if not item: return None
-            # 9-tuple return as of #899 trajectory threading; we only need
-            # the predicted kWh here (single-point query, no trajectory).
-            val, _, _, _, _, _, _, _, _ = self.coordinator.forecast._process_forecast_item(
+            # 10-tuple return as of #980 (9th element added by #899); we only
+            # need the predicted kWh here (single-point query, no trajectory).
+            val, _, _, _, _, _, _, _, _, _ = self.coordinator.forecast._process_forecast_item(
                 item, list(local_inertia_seed), weather_wind_unit, current_cloud, ignore_aux=ignore_aux
             )
             return val
@@ -527,9 +549,27 @@ class HourlyProcessor:
             # ``effective_solar_impact``, hourly log
             # ``solar_impact_kwh``).  Same gate + same decay as the
             # scalar battery for physical consistency.
+            # 4D primary opt-in pauses carryover charging (#962).  Under
+            # ``experimental_4d_primary=True`` the live read-path uses
+            # ``calculate_total_power_4d`` whose carryover release is
+            # hardcoded to 0 (#896 is a 3D-pipeline intervention not yet
+            # ported to the 4D coefficient space).  Charging the EMA
+            # while release is zero would let it grow unbounded on
+            # installs with ``battery_thermal_feedback_k > 0``.  Strict
+            # ``is True`` check matches the dispatcher seam — guards
+            # against MagicMock auto-attributes in tests.  The state
+            # decays toward 0 naturally while paused, so rollback to
+            # flag=False is symmetric (re-charges from scratch).
+            _flag_4d_carryover = (
+                getattr(self.coordinator, "experimental_4d_primary", False) is True
+            )
             carryover_input = (
                 self.coordinator.battery_thermal_feedback_k * solar_heating_wasted
-                if (self.coordinator.battery_thermal_feedback_k > 0.0 and has_heating_unit)
+                if (
+                    self.coordinator.battery_thermal_feedback_k > 0.0
+                    and has_heating_unit
+                    and not _flag_4d_carryover
+                )
                 else 0.0
             )
             self.coordinator._solar_carryover_state = (
@@ -573,6 +613,67 @@ class HourlyProcessor:
                 self.coordinator._potential_battery_w = (
                     self.coordinator._potential_battery_w * decay + pot_w * (1 - decay)
                 )
+
+                # 4D potential battery (#954 commit 7).  Same EMA decay
+                # and gating as the 3D path.  Uses installation-level
+                # screen_config (house-level state, not per-entity)
+                # per the CLAUDE.md global-state note.  Sourced from
+                # collector irradiance averages via the resolve_dni_dhi
+                # ladder.  Any failure (mock coordinator without sun
+                # helpers, etc.) decays the 4D batteries toward zero —
+                # same defensive stance as the 3D path.
+                try:
+                    col = self.coordinator._collector
+                    dni_avg = (col.dni_sum / col.dni_count) if col.dni_count > 0 else None
+                    dhi_avg = (col.dhi_sum / col.dhi_count) if col.dhi_count > 0 else None
+                    ghi_avg = (col.ghi_sum / col.ghi_count) if col.ghi_count > 0 else None
+                    cloud_avg = (
+                        col.cloud_coverage_sum / col.cloud_coverage_count
+                        if col.cloud_coverage_count > 0
+                        else None
+                    )
+                    from datetime import timedelta as _td
+                    from .solar import resolve_dni_dhi
+                    mid_dt = (
+                        self.coordinator._collector.start_time + _td(minutes=30)
+                        if self.coordinator._collector.start_time is not None
+                        else current_time + _td(minutes=30)
+                    )
+                    elev_4d, az_4d = self.coordinator.solar.get_approx_sun_pos(mid_dt)
+                    if elev_4d > 0:
+                        day_of_year = mid_dt.timetuple().tm_yday
+                        dni_4d, dhi_4d, _src = resolve_dni_dhi(
+                            dni_avg, dhi_avg, ghi_avg, cloud_avg,
+                            elev_4d, day_of_year,
+                        )
+                        pot4 = self.coordinator.solar.calculate_unit_potential_4d(
+                            "__house__",
+                            dni_4d, dhi_4d, elev_4d, az_4d,
+                            screen_cfg, actual_correction,
+                        )
+                        p4s, p4e, p4w, p4d = pot4
+                        self.coordinator._potential_battery_4d_s = (
+                            self.coordinator._potential_battery_4d_s * decay
+                            + p4s * (1 - decay)
+                        )
+                        self.coordinator._potential_battery_4d_e = (
+                            self.coordinator._potential_battery_4d_e * decay
+                            + p4e * (1 - decay)
+                        )
+                        self.coordinator._potential_battery_4d_w = (
+                            self.coordinator._potential_battery_4d_w * decay
+                            + p4w * (1 - decay)
+                        )
+                        self.coordinator._potential_battery_4d_diffuse = (
+                            self.coordinator._potential_battery_4d_diffuse * decay
+                            + p4d * (1 - decay)
+                        )
+                except Exception:
+                    # Defensive: any malformation (mock coordinator, missing
+                    # solar helper, etc.) leaves the 4D battery to decay
+                    # toward zero on the next clean hour.  Same stance as
+                    # the 3D path above.
+                    pass
             except (TypeError, ValueError, ZeroDivisionError):
                 # Mock-friendly fallback.  Real screen_transmittance_vector
                 # cannot raise — it returns a fixed-length tuple of floats.
@@ -757,6 +858,13 @@ class HourlyProcessor:
                         and getattr(strat, "use_synthetic", False)
                     )
                 ),
+                # 4D primary read-path opt-in (#962).  Strict ``is True``
+                # check guards against MagicMock test coordinators whose
+                # auto-attribute would otherwise route legacy tests to 4D.
+                experimental_4d_primary=(
+                    getattr(self.coordinator, "experimental_4d_primary", False)
+                    is True
+                ),
             )
 
             learning_result = self.coordinator.learning.process_learning(
@@ -844,6 +952,21 @@ class HourlyProcessor:
 
             thermodynamic_gross_kwh = total_energy_kwh + aux_impact_kwh + solar_adjustment
 
+            # Derive the dni/dhi source label using the same priority ladder
+            # as solar.resolve_dni_dhi.  Logged unconditionally so future
+            # retrospective replays can separate Kasten-bias contribution
+            # from native / GHI-sensor contribution without re-deriving
+            # which path the 4D pipeline would have taken at log time.
+            collector = self.coordinator._collector
+            if collector.ghi_count > 0:
+                dni_dhi_source = "erbs_from_ghi"
+            elif collector.dni_count > 0 and collector.dhi_count > 0:
+                dni_dhi_source = "native"
+            elif collector.cloud_coverage_count > 0:
+                dni_dhi_source = "kasten_synthetic"
+            else:
+                dni_dhi_source = "none"
+
             log_entry = {
                 "timestamp": self.coordinator._collector.start_time.isoformat() if self.coordinator._collector.start_time else current_time.isoformat(),
                 "hour": self.coordinator._collector.start_time.hour if self.coordinator._collector.start_time else current_time.hour,
@@ -871,6 +994,8 @@ class HourlyProcessor:
                 "auxiliary_active": is_aux_dominant,
                 "aux_impact_kwh": aux_impact_kwh,
                 "guest_impact_kwh": round(guest_impact_kwh, 3),
+                "solar_pipeline_schema_version": 1,
+                "dni_dhi_source": dni_dhi_source,
                 "solar_factor": round(avg_solar_factor, 3),
                 "solar_vector_s": round(avg_solar_vector[0], 3),
                 "solar_vector_e": round(avg_solar_vector[1], 3),
@@ -929,6 +1054,16 @@ class HourlyProcessor:
                 "correction_percent": round(actual_correction, 1),
                 "potential_solar_factor": round(potential_factor_avg, 3),
                 "solar_normalization_delta": round(solar_normalization_delta, 5),
+                **(
+                    {"solar_impact_4d_kwh": round(learning_result["solar_impact_4d_kwh"], 3)}
+                    if learning_result.get("solar_impact_4d_kwh") is not None
+                    else {}
+                ),
+                **(
+                    {"solar_normalization_delta_4d": round(learning_result["solar_normalization_delta_4d"], 5)}
+                    if learning_result.get("solar_normalization_delta_4d") is not None
+                    else {}
+                ),
                 "solar_regime": "shutdown" if is_solar_dominant else "normal",
                 "solar_dominant_entities": list(solar_dominant_entities),
                 # Balance point active when this entry was logged (#856).  BP is

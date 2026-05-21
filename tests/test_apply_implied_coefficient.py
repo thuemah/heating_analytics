@@ -779,3 +779,297 @@ class TestDaysBackTimestampParsing:
         assert _filter_log_by_days_back(log, None) is log
         assert _filter_log_by_days_back(log, 0) is log
         assert _filter_log_by_days_back(log, -5) is log
+
+
+# -----------------------------------------------------------------------------
+# #969 slim: 4D dimension routing
+# -----------------------------------------------------------------------------
+#
+# The 4D Tobit collector requires real solar geometry (sun position,
+# DNI/DHI) to produce samples, which is heavy to fixture.  These tests
+# mock ``compute_implied_for_apply`` to return controllable 3D + 4D
+# output, then assert the dimension-routing logic in
+# ``async_apply_implied_coefficient`` writes the right dicts.  The
+# engine-level 3D and 4D fits are covered by their own dedicated test
+# modules (test_apply_implied_coefficient.py 3D paths and the
+# batch_fit_solar_4d tests).
+
+
+def _fake_analysis(*, implied_3d=None, implied_4d=None, n_windows=3):
+    """Build a ``compute_implied_for_apply`` return dict with stable
+    windows (all values identical → ok stability)."""
+    windows = (
+        [{"coefficient": dict(implied_3d), "qualifying_hours": 20}] * n_windows
+        if implied_3d is not None
+        else [None] * n_windows
+    )
+    windows_4d = (
+        [{"coefficient": dict(implied_4d), "qualifying_hours": 20}] * n_windows
+        if implied_4d is not None
+        else [None] * n_windows
+    )
+    return {
+        "sample_count": 60 if implied_3d is not None else 0,
+        "drop_counts": {},
+        "days_back": None,
+        "implied": dict(implied_3d) if implied_3d is not None else None,
+        "windows": windows,
+        "sample_count_4d": 60 if implied_4d is not None else 0,
+        "drop_counts_4d": {},
+        "implied_4d": dict(implied_4d) if implied_4d is not None else None,
+        "windows_4d": windows_4d,
+    }
+
+
+@pytest.mark.asyncio
+async def test_compute_implied_returns_4d_keys_in_result_shape():
+    """``compute_implied_for_apply`` always populates the 4D keys —
+    even when the 4D collector returns zero samples — so downstream
+    coordinator code can rely on the shape."""
+    coord = _make_coord()
+    result = coord.learning.compute_implied_for_apply(
+        hourly_log=coord._hourly_log,
+        entity_id="sensor.heater1",
+        regime="heating",
+        coordinator=coord,
+    )
+    # 3D keys present.
+    assert "implied" in result and "windows" in result
+    # 4D keys present.  The synthetic log lacks real DNI/DHI / sun
+    # position, so the 4D collector yields no samples and the fit
+    # returns None.  Both states must be a stable shape.
+    assert "implied_4d" in result
+    assert "windows_4d" in result
+    assert "sample_count_4d" in result
+    assert "drop_counts_4d" in result
+    assert isinstance(result["windows_4d"], list)
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_dimension_3d_writes_only_3d_dict():
+    """``dimension='3d'`` writes the 3D coefficient and leaves 4D untouched."""
+    coord = _make_coord()
+    fake = _fake_analysis(
+        implied_3d={"s": 1.0, "e": 0.5, "w": 0.3},
+        implied_4d={"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": 0.6},
+    )
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        result = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1", mode=MODE_HEATING, dimension="3d"
+        )
+    assert result["status"] == "ok"
+    assert result["dimension"] == "3d"
+    assert set(result["applied_3d"]) == {"s", "e", "w"}
+    assert result["applied_4d"] == []
+    # 3D dict written.
+    assert coord._solar_coefficients_per_unit["sensor.heater1"]["heating"][
+        "s"
+    ] == pytest.approx(1.0)
+    # 4D dict NOT written (no entry created).
+    assert "sensor.heater1" not in coord._solar_coefficients_4d_per_unit
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_dimension_4d_writes_only_4d_dict():
+    """``dimension='4d'`` writes only the 4D shadow coefficient."""
+    coord = _make_coord()
+    fake = _fake_analysis(
+        implied_3d={"s": 1.0, "e": 0.5, "w": 0.3},
+        implied_4d={"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": 0.6},
+    )
+    before_3d = dict(
+        coord._solar_coefficients_per_unit.get("sensor.heater1", {}).get(
+            "heating", {"s": 0.0, "e": 0.0, "w": 0.0}
+        )
+    )
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        result = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1", mode=MODE_HEATING, dimension="4d"
+        )
+    assert result["status"] == "ok"
+    assert result["dimension"] == "4d"
+    assert set(result["applied_4d"]) == {"s", "e", "w", "diffuse"}
+    assert result["applied_3d"] == []
+    # 4D dict written.
+    coeff_4d = coord._solar_coefficients_4d_per_unit["sensor.heater1"][
+        "heating"
+    ]
+    assert coeff_4d["s"] == pytest.approx(1.1)
+    assert coeff_4d["diffuse"] == pytest.approx(0.6)
+    # 3D dict unchanged.
+    after_3d = coord._solar_coefficients_per_unit.get(
+        "sensor.heater1", {}
+    ).get("heating", {})
+    if after_3d:
+        for k in ("s", "e", "w"):
+            assert after_3d.get(k, 0.0) == pytest.approx(
+                before_3d.get(k, 0.0)
+            )
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_dimension_both_writes_both_dicts():
+    """Default ``dimension='both'`` writes BOTH 3D and 4D coefficients."""
+    coord = _make_coord()
+    fake = _fake_analysis(
+        implied_3d={"s": 1.0, "e": 0.5, "w": 0.3},
+        implied_4d={"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": 0.6},
+    )
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        result = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1", mode=MODE_HEATING
+        )
+    assert result["status"] == "ok"
+    assert result["dimension"] == "both"
+    assert set(result["applied_3d"]) == {"s", "e", "w"}
+    assert set(result["applied_4d"]) == {"s", "e", "w", "diffuse"}
+    # Both dicts populated.
+    assert coord._solar_coefficients_per_unit["sensor.heater1"]["heating"][
+        "s"
+    ] == pytest.approx(1.0)
+    assert coord._solar_coefficients_4d_per_unit["sensor.heater1"][
+        "heating"
+    ]["diffuse"] == pytest.approx(0.6)
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_4d_stability_guard_per_direction():
+    """Stability guard applies per-direction across all four 4D
+    components — an unstable diffuse must be skipped while s/e/w
+    are written."""
+    coord = _make_coord()
+    # Sign-flip on diffuse across windows.
+    fake = _fake_analysis(
+        implied_3d={"s": 1.0, "e": 0.5, "w": 0.3},
+        implied_4d={"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": 0.6},
+    )
+    fake["windows_4d"] = [
+        {"coefficient": {"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": 0.6}, "qualifying_hours": 20},
+        {"coefficient": {"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": -0.5}, "qualifying_hours": 20},
+        {"coefficient": {"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": 0.8}, "qualifying_hours": 20},
+    ]
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        result = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1", mode=MODE_HEATING, dimension="4d"
+        )
+    assert result["status"] == "ok"
+    assert "diffuse" in result["skipped_4d"]
+    assert "s" in result["applied_4d"]
+    assert "e" in result["applied_4d"]
+    assert "w" in result["applied_4d"]
+    # Force should bypass.
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        forced = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1",
+            mode=MODE_HEATING,
+            dimension="4d",
+            force=True,
+        )
+    assert "diffuse" in forced["applied_4d"]
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_dry_run_does_not_write_either_dict():
+    """``dry_run=True`` runs the analysis but writes nothing for any
+    dimension."""
+    coord = _make_coord()
+    fake = _fake_analysis(
+        implied_3d={"s": 1.0, "e": 0.5, "w": 0.3},
+        implied_4d={"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": 0.6},
+    )
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        result = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1",
+            mode=MODE_HEATING,
+            dimension="both",
+            dry_run=True,
+        )
+    assert result["status"] == "ok"
+    assert result["dry_run"] is True
+    # Neither dict was mutated.
+    assert "sensor.heater1" not in coord._solar_coefficients_4d_per_unit
+    # 3D may have a default-shaped entry but values should be 0.
+    coeff_3d = coord._solar_coefficients_per_unit.get(
+        "sensor.heater1", {}
+    ).get("heating", {})
+    if coeff_3d:
+        assert coeff_3d.get("s", 0.0) == 0.0
+    coord._async_save_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_dimension_4d_no_data_when_4d_fit_unavailable():
+    """When 4D Tobit returns None and dimension='4d', status is no_data."""
+    coord = _make_coord()
+    fake = _fake_analysis(
+        implied_3d={"s": 1.0, "e": 0.5, "w": 0.3},
+        implied_4d=None,  # 4D unavailable
+    )
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        result = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1", mode=MODE_HEATING, dimension="4d"
+        )
+    assert result["status"] == "no_data"
+    assert result["skip_reason"] == "insufficient_samples"
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_dimension_both_partial_when_only_3d_available():
+    """When 3D fit succeeds but 4D doesn't, ``dimension='both'`` still
+    returns ok with applied_3d populated and applied_4d empty."""
+    coord = _make_coord()
+    fake = _fake_analysis(
+        implied_3d={"s": 1.0, "e": 0.5, "w": 0.3},
+        implied_4d=None,
+    )
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        result = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1", mode=MODE_HEATING, dimension="both"
+        )
+    assert result["status"] == "ok"
+    assert set(result["applied_3d"]) == {"s", "e", "w"}
+    assert result["applied_4d"] == []
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_invalid_dimension_raises():
+    coord = _make_coord()
+    with pytest.raises(ValueError, match="dimension"):
+        await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1", mode=MODE_HEATING, dimension="2d"
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_implied_legacy_keys_preserved_for_3d_callers():
+    """Pre-#969 callers reading ``applied_components`` / ``skipped_components``
+    must see the 3D answer (these were the only writeable dimension)."""
+    coord = _make_coord()
+    fake = _fake_analysis(
+        implied_3d={"s": 1.0, "e": 0.5, "w": 0.3},
+        implied_4d={"s": 1.1, "e": 0.4, "w": 0.2, "diffuse": 0.6},
+    )
+    with patch.object(
+        coord.learning, "compute_implied_for_apply", return_value=fake
+    ):
+        result = await coord.async_apply_implied_coefficient(
+            entity_id="sensor.heater1", mode=MODE_HEATING
+        )
+    assert result["applied_components"] == result["applied_3d"]
+    assert result["skipped_components"] == result["skipped_3d"]

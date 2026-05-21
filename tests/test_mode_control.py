@@ -4,9 +4,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.util import dt as dt_util
-
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 from custom_components.heating_analytics.const import (
     DOMAIN,
@@ -15,92 +12,48 @@ from custom_components.heating_analytics.const import (
     MODE_OFF,
     STORAGE_KEY,
     STORAGE_VERSION,
+    MODE_GUEST_COOLING
 )
 
-# Mock Coordinator fixture
-@pytest.fixture
-def mock_coordinator(hass):
-    """Create a mock coordinator."""
-    entry = MagicMock()
-    entry.data = {
-        "outdoor_temp_sensor": "sensor.outdoor_temp",
-        "energy_sensors": ["sensor.heater_1", "sensor.heater_2"],
-        "solar_enabled": True
-    }
-
-    # Patch dependencies
-    with patch("custom_components.heating_analytics.coordinator.StorageManager") as mock_storage_cls, \
+@pytest.mark.asyncio
+async def test_mode_selection(hass, mock_entry):
+    """Test setting and getting unit modes."""
+    # Specialized setup: real coordinator with mocks for dependencies
+    with patch("custom_components.heating_analytics.coordinator.StorageManager"), \
          patch("custom_components.heating_analytics.coordinator.ForecastManager"), \
          patch("custom_components.heating_analytics.coordinator.StatisticsManager"), \
          patch("custom_components.heating_analytics.coordinator.LearningManager"), \
-         patch("custom_components.heating_analytics.coordinator.SolarCalculator") as mock_solar_cls:
+         patch("custom_components.heating_analytics.coordinator.SolarCalculator"):
 
-        # Setup Coordinator
-        coord = HeatingDataCoordinator(hass, entry)
-
-        # Setup Solar Mock
-        mock_solar_instance = mock_solar_cls.return_value
-        coord.solar = mock_solar_instance
-
-        # Setup Storage Mock (Real-ish behavior needed for persistence tests)
-        # But for unit tests, we usually mock the underlying store or the manager methods.
-        # Here we want to test that Coordinator calls Storage correctly.
-        mock_storage_instance = mock_storage_cls.return_value
-        # Configure AsyncMock for async methods
-        mock_storage_instance.async_save_data = AsyncMock()
-        mock_storage_instance.async_load_data = AsyncMock()
-        coord.storage = mock_storage_instance
-
-        # Initialize internal structures
-        coord._unit_modes = {}
-
-        # Mock async_set_updated_data (since it's a DataUpdateCoordinator method we didn't mock out, wait...
-        # We are using the REAL HeatingDataCoordinator, so it inherits from DataUpdateCoordinator.
-        # But we are mocking many internals. DataUpdateCoordinator needs hass.
-        # It seems we are hitting an issue where async_set_updated_data is not available or failing?
-        # Actually DataUpdateCoordinator has async_set_updated_data.
-        # Ah, we mocked `super().__init__`? No, we didn't.
-        # But `HeatingDataCoordinator` calls `super().__init__`.
-        # The error says: 'HeatingDataCoordinator' object has no attribute 'async_set_updated_data'.
-        # This implies that `super().__init__` might not have been called correctly or something in the environment is off.
-        # Let's just mock it for the test since we don't care about the listener update here.
+        coord = HeatingDataCoordinator(hass, mock_entry)
         coord.async_set_updated_data = MagicMock()
+        coord.storage.async_save_data = AsyncMock()
+        coord.energy_sensors = ["sensor.heater_1"]
 
-        return coord
+        entity_id = "sensor.heater_1"
 
-@pytest.mark.asyncio
-async def test_mode_selection(mock_coordinator):
-    """Test setting and getting unit modes."""
-    entity_id = "sensor.heater_1"
+        # Default should be HEATING (if not set)
+        assert coord.get_unit_mode(entity_id) == MODE_HEATING
 
-    # Default should be HEATING (if not set)
-    # The getter currently defaults to HEATING in coordinator.py: return self._unit_modes.get(entity_id, MODE_HEATING)
-    assert mock_coordinator.get_unit_mode(entity_id) == MODE_HEATING
+        # Set to COOLING
+        await coord.async_set_unit_mode(entity_id, MODE_COOLING)
+        assert coord.get_unit_mode(entity_id) == MODE_COOLING
+        assert coord._unit_modes[entity_id] == MODE_COOLING
 
-    # Set to COOLING
-    await mock_coordinator.async_set_unit_mode(entity_id, MODE_COOLING)
-    assert mock_coordinator.get_unit_mode(entity_id) == MODE_COOLING
-    assert mock_coordinator._unit_modes[entity_id] == MODE_COOLING
+        # Verify Save was triggered
+        coord.storage.async_save_data.assert_called()
 
-    # Verify Save was triggered
-    mock_coordinator.storage.async_save_data.assert_called()
+        # Set to OFF
+        await coord.async_set_unit_mode(entity_id, MODE_OFF)
+        assert coord.get_unit_mode(entity_id) == MODE_OFF
 
-    # Set to OFF
-    await mock_coordinator.async_set_unit_mode(entity_id, MODE_OFF)
-    assert mock_coordinator.get_unit_mode(entity_id) == MODE_OFF
-
-    # Set to HEATING
-    await mock_coordinator.async_set_unit_mode(entity_id, MODE_HEATING)
-    assert mock_coordinator.get_unit_mode(entity_id) == MODE_HEATING
+        # Set to HEATING
+        await coord.async_set_unit_mode(entity_id, MODE_HEATING)
+        assert coord.get_unit_mode(entity_id) == MODE_HEATING
 
 @pytest.mark.asyncio
 async def test_solar_interaction_with_modes(mock_coordinator):
     """Test that solar correction behaves differently based on mode."""
-    # We are testing the integration of coordinator -> solar.apply_correction
-    # We need to use the REAL SolarCalculator logic for this test, or mock it carefully.
-    # Let's use the REAL SolarCalculator logic by importing it,
-    # but still use the mock coordinator structure.
-
     from custom_components.heating_analytics.solar import SolarCalculator
     real_solar = SolarCalculator(mock_coordinator)
 
@@ -128,43 +81,13 @@ async def test_solar_interaction_with_modes(mock_coordinator):
     assert result_clamped == 0.0
 
 @pytest.mark.asyncio
-async def test_learning_normalization_with_modes(mock_coordinator):
-    """Test that learning normalization behaves differently based on mode."""
-    from custom_components.heating_analytics.solar import SolarCalculator
-    real_solar = SolarCalculator(mock_coordinator)
-
-    actual_kwh = 8.0
-    solar_impact = 2.0
-
-    # HEATING: Actual (8) was reduced by solar (2). Base (Dark) = 8 + 2 = 10
-    norm_heating = real_solar.normalize_for_learning(actual_kwh, solar_impact, MODE_HEATING)
-    assert norm_heating == 10.0
-
-    # COOLING: Actual (8) was increased by solar (2). Base (Dark) = 8 - 2 = 6
-    norm_cooling = real_solar.normalize_for_learning(actual_kwh, solar_impact, MODE_COOLING)
-    assert norm_cooling == 6.0
-
-    # OFF: No correction
-    norm_off = real_solar.normalize_for_learning(actual_kwh, solar_impact, MODE_OFF)
-    assert norm_off == 8.0
-
-@pytest.mark.asyncio
-async def test_persistence_integration(hass):
+async def test_persistence_integration(hass, mock_entry):
     """Test that unit modes are saved and loaded correctly via StorageManager."""
-    # This requires a more integrated test with the real StorageManager
-    # and mocking the underlying Store.
-
     from custom_components.heating_analytics.storage import StorageManager
 
     # Setup Coordinator
-    entry = MagicMock()
-    entry.data = {
-        "energy_sensors": ["sensor.h1", "sensor.h2"],
-        "outdoor_temp_source": "sensor",
-        "wind_source": "sensor",
-        "wind_gust_source": "sensor"
-    }
-    coord = HeatingDataCoordinator(hass, entry)
+    coord = HeatingDataCoordinator(hass, mock_entry)
+    coord.energy_sensors = ["sensor.h1", "sensor.h2"]
     # Mock dependencies to avoid side effects
     coord.forecast = MagicMock()
     coord.statistics = MagicMock()
@@ -204,7 +127,7 @@ async def test_persistence_integration(hass):
             "sensor.h1": MODE_HEATING, # Changed for verification
             "sensor.h2": MODE_COOLING
         },
-        "energy_sensors": ["sensor.h1", "sensor.h2"] # Context usually not in saved data like this but good for test
+        "energy_sensors": ["sensor.h1", "sensor.h2"]
     }
 
     await storage.async_load_data()
@@ -213,14 +136,13 @@ async def test_persistence_integration(hass):
     assert coord._unit_modes["sensor.h2"] == MODE_COOLING
 
 @pytest.mark.asyncio
-async def test_persistence_cleanup(hass):
+async def test_persistence_cleanup(hass, mock_entry):
     """Test that removed sensors are cleaned up from unit_modes on load."""
     from custom_components.heating_analytics.storage import StorageManager
 
-    entry = MagicMock()
     # Only sensor.h1 is configured
-    entry.data = {"energy_sensors": ["sensor.h1"]}
-    coord = HeatingDataCoordinator(hass, entry)
+    mock_entry.data = {"energy_sensors": ["sensor.h1"]}
+    coord = HeatingDataCoordinator(hass, mock_entry)
     coord.forecast = MagicMock()
     coord.statistics = MagicMock()
     coord.solar = MagicMock()
@@ -248,16 +170,18 @@ async def test_calculate_total_power_respects_unit_modes(mock_coordinator):
     """Test that StatisticsManager.calculate_total_power passes the correct mode to solar."""
     from custom_components.heating_analytics.statistics import StatisticsManager
 
-    # Instantiate a real StatisticsManager and attach it to the coordinator,
-    # overriding the mock from the fixture.
-    stats = StatisticsManager(mock_coordinator)
-    mock_coordinator.statistics = stats
-
-    # Set modes
+    # Setup mock_coordinator to use its _unit_modes in get_unit_mode
     mock_coordinator._unit_modes = {
         "sensor.heater_1": MODE_COOLING,
         "sensor.heater_2": MODE_HEATING,
     }
+    mock_coordinator.get_unit_mode.side_effect = lambda eid: mock_coordinator._unit_modes.get(eid, MODE_HEATING)
+
+    # Instantiate a real StatisticsManager and attach it to the coordinator
+    stats = StatisticsManager(mock_coordinator)
+    mock_coordinator.statistics = stats
+
+    mock_coordinator.energy_sensors = ["sensor.heater_1", "sensor.heater_2"]
 
     # Mock Solar methods
     mock_coordinator.solar.calculate_unit_coefficient.return_value = {"s": 1.0, "e": 0.0, "w": 0.0}
@@ -273,6 +197,8 @@ async def test_calculate_total_power_respects_unit_modes(mock_coordinator):
     mock_coordinator._correlation_data = {"10": {"normal": 10.0}}
     mock_coordinator.balance_point = 15.0
     mock_coordinator._aux_coefficients = {}
+    mock_coordinator._get_predicted_kwh.return_value = 10.0
+    mock_coordinator.model.aux_coefficients = {}
 
     # Call method
     stats.calculate_total_power(

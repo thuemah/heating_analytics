@@ -105,6 +105,54 @@ retrain_from_history:
       selector:
         boolean:
 
+retrain_unit_from_history:
+  name: Retrain Unit From History
+  description: >-
+    Targeted per-unit base-coefficient retrain from the hourly log.
+    Only this entity's per-unit ``correlation_data_per_unit`` slice is
+    affected; aux and solar per-unit state are untouched (use the
+    dedicated solar services for those).  Default is "nudge" — replay
+    on top of existing buckets.  Set ``reset_first`` to wipe this
+    entity's slice before replay.  Set ``dry_run`` to report the
+    would-be diff without writing.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor
+      description: The energy sensor (per-unit) to retrain. Must be one of the integration's configured energy_sensors.
+      required: true
+      selector:
+        entity:
+          domain: sensor
+    reset_first:
+      name: Reset First (this unit only)
+      description: >-
+        If true, clears this entity's per-unit base correlation data and
+        learning buffer before replay.  If false (default, "nudge"), replay
+        applies EMA steps on top of the existing state.
+      default: false
+      selector:
+        boolean:
+    dry_run:
+      name: Dry Run
+      description: If true, computes the diff diagnostic without writing to state.
+      default: false
+      selector:
+        boolean:
+    days_back:
+      name: Days Back
+      description: Limit replay to the most recent N days of logged data.  Leave empty to use all available history.
+      selector:
+        number:
+          min: 1
+          max: 730
+          mode: box
+
 reset_learning_data:
   name: Reset Learning Data
   description: Reset all learned correlation data and start fresh. If no entity is selected the first available instance is targeted.
@@ -340,6 +388,88 @@ batch_fit_solar:
       selector:
         boolean:
 
+batch_fit_solar_4d:
+  name: Batch-Fit Solar Coefficients (4D Shadow, experimental)
+  description: >-
+    Experimental shadow path: run a periodic batch Tobit MLE fit on the
+    4D ``(S, E, W, diffuse)`` solar potential instead of the production
+    3D one.  Writes only to the 4D shadow coefficient store; no
+    production read-path consumer yet.  Use to evaluate whether the
+    diffuse-aware decomposition matches the live 3D coefficients on
+    your installation before the 4D path is wired into prediction.
+    Same gating, damping, and right-censoring semantics as the 3D
+    ``batch_fit_solar`` service.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor (optional)
+      description: Restrict the batch fit to a single energy sensor. Leave empty to fit all units in the instance.
+      selector:
+        entity:
+          domain: sensor
+    days_back:
+      name: Days of History
+      description: >-
+        Restrict the fit to the last N days of the hourly log.  Default 30.
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 730
+          mode: box
+    dry_run:
+      name: Dry Run (preview only)
+      description: >-
+        When enabled, run every gate and the Tobit solve but do NOT write
+        the 4D coefficients back.  The response carries the would-be
+        result per (unit, regime).
+      default: false
+      selector:
+        boolean:
+    seed_live_window:
+      name: Seed live Tobit window from batch samples
+      description: >-
+        Accepted for parity with the 3D service.  Currently a no-op for
+        4D — the shadow path has no live Tobit sliding window yet.
+      default: false
+      selector:
+        boolean:
+
+fit_solar_obstruction:
+  name: Fit Solar Obstruction (per-facade direct-beam gate)
+  description: >-
+    Find the sun elevation above which an external overhang or
+    neighbouring structure blocks direct beam on each facade (S, E, W).
+    Brute-force searches a candidate cutoff per facade over the
+    modulating-regime hourly log; a cutoff is committed when the
+    elevation step-function reduces SSE by more than the configured
+    threshold and at least 10 samples sit on each side of it.
+    Per-entity 4D coefficients are held fixed during the fit — once a
+    gate is committed, run ``batch_fit_solar_4d`` afterwards to refit
+    coefficients on the gated geometry.  Building-level invariant —
+    applies to all entities, not gated by ``screen_affected_entities``.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    dry_run:
+      name: Dry Run (preview only)
+      description: >-
+        When enabled, run the fit and return per-facade candidate +
+        SSE-improvement diagnostics but write nothing.  Useful for
+        previewing what the gate would do before committing.
+      default: false
+      selector:
+        boolean:
+
 apply_implied_coefficient:
   name: Apply Implied Solar Coefficient
   description: >-
@@ -430,6 +560,24 @@ apply_implied_coefficient:
       default: false
       selector:
         boolean:
+    dimension:
+      name: Dimension
+      description: >-
+        Which coefficient dict(s) to write.  ``both`` (default) writes
+        the live 3D coefficient AND the experimental 4D shadow
+        coefficient — recommended for most users.  ``3d`` writes only
+        the live 3D coefficient (pre-#969 behaviour).  ``4d`` writes
+        only the 4D shadow coefficient — useful for installations
+        running ``experimental_4d_primary=True`` that want to avoid a
+        redundant 3D write.  The 4D write is a no-op on the live
+        read-path unless the 4D-primary flag has been flipped.
+      default: both
+      selector:
+        select:
+          options:
+            - "3d"
+            - "4d"
+            - both
 
 exit_cooldown:
   name: Exit Auxiliary Cooldown

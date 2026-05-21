@@ -1,6 +1,5 @@
 """Tests for SolarOptimizer."""
 import pytest
-from unittest.mock import MagicMock
 
 # Import the class under test
 from custom_components.heating_analytics.solar_optimizer import SolarOptimizer
@@ -10,15 +9,9 @@ from custom_components.heating_analytics.const import (
     RECOMMENDATION_MITIGATE_SOLAR,
 )
 
-@pytest.fixture
-def mock_coordinator():
-    """Mock coordinator with configuration."""
-    coordinator = MagicMock()
-    coordinator.balance_point = 17.0
-    return coordinator
-
 def test_recommendation_state(mock_coordinator):
     """Test recommendation state logic."""
+    mock_coordinator.balance_point = 17.0
     optimizer = SolarOptimizer(mock_coordinator)
 
     # 1. Cold and Sunny (Maximize)

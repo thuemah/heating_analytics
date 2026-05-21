@@ -1,8 +1,5 @@
 """Tests for the Efficiency Sensor Logic."""
 import pytest
-from unittest.mock import MagicMock, patch
-from datetime import datetime, timedelta
-import sys
 from custom_components.heating_analytics.const import (
     ATTR_TDD,
     ATTR_TDD_SO_FAR,
@@ -15,25 +12,6 @@ from custom_components.heating_analytics.const import (
     ATTR_EFFICIENCY_LAST_30D,
     ATTR_EFFICIENCY_FORECAST_TODAY
 )
-
-# Move imports inside tests/fixtures to avoid metaclass conflict during collection
-# from custom_components.heating_analytics.sensor import HeatingEfficiencySensor
-
-@pytest.fixture
-def mock_coordinator():
-    """Mock the HeatingDataCoordinator."""
-    coordinator = MagicMock()
-    coordinator.data = {}
-    coordinator.statistics = MagicMock()
-    return coordinator
-
-@pytest.fixture
-def mock_entry():
-    """Mock ConfigEntry."""
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    entry.title = "Test Heating"
-    return entry
 
 def test_efficiency_calculation_delegation(mock_coordinator, mock_entry):
     """Test that native_value delegates to StatisticsManager."""

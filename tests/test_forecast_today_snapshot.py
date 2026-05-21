@@ -4,7 +4,6 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from custom_components.heating_analytics.forecast import ForecastManager
-from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 from custom_components.heating_analytics.const import (
     ATTR_DAILY_FORECAST,
 )
@@ -14,41 +13,29 @@ from custom_components.heating_analytics.const import (
 # are an arbitrary mock value satisfying the weighted-average shape.
 _INERTIA_WEIGHTS_FIXTURE = (0.20, 0.30, 0.30, 0.20)
 
-@pytest.fixture
-def mock_coordinator():
-    """Mock the coordinator."""
-    coordinator = MagicMock(spec=HeatingDataCoordinator)
-    coordinator.hass = MagicMock()
-    coordinator.hass.config.time_zone = "UTC"
-    coordinator.weather_entity = "weather.test"
-    coordinator.inertia_weights = _INERTIA_WEIGHTS_FIXTURE
-    coordinator.entry = MagicMock()
-    coordinator.entry.data = {}
-    coordinator.data = {}
-
-    # Mock statistics manager
-    coordinator.statistics = MagicMock()
-    coordinator.statistics._get_daily_log_map = MagicMock(return_value={})
-
-    # Mock calculate_modeled_energy
-    coordinator.calculate_modeled_energy = MagicMock(return_value=(10.0, 0.0, 5.0, 5.0, 10.0))
-
-    # Mock inertia helper
-    coordinator._get_inertia_list = MagicMock(return_value=[])
-    coordinator._calculate_inertia_temp = MagicMock(return_value=5.0)
-
-    # Mock wind bucket
-    coordinator._get_wind_bucket = MagicMock(return_value="normal")
-    coordinator._is_model_covered = MagicMock(return_value=True)
-    coordinator._get_weather_wind_unit = MagicMock(return_value="m/s")
-    coordinator._calculate_effective_wind = MagicMock(return_value=0.0)
-    coordinator.solar_enabled = False
-
-    return coordinator
-
 @patch("custom_components.heating_analytics.forecast.dt_util.now")
 def test_week_ahead_uses_snapshot_for_today(mock_now, mock_coordinator):
     """Test that Today's kwh is overridden by midnight snapshot."""
+    # Specialized setup
+    mock_coordinator.hass.config.time_zone = "UTC"
+    mock_coordinator.weather_entity = "weather.test"
+    mock_coordinator.inertia_weights = _INERTIA_WEIGHTS_FIXTURE
+    
+    mock_coordinator.statistics._get_daily_log_map = MagicMock(return_value={})
+
+    # Mock calculate_modeled_energy
+    mock_coordinator.calculate_modeled_energy = MagicMock(return_value=(10.0, 0.0, 5.0, 5.0, 10.0))
+
+    # Mock inertia helper
+    mock_coordinator._get_inertia_list = MagicMock(return_value=[])
+    mock_coordinator._calculate_inertia_temp = MagicMock(return_value=5.0)
+
+    # Mock wind bucket
+    mock_coordinator._get_wind_bucket = MagicMock(return_value="normal")
+    mock_coordinator._is_model_covered = MagicMock(return_value=True)
+    mock_coordinator._get_weather_wind_unit = MagicMock(return_value="m/s")
+    mock_coordinator._calculate_effective_wind = MagicMock(return_value=0.0)
+    mock_coordinator.solar_enabled = False
 
     # Setup Today
     today = date(2023, 10, 27)

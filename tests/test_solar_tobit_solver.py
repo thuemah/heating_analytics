@@ -131,7 +131,7 @@ def test_tobit_recovers_synthetic_coefficient(rate, bias_tol):
         n=300, true_c=true_c, sigma=0.10,
         target_censor_rate=rate, rng=rng,
     )
-    fit = LearningManager._solve_tobit_3d(samples, mask)
+    fit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit is not None
     assert fit["converged"], f"did not converge at rate={rate}"
     # Compare each direction; accept failure on at most one direction
@@ -174,7 +174,7 @@ def test_tobit_matches_ols_when_no_censoring():
         mask.append(False)
 
     ols = LearningManager._solve_batch_fit_normal_equations(samples)
-    tobit = LearningManager._solve_tobit_3d(samples, mask)
+    tobit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert ols is not None and tobit is not None
     for k in ("s", "e", "w"):
         assert abs(tobit[k] - ols[k]) < 1e-3, (
@@ -206,7 +206,7 @@ def test_tobit_respects_non_negativity():
         samples.append((s, e, w, max(0.001, y)))
         mask.append(False)
 
-    fit = LearningManager._solve_tobit_3d(samples, mask)
+    fit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit is not None
     assert fit["e"] >= 0.0, f"E={fit['e']} broke non-negativity"
     assert fit["e"] <= 0.05, f"E={fit['e']} should be near zero"
@@ -231,7 +231,7 @@ def test_tobit_converges_at_high_censoring_rate():
         n=200, true_c=true_c, sigma=0.12,
         target_censor_rate=0.36, rng=rng,
     )
-    fit = LearningManager._solve_tobit_3d(samples, mask)
+    fit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit is not None
     assert fit["converged"]
     assert fit["iterations"] <= 12, f"took {fit['iterations']} iters at {realised:.0%} censoring"
@@ -262,7 +262,7 @@ def test_tobit_handles_single_direction_dropout():
         samples.append((s, e, w, max(0.001, y)))
         mask.append(False)
 
-    fit = LearningManager._solve_tobit_3d(samples, mask)
+    fit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit is not None
     # E should recover within tolerance
     assert abs(fit["e"] - true_c[1]) < 0.05
@@ -303,7 +303,7 @@ def test_tobit_pinned_reference_fit():
         (0.9, 0.4, 0.6, 0.50),
     ]
     mask = [False] * 12 + [True] * 4
-    fit = LearningManager._solve_tobit_3d(samples, mask)
+    fit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit is not None
     # Pinned values: recompute when intentional changes occur, with
     # PR justification.  Note that on this fixture the censored
@@ -334,7 +334,7 @@ def test_tobit_solver_returns_none_below_uncensored_floor():
     """
     samples = [(0.5, 0.3, 0.2, 0.5)]  # single censored row
     mask = [True]
-    assert LearningManager._solve_tobit_3d(samples, mask) is None
+    assert LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w')) is None
 
     # 2 uncensored — still under solver floor
     samples = [
@@ -342,7 +342,7 @@ def test_tobit_solver_returns_none_below_uncensored_floor():
         (0.4, 0.4, 0.3, 0.45),
     ]
     mask = [False, False]
-    assert LearningManager._solve_tobit_3d(samples, mask) is None
+    assert LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w')) is None
 
 
 def test_tobit_constants_match_choice_4():
@@ -397,7 +397,7 @@ def test_tobit_bias_under_mixture_residuals_documented():
             samples.append((s, e, w, max(0.001, y_star)))
             mask.append(False)
 
-    fit = LearningManager._solve_tobit_3d(samples, mask)
+    fit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit is not None
     assert fit["converged"]
     diffs = [
@@ -456,7 +456,7 @@ def test_tobit_did_not_converge_returns_unconverged_iterate():
         n=80, true_c=true_c, sigma=0.10,
         target_censor_rate=0.30, rng=rng,
     )
-    fit = LearningManager._solve_tobit_3d(samples, mask, max_iter=1)
+    fit = LearningManager._solve_tobit(samples, mask, max_iter=1, components=('s', 'e', 'w'))
     assert fit is not None, "solver should still return a dict on non-convergence"
     assert fit["iterations"] == 1
     # Convergence flag is False AND coefficient is populated.
@@ -472,7 +472,7 @@ def test_tobit_did_not_converge_returns_unconverged_iterate():
 # -----------------------------------------------------------------------------
 
 def test_tobit_returns_none_when_uncensored_below_three():
-    """``_solve_tobit_3d`` returns None when ``n_unc < 3`` — defensive
+    """``_solve_tobit`` returns None when ``n_unc < 3`` — defensive
     guard before LS warm-start.  Bubbles up to
     ``compute_tobit_for_diagnose`` / ``batch_fit_solar_coefficients``
     as ``warm_start_failed``.  The public-API gate
@@ -484,11 +484,11 @@ def test_tobit_returns_none_when_uncensored_below_three():
         (0.4, 0.4, 0.3, 0.45),
     ]
     mask = [False, False]  # n_unc=2 < 3
-    assert LearningManager._solve_tobit_3d(samples, mask) is None
+    assert LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w')) is None
 
 
 def test_tobit_returns_none_when_warm_start_ls_degenerate():
-    """``_solve_tobit_3d`` returns None when the LS warm-start is
+    """``_solve_tobit`` returns None when the LS warm-start is
     degenerate — collinear samples with zero direction sum.  This
     is the ``warm_start_failed`` skip-reason path that the gate
     above this layer (``insufficient_uncensored``) cannot catch
@@ -498,7 +498,7 @@ def test_tobit_returns_none_when_warm_start_ls_degenerate():
     # see Gram matrix degenerate AND zero direction sum → returns None.
     samples = [(0.0, 0.0, 0.0, 0.5)] * 5
     mask = [False] * 5
-    assert LearningManager._solve_tobit_3d(samples, mask) is None
+    assert LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w')) is None
 
 
 # -----------------------------------------------------------------------------
@@ -529,11 +529,11 @@ def test_tobit_optimum_is_local_maximum():
         n=200, true_c=true_c, sigma=0.10,
         target_censor_rate=0.25, rng=rng,
     )
-    fit = LearningManager._solve_tobit_3d(samples, mask)
+    fit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit is not None and fit["converged"]
 
     # Reconstruct the log-likelihood at arbitrary (c, γ).  Mirrors
-    # the closure inside _solve_tobit_3d — kept minimal because we
+    # the closure inside _solve_tobit — kept minimal because we
     # only need values, not gradients.
     def loglik(c_vec, gamma):
         sig = math.exp(gamma)
@@ -621,7 +621,7 @@ def test_tobit_line_search_failed_propagates_as_unconverged():
         samples.append((s, e, w, impact))
         mask.append(False)
 
-    fit = LearningManager._solve_tobit_3d(samples, mask)
+    fit = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit is not None
     if fit.get("failure_reason") == "line_search_failed":
         assert fit["converged"] is False, (
@@ -664,11 +664,11 @@ def test_tobit_singular_step_propagates_as_unconverged(monkeypatch):
 
     monkeypatch.setattr(
         LearningManager,
-        "_solve_tobit_3d",
+        "_solve_tobit",
         staticmethod(_fake_solver),
     )
 
-    fit = LearningManager._solve_tobit_3d([(0.5, 0, 0, 0.3)] * 25, [False] * 25)
+    fit = LearningManager._solve_tobit([(0.5, 0, 0, 0.3)] * 25, [False] * 25, components=('s', 'e', 'w'))
     assert fit["converged"] is False
     assert fit["failure_reason"] == "singular_step"
 
@@ -694,12 +694,12 @@ def test_tobit_failure_reason_distinguishes_skip_paths():
         target_censor_rate=0.20, rng=rng,
     )
     # Success path.
-    fit_ok = LearningManager._solve_tobit_3d(samples, mask)
+    fit_ok = LearningManager._solve_tobit(samples, mask, components=('s', 'e', 'w'))
     assert fit_ok is not None and fit_ok["converged"] is True
     assert fit_ok["failure_reason"] is None
 
     # max_iter exhaustion path (converged=False, failure_reason None).
-    fit_max = LearningManager._solve_tobit_3d(samples, mask, max_iter=1)
+    fit_max = LearningManager._solve_tobit(samples, mask, max_iter=1, components=('s', 'e', 'w'))
     assert fit_max is not None
     if not fit_max["converged"]:
         # On 1-iter cap with reasonable warm-start the gradient guard

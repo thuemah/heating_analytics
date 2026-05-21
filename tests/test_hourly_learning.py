@@ -65,6 +65,16 @@ async def test_hourly_learning_basic(hass: HomeAssistant):
         assert log["actual_kwh"] == 2.0
         assert log["expected_kwh"] == 1.0 # The expectation BEFORE update
 
+        # Forensic fields for retrospective 4D replay must be present
+        # unconditionally on every hourly log entry.  Without these,
+        # future analyses cannot separate Kasten-bias contribution from
+        # native / GHI-sensor contribution, and cannot migrate field
+        # semantics cleanly.  Regression guard against silent drops.
+        assert log["solar_pipeline_schema_version"] == 1
+        # No DNI / DHI / GHI / cloud_coverage accumulated in this test
+        # scenario -> source must collapse to "none", not be absent.
+        assert log["dni_dhi_source"] == "none"
+
 async def test_hourly_bucket_auxiliary(hass: HomeAssistant):
     """Test that auxiliary heating updates Aux Coefficient (Refactor Check)."""
     entry = MagicMock()

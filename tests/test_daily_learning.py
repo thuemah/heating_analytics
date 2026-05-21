@@ -1,41 +1,10 @@
 import pytest
 from unittest.mock import MagicMock, AsyncMock
-from datetime import datetime, date, timedelta
+from datetime import timedelta
 from homeassistant.util import dt as dt_util
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 from custom_components.heating_analytics.storage import StorageManager
-from custom_components.heating_analytics.const import DEFAULT_THERMAL_MASS, MODE_OFF, MODE_DHW, MODE_COOLING
-
-@pytest.fixture
-def mock_coordinator():
-    coord = MagicMock()
-    coord.hass = MagicMock()
-    coord.entry = MagicMock()
-    coord.entry.entry_id = "test_entry"
-    coord.data = {}
-    coord._learned_u_coefficient = None
-    coord._last_midnight_indoor_temp = None
-    coord.thermal_mass_kwh_per_degree = 0.0
-    coord.learning_enabled = True
-    coord.learning_rate = 0.01
-    coord._correlation_data = {}
-    coord._collector.wind_values = []
-    coord._hourly_log = []
-    return coord
-
-def _get_real_coordinator(hass):
-    entry = MagicMock()
-    entry.data = {
-        "energy_sensors": ["sensor.heater1"],
-        "outdoor_temp_sensor": "sensor.outdoor_temp",
-        "thermal_mass_kwh_per_degree": 2.9,
-        "indoor_temp_sensor": "sensor.indoor_temp"
-    }
-    coord = HeatingDataCoordinator(hass, entry)
-    coord.storage = MagicMock()
-    coord.forecast = MagicMock()
-    coord.statistics = MagicMock()
-    return coord
+from custom_components.heating_analytics.const import MODE_OFF, MODE_DHW, MODE_COOLING
 
 @pytest.mark.asyncio
 async def test_daily_learning_storage_save_load(mock_coordinator):
@@ -64,8 +33,17 @@ async def test_daily_learning_storage_save_load(mock_coordinator):
     assert mock_coordinator._last_midnight_indoor_temp == 19.0
 
 @pytest.mark.asyncio
-async def test_daily_learning_thermal_mass_correction(hass):
-    coord = _get_real_coordinator(hass)
+async def test_daily_learning_thermal_mass_correction(hass, mock_entry):
+    mock_entry.data = {
+        "energy_sensors": ["sensor.heater1"],
+        "outdoor_temp_sensor": "sensor.outdoor_temp",
+        "thermal_mass_kwh_per_degree": 2.9,
+        "indoor_temp_sensor": "sensor.indoor_temp"
+    }
+    coord = HeatingDataCoordinator(hass, mock_entry)
+    coord.storage = MagicMock()
+    coord.forecast = MagicMock()
+    coord.statistics = MagicMock()
     coord.learning_enabled = True
     coord.daily_learning_mode = True
     coord._last_midnight_indoor_temp = 20.0
@@ -110,8 +88,17 @@ async def test_daily_learning_thermal_mass_correction(hass):
     assert round(coord._correlation_data["0"]["normal"], 4) == 1.7583
 
 @pytest.mark.asyncio
-async def test_daily_learning_rejects_partial_day(hass):
-    coord = _get_real_coordinator(hass)
+async def test_daily_learning_rejects_partial_day(hass, mock_entry):
+    mock_entry.data = {
+        "energy_sensors": ["sensor.heater1"],
+        "outdoor_temp_sensor": "sensor.outdoor_temp",
+        "thermal_mass_kwh_per_degree": 2.9,
+        "indoor_temp_sensor": "sensor.indoor_temp"
+    }
+    coord = HeatingDataCoordinator(hass, mock_entry)
+    coord.storage = MagicMock()
+    coord.forecast = MagicMock()
+    coord.statistics = MagicMock()
     coord.learning_enabled = True
     coord._last_midnight_indoor_temp = 20.0
 
@@ -175,9 +162,18 @@ def test_compute_excluded_mode_energy_no_modes():
 
 
 @pytest.mark.asyncio
-async def test_daily_learning_excludes_off_dhw_energy(hass):
+async def test_daily_learning_excludes_off_dhw_energy(hass, mock_entry):
     """Track B q_adjusted must exclude OFF/DHW energy (#789)."""
-    coord = _get_real_coordinator(hass)
+    mock_entry.data = {
+        "energy_sensors": ["sensor.heater1"],
+        "outdoor_temp_sensor": "sensor.outdoor_temp",
+        "thermal_mass_kwh_per_degree": 2.9,
+        "indoor_temp_sensor": "sensor.indoor_temp"
+    }
+    coord = HeatingDataCoordinator(hass, mock_entry)
+    coord.storage = MagicMock()
+    coord.forecast = MagicMock()
+    coord.statistics = MagicMock()
     coord.learning_enabled = True
     coord.daily_learning_mode = True
     coord._last_midnight_indoor_temp = 20.0

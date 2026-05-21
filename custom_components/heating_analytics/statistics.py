@@ -7,8 +7,14 @@ from datetime import datetime, timedelta, date
 
 from homeassistant.util import dt as dt_util
 
-from .helpers import get_last_year_iso_date, generate_gaussian_kernel, generate_exponential_kernel, calculate_asymmetric_inertia
+from .helpers import (
+    get_last_year_iso_date,
+    generate_gaussian_kernel,
+    generate_exponential_kernel,
+    calculate_asymmetric_inertia,
+)
 from .explanation import WeatherImpactAnalyzer, ExplanationFormatter
+from .learning import _solar_coeff_regime
 from .solar import SolarCalculator
 from .const import (
     ATTR_TEMP_ACTUAL_TODAY,
@@ -73,6 +79,99 @@ class StatisticsManager:
         self._daily_savings_cache = {}
 
     def calculate_total_power(
+        self,
+        temp: float,
+        effective_wind: float,
+        solar_impact: float,
+        is_aux_active: bool,
+        unit_modes: dict[str, str] | None = None,
+        override_solar_factor: float | None = None,
+        override_solar_vector: tuple[float, float, float] | None = None,
+        detailed: bool = True,
+        known_aux_impact_kwh: float | None = None,
+        carryover_state_override: float | None = None,
+        override_now: datetime | None = None,
+        force_3d: bool = False,
+        override_dni_dhi: tuple[float, float] | None = None,
+        override_correction_percent: float | None = None,
+        override_sun_pos: tuple[float, float] | None = None,
+    ) -> dict:
+        """Compute total power for the given conditions (#962 dispatcher).
+
+        When ``experimental_4d_primary`` is False (default) or
+        ``force_3d=True``, runs the 3D pipeline (``_calculate_total_power_3d``).
+        When the flag is True and ``force_3d`` is False, routes to
+        ``calculate_total_power_4d``.
+
+        Override-kwarg routing:
+
+        - ``override_solar_factor`` / ``override_solar_vector`` /
+          ``carryover_state_override`` are 3D-only.  Callers that pass any
+          of these (forecast 3D fallback, diagnostics replay, sensitivity
+          attributes) are auto-routed back to the 3D primitive so the
+          injected overrides are honoured instead of silently dropped.
+        - ``override_dni_dhi`` / ``override_correction_percent`` /
+          ``override_sun_pos`` are 4D-only.  Forwarded to
+          ``calculate_total_power_4d`` when routing 4D; silently ignored
+          on the 3D branch (the 3D path has no equivalent).
+
+        ``force_3d=True`` is reserved for sensitivity / "what-if"
+        attributes (wind penalty diff, max-solar deficit) that
+        semantically target the 3D rollback model and must not flip
+        regardless of flag state.
+
+        The public name and signature of ``calculate_total_power`` is
+        preserved so existing test mocks (``coordinator.statistics =
+        MagicMock(); .calculate_total_power.return_value = {...}``)
+        continue to work unmodified.
+        """
+        # Strict ``is True`` check: MagicMock test coordinators yield a
+        # truthy auto-attribute for any name access; treat anything that
+        # is not literally ``True`` as ``False`` so legacy mock-based
+        # tests keep routing through the 3D primitive unchanged.
+        flag = getattr(self.coordinator, "experimental_4d_primary", False) is True
+        has_3d_only_overrides = (
+            override_solar_factor is not None
+            or override_solar_vector is not None
+            or carryover_state_override is not None
+        )
+        if not flag or force_3d or has_3d_only_overrides:
+            return self._calculate_total_power_3d(
+                temp,
+                effective_wind,
+                solar_impact,
+                is_aux_active,
+                unit_modes=unit_modes,
+                override_solar_factor=override_solar_factor,
+                override_solar_vector=override_solar_vector,
+                detailed=detailed,
+                known_aux_impact_kwh=known_aux_impact_kwh,
+                carryover_state_override=carryover_state_override,
+                override_now=override_now,
+            )
+        # 4D dispatch.  Forward the 4D-only overrides; the 3D-only kwargs
+        # were already routed out above via has_3d_only_overrides.
+        kwargs_4d: dict = {
+            "unit_modes": unit_modes,
+            "detailed": detailed,
+            "known_aux_impact_kwh": known_aux_impact_kwh,
+            "override_now": override_now,
+        }
+        if override_dni_dhi is not None:
+            kwargs_4d["override_dni_dhi"] = override_dni_dhi
+        if override_correction_percent is not None:
+            kwargs_4d["override_correction_percent"] = override_correction_percent
+        if override_sun_pos is not None:
+            kwargs_4d["override_sun_pos"] = override_sun_pos
+        return self.calculate_total_power_4d(
+            temp,
+            effective_wind,
+            solar_impact,
+            is_aux_active,
+            **kwargs_4d,
+        )
+
+    def _calculate_total_power_3d(
         self,
         temp: float,
         effective_wind: float,
@@ -320,12 +419,15 @@ class StatisticsManager:
             if global_aux_reduction > 0:
                 effective_aux_active = True
         elif is_aux_active:
-            # Kelvin Protocol: Global Model is the TRUTH for Total Reduction.
+            # Track A's aux signal is the LEARNING TRUTH for per-entity aux
+            # (per-unit coefficients are learned against this reduction).
+            # Track A no longer drives ``total_kwh`` aggregate arithmetic
+            # — per-(scope, mode) partitions own that since #992 c2.
             # Note: If aux_affected_entities is explicitly empty (user removed all units),
             # the Global Model still returns its learned prediction. Track B will mark no
-            # units as affected, so the full reduction becomes unassigned. This surfaces
-            # via unassigned_kwh / leak_status in the Potential Savings sensor — that is
-            # the intended feedback loop for this configuration.
+            # units as affected, so the full reduction becomes orphaned_aux_savings.
+            # This surfaces via the Potential Savings sensor as the diagnostic gap
+            # between Track A's belief and what per-entity learning attributes.
             global_aux_reduction = self._get_prediction_from_model(
                 self.coordinator.model.aux_coefficients, temp_key, wind_bucket, temp, self.coordinator.balance_point
             )
@@ -481,6 +583,29 @@ class StatisticsManager:
         # Re-calculate global solar effect using the APPLIED (saturated) values to ensure consistency
         sum_applied_heating = 0.0
         sum_applied_cooling = 0.0
+        # Per-(scope, mode) partition accumulators for the SOLAR aggregate
+        # clamp (#992 commit 1).  The legacy ``max(0, global_net_after_aux
+        # + global_solar_effect)`` clamp absorbed base demand from
+        # out-of-scope entities (cellars, DHW, parasitic loads) when
+        # in-scope heating units saturated, and let heating-side solar
+        # reduction cancel cooling-side base on mixed-mode hours.  We
+        # rebuild the post-aux/post-solar total from explicit partitions:
+        #   heating-in-solar-scope: clamped at 0 per partition (solar
+        #     can only reduce in-scope heating demand)
+        #   cooling-in-solar-scope: additive (cooling solar increases
+        #     demand)
+        #   not-in-solar-scope: base passes through (OFF/DHW/unknown
+        #     mode AND entities outside solar_affected_entities)
+        # Partition base uses ``net_after_aux = base − applied_aux`` so
+        # the aux flow continues to run on the existing global path;
+        # commit 2 will fix the aux scope leak with a parallel split.
+        scope_set = getattr(self.coordinator, "_solar_affected_set", None)
+        if scope_set is None:
+            # Legacy default: all energy_sensors are solar-affected.
+            scope_set = frozenset(self.coordinator.energy_sensors)
+        base_heating_in_scope = 0.0
+        base_cooling_in_scope = 0.0
+        base_not_in_scope = 0.0
         # Heating-only wasted (#896).  Cooling-mode saturation returns
         # wasted=0 today (see solar.calculate_saturation), so summing
         # only on the heating branch is structurally equivalent to the
@@ -545,19 +670,50 @@ class StatisticsManager:
             # Accumulate Global Stats
             # Optimization: Calculate these here to avoid iterating unit_breakdown later
             # This also fixes a bug where detailed=False resulted in 0 solar effect
+            # Partition for the per-(scope, mode) solar clamp (#992 c1).
+            in_solar_scope = entity_id in scope_set
             if data["mode"] in (MODE_COOLING, MODE_GUEST_COOLING):
                 sum_applied_cooling += solar_applied
                 cooling_unit_sum_net += net_final
+                if in_solar_scope:
+                    base_cooling_in_scope += net_after_aux
+                else:
+                    base_not_in_scope += net_after_aux
             else:
+                # Heating regimes (MODE_HEATING / MODE_GUEST_HEATING)
+                # AND fall-through modes (OFF / DHW / unknown — whose
+                # ``calculate_saturation`` returns ``solar_applied = 0``
+                # so the global solar effect aggregate is unchanged).
                 sum_applied_heating += solar_applied
                 heating_unit_sum_net += net_final
-                # Heating-only wasted (#896).  Gate on heating modes
-                # explicitly, not the else branch — OFF/DHW also fall
-                # through to else and their wasted is structurally 0,
-                # but a stricter gate keeps the contract robust.
                 if data["mode"] in (MODE_HEATING, MODE_GUEST_HEATING):
+                    # Heating-only wasted (#896).  Gate on heating modes
+                    # explicitly so OFF/DHW don't contaminate the
+                    # heating-only release accumulator.
                     sum_wasted_heating += solar_wasted
                     heating_only_unit_sum_net += net_final
+                    # Solar-partition base for #992 commit 1.  Out-of-
+                    # scope heating units (cellars, parasitic loads
+                    # excluded from solar_affected_entities) flow into
+                    # the not-in-scope partition so the per-(scope, mode)
+                    # solar clamp doesn't absorb their base.
+                    if in_solar_scope:
+                        base_heating_in_scope += net_after_aux
+                    else:
+                        base_not_in_scope += net_after_aux
+                else:
+                    # DHW / unknown — solar has no effect (``solar_applied =
+                    # 0`` from the fall-through branch of
+                    # ``calculate_saturation``) but the entity is still
+                    # consuming, so its base passes through to the
+                    # not-in-scope partition.  MODE_OFF is excluded here
+                    # because ``calculate_saturation(MODE_OFF)`` overrides
+                    # ``final_net`` to 0 (the entity is commanded off, so
+                    # we predict no consumption) — adding its base to the
+                    # partition would inflate ``total_kwh`` beyond the
+                    # per-entity sum and surface as ``unspecified_kwh``.
+                    if data["mode"] != MODE_OFF:
+                        base_not_in_scope += net_after_aux
 
             unit_sum_net += net_final
             unit_sum_aux_final += applied_aux
@@ -576,9 +732,65 @@ class StatisticsManager:
 
         global_solar_effect = sum_applied_cooling - sum_applied_heating
 
-        # 4. Global Net Calculation
-        global_net_after_aux = max(0.0, global_base - global_aux_reduction)
-        global_net = max(0.0, global_net_after_aux + global_solar_effect)
+        # 4. Global Net Calculation — per-(scope, mode) partitions (#992).
+        #
+        # Commit 1 introduced the solar partition (heating-in-solar-scope,
+        # cooling-in-solar-scope, not-in-solar-scope) and clamped solar
+        # against each partition's own base.  Commit 2 closes the
+        # aux-scope leak by computing ``total_kwh`` from the same
+        # partitions instead of the legacy Track A ``max(0, global_base −
+        # global_aux_reduction)`` formula.  Aux is heating-only by
+        # construction (``calculate_saturation`` ignores it on cooling),
+        # and per-entity ``applied_aux = min(final_aux, base)`` is
+        # already clamped per entity in pass 2 — so ``base_*_in_scope``
+        # accumulators (built from ``net_after_aux`` per entity) carry
+        # the aux-correct, scope-correct, mode-correct base for each
+        # partition.  Out-of-aux-scope entities (``final_aux = 0``)
+        # contribute their full base to the appropriate partition; they
+        # can never be absorbed by another partition's aux or solar.
+        #
+        # Track A ``global_base`` and ``global_aux_reduction`` are
+        # retained as diagnostic fields in the output (``global_base_kwh``,
+        # ``global_aux_reduction_kwh``).  Track A vs Track B disagreement
+        # surfaces via ``orphaned_aux_savings`` (Track A aux >
+        # per-entity sum) and ``unspecified_kwh`` (final partition sum
+        # vs per-entity-clamped sum, which is ~0 on consistent state).
+        #
+        # The Kelvin Protocol ("Global Model is the TRUTH for Total
+        # Reduction") that motivated the legacy formula is hereby
+        # softened: Global Model remains the truth for the AUX SIGNAL
+        # (per-entity aux is learned against Track A's reduction), but
+        # it no longer drives ``total_kwh`` arithmetic.  The legacy
+        # formula absorbed out-of-aux-scope base demand on hours where
+        # ``global_aux_reduction > Σ_{e ∈ aux_affected} base_e`` — a
+        # real entity's real consumption was deleted to make the
+        # arithmetic close.  Users with leakage symptoms should add
+        # affected units to ``aux_affected_entities`` rather than rely
+        # on the absorption to mask them.
+        #
+        # Cold-start / no-per-unit-data fallback: when the partition
+        # accumulators sum to zero (no ``energy_sensors`` configured,
+        # or empty ``_correlation_data_per_unit``), the per-(scope, mode)
+        # split has no information.  Fall back to the legacy Track A
+        # formula ``max(0, global_base − global_aux_reduction) +
+        # global_solar_effect`` clamped at 0 — bit-identical pre-#992
+        # behaviour for installs that have not yet learned per-entity
+        # buckets.  Scope-leak concerns are moot when no per-entity
+        # base exists.
+        unit_partition_total = (
+            base_heating_in_scope + base_cooling_in_scope + base_not_in_scope
+        )
+        if unit_partition_total > 1e-9:
+            heating_in_scope_net = max(
+                0.0, base_heating_in_scope - sum_applied_heating
+            )
+            cooling_in_scope_net = base_cooling_in_scope + sum_applied_cooling
+            global_net = (
+                heating_in_scope_net + cooling_in_scope_net + base_not_in_scope
+            )
+        else:
+            global_net_after_aux = max(0.0, global_base - global_aux_reduction)
+            global_net = max(0.0, global_net_after_aux + global_solar_effect)
 
         # 4b. Solar carry-over reservoir release (#896 follow-up).
         #
@@ -696,6 +908,476 @@ class StatisticsManager:
                 "unspecified_kwh": round(unspecified_kwh, 3)
             },
             "unit_breakdown": unit_breakdown
+        }
+
+    def calculate_total_power_4d(
+        self,
+        temp: float,
+        effective_wind: float,
+        solar_impact: float,
+        is_aux_active: bool,
+        unit_modes: dict[str, str] | None = None,
+        detailed: bool = True,
+        known_aux_impact_kwh: float | None = None,
+        override_now: datetime | None = None,
+        override_dni_dhi: tuple[float, float] | None = None,
+        override_sun_pos: tuple[float, float] | None = None,
+        override_correction_percent: float | None = None,
+    ) -> dict:
+        """4D shadow read-path counterpart to :meth:`calculate_total_power` (#962).
+
+        **Strict shadow — no live read-path consumer.**  This method exists
+        so future bucket-drift / shadow-vs-live diagnostics can compare
+        an end-to-end 4D prediction against the 3D pipeline on identical
+        inputs.  No code in ``coordinator.py``, ``forecast.py``,
+        ``sensor.py``, or anywhere else in the live pipeline calls it.
+        Wiring it into prediction must be a separate, deliberate change.
+
+        Differences from the 3D path:
+
+        * Solar branch uses ``solar.calculate_unit_potential_4d`` +
+          ``solar.calculate_unit_solar_impact_4d`` with per-entity
+          coefficients read via ``solar.calculate_unit_coefficient_4d``.
+          DNI / DHI for the call hour are resolved via
+          ``solar.resolve_dni_dhi`` using the same input ladder the 4D
+          learner uses (GHI sensor → native DNI+DHI → cloud_coverage →
+          synthetic Kasten).  When unresolvable (below-horizon, missing
+          inputs), per-entity 4D potential is ``(0, 0, 0, 0)`` and the
+          solar contribution collapses to 0 for the whole call; the
+          source label is propagated to the output as
+          ``dni_dhi_source``.
+        * The experimental hotspot-loss attenuation (#950),
+          tail-aware solar-impact redistribution (#948), and
+          saturation-wasted carryover release (#896) are intentionally
+          NOT applied.  These are 3D-pipeline interventions; the 4D
+          variant is the bare physics, by design — they would have to be
+          re-derived for the 4D coefficient space before they could fire
+          here.  ``breakdown.carryover_release_kwh`` is fixed at 0.
+        * Base + aux paths are identical to 3D.  4D is a solar-only
+          pipeline change; there is no separate "4D base" model.
+
+        The output dict shape matches 3D exactly, with two added
+        top-level marker fields (``pipeline`` and ``dni_dhi_source``)
+        that make shadow-vs-live comparison cheap downstream.
+
+        Args:
+            temp: Outdoor temperature (C).
+            effective_wind: Effective wind speed (m/s).
+            solar_impact: Unused (legacy 3D-compat parameter).
+            is_aux_active: Whether auxiliary heating is active.
+            unit_modes: Optional ``{entity_id: mode}`` override; defaults
+                to coordinator state.
+            detailed: When False, ``unit_breakdown`` is empty.
+            known_aux_impact_kwh: When provided, overrides the model-
+                predicted aux reduction (same semantics as 3D).
+            override_now: Datetime for sun-position resolution.  Defaults
+                to ``dt_util.now()``.  Tests inject this to pin a
+                specific hour without freezing wall-clock time globally.
+            override_dni_dhi: Optional ``(dni, dhi)`` pair.  When provided
+                the ``resolve_dni_dhi`` ladder is skipped entirely and
+                these values are used as-is; the output
+                ``dni_dhi_source`` is set to ``"replay_override"``.  This
+                is the replay-path entry point — callers walking
+                ``hourly_log`` already have DNI/DHI in hand and the
+                resolution call would otherwise hit the coordinator's
+                *live* signal which is meaningless for a historical
+                hour.  When set, the call also bypasses the
+                ``solar_enabled`` gate for signal resolution — users
+                sometimes toggle solar off after data has been
+                collected, and we do not want the replay leg to silently
+                zero out.
+            override_sun_pos: Optional ``(sun_elev_deg, sun_az_deg)``
+                pair.  When provided the ``get_approx_sun_pos`` call is
+                skipped and these values used directly.  Complements
+                ``override_now``: when both are ``None`` we compute from
+                coordinator state; when ``override_sun_pos`` is set it
+                wins.  Lets diagnostic replay paths compute sun position
+                once and inject it instead of paying the astral cost per
+                hour.
+            override_correction_percent: Optional 0–100 screen slider
+                position to use for transmittance calculation instead of
+                the coordinator's live ``solar_correction_percent``.
+                Required on the replay path: historical hours were
+                collected with a specific screen position which is
+                already baked into the 3D ``effective_solar_vector``
+                supplied via ``override_solar_vector``; the 4D leg
+                forward-computes transmittance from this scalar via
+                ``_screen_transmittance_vector(correction, screen_cfg)``
+                and would otherwise apply present-day transmittance to
+                historical DNI/DHI — creating artificial 3D-vs-4D
+                divergence whenever the slider has moved during the
+                replay window.
+
+        Returns:
+            Same shape as :meth:`calculate_total_power`, plus:
+                ``pipeline``: always ``"4d_shadow"``.
+                ``dni_dhi_source``: source label from ``resolve_dni_dhi``
+                    (``"erbs_from_ghi"``, ``"native"``,
+                    ``"kasten_synthetic"``, ``"no_sun"``, ``"none"``).
+        """
+        temp_key = str(int(round(temp)))
+        wind_bucket = self.coordinator._get_wind_bucket(effective_wind)
+
+        # Retrieve per-unit data structures (identical to 3D path).
+        correlation_per_unit = self.coordinator.model.correlation_data_per_unit
+        aux_coeffs_per_unit = self.coordinator.model.aux_coefficients_per_unit
+
+        # Installation-level screen state.  Per-entity screen_config is
+        # resolved inside the per-entity loop via
+        # ``coordinator.screen_config_for_entity`` — same pattern as 3D.
+        if override_correction_percent is not None:
+            try:
+                screen_pct = float(override_correction_percent)
+            except (TypeError, ValueError):
+                screen_pct = 100.0
+        else:
+            try:
+                screen_pct = float(self.coordinator.solar_correction_percent)
+            except (TypeError, ValueError):
+                screen_pct = 100.0
+        screen_cfg = getattr(self.coordinator, "screen_config", None)
+
+        # --- Resolve hour-midpoint sun + DNI/DHI ONCE per call ----------
+        # Pattern mirrors learning.py's 4D branch (lines ~960-990).  We
+        # use the override_now hour (or wall-clock now()) instead of an
+        # obs.timestamp because this is the read path, not the learning
+        # path — there is no "hour boundary" obs object to consult.
+        now_dt = override_now if override_now is not None else dt_util.now()
+        dni = 0.0
+        dhi = 0.0
+        sun_elev = 0.0
+        sun_az = 0.0
+        dni_dhi_source = "unavailable"
+
+        # Replay override path — used by the divergence diagnose block
+        # to feed historical DNI/DHI and pre-computed sun position
+        # straight into the 4D leg without re-hitting astral or the
+        # live signal ladder.  Bypasses ``solar_enabled`` for the same
+        # reason cold-start replay does: the historical hour was
+        # collected with solar on; the toggle's current state is
+        # irrelevant.
+        if override_dni_dhi is not None:
+            if override_sun_pos is not None:
+                sun_elev, sun_az = override_sun_pos
+            else:
+                try:
+                    sun_elev, sun_az = self.coordinator.solar.get_approx_sun_pos(now_dt)
+                except Exception:  # pragma: no cover — defensive against mocks
+                    sun_elev, sun_az = 0.0, 0.0
+            if sun_elev > 0.0:
+                dni, dhi = float(override_dni_dhi[0]), float(override_dni_dhi[1])
+                dni_dhi_source = "replay_override"
+            else:
+                dni_dhi_source = "no_sun"
+        elif self.coordinator.solar_enabled:
+            if override_sun_pos is not None:
+                sun_elev, sun_az = override_sun_pos
+            else:
+                try:
+                    sun_elev, sun_az = self.coordinator.solar.get_approx_sun_pos(now_dt)
+                except Exception:  # pragma: no cover — defensive against mocks
+                    sun_elev, sun_az = 0.0, 0.0
+
+            if sun_elev > 0.0:
+                # Read the three irradiance signals from the coordinator
+                # in the same order learning.py 4D uses.  ``_get_ghi``
+                # returns None when no sensor is configured;
+                # ``_get_weather_attribute_with_fallback`` returns None
+                # when the weather entity lacks the attribute; the
+                # cloud-coverage fallback inside resolve_dni_dhi handles
+                # all three None-ness combinations.  Defensive ``getattr``
+                # for test fixtures that don't expose these methods.
+                ghi_in: float | None = None
+                dni_in: float | None = None
+                dhi_in: float | None = None
+                cloud_in: float | None = None
+                _get_ghi = getattr(self.coordinator, "_get_ghi", None)
+                if callable(_get_ghi):
+                    try:
+                        ghi_in = _get_ghi()
+                    except Exception:
+                        ghi_in = None
+                _get_weather = getattr(
+                    self.coordinator, "_get_weather_attribute_with_fallback", None
+                )
+                if callable(_get_weather):
+                    try:
+                        dni_in = _get_weather("direct_normal_irradiance")
+                        dhi_in = _get_weather("diffuse_radiation")
+                    except Exception:
+                        dni_in = None
+                        dhi_in = None
+                _get_cloud = getattr(self.coordinator, "_get_cloud_coverage", None)
+                if callable(_get_cloud):
+                    try:
+                        cloud_in = _get_cloud()
+                    except Exception:
+                        cloud_in = None
+
+                # resolve_dni_dhi imported lazily to mirror learning.py.
+                from .solar import resolve_dni_dhi as _resolve_dni_dhi
+
+                day_of_year = now_dt.timetuple().tm_yday
+                dni, dhi, src_label = _resolve_dni_dhi(
+                    dni_in, dhi_in, ghi_in, cloud_in, sun_elev, day_of_year
+                )
+                if src_label == "none":
+                    dni_dhi_source = "unavailable"
+                else:
+                    dni_dhi_source = src_label
+            else:
+                dni_dhi_source = "no_sun"
+
+        # --- Track A: Global Model (Top-Down / Master) ------------------
+        # Identical to 3D.  4D does NOT alter base/aux learning surfaces.
+        global_base = self.coordinator._get_predicted_kwh(temp_key, wind_bucket, temp)
+
+        global_aux_reduction = 0.0
+        effective_aux_active = is_aux_active
+        if known_aux_impact_kwh is not None:
+            global_aux_reduction = known_aux_impact_kwh
+            if global_aux_reduction > 0:
+                effective_aux_active = True
+        elif is_aux_active:
+            global_aux_reduction = self._get_prediction_from_model(
+                self.coordinator.model.aux_coefficients,
+                temp_key, wind_bucket, temp, self.coordinator.balance_point,
+            )
+
+        # --- Track B: Unit Models (Bottom-Up) ---------------------------
+        raw_unit_data: dict = {}
+        sum_affected_aux = 0.0
+        unit_sum_base = 0.0
+
+        aux_affected_set = None
+        if effective_aux_active:
+            if hasattr(self.coordinator, "_aux_affected_set"):
+                aux_affected_set = self.coordinator.aux_affected_set
+            elif self.coordinator.aux_affected_entities:
+                aux_affected_set = set(self.coordinator.aux_affected_entities)
+
+        # Sun-gate for the 4D solar branch.  When DNI/DHI is unresolvable
+        # OR the sun is below the horizon, every per-entity potential is
+        # (0, 0, 0, 0) and we skip the per-entity solar work entirely.
+        solar_gate_open = (
+            (self.coordinator.solar_enabled or override_dni_dhi is not None)
+            and sun_elev > 0.0
+            and dni_dhi_source not in ("unavailable", "no_sun")
+        )
+
+        for entity_id in self.coordinator.energy_sensors:
+            if unit_modes and entity_id in unit_modes:
+                unit_mode = unit_modes[entity_id]
+            else:
+                unit_mode = self.coordinator.get_unit_mode(entity_id)
+            effective_wind_bucket = (
+                COOLING_WIND_BUCKET if unit_mode == MODE_COOLING else wind_bucket
+            )
+
+            # Base prediction (identical to 3D).
+            unit_data = correlation_per_unit.get(entity_id, {})
+            base_kwh = self._get_prediction_from_model(
+                unit_data, temp_key, effective_wind_bucket, temp,
+                self.coordinator.balance_point,
+            )
+            unit_sum_base += base_kwh
+
+            # Aux reduction (identical to 3D).
+            aux_reduction = 0.0
+            is_affected = False
+            if effective_aux_active:
+                if aux_affected_set:
+                    if entity_id in aux_affected_set:
+                        is_affected = True
+                elif entity_id in self.coordinator.aux_affected_entities:
+                    is_affected = True
+                if is_affected:
+                    unit_aux_data = aux_coeffs_per_unit.get(entity_id, {})
+                    aux_reduction = self._get_prediction_from_model(
+                        unit_aux_data, temp_key, effective_wind_bucket, temp,
+                        self.coordinator.balance_point,
+                    )
+                    sum_affected_aux += aux_reduction
+
+            # --- 4D solar branch ---------------------------------------
+            unit_solar_reduction = 0.0
+            cooling_solar_cold_start = (
+                unit_mode in (MODE_COOLING, MODE_GUEST_COOLING)
+                and self._is_cooling_solar_cold_start(entity_id)
+            )
+            if solar_gate_open and not cooling_solar_cold_start:
+                unit_coeff_4d = self.coordinator.solar.calculate_unit_coefficient_4d(
+                    entity_id, temp_key, unit_mode
+                )
+                _scr_fn = getattr(
+                    self.coordinator, "screen_config_for_entity", None
+                )
+                entity_scr_cfg = _scr_fn(entity_id) if _scr_fn else screen_cfg
+                pot_4d = self.coordinator.solar.calculate_unit_potential_4d(
+                    entity_id,
+                    dni, dhi,
+                    sun_elev, sun_az,
+                    entity_scr_cfg,
+                    screen_pct,
+                )
+                unit_solar_reduction = (
+                    self.coordinator.solar.calculate_unit_solar_impact_4d(
+                        pot_4d, unit_coeff_4d
+                    )
+                )
+
+            raw_unit_data[entity_id] = {
+                "base": base_kwh,
+                "raw_aux": aux_reduction,
+                "solar": unit_solar_reduction,
+                "mode": unit_mode,
+                "affected": is_affected,
+            }
+
+        # --- Pass 2: Finalize Breakdown (identical 3D arithmetic) -------
+        unit_sum_net = 0.0
+        unit_sum_aux_final = 0.0
+        unit_sum_solar_final = 0.0
+        unit_sum_solar_wasted = 0.0
+        unassigned_aux_savings = 0.0
+        unit_breakdown: dict = {}
+
+        sum_applied_heating = 0.0
+        sum_applied_cooling = 0.0
+        sum_wasted_heating = 0.0
+        heating_unit_sum_net = 0.0
+        cooling_unit_sum_net = 0.0
+        # Per-(scope, mode) partition accumulators for the 4D shadow
+        # path (#992 commit 3 — parallel to commits 1+2 on the 3D
+        # ``calculate_total_power``).  Same partition semantics: the
+        # legacy ``max(0, global_base − global_aux_reduction) +
+        # global_solar_effect`` formula absorbed out-of-scope base
+        # demand and mode-mixed solar effects.  4D shadow had to mirror
+        # the bug to stay diff-comparable; now both paths share the
+        # corrected per-partition aggregation.
+        scope_set = getattr(self.coordinator, "_solar_affected_set", None)
+        if scope_set is None:
+            scope_set = frozenset(self.coordinator.energy_sensors)
+        base_heating_in_scope = 0.0
+        base_cooling_in_scope = 0.0
+        base_not_in_scope = 0.0
+
+        for entity_id, data in raw_unit_data.items():
+            final_aux = data["raw_aux"]
+            if not data["affected"]:
+                final_aux = 0.0
+
+            applied_aux = min(final_aux, data["base"])
+            overflow_aux = final_aux - applied_aux
+            if overflow_aux > 0:
+                unassigned_aux_savings += overflow_aux
+            net_after_aux = data["base"] - applied_aux
+
+            solar_applied, solar_wasted, net_final = (
+                self.coordinator.solar.calculate_saturation(
+                    net_after_aux, data["solar"], data["mode"]
+                )
+            )
+
+            if detailed:
+                unit_breakdown[entity_id] = {
+                    "net_kwh": round(net_final, 3),
+                    "base_kwh": round(data["base"], 3),
+                    "aux_reduction_kwh": round(applied_aux, 3),
+                    "raw_aux_kwh": round(final_aux, 3),
+                    "overflow_kwh": round(overflow_aux, 3),
+                    "clamped": overflow_aux > 0.001,
+                    "solar_reduction_kwh": round(solar_applied, 3),
+                    "raw_solar_kwh": round(data["solar"], 3),
+                    "solar_wasted_kwh": round(solar_wasted, 3),
+                }
+
+            in_solar_scope = entity_id in scope_set
+            if data["mode"] in (MODE_COOLING, MODE_GUEST_COOLING):
+                sum_applied_cooling += solar_applied
+                cooling_unit_sum_net += net_final
+                if in_solar_scope:
+                    base_cooling_in_scope += net_after_aux
+                else:
+                    base_not_in_scope += net_after_aux
+            else:
+                sum_applied_heating += solar_applied
+                heating_unit_sum_net += net_final
+                if data["mode"] in (MODE_HEATING, MODE_GUEST_HEATING):
+                    sum_wasted_heating += solar_wasted
+                    if in_solar_scope:
+                        base_heating_in_scope += net_after_aux
+                    else:
+                        base_not_in_scope += net_after_aux
+                else:
+                    # DHW / unknown — solar no-op, base passes through.
+                    # MODE_OFF excluded: see 3D path for rationale
+                    # (``calculate_saturation`` overrides final_net=0).
+                    if data["mode"] != MODE_OFF:
+                        base_not_in_scope += net_after_aux
+
+            unit_sum_net += net_final
+            unit_sum_aux_final += applied_aux
+            unit_sum_solar_final += solar_applied
+            unit_sum_solar_wasted += solar_wasted
+
+        orphaned_aux_savings = 0.0
+        if effective_aux_active and global_aux_reduction > 0:
+            remaining = (
+                global_aux_reduction - unit_sum_aux_final - unassigned_aux_savings
+            )
+            if remaining > 0.001:
+                orphaned_aux_savings = remaining
+                unassigned_aux_savings += remaining
+
+        global_solar_effect = sum_applied_cooling - sum_applied_heating
+        # Per-(scope, mode) partition sum — see 3D implementation for
+        # the full rationale.  Cold-start fallback to the legacy Track A
+        # formula when no per-entity base has been learned yet.
+        unit_partition_total = (
+            base_heating_in_scope + base_cooling_in_scope + base_not_in_scope
+        )
+        if unit_partition_total > 1e-9:
+            heating_in_scope_net = max(
+                0.0, base_heating_in_scope - sum_applied_heating
+            )
+            cooling_in_scope_net = base_cooling_in_scope + sum_applied_cooling
+            global_net = (
+                heating_in_scope_net + cooling_in_scope_net + base_not_in_scope
+            )
+        else:
+            global_net_after_aux = max(0.0, global_base - global_aux_reduction)
+            global_net = max(0.0, global_net_after_aux + global_solar_effect)
+
+        # Carryover release (#896) is intentionally NOT applied in the 4D
+        # shadow path — see method docstring.  Fixed at 0 so the field
+        # is present for downstream shadow-vs-live comparison code.
+        carryover_release_applied = 0.0
+
+        unspecified_kwh = global_net - unit_sum_net
+
+        return {
+            "pipeline": "4d_shadow",
+            "dni_dhi_source": dni_dhi_source,
+            "total_kwh": round(global_net, 3),
+            "global_base_kwh": round(global_base, 3),
+            "global_aux_reduction_kwh": round(global_aux_reduction, 3),
+            "heating_total_kwh": round(heating_unit_sum_net, 3),
+            "cooling_total_kwh": round(cooling_unit_sum_net, 3),
+            "breakdown": {
+                "base_kwh": round(unit_sum_base, 3),
+                "aux_reduction_kwh": round(unit_sum_aux_final, 3),
+                "solar_reduction_kwh": round(unit_sum_solar_final, 3),
+                "solar_wasted_kwh": round(unit_sum_solar_wasted, 3),
+                "solar_heating_wasted_kwh": round(sum_wasted_heating, 3),
+                "solar_heating_applied_kwh": round(sum_applied_heating, 3),
+                "solar_cooling_applied_kwh": round(sum_applied_cooling, 3),
+                "carryover_release_kwh": round(carryover_release_applied, 3),
+                "unassigned_aux_savings": round(unassigned_aux_savings, 3),
+                "orphaned_aux_savings": round(orphaned_aux_savings, 3),
+                "unspecified_kwh": round(unspecified_kwh, 3),
+            },
+            "unit_breakdown": unit_breakdown,
         }
 
     def _is_cooling_solar_cold_start(self, entity_id: str) -> bool:
@@ -1336,7 +2018,7 @@ class StatisticsManager:
         for entry in today_logs:
             temp = entry["temp"]
             eff_wind = entry["effective_wind"]
-            solar_impact = entry.get("solar_impact_kwh", 0.0)
+            solar_impact = self.coordinator.hourly_solar_impact_kwh(entry)
 
             t_norm, t_aux, is_missing, _ = self._calculate_savings_component(temp, eff_wind, solar_impact, detailed=False)
 
@@ -2150,14 +2832,18 @@ class StatisticsManager:
             wind_bucket = COOLING_WIND_BUCKET
         unit_base_curr = self._get_prediction_from_model(unit_data, temp_key, wind_bucket, current_temp, self.coordinator.balance_point)
 
+        # Per-entity regime (invariant #6) — never derive mode from outdoor
+        # temperature.  OFF / DHW / unknown → no solar contribution.
+        regime = _solar_coeff_regime(unit_mode_fb)
+
         # Cooling cold-start solar guard — match the gate in
         # ``calculate_total_power``.  See ``_is_cooling_solar_cold_start``
         # for rationale.
         cooling_solar_cold_start = (
-            unit_mode_fb in (MODE_COOLING, MODE_GUEST_COOLING)
+            regime == "cooling"
             and self._is_cooling_solar_cold_start(entity_id)
         )
-        if self.coordinator.solar_enabled and not cooling_solar_cold_start:
+        if self.coordinator.solar_enabled and regime is not None and not cooling_solar_cold_start:
              curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
              unit_coeff = self.coordinator.solar.calculate_unit_coefficient(
                  entity_id, temp_key, unit_mode_fb
@@ -2179,11 +2865,13 @@ class StatisticsManager:
              )
              unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(pot_vec, unit_coeff)
 
-             mode = MODE_HEATING if current_temp < self.coordinator.balance_point else MODE_COOLING
-             unit_rate_curr = self.coordinator.solar.apply_correction(unit_base_curr, unit_solar_curr_kw, mode)
+             # Route via per-entity regime, not outdoor temp (invariant #6).
+             correction_mode = MODE_HEATING if regime == "heating" else MODE_COOLING
+             unit_rate_curr = self.coordinator.solar.apply_correction(unit_base_curr, unit_solar_curr_kw, correction_mode)
         else:
-             # Either solar disabled, or cooling cold-start (skip phantom
-             # additive demand from migration-seeded cooling coefficient).
+             # Solar disabled, no-solar regime (OFF/DHW/unknown), or cooling
+             # cold-start (skip phantom additive demand from migration-seeded
+             # cooling coefficient).
              unit_rate_curr = unit_base_curr
 
         return unit_rate_curr * (minutes_passed / 60.0)
@@ -2523,7 +3211,7 @@ class StatisticsManager:
                 discarded_reasons["zero_or_negative_consumption"] += 1
                 continue
 
-            solar_impact = log.get("solar_impact_kwh", 0.0)
+            solar_impact = self.coordinator.hourly_solar_impact_kwh(log)
             if solar_impact > 0.1: # Exclude if solar > 100W
                 discarded_reasons["solar_interference"] += 1
                 continue
@@ -2899,7 +3587,7 @@ class StatisticsManager:
                 discarded["zero_or_negative_consumption"] += 1
                 continue
 
-            solar_impact = log.get("solar_impact_kwh", 0.0)
+            solar_impact = self.coordinator.hourly_solar_impact_kwh(log)
             if solar_impact > 0.1:
                 discarded["solar_interference"] += 1
                 continue

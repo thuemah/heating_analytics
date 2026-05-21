@@ -6,26 +6,6 @@ from homeassistant.core import HomeAssistant
 from custom_components.heating_analytics.sensor import HeatingCorrelationDataSensor
 from custom_components.heating_analytics.const import ATTR_CORRELATION_DATA
 
-@pytest.fixture
-def mock_hass():
-    """Mock Home Assistant."""
-    return MagicMock()
-
-@pytest.fixture
-def mock_entry():
-    """Mock Config Entry."""
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    return entry
-
-@pytest.fixture
-def mock_coordinator():
-    """Mock Coordinator."""
-    coord = MagicMock()
-    coord.data = {}
-    coord._aux_coefficients = {}
-    return coord
-
 @pytest.mark.asyncio
 async def test_correlation_data_sensor_attributes(hass: HomeAssistant, mock_coordinator, mock_entry):
     """Test HeatingCorrelationDataSensor attributes and JSON generation."""

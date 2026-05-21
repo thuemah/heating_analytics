@@ -7,14 +7,6 @@ from custom_components.heating_analytics.forecast import ForecastManager
 
 
 @pytest.fixture
-def mock_coordinator():
-    coord = MagicMock()
-    coord._hourly_log = []
-    coord.data = {}
-    return coord
-
-
-@pytest.fixture
 def forecast_manager(mock_coordinator):
     """Forecast manager with a 50 kWh midnight snapshot — used by the
     gross-logic and aux-correction paths."""

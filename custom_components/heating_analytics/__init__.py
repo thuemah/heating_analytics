@@ -43,7 +43,10 @@ SERVICE_DIAGNOSE_MODEL = "diagnose_model"
 SERVICE_DIAGNOSE_SOLAR = "diagnose_solar"
 SERVICE_RESET_SOLAR_LEARNING = "reset_solar_learning"
 SERVICE_RETRAIN_FROM_HISTORY = "retrain_from_history"
+SERVICE_RETRAIN_UNIT_FROM_HISTORY = "retrain_unit_from_history"
 SERVICE_BATCH_FIT_SOLAR = "batch_fit_solar"
+SERVICE_BATCH_FIT_SOLAR_4D = "batch_fit_solar_4d"
+SERVICE_FIT_SOLAR_OBSTRUCTION = "fit_solar_obstruction"
 SERVICE_APPLY_IMPLIED_COEFFICIENT = "apply_implied_coefficient"
 SERVICE_SET_EXPERIMENTAL_TOBIT_LIVE_LEARNER = "set_experimental_tobit_live_learner"
 SERVICE_SET_TOBIT_LIVE_ENTITIES = "set_tobit_live_entities"
@@ -132,6 +135,22 @@ SERVICE_SCHEMA_RETRAIN = vol.Schema({
     vol.Optional("experimental_cop_smear", default=False): cv.boolean,  # #793 hidden flag
 })
 
+SERVICE_SCHEMA_RETRAIN_UNIT = vol.Schema({
+    # ``entity_id`` (optional): a Heating Analytics-owned entity used to
+    # disambiguate which integration instance to operate on (defaults to
+    # the first available coordinator).  Energy sensors are owned by
+    # other integrations and CANNOT serve this role — ``_get_target_coordinator``
+    # would raise ValueError on lookup.  Mirrors the ``batch_fit_solar``
+    # convention.
+    vol.Optional("entity_id"): cv.entity_id,
+    # ``unit_entity_id`` (required): the energy sensor whose per-unit
+    # base coefficients are to be retrained.
+    vol.Required("unit_entity_id"): cv.entity_id,
+    vol.Optional("reset_first", default=False): cv.boolean,
+    vol.Optional("dry_run", default=False): cv.boolean,
+    vol.Optional("days_back"): vol.All(vol.Coerce(int), vol.Range(min=1, max=730)),
+})
+
 SERVICE_SCHEMA_BATCH_FIT_SOLAR = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("unit_entity_id"): cv.entity_id,
@@ -140,6 +159,21 @@ SERVICE_SCHEMA_BATCH_FIT_SOLAR = vol.Schema({
     ),
     vol.Optional("dry_run", default=False): cv.boolean,
     vol.Optional("seed_live_window", default=False): cv.boolean,
+})
+
+SERVICE_SCHEMA_BATCH_FIT_SOLAR_4D = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("unit_entity_id"): cv.entity_id,
+    vol.Optional("days_back", default=30): vol.All(
+        vol.Coerce(int), vol.Range(min=1, max=730)
+    ),
+    vol.Optional("dry_run", default=False): cv.boolean,
+    vol.Optional("seed_live_window", default=False): cv.boolean,
+})
+
+SERVICE_SCHEMA_FIT_SOLAR_OBSTRUCTION = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("dry_run", default=False): cv.boolean,
 })
 
 SERVICE_SCHEMA_APPLY_IMPLIED_COEFFICIENT = vol.Schema({
@@ -167,6 +201,13 @@ SERVICE_SCHEMA_APPLY_IMPLIED_COEFFICIENT = vol.Schema({
     ),
     vol.Optional("dry_run", default=False): cv.boolean,
     vol.Optional("force", default=False): cv.boolean,
+    # ``dimension`` selects which solar-coefficient dict(s) to write
+    # (#969 slim).  ``both`` (default) preserves pre-#969 user-visible
+    # semantics — the 3D coefficient is still written — and additionally
+    # writes the 4D shadow coefficient when the Tobit fit converges.
+    # The 4D write is a no-op on the live read-path unless the user has
+    # flipped ``experimental_4d_primary``.
+    vol.Optional("dimension", default="both"): vol.In(("3d", "4d", "both")),
 })
 
 # Tobit live-learner experimental services (#904 stage 3, storage v5).
@@ -407,6 +448,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
 
+    # Register Retrain Unit From History Service — targeted per-unit
+    # base coefficient retrain.  Default nudge (no reset); dry_run
+    # exposes the would-be diff without writing.
+    async def handle_retrain_unit_from_history(call: ServiceCall) -> dict:
+        entity_id = call.data.get("entity_id")  # HA instance disambiguator
+        unit_entity_id = call.data["unit_entity_id"]  # energy sensor to retrain
+        reset_first = bool(call.data.get("reset_first", False))
+        dry_run = bool(call.data.get("dry_run", False))
+        days_back = call.data.get("days_back")
+        coord = _get_target_coordinator(hass, entity_id)
+        _LOGGER.info(
+            f"Service called: retrain_unit_from_history unit={unit_entity_id} "
+            f"reset_first={reset_first} dry_run={dry_run} days_back={days_back} "
+            f"(coordinator={coord.entry.entry_id})"
+        )
+        return await coord.retrain_unit_from_history(
+            entity_id=unit_entity_id,
+            reset_first=reset_first,
+            dry_run=dry_run,
+            days_back=days_back,
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RETRAIN_UNIT_FROM_HISTORY,
+        handle_retrain_unit_from_history,
+        schema=SERVICE_SCHEMA_RETRAIN_UNIT,
+        supports_response=SupportsResponse.ONLY,
+    )
+
     # Register Batch-Fit Solar Service (#884)
     async def handle_batch_fit_solar(call: ServiceCall) -> dict:
         """Handle the batch-fit-solar service call.
@@ -455,6 +526,138 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
 
+    # Register 4D Shadow Batch-Fit Solar Service (#954)
+    async def handle_batch_fit_solar_4d(call: ServiceCall) -> dict:
+        """Handle the experimental 4D shadow batch-fit-solar service call.
+
+        Strict shadow: writes only to ``_solar_coefficients_4d_per_unit``.
+        No production read-path consumer yet.  Same gating + damping
+        semantics as the 3D path, but the per-row potential is the 4D
+        ``(s, e, w, diffuse)`` vector built from DNI/DHI via the
+        f41ffd8 hour-midpoint pipeline.
+        """
+        entity_id = call.data.get("entity_id")
+        unit_entity_id = call.data.get("unit_entity_id")
+        days_back = call.data.get("days_back", 30)
+        dry_run = call.data.get("dry_run", False)
+        seed_live_window = call.data.get("seed_live_window", False)
+        coord = _get_target_coordinator(hass, entity_id)
+        scope = f"unit {unit_entity_id}" if unit_entity_id else "all units"
+        suffix_parts = [f"last {days_back}d"]
+        if dry_run:
+            suffix_parts.append("dry-run")
+        if seed_live_window:
+            suffix_parts.append("seed-live-window")
+        suffix = f" ({', '.join(suffix_parts)})"
+        _LOGGER.info(
+            f"Service called: batch_fit_solar_4d for {scope}{suffix} "
+            f"(coordinator={coord.entry.entry_id})"
+        )
+        if seed_live_window:
+            _LOGGER.info(
+                "batch_fit_solar_4d: seed_live_window=True accepted but no-op "
+                "— there is no Stage-3 live Tobit window for the 4D shadow "
+                "learner yet; flag is reserved for future use."
+            )
+        result = coord.learning.batch_fit_solar_coefficients_4d(
+            hourly_log=coord._hourly_log,
+            solar_coefficients_4d_per_unit=coord._solar_coefficients_4d_per_unit,
+            energy_sensors=coord.energy_sensors,
+            coordinator=coord,
+            entity_id_filter=unit_entity_id,
+            unit_min_base=coord._per_unit_min_base_thresholds or None,
+            screen_affected_entities=getattr(
+                coord, "_screen_affected_set", None
+            ),
+            days_back=days_back,
+            dry_run=dry_run,
+            seed_live_window=seed_live_window,
+        )
+        applied_count = 0
+        skipped_count = 0
+        for regimes in result.values():
+            if not isinstance(regimes, dict):
+                skipped_count += 1
+                continue
+            if "skip_reason" in regimes and "heating" not in regimes:
+                skipped_count += 1
+                continue
+            for regime_diag in regimes.values():
+                if not isinstance(regime_diag, dict):
+                    continue
+                if regime_diag.get("applied"):
+                    applied_count += 1
+                elif regime_diag.get("skip_reason"):
+                    skipped_count += 1
+        if applied_count and not dry_run:
+            await coord._async_save_data(force=True)
+        response = {
+            "status": "ok",
+            "unit_entity_id": unit_entity_id,
+            "days_back": days_back,
+            "dry_run": dry_run,
+            "applied_count": applied_count,
+            "skipped_count": skipped_count,
+            "per_unit": result,
+        }
+        if seed_live_window:
+            response["seed_skip_reason"] = "no_live_window_4d"
+        return response
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_BATCH_FIT_SOLAR_4D,
+        handle_batch_fit_solar_4d,
+        schema=SERVICE_SCHEMA_BATCH_FIT_SOLAR_4D,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    # Register Fit Solar Obstruction Service (#991)
+    async def handle_fit_solar_obstruction(call: ServiceCall) -> dict:
+        """Handle the fit-solar-obstruction service call.
+
+        Per-facade direct-beam critical_elev fit.  Brute-force searches
+        for the sun elevation above which an external overhang /
+        neighbouring structure blocks direct beam on each facade, using
+        the modulating-regime 4D potential against existing per-entity
+        coefficients (held fixed).  Writes ``_critical_elev_per_facade``
+        on success; recommended to run ``batch_fit_solar_4d`` afterwards
+        to refit coefficients on the gated geometry.
+        """
+        entity_id = call.data.get("entity_id")
+        dry_run = call.data.get("dry_run", False)
+        coord = _get_target_coordinator(hass, entity_id)
+        suffix = " (dry-run)" if dry_run else ""
+        _LOGGER.info(
+            f"Service called: fit_solar_obstruction{suffix} "
+            f"(coordinator={coord.entry.entry_id})"
+        )
+        result = coord.learning.fit_solar_obstruction(
+            hourly_log=list(coord._hourly_log),
+            coordinator=coord,
+            dry_run=dry_run,
+        )
+        learned_count = sum(
+            1 for f in ("s", "e", "w")
+            if isinstance(result.get(f), dict) and result[f].get("learned")
+        )
+        if learned_count and not dry_run:
+            await coord._async_save_data(force=True)
+        return {
+            "status": "ok",
+            "dry_run": dry_run,
+            "learned_count": learned_count,
+            "per_facade": result,
+        }
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_FIT_SOLAR_OBSTRUCTION,
+        handle_fit_solar_obstruction,
+        schema=SERVICE_SCHEMA_FIT_SOLAR_OBSTRUCTION,
+        supports_response=SupportsResponse.ONLY,
+    )
+
     # Register Apply Implied Coefficient Service (#884 follow-up)
     async def handle_apply_implied_coefficient(call: ServiceCall) -> dict:
         """Handle the apply-implied-coefficient service call.
@@ -474,6 +677,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         days_back = call.data.get("days_back", 30)
         dry_run = call.data.get("dry_run", False)
         force = call.data.get("force", False)
+        dimension = call.data.get("dimension", "both")
         coord = _get_target_coordinator(hass, entity_id)
         # Conditional ``last Nd`` mirrors the coordinator-side log line
         # — currently the schema default forces a non-None value here,
@@ -495,6 +699,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             dry_run=dry_run,
             force=force,
             days_back=days_back,
+            dimension=dimension,
         )
 
     hass.services.async_register(
@@ -940,6 +1145,19 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
         hass.config_entries.async_update_entry(config_entry, version=2, data=new_data)
         _LOGGER.info("Migration to version 2 successful")
 
+    if config_entry.version == 2:
+        # v3: drop legacy 4D diffuse sky-view-factor knobs (#991).
+        # Diffuse term re-anchored to a fixed internal 0.5; per-facade
+        # asymmetry is absorbed by ``c_diff``.  Unread keys would be
+        # harmless but stripping them keeps entry.data clean.
+        new_data = {
+            k: v
+            for k, v in config_entry.data.items()
+            if k not in ("house_svf", "svf_south", "svf_east", "svf_west")
+        }
+        hass.config_entries.async_update_entry(config_entry, version=3, data=new_data)
+        _LOGGER.info("Migration to version 3 successful")
+
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -967,6 +1185,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_WIND_THRESHOLDS)
             hass.services.async_remove(DOMAIN, SERVICE_RESET_SOLAR_LEARNING)
             hass.services.async_remove(DOMAIN, SERVICE_RETRAIN_FROM_HISTORY)
+            hass.services.async_remove(DOMAIN, SERVICE_RETRAIN_UNIT_FROM_HISTORY)
             # Diagnose surfaces
             hass.services.async_remove(DOMAIN, SERVICE_DIAGNOSE_MODEL)
             hass.services.async_remove(DOMAIN, SERVICE_DIAGNOSE_SOLAR)
@@ -974,6 +1193,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_UNIT_THRESHOLDS)
             # Solar coefficient on-demand fitters (#884, #904)
             hass.services.async_remove(DOMAIN, SERVICE_BATCH_FIT_SOLAR)
+            hass.services.async_remove(DOMAIN, SERVICE_BATCH_FIT_SOLAR_4D)
+            hass.services.async_remove(DOMAIN, SERVICE_FIT_SOLAR_OBSTRUCTION)
             hass.services.async_remove(DOMAIN, SERVICE_APPLY_IMPLIED_COEFFICIENT)
             # Tobit live-learner controls (#904 stage 3)
             hass.services.async_remove(

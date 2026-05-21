@@ -352,14 +352,8 @@ def _build_per_unit_kwargs(**overrides):
     def _fake_impact(vec, coeff, *args, **kwargs):
         return coeff.get("s", 0) * vec[0] + coeff.get("e", 0) * vec[1] + coeff.get("w", 0) * vec[2]
 
-    def _fake_normalize(actual, solar_impact, mode):
-        if mode == MODE_HEATING:
-            return max(0.0, actual + solar_impact)
-        return max(0.0, actual - solar_impact)
-
     defaults["solar_calculator"].calculate_unit_coefficient.side_effect = _fake_unit_coeff
     defaults["solar_calculator"].calculate_unit_solar_impact.side_effect = _fake_impact
-    defaults["solar_calculator"].normalize_for_learning.side_effect = _fake_normalize
     return defaults
 
 

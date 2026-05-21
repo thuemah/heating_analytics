@@ -10,58 +10,20 @@ from custom_components.heating_analytics.const import (
     ATTR_ENERGY_TODAY,
 )
 
-# Dummy classes for inheritance
-class MockCoordinatorEntity:
-    def __init__(self, coordinator):
-        self.coordinator = coordinator
-
-class MockSensorEntity:
-    pass
-
-@pytest.fixture
-def mock_coordinator():
-    coordinator = MagicMock()
-    coordinator.data = {}
-    coordinator._daily_history = {}
-
-    # Mock wind bucket logic
-    def get_wind_bucket(wind, ignore_aux=False):
-        if wind is None: return "normal"
-        if wind >= 10.8: return "extreme_wind"
-        if wind >= 5.5: return "high_wind"
-        return "normal"
-
-    coordinator._get_wind_bucket.side_effect = get_wind_bucket
-
-    # Mock forecast
-    coordinator.forecast = MagicMock()
-
-    # CRITICAL: Ensure calculate_modeled_energy returns a tuple of 5 elements
-    # Using 30.0 kWh per day to sum up to ~210 for the week. 5th element is TDD (e.g. 10.0).
-    coordinator.calculate_modeled_energy.return_value = (30.0, 0.0, 10.0, 5.0, 10.0)
-
-    # CRITICAL: Ensure _calculate_pure_model_today returns a tuple of 2 elements
-    coordinator.statistics._calculate_pure_model_today.return_value = (60.0, 0.0)
-
-    # CRITICAL: Ensure calculate_future_energy returns a tuple of 3 elements
-    coordinator.forecast.calculate_future_energy.return_value = (0.0, 0.0, {})
-
-    return coordinator
-
-@pytest.fixture
-def mock_entry():
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    entry.title = "Heating Analytics"
-    return entry
-
-# Mock dependencies to prevent import errors during test execution if not using full HASS env
-@patch('custom_components.heating_analytics.sensor.CoordinatorEntity', MockCoordinatorEntity)
-@patch('custom_components.heating_analytics.sensor.SensorEntity', MockSensorEntity)
 class TestWeekComparisonExplanation:
 
     def test_week_comparison_with_explanation_module(self, mock_coordinator, mock_entry):
         """Test Week Comparison sensor uses explanation module correctly."""
+        # Setup specific mock_coordinator defaults for this file
+        def get_wind_bucket(wind, ignore_aux=False):
+            if wind is None: return "normal"
+            if wind >= 10.8: return "extreme_wind"
+            if wind >= 5.5: return "high_wind"
+            return "normal"
+        mock_coordinator._get_wind_bucket.side_effect = get_wind_bucket
+        mock_coordinator.calculate_modeled_energy.return_value = (30.0, 0.0, 10.0, 5.0, 10.0)
+        mock_coordinator.statistics._calculate_pure_model_today.return_value = (60.0, 0.0)
+        mock_coordinator.forecast.calculate_future_energy.return_value = (0.0, 0.0, {})
 
         # Setup Dates
         today = date(2023, 10, 18)
@@ -71,8 +33,8 @@ class TestWeekComparisonExplanation:
 
             # 1. Setup Data
             mock_coordinator._daily_history = {
-                '2023-10-16': {'temp': 5.0, 'wind': 5.0, 'kwh': 50.0}, # Mon
-                '2023-10-17': {'temp': 4.0, 'wind': 6.0, 'kwh': 55.0}, # Tue
+                "2023-10-16": {"temp": 5.0, "wind": 5.0, "kwh": 50.0}, # Mon
+                "2023-10-17": {"temp": 4.0, "wind": 6.0, "kwh": 55.0}, # Tue
             }
 
             mock_coordinator.data = {
@@ -87,7 +49,7 @@ class TestWeekComparisonExplanation:
 
             def get_future_prediction(d, ignore_aux=False):
                 if d > today:
-                    return (40.0, 0.0, {'temp': 2.0, 'wind': 8.0, 'wind_bucket': 'high_wind'})
+                    return (40.0, 0.0, {"temp": 2.0, "wind": 8.0, "wind_bucket": "high_wind"})
                 return None
 
             mock_coordinator.forecast.get_future_day_prediction.side_effect = get_future_prediction
@@ -96,7 +58,7 @@ class TestWeekComparisonExplanation:
             for i in range(7):
                 d = date(2022, 10, 17) + timedelta(days=i)
                 mock_coordinator._daily_history[d.isoformat()] = {
-                    'temp': 10.0, 'wind': 2.0, 'kwh': 30.0
+                    "temp": 10.0, "wind": 2.0, "kwh": 30.0
                 }
 
             # Mock period stats calculation
@@ -141,6 +103,9 @@ class TestWeekComparisonExplanation:
 
     def test_week_comparison_explanation_fallback(self, mock_coordinator, mock_entry):
         """Test fallback when explanation module fails."""
+        # Setup specific mock_coordinator defaults
+        mock_coordinator.statistics._calculate_pure_model_today.return_value = (60.0, 0.0)
+
         with patch("custom_components.heating_analytics.sensor.dt_util.now", return_value=datetime(2023, 10, 18, 12, 0, 0)):
              sensor = HeatingModelComparisonWeekSensor(mock_coordinator, mock_entry)
 
@@ -165,14 +130,14 @@ class TestWeekComparisonExplanation:
         end_week = start_week + timedelta(days=6)
 
         with patch("custom_components.heating_analytics.sensor.dt_util.now", return_value=datetime(2023, 10, 18, 12, 0, 0)):
-            mock_coordinator._daily_history = {'2023-10-16': {'temp': 10, 'wind': 5}}
+            mock_coordinator._daily_history = {"2023-10-16": {"temp": 10, "wind": 5}}
             mock_coordinator.data = {
                 ATTR_TEMP_ACTUAL_TODAY: 11,
                 ATTR_WIND_ACTUAL_TODAY: 6,
                 ATTR_PREDICTED: 50,
                 ATTR_ENERGY_TODAY: 20.0 # Actual so far
             }
-            mock_coordinator.forecast.get_future_day_prediction.return_value = (40, 0, {'temp': 12, 'wind': 7})
+            mock_coordinator.forecast.get_future_day_prediction.return_value = (40, 0, {"temp": 12, "wind": 7})
 
             # Mock Future Energy (Remaining for Today) -> 30.0
             # Total Today = 20 (Actual) + 30 (Forecast) = 50
@@ -186,13 +151,13 @@ class TestWeekComparisonExplanation:
             days = sensor._build_current_period_days(start_week, end_week)
 
             assert len(days) == 7
-            assert days[0]['date'] == '2023-10-16' # Past
-            assert days[0]['temp'] == 10
+            assert days[0]["date"] == "2023-10-16" # Past
+            assert days[0]["temp"] == 10
 
-            assert days[2]['date'] == '2023-10-18' # Today
-            assert days[2]['temp'] == 11
-            assert days[2]['kwh'] == 50.0
+            assert days[2]["date"] == "2023-10-18" # Today
+            assert days[2]["temp"] == 11
+            assert days[2]["kwh"] == 50.0
 
-            assert days[3]['date'] == '2023-10-19' # Future
-            assert days[3]['temp'] == 12
-            assert days[3]['kwh'] == 40
+            assert days[3]["date"] == "2023-10-19" # Future
+            assert days[3]["temp"] == 12
+            assert days[3]["kwh"] == 40

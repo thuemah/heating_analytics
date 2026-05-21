@@ -379,6 +379,13 @@ def _track_a_aux_coord(hourly_log):
     coord._daily_history = {}
     coord.storage.async_save_data = AsyncMock()
     coord._get_predicted_kwh = MagicMock(return_value=4.0)  # base prediction at -5°C
+    coord.wind_threshold = 8.0
+    coord.extreme_wind_threshold = 10.8
+    coord._get_wind_bucket = lambda w: (
+        "extreme_wind" if w >= coord.extreme_wind_threshold
+        else "high_wind" if w >= coord.wind_threshold
+        else "normal"
+    )
     coord.learning = LearningManager()
     coord.solar = SolarCalculator(coord)
     coord._unit_strategies = build_strategies(

@@ -66,6 +66,13 @@ def _make_coordinator(
             return (False, False, False)
         coord.screen_config_for_entity = MagicMock(side_effect=_scr)
     coord.solar = SolarCalculator(coord)
+    coord.wind_threshold = 8.0
+    coord.extreme_wind_threshold = 10.8
+    coord._get_wind_bucket = lambda w: (
+        "extreme_wind" if w >= coord.extreme_wind_threshold
+        else "high_wind" if w >= coord.wind_threshold
+        else "normal"
+    )
     return coord
 
 
@@ -240,9 +247,23 @@ class TestSyntheticRecovery:
 
 class TestFilterGates:
 
-    def test_shutdown_samples_excluded(self):
+    def test_shutdown_samples_kept_as_censored(self):
+        """Shutdown rows under Tobit are kept, not dropped.
+
+        Pre-fix: shutdown-flagged rows were dropped to protect NLMS
+        from censoring inflation.  Tobit handles right-censoring
+        natively via Mills-ratio, so dropping these rows discards
+        the lower-bound information they carry.  Each shutdown row
+        is now routed through the downstream saturation gate (which
+        emits ``censored_mask = True`` for rows with
+        ``actual_impact >= 0.95 × base``) and tracked under the
+        ``shutdown_kept_censored`` counter.
+        """
         entries = _build_synthetic_log(30, {"s": 1.0, "e": 0.4, "w": 0.3})
-        # Flag every entry as shutdown — should drop all.
+        # Flag every entry as shutdown.  In the synthetic log the
+        # actual remains > 0 (impact = coeff·pot), so the row may or
+        # may not trip the saturation gate; either way it must NOT
+        # be dropped under the shutdown rule.
         for e in entries:
             e["solar_dominant_entities"] = ["sensor.heater1"]
         coord = _make_coordinator(
@@ -257,14 +278,10 @@ class TestFilterGates:
             coordinator=coord,
         )
         diag = result["sensor.heater1"]["heating"]
-        assert diag["sample_count"] == 0
-        # Stage 2 (#904) renamed the skip reason — Tobit gates on
-        # uncensored count, not raw sample count.  Zero samples
-        # trivially trips the |U| < 20 floor.
-        assert diag["skip_reason"] == "insufficient_uncensored"
-        assert diag["drop_counts"]["shutdown"] == 30
-        # Coefficient unchanged.
-        assert "sensor.heater1" not in coeffs
+        # All 30 shutdown rows are tracked under the new key.
+        assert diag["drop_counts"].get("shutdown_kept_censored", 0) == 30
+        # And they are NOT counted as a drop.
+        assert diag["drop_counts"].get("shutdown", 0) == 0
 
     def test_saturated_samples_kept_as_censored(self):
         """Samples with impact ≥ 0.95×base are kept as right-censored (#904 stage 2).
@@ -1025,7 +1042,7 @@ class TestTobitSolverWiring:
                             assert rd["skip_reason"] not in legacy
 
     def test_did_not_converge_skip_path(self, monkeypatch):
-        """When ``_solve_tobit_3d`` returns ``converged=False``,
+        """When ``_solve_tobit`` returns ``converged=False``,
         ``batch_fit_solar_coefficients`` populates ``skip_reason
         = 'did_not_converge'`` and preserves ``coefficient_before``
         as ``coefficient_after``.  We monkeypatch the solver to
@@ -1049,7 +1066,7 @@ class TestTobitSolverWiring:
                 "n_eff": float(len(samples)),
             }
 
-        monkeypatch.setattr(LearningManager, "_solve_tobit_3d", staticmethod(_fake_solver))
+        monkeypatch.setattr(LearningManager, "_solve_tobit", staticmethod(_fake_solver))
 
         coeffs = {"sensor.heater1": stratified_coeff(s=0.42)}
         lm = LearningManager()
@@ -1068,7 +1085,7 @@ class TestTobitSolverWiring:
         assert diag["tobit_diagnostics"]["converged"] is False
 
     def test_warm_start_failed_skip_path(self, monkeypatch):
-        """When ``_solve_tobit_3d`` returns ``None`` (e.g. degenerate
+        """When ``_solve_tobit`` returns ``None`` (e.g. degenerate
         LS warm-start), wiring sets ``skip_reason = 'warm_start_failed'``.
         Cannot trigger from a synthetic log — the collector's
         low_magnitude gate filters degenerate vectors before the
@@ -1081,7 +1098,7 @@ class TestTobitSolverWiring:
         )
         monkeypatch.setattr(
             LearningManager,
-            "_solve_tobit_3d",
+            "_solve_tobit",
             staticmethod(lambda *_a, **_kw: None),
         )
 
@@ -1292,10 +1309,11 @@ class TestSeedLiveWindow:
         )
         diag = result["sensor.heater1"]["heating"]
         # 5 parasitic hours should be reclassified as shutdown by the
-        # current rules and dropped from the seeded window.
-        assert diag["drop_counts"]["shutdown"] >= 5, (
-            f"expected ≥ 5 reclassified shutdown drops, got "
-            f"{diag['drop_counts']['shutdown']}"
+        # current rules.  Post-fix they are kept as censored rows
+        # (not dropped), tracked under shutdown_kept_censored.
+        assert diag["drop_counts"].get("shutdown_kept_censored", 0) >= 5, (
+            f"expected ≥ 5 reclassified shutdown rows, got "
+            f"{diag['drop_counts'].get('shutdown_kept_censored', 0)}"
         )
         # Window contains only the modulating samples (synthetic noise
         # may turn a few into censored — within range either way).

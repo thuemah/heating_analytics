@@ -91,8 +91,8 @@ class TestBatteryDecayMechanics:
     def test_half_life_at_default(self):
         """Current default decay has expected half-life."""
         half_life = math.log(0.5) / math.log(SOLAR_BATTERY_DECAY)
-        # 0.80 → ~3.1h
-        assert 3.0 < half_life < 3.5
+        # 0.50 → ~1.0h
+        assert 0.9 < half_life < 1.1
 
     def test_half_life_at_080(self):
         """Decay 0.80 has half-life of ~3.1 hours."""

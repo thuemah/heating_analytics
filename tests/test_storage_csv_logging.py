@@ -2,36 +2,28 @@
 import pytest
 import os
 import csv
-from unittest.mock import MagicMock
 from custom_components.heating_analytics.storage import StorageManager
-from custom_components.heating_analytics.const import ATTR_TDD
 
 @pytest.fixture
-def mock_coordinator(hass, tmp_path):
-    coordinator = MagicMock()
-    coordinator.hass = hass
-
-    # Configure async_add_executor_job to execute the function immediately
+def csv_setup(mock_coordinator, tmp_path):
+    """Setup for CSV logging tests."""
     async def mock_executor(func, *args, **kwargs):
         return func(*args, **kwargs)
+    mock_coordinator.hass.async_add_executor_job.side_effect = mock_executor
 
-    coordinator.hass.async_add_executor_job.side_effect = mock_executor
-
-    coordinator.csv_auto_logging = True
-    # Use real temp paths
-    coordinator.csv_hourly_path = str(tmp_path / "test_hourly_log.csv")
-    coordinator.csv_daily_path = str(tmp_path / "test_daily_log.csv")
-    coordinator.energy_sensors = ["sensor.heat_pump_energy"]
-    coordinator.data = {}
-    return coordinator
+    mock_coordinator.csv_auto_logging = True
+    mock_coordinator.csv_hourly_path = str(tmp_path / "test_hourly_log.csv")
+    mock_coordinator.csv_daily_path = str(tmp_path / "test_daily_log.csv")
+    mock_coordinator.energy_sensors = ["sensor.heat_pump_energy"]
+    return mock_coordinator
 
 @pytest.mark.asyncio
-async def test_csv_hourly_logging_schema_evolution(hass, mock_coordinator):
+async def test_csv_hourly_logging_schema_evolution(hass, csv_setup):
     """Test that CSV logging handles schema evolution correctly."""
 
     # Setup
-    storage = StorageManager(mock_coordinator)
-    file_path = mock_coordinator.csv_hourly_path
+    storage = StorageManager(csv_setup)
+    file_path = csv_setup.csv_hourly_path
 
     # 1. First write (Initial Schema)
     log_entry_1 = {
@@ -85,7 +77,7 @@ async def test_csv_hourly_logging_schema_evolution(hass, mock_coordinator):
 
     # 3. Third write (Schema Evolution: New Column via new sensor)
     # Simulate adding a new sensor
-    mock_coordinator.energy_sensors.append("sensor.aux_heater")
+    csv_setup.energy_sensors.append("sensor.aux_heater")
 
     log_entry_3 = {
         "timestamp": "2023-10-27T12:00:00",
@@ -127,11 +119,11 @@ async def test_csv_hourly_logging_schema_evolution(hass, mock_coordinator):
 
 
 @pytest.mark.asyncio
-async def test_csv_daily_logging_schema_evolution(hass, mock_coordinator):
+async def test_csv_daily_logging_schema_evolution(hass, csv_setup):
     """Test that CSV daily logging handles schema evolution correctly."""
 
-    storage = StorageManager(mock_coordinator)
-    file_path = mock_coordinator.csv_daily_path
+    storage = StorageManager(csv_setup)
+    file_path = csv_setup.csv_daily_path
 
     # 1. Initial write
     log_1 = {"date": "2023-10-27", "tdd": 10.0, "kwh": 20.0}

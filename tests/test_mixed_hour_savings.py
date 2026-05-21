@@ -1,26 +1,15 @@
 """Test savings calculation logic for mixed hours."""
 import pytest
 from unittest.mock import MagicMock
-from datetime import datetime
 from custom_components.heating_analytics.statistics import StatisticsManager
-
-@pytest.fixture
-def mock_coordinator():
-    """Create a mock coordinator."""
-    coord = MagicMock()
-    coord.data = {}
-    coord._hourly_log = []
-    coord.auxiliary_heating_active = False # Currently OFF
-    coord._collector.aux_impact_hour = 2.5 # But was ON earlier (mixed hour)
-    coord._collector.energy_hour = 5.0
-
-    # Mock calculate_total_power dependencies
-    coord.energy_sensors = ["sensor.heat_pump"]
-    coord.get_unit_mode.return_value = "heating"
-    return coord
+from custom_components.heating_analytics.const import MODE_HEATING
 
 def test_mixed_hour_savings_captured(mock_coordinator):
     """Test that savings are captured even if auxiliary_active is False, provided aux_impact_kwh > 0."""
+    # Specialized setup
+    mock_coordinator.energy_sensors = ["sensor.heat_pump"]
+    mock_coordinator.get_unit_mode.return_value = MODE_HEATING
+    
     stats = StatisticsManager(mock_coordinator)
 
     # Get the "Today" from dt_util (which is mocked via conftest implicitly for imports in statistics.py)

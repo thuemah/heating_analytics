@@ -1,6 +1,6 @@
 """Test Thermodynamic Integrity and Jensen's Inequality handling."""
-from unittest.mock import MagicMock, patch
-from datetime import date, datetime, timedelta
+from unittest.mock import MagicMock
+from datetime import date
 import pytest
 
 from custom_components.heating_analytics.statistics import StatisticsManager
@@ -23,34 +23,24 @@ def mock_get_predicted_kwh_per_unit(entity_id, temp_key, bucket, actual_temp):
     # Split across 2 units
     return mock_get_predicted_kwh(temp_key, bucket, actual_temp) / 2.0
 
-@pytest.fixture
-def mock_coordinator():
-    coord = MagicMock()
-    coord.balance_point = 15.0
-    coord.solar_enabled = False
-    coord.solar_azimuth = 180
-    # Use a lambda to pass the arguments correctly from the MagicMock call to the standalone mock function
-    coord._get_predicted_kwh.side_effect = lambda tk, b, at: mock_get_predicted_kwh(tk, b, at)
-    coord.energy_sensors = ["sensor.heater_1", "sensor.heater_2"]
-    coord._get_predicted_kwh_per_unit.side_effect = lambda eid, tk, b, at: mock_get_predicted_kwh_per_unit(eid, tk, b, at)
-
-    # Fix: update _get_wind_bucket signature to accept ignore_aux
-    coord._get_wind_bucket.side_effect = lambda w, ignore_aux=False: "normal"
-
-    coord._daily_history = {}
-    coord._hourly_log = []
-
-    # Mock solar calculator
-    coord.solar = MagicMock()
-    coord.solar.apply_correction = MagicMock(side_effect=lambda v, i, t: v)
-    coord.solar.calculate_saturation.side_effect = lambda net, pot, val: (0.0, 0.0, net)
-    coord.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
-    coord.solar.calculate_unit_solar_impact.return_value = 0.0
-
-    return coord
-
 def test_jensens_inequality_daily_fallback(mock_coordinator):
     """Test that daily fallback uses TDD to reconstruct effective temperature."""
+    # Setup specialized coordinator state
+    mock_coordinator.balance_point = 15.0
+    mock_coordinator.solar_enabled = False
+    mock_coordinator.energy_sensors = ["sensor.heater_1", "sensor.heater_2"]
+    
+    # Use a lambda to pass the arguments correctly from the MagicMock call to the standalone mock function
+    mock_coordinator._get_predicted_kwh.side_effect = lambda tk, b, at: mock_get_predicted_kwh(tk, b, at)
+    mock_coordinator._get_predicted_kwh_per_unit.side_effect = lambda eid, tk, b, at: mock_get_predicted_kwh_per_unit(eid, tk, b, at)
+    mock_coordinator._get_wind_bucket.side_effect = lambda w, ignore_aux=False: "normal"
+
+    # Mock solar calculator
+    mock_coordinator.solar.apply_correction.side_effect = lambda v, i, t: v
+    mock_coordinator.solar.calculate_saturation.side_effect = lambda net, pot, val: (0.0, 0.0, net)
+    mock_coordinator.solar.calculate_unit_coefficient.return_value = {"s": 0.0, "e": 0.0, "w": 0.0}
+    mock_coordinator.solar.calculate_unit_solar_impact.return_value = 0.0
+
     stats = StatisticsManager(mock_coordinator)
 
     target_date = date(2023, 1, 1)

@@ -39,10 +39,43 @@ class DailyProcessor:
         total_kwh = sum(e.get("actual_kwh", 0.0) for e in day_logs)
         expected_kwh = sum(e.get("expected_kwh", 0.0) for e in day_logs)
         forecasted_kwh = sum(e.get("forecasted_kwh", 0.0) for e in day_logs)
-        solar_impact = sum(e.get("solar_impact_kwh", 0.0) for e in day_logs)
+        solar_impact = sum(
+            self.coordinator.hourly_solar_impact_kwh(e) for e in day_logs
+        )
         aux_impact = sum(e.get("aux_impact_kwh", 0.0) for e in day_logs)
         guest_impact = sum(e.get("guest_impact_kwh", 0.0) for e in day_logs)
-        solar_norm_delta_total = sum(e.get("solar_normalization_delta", 0.0) for e in day_logs)
+        # #968: prefer 4D delta per-entry when present, falling back to 3D.
+        # Independent of ``experimental_4d_primary`` — aggregation paths
+        # consume the best available signal regardless of the live read-path
+        # flag.  Mixed-hour days produce a hybrid sum by construction.
+        solar_norm_delta_total = sum(
+            e.get("solar_normalization_delta_4d", e.get("solar_normalization_delta", 0.0))
+            for e in day_logs
+        )
+
+        # #982: 4D-pipeline daily aggregates.  These fields are only present
+        # on hourly_log entries where the 4D shadow/live learner actually
+        # fired (key-presence filter, NOT ``.get(..., 0.0)``).  Treating
+        # missing entries as zero would conflate "no 4D signal this hour"
+        # with "4D signal summed to zero" and bias daily totals downward.
+        # When no day_logs carry 4D data: aggregate stays None — downstream
+        # consumers branch on that (future Track B/C 4D-retrain).
+        delta_4d_present = [
+            e["solar_normalization_delta_4d"]
+            for e in day_logs
+            if "solar_normalization_delta_4d" in e
+        ]
+        solar_norm_delta_4d_total = (
+            round(sum(delta_4d_present), 5) if delta_4d_present else None
+        )
+        impact_4d_present = [
+            e["solar_impact_4d_kwh"]
+            for e in day_logs
+            if "solar_impact_4d_kwh" in e
+        ]
+        solar_impact_4d_kwh_total = (
+            round(sum(impact_4d_present), 2) if impact_4d_present else None
+        )
 
         # Sum thermodynamic gross values
         thermodynamic_gross_from_logs = sum(e.get("thermodynamic_gross_kwh", 0.0) for e in day_logs)
@@ -60,7 +93,7 @@ class DailyProcessor:
                 # Per-hour reconstruction
                 act = e.get("actual_kwh", 0.0)
                 aux = e.get("aux_impact_kwh", 0.0)
-                sol = e.get("solar_impact_kwh", 0.0)
+                sol = self.coordinator.hourly_solar_impact_kwh(e)
                 temp = e.get("temp", 0.0)
 
                 # Mode-aware solar correction
@@ -103,6 +136,13 @@ class DailyProcessor:
         if self.coordinator.solar_enabled:
             hourly_vectors["solar_rad"] = [None] * 24
             hourly_vectors["solar_norm_delta"] = [None] * 24
+            # #982: 4D inputs + delta per hour for future Track B/C retraining
+            # against 4D coefficients.  Persist in daily_history because
+            # hourly_log trims after the retention window (90/180/365 days)
+            # while daily_history is unbounded.
+            hourly_vectors["solar_norm_delta_4d"] = [None] * 24
+            hourly_vectors["dni"] = [None] * 24
+            hourly_vectors["dhi"] = [None] * 24
 
         # Hour Collision Fix: Aggregate instead of overwrite
         # Iterate over hour slots (0-23) and aggregate all entries for that hour.
@@ -136,6 +176,29 @@ class DailyProcessor:
                 hourly_vectors["solar_norm_delta"][hour] = sum(
                     e.get("solar_normalization_delta", 0.0) for e in hour_entries
                 )
+                # #982: 4D fields use key-presence filtering, NOT .get(..., 0.0)
+                # — an hour where 4D didn't fire (key absent) must not drag the
+                # average toward 0 (DNI/DHI) or contribute a phantom 0 to the
+                # sum (delta).  None signals "no data" to downstream consumers.
+                dni_present = [e["dni"] for e in hour_entries if "dni" in e]
+                if dni_present:
+                    hourly_vectors["dni"][hour] = round(
+                        sum(dni_present) / len(dni_present), 2
+                    )
+                dhi_present = [e["dhi"] for e in hour_entries if "dhi" in e]
+                if dhi_present:
+                    hourly_vectors["dhi"][hour] = round(
+                        sum(dhi_present) / len(dhi_present), 2
+                    )
+                delta_4d_present_hour = [
+                    e["solar_normalization_delta_4d"]
+                    for e in hour_entries
+                    if "solar_normalization_delta_4d" in e
+                ]
+                if delta_4d_present_hour:
+                    hourly_vectors["solar_norm_delta_4d"][hour] = round(
+                        sum(delta_4d_present_hour), 5
+                    )
 
         # Provenance (Last one wins)
         last_entry = day_logs[-1]
@@ -151,6 +214,8 @@ class DailyProcessor:
             "solar_impact_kwh": round(solar_impact, 2),
             "guest_impact_kwh": round(guest_impact, 2),
             "solar_normalization_delta": round(solar_norm_delta_total, 5),
+            "solar_normalization_delta_4d": solar_norm_delta_4d_total,
+            "solar_impact_4d_kwh": solar_impact_4d_kwh_total,
             "thermodynamic_gross_kwh": round(thermodynamic_gross_kwh, 2),
             "tdd": round(total_tdd, 1),
             "temp": round(avg_temp, 1),
@@ -522,6 +587,8 @@ class DailyProcessor:
             strategies=self.coordinator._unit_strategies,
             model=self.coordinator.get_model_state(),
             learning_rate=self.coordinator.learning_rate,
+            wind_threshold=self.coordinator.wind_threshold,
+            extreme_wind_threshold=self.coordinator.extreme_wind_threshold,
         )
 
     async def try_track_b_cop_smearing(
@@ -731,7 +798,12 @@ class DailyProcessor:
         daily_solar_delta = 0.0
         if day_logs:
             for entry in day_logs:
-                daily_solar_delta += entry.get("solar_normalization_delta", 0.0)
+                # #968: prefer 4D delta per-entry when present; fall back to
+                # 3D otherwise.  Flag-independent (aggregation path).
+                daily_solar_delta += entry.get(
+                    "solar_normalization_delta_4d",
+                    entry.get("solar_normalization_delta", 0.0),
+                )
 
         if excluded_mode_kwh > 0.0:
             _LOGGER.debug(

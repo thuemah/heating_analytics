@@ -439,6 +439,132 @@ class TestDeadZoneDetection:
         # Heating regime buffer cleared.
         assert buffers["unit_buf"]["heating"] == []
 
+
+class TestDeadZone4DArbitration:
+    """#981: dead-zone gate must follow the live read-path writer, not
+    hard-code 3D.  Pre-promotion (``experimental_4d_primary=False``) the
+    3D pipeline is live and the 4D pipeline is shadow; post-promotion the
+    arbitration flips.  ``_process_per_unit_learning`` threads the flag
+    into ``is_shadow_path`` on each call site so the dead-zone block
+    inside ``_learn_unit_solar_coefficient`` arbitrates correctly.
+
+    These tests exercise the gate directly by calling
+    ``_learn_unit_solar_coefficient`` with the 4-component path and
+    explicit ``is_shadow_path`` — the gate's behaviour is what we pin
+    here, not the call-site wiring (which is covered by the integration
+    suite).
+    """
+
+    def _stratified_4d(self, s=0.0, e=0.0, w=0.0, diffuse=0.0):
+        return {
+            "heating": {"s": s, "e": e, "w": w, "diffuse": diffuse},
+            "cooling": {"s": 0.0, "e": 0.0, "w": 0.0, "diffuse": 0.0},
+        }
+
+    def test_4d_live_path_triggers_dead_zone_reset(self):
+        """When 4D is the live writer (``is_shadow_path=False``), a stuck
+        4D coefficient resets after the threshold — the exact safety net
+        that was missing pre-#981.
+        """
+        manager = LearningManager()
+        coeffs = {"unit_4d_live": self._stratified_4d(s=0.1, diffuse=0.05)}
+        buffers = {"unit_4d_live": {"heating": [], "cooling": []}}
+
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD):
+            manager._learn_unit_solar_coefficient(
+                "unit_4d_live", "10",
+                expected_unit_base=0.03,
+                actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2, 0.15),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0,
+                balance_point=15.0,
+                unit_mode=MODE_HEATING,
+                components=("s", "e", "w", "diffuse"),
+                is_shadow_path=False,
+            )
+
+        # All 4 heating components zeroed — including diffuse.
+        assert coeffs["unit_4d_live"]["heating"] == {
+            "s": 0.0, "e": 0.0, "w": 0.0, "diffuse": 0.0
+        }
+        # Cooling regime preserved.
+        assert coeffs["unit_4d_live"]["cooling"]["s"] == 0.0  # was 0.0 anyway, sanity
+
+    def test_4d_shadow_path_does_not_trigger_dead_zone(self):
+        """When 4D is shadow (``is_shadow_path=True``, the current default
+        pre-promotion), the dead-zone never fires for 4D — preserving the
+        rationale at the gate site: shadow is reference-only.
+        """
+        manager = LearningManager()
+        coeffs = {"unit_4d_shadow": self._stratified_4d(s=0.1, diffuse=0.05)}
+        buffers = {"unit_4d_shadow": {"heating": [], "cooling": []}}
+
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD + 5):
+            manager._learn_unit_solar_coefficient(
+                "unit_4d_shadow", "10",
+                expected_unit_base=0.03,
+                actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2, 0.15),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0,
+                balance_point=15.0,
+                unit_mode=MODE_HEATING,
+                components=("s", "e", "w", "diffuse"),
+                is_shadow_path=True,
+            )
+
+        # Dead-zone never fired — counter never written by shadow path.
+        # NLMS drift on the shadow path is allowed (and expected, since
+        # the NLMS update runs regardless of dead-zone arbitration); the
+        # invariant under test is the *absence of a hard reset to zero*.
+        # If dead-zone had fired, ALL components would be exactly 0.0.
+        heating = coeffs["unit_4d_shadow"]["heating"]
+        assert not all(heating[c] == 0.0 for c in ("s", "e", "w", "diffuse")), (
+            f"Shadow path triggered dead-zone reset; all components zeroed: {heating}"
+        )
+        assert manager._dead_zone_counts.get(("unit_4d_shadow", "heating"), 0) == 0
+
+    def test_3d_shadow_path_does_not_trigger_dead_zone(self):
+        """Symmetric to the 4D-shadow case: when 3D is shadow (post-
+        promotion ``experimental_4d_primary=True``), the 3D pipeline
+        stops self-resetting.  The dead-zone moves to whichever path is
+        live."""
+        from tests.helpers import stratified_coeff
+        manager = LearningManager()
+        coeffs = {"unit_3d_shadow": stratified_coeff(s=0.1)}
+        buffers = {"unit_3d_shadow": {"heating": [], "cooling": []}}
+
+        for _ in range(SOLAR_DEAD_ZONE_THRESHOLD + 5):
+            manager._learn_unit_solar_coefficient(
+                "unit_3d_shadow", "10",
+                expected_unit_base=0.03,
+                actual_unit=0.18,
+                avg_solar_vector=(0.3, 0.1, 0.2),
+                learning_rate=0.01,
+                solar_coefficients_per_unit=coeffs,
+                learning_buffer_solar_per_unit=buffers,
+                avg_temp=12.0,
+                balance_point=15.0,
+                unit_mode=MODE_HEATING,
+                is_shadow_path=True,
+            )
+
+        # Same invariant as the 4D-shadow case: NLMS may drift the
+        # coefficient toward zero asymptotically, but dead-zone must not
+        # fire a hard reset to exactly 0.0 on the shadow path.
+        heating = coeffs["unit_3d_shadow"]["heating"]
+        assert not all(heating[c] == 0.0 for c in ("s", "e", "w")), (
+            f"Shadow path triggered dead-zone reset; all components zeroed: {heating}"
+        )
+        assert manager._dead_zone_counts.get(("unit_3d_shadow", "heating"), 0) == 0
+
+
+class TestDeadZoneColdStart:
     def test_cold_start_discards_all_zero_impact_buffer(self):
         """Cold-start with all-zero impact samples discards buffer instead
         of creating a (0,0,0) coefficient that re-enters the dead zone.

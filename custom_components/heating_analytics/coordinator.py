@@ -13,7 +13,10 @@ from homeassistant.helpers.update_coordinator import (
 from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfSpeed
 
-from .helpers import convert_speed_to_ms, generate_exponential_kernel
+from .helpers import (
+    convert_speed_to_ms,
+    generate_exponential_kernel,
+)
 from .solar import SolarCalculator
 from .forecast import ForecastManager
 from .statistics import StatisticsManager
@@ -98,6 +101,8 @@ from .const import (
     DEFAULT_SCREEN_EAST,
     DEFAULT_SCREEN_WEST,
     CONF_AUX_AFFECTED_ENTITIES,
+    CONF_EXPERIMENTAL_4D_PRIMARY,
+    DEFAULT_EXPERIMENTAL_4D_PRIMARY,
     DEFAULT_SOLAR_LEARNING_RATE,
     DEFAULT_SOLAR_COEFF_HEATING,
     DEFAULT_SOLAR_COEFF_COOLING,
@@ -178,6 +183,25 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Mode-stratified per-unit solar coefficients (#868):
         # {entity_id: {"heating": {s, e, w}, "cooling": {s, e, w}}}
         self._solar_coefficients_per_unit = {}
+
+        # Parallel 4D solar-coefficient state (#954).  Scaffolding for
+        # the diffuse-component shadow learner: structure mirrors the
+        # 3D dict above but each regime value is
+        # {"s", "e", "w", "diffuse", "learned"}.  Empty on fresh install
+        # and pre-v6 migrations; populated by the 4D learner on first
+        # qualifying hour (later commit).
+        self._solar_coefficients_4d_per_unit: dict = {}
+
+        # Per-facade direct-beam obstruction critical elevation (#991).
+        # ``{"s": float|None, "e": float|None, "w": float|None}``.  ``None``
+        # = no gate (default; written by ``fit_solar_obstruction`` after
+        # SSE-ratio threshold passes).  Applied globally across all
+        # entities in ``solar.calculate_unit_potential_4d`` — bypasses
+        # ``screen_affected_entities`` since overhang geometry is a
+        # building-level invariant.
+        self._critical_elev_per_facade: dict[str, float | None] = {
+            "s": None, "e": None, "w": None,
+        }
 
         # Per-unit min-base thresholds (#871).  Populated from dark-hour
         # p10 by :meth:`_calibrate_per_unit_min_base_thresholds` at startup
@@ -305,6 +329,18 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self._potential_battery_e: float = 0.0
         self._potential_battery_w: float = 0.0
 
+        # Parallel 4D potential battery (#954 commit 7).  Per-direction
+        # EMA of the four-component 4D potential vector, consumed by the
+        # 4D shadow inequality learner.  Same decay (``solar_battery_decay``)
+        # as the 3D battery; uses installation-level ``screen_config``
+        # (not per-entity) per the CLAUDE.md global-state note.  Reset
+        # alongside the 3D battery on the all-units reset path; per-unit
+        # reset does NOT touch them (battery is house-level).
+        self._potential_battery_4d_s: float = 0.0
+        self._potential_battery_4d_e: float = 0.0
+        self._potential_battery_4d_w: float = 0.0
+        self._potential_battery_4d_diffuse: float = 0.0
+
         # Hour-scoped accumulators — delegated to ObservationCollector (#775).
         # The collector owns all hourly state; the coordinator keeps
         # backward-compatible aliases that point to the SAME dict objects.
@@ -323,6 +359,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # Mode-stratified per-unit solar cold-start buffer (#868):
         # {entity_id: {"heating": [(s, e, w, impact), ...], "cooling": [...]}}
         self._learning_buffer_solar_per_unit = {}
+
+        # Parallel 4D cold-start buffer (#954).  Mirrors the 3D buffer
+        # above; populated by the 4D shadow learner (later commit).
+        self._learning_buffer_solar_4d_per_unit: dict = {}
 
         # Stage 3 (#912): NLMS shadow path runs in parallel with live Tobit
         # for allow-listed entities to provide a reference signal during the
@@ -704,6 +744,45 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Get current mode for a unit."""
         return self._unit_modes.get(entity_id, MODE_HEATING)
 
+    def hourly_solar_impact_kwh(self, entry: dict) -> float:
+        """Read solar impact for display aggregation (#962).
+
+        Under ``experimental_4d_primary``, prefer the 4D-derived field
+        ``solar_impact_4d_kwh`` for display consumers (daily totals,
+        ``accumulated_solar_impact_kwh``, ``last_hour_solar_impact_kwh``,
+        etc.).  Legacy hourly_log entries pre-dating the 4D field (or
+        hours where the 4D path was not exercised — see
+        ``learning._process_per_unit_learning`` field-absence
+        semantics) fall back to the 3D ``solar_impact_kwh`` so display
+        history stays continuous across the toggle.
+
+        Hourly log write side is unchanged: both fields keep being
+        written whenever applicable.  Diagnose blocks
+        (``diagnostics.py``) read the raw 3D/4D fields directly and
+        must NOT route through this helper.
+        """
+        # Strict ``is True`` check matches the dispatcher seam.
+        flag = getattr(self, "experimental_4d_primary", False) is True
+        if flag and entry.get("solar_impact_4d_kwh") is not None:
+            return float(entry["solar_impact_4d_kwh"])
+        return float(entry.get("solar_impact_kwh") or 0.0)
+
+    @property
+    def experimental_4d_primary(self) -> bool:
+        """Whether the experimental 4D solar pipeline is the primary read path (#962).
+
+        Read seam for the forthcoming read-path wiring.  This commit
+        introduces the flag only — no live consumer reads it yet, so the
+        property is a no-op end-to-end until the follow-up PR routes the
+        five read sites (prediction, base learning, battery, aux
+        normalisation, display sensors) through the 4D pipeline.
+
+        Read from ``entry.data`` on every access — no cache field on the
+        coordinator.  Toggling via reconfigure-advanced takes effect on
+        the entry reload that HA performs after the form submits.
+        """
+        return bool(self.entry.data.get(CONF_EXPERIMENTAL_4D_PRIMARY, DEFAULT_EXPERIMENTAL_4D_PRIMARY))
+
     def screen_config_for_entity(self, entity_id: str) -> tuple[bool, bool, bool]:
         """Return the effective screen_config for this entity.
 
@@ -806,6 +885,12 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             if entity_id in self._learning_buffer_solar_per_unit:
                 del self._learning_buffer_solar_per_unit[entity_id]
                 _LOGGER.debug(f"Cleared solar learning buffer for {entity_id}")
+            # Parallel 4D state (#954): clear the same slot so the shadow
+            # learner rebuilds in lock-step with the 3D learner.
+            if entity_id in self._solar_coefficients_4d_per_unit:
+                del self._solar_coefficients_4d_per_unit[entity_id]
+            if entity_id in self._learning_buffer_solar_4d_per_unit:
+                del self._learning_buffer_solar_4d_per_unit[entity_id]
             # Clear the unit's last batch-fit summary — its before/after
             # snapshot no longer matches the (now-empty) coefficient state.
             if entity_id in self._last_batch_fit_per_unit:
@@ -828,6 +913,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         else:
             self._solar_coefficients_per_unit.clear()
             self._learning_buffer_solar_per_unit.clear()
+            # Parallel 4D state (#954): wipe alongside the 3D table.
+            self._solar_coefficients_4d_per_unit.clear()
+            self._learning_buffer_solar_4d_per_unit.clear()
             # Last batch-fit summaries are stale once coefficients are wiped.
             self._last_batch_fit_per_unit.clear()
             # Carry-over reservoir is whole-house (#896 follow-up) — no
@@ -837,6 +925,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             # (entity_id != None) does NOT clear it: other units are
             # still operating against the same physical reservoir.
             self._solar_carryover_state = 0.0
+            # 4D potential battery (#954): zero alongside the 3D
+            # per-direction battery.  House-level state — clear only on
+            # the all-units branch; per-unit reset above does not touch
+            # it (other units still operate against this reservoir).
+            self._potential_battery_4d_s = 0.0
+            self._potential_battery_4d_e = 0.0
+            self._potential_battery_4d_w = 0.0
+            self._potential_battery_4d_diffuse = 0.0
             # Stage 3 (#912): wipe the live Tobit windows + shadow
             # coefficients + shadow cold-start buffers in lock-step
             # with the coefficient table.  See per-entity branch for
@@ -882,6 +978,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     if isinstance(getattr(self, "_solar_affected_set", None), (frozenset, set))
                     else None
                 ),
+                wind_threshold=self.wind_threshold,
+                extreme_wind_threshold=self.extreme_wind_threshold,
                 return_diagnostics=True,
             )
             _LOGGER.info(
@@ -1045,6 +1143,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         dry_run: bool = False,
         force: bool = False,
         days_back: int | None = None,
+        dimension: str = "both",
     ) -> dict:
         """Apply diagnose_solar's implied LS-fit to a unit's coefficient (#884 follow-up).
 
@@ -1103,6 +1202,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             SOLAR_COEFF_CAP,
         )
 
+        if dimension not in ("3d", "4d", "both"):
+            raise ValueError(
+                f"apply_implied_coefficient called with dimension={dimension!r}; "
+                f"must be one of '3d', '4d', or 'both'."
+            )
+        write_3d = dimension in ("3d", "both")
+        write_4d = dimension in ("4d", "both")
+
         if mode in (MODE_HEATING, MODE_GUEST_HEATING):
             regime = "heating"
         elif mode in (MODE_COOLING, MODE_GUEST_COOLING):
@@ -1151,7 +1258,89 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         )
         before = {k: float(before_dict.get(k, 0.0)) for k in ("s", "e", "w")}
 
-        if analysis["implied"] is None:
+        before_dict_4d = (
+            self._solar_coefficients_4d_per_unit.get(entity_id, {}).get(regime)
+            or {"s": 0.0, "e": 0.0, "w": 0.0, "diffuse": 0.0}
+        )
+        before_4d = {
+            k: float(before_dict_4d.get(k, 0.0))
+            for k in ("s", "e", "w", "diffuse")
+        }
+
+        # 3D path (existing semantics — bit-identical when dimension="3d"
+        # or dimension="both", modulo the new applied_3d/skipped_3d keys).
+        applied_3d: list[str] = []
+        skipped_3d: list[str] = []
+        new_coeff = dict(before)
+        stability: dict = {}
+        implied_30d = analysis["implied"]
+        status_3d: str | None = None
+        if write_3d:
+            if implied_30d is None:
+                status_3d = "no_data"
+            else:
+                stability = self.learning.assess_apply_implied_stability(
+                    analysis["windows"]
+                )
+                for d in ("s", "e", "w"):
+                    stable = stability[d]["stable"]
+                    if force or stable:
+                        new_coeff[d] = max(
+                            0.0, min(SOLAR_COEFF_CAP, implied_30d[d])
+                        )
+                        applied_3d.append(d)
+                    else:
+                        skipped_3d.append(d)
+                if not applied_3d:
+                    status_3d = "no_stable_components"
+
+        # 4D path (#969 slim).  Parallel logic on the 4-component fit
+        # produced by ``compute_implied_for_apply``.  Stability guard
+        # reuses ``assess_apply_implied_stability`` with the 4-dir tuple
+        # (diffuse included) — exact mirror of the 3D check.
+        applied_4d: list[str] = []
+        skipped_4d: list[str] = []
+        new_coeff_4d = dict(before_4d)
+        stability_4d: dict = {}
+        implied_30d_4d = analysis.get("implied_4d")
+        status_4d: str | None = None
+        if write_4d:
+            if implied_30d_4d is None:
+                status_4d = "no_data"
+            else:
+                stability_4d = self.learning.assess_apply_implied_stability(
+                    analysis.get("windows_4d") or [None] * 3,
+                    directions=("s", "e", "w", "diffuse"),
+                )
+                for d in ("s", "e", "w", "diffuse"):
+                    stable = stability_4d[d]["stable"]
+                    if force or stable:
+                        new_coeff_4d[d] = max(
+                            0.0, min(SOLAR_COEFF_CAP, implied_30d_4d[d])
+                        )
+                        applied_4d.append(d)
+                    else:
+                        skipped_4d.append(d)
+                if not applied_4d:
+                    status_4d = "no_stable_components"
+
+        # Aggregate status: ok if any requested dimension applied
+        # something; otherwise propagate the most-informative failure
+        # reason.  Bit-identical to pre-#969 when dimension == "3d" and
+        # the 3D path produced a result.
+        if write_3d and write_4d:
+            if applied_3d or applied_4d:
+                status = "ok"
+            elif status_3d == "no_data" and status_4d == "no_data":
+                status = "no_data"
+            else:
+                status = "no_stable_components"
+        elif write_3d:
+            status = "ok" if applied_3d else (status_3d or "no_stable_components")
+        else:  # write_4d only
+            status = "ok" if applied_4d else (status_4d or "no_stable_components")
+
+        if status == "no_data":
             return {
                 "status": "no_data",
                 "unit_entity_id": entity_id,
@@ -1159,36 +1348,29 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "dry_run": dry_run,
                 "force_applied": force,
                 "days_back": days_back,
+                "dimension": dimension,
                 "sample_count": analysis["sample_count"],
+                "sample_count_4d": analysis.get("sample_count_4d", 0),
                 "drop_counts": analysis["drop_counts"],
-                "implied_30d": None,
-                "stability": {},
+                "drop_counts_4d": analysis.get("drop_counts_4d", {}),
+                "implied_30d": implied_30d,
+                "implied_30d_4d": implied_30d_4d,
+                "stability": stability,
+                "stability_4d": stability_4d,
                 "before": before,
                 "after": before,
+                "before_4d": before_4d,
+                "after_4d": before_4d,
                 "applied_components": [],
                 "skipped_components": [],
+                "applied_3d": [],
+                "skipped_3d": [],
+                "applied_4d": [],
+                "skipped_4d": [],
                 "skip_reason": "insufficient_samples",
             }
 
-        stability = self.learning.assess_apply_implied_stability(
-            analysis["windows"]
-        )
-
-        implied_30d = analysis["implied"]
-        applied_components: list[str] = []
-        skipped_components: list[str] = []
-        new_coeff = dict(before)
-        for d in ("s", "e", "w"):
-            stable = stability[d]["stable"]
-            if force or stable:
-                # Clamp to invariant #4: non-negative, ≤ CAP.
-                new_coeff[d] = max(0.0, min(SOLAR_COEFF_CAP, implied_30d[d]))
-                applied_components.append(d)
-            else:
-                # Preserve current value.
-                skipped_components.append(d)
-
-        if not applied_components:
+        if status == "no_stable_components":
             return {
                 "status": "no_stable_components",
                 "unit_entity_id": entity_id,
@@ -1196,32 +1378,65 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 "dry_run": dry_run,
                 "force_applied": force,
                 "days_back": days_back,
+                "dimension": dimension,
                 "sample_count": analysis["sample_count"],
+                "sample_count_4d": analysis.get("sample_count_4d", 0),
                 "implied_30d": implied_30d,
+                "implied_30d_4d": implied_30d_4d,
                 "stability": stability,
+                "stability_4d": stability_4d,
                 "before": before,
                 "after": before,
+                "before_4d": before_4d,
+                "after_4d": before_4d,
                 "applied_components": [],
-                "skipped_components": skipped_components,
+                "skipped_components": skipped_3d,
+                "applied_3d": [],
+                "skipped_3d": skipped_3d,
+                "applied_4d": [],
+                "skipped_4d": skipped_4d,
             }
 
         if not dry_run:
-            self.learning._update_unit_solar_coefficient(
-                entity_id, new_coeff, self._solar_coefficients_per_unit, regime
-            )
+            if applied_3d:
+                self.learning._update_unit_solar_coefficient(
+                    entity_id,
+                    new_coeff,
+                    self._solar_coefficients_per_unit,
+                    regime,
+                )
+            if applied_4d:
+                self.learning._update_unit_solar_coefficient(
+                    entity_id,
+                    new_coeff_4d,
+                    self._solar_coefficients_4d_per_unit,
+                    regime,
+                    components=("s", "e", "w", "diffuse"),
+                )
             await self._async_save_data(force=True)
 
         scope = (
             f"{entity_id} [{regime}]"
+            f" dim={dimension}"
             f"{f', last {days_back}d' if days_back is not None else ''}"
             f"{', DRY RUN' if dry_run else ''}"
             f"{', forced' if force else ''}"
         )
         _LOGGER.info(
-            "apply_implied_coefficient (%s): applied=%s, skipped=%s "
-            "(samples=%d, before=%s, after=%s)",
-            scope, applied_components, skipped_components,
-            analysis["sample_count"], before, new_coeff,
+            "apply_implied_coefficient (%s): applied_3d=%s, skipped_3d=%s, "
+            "applied_4d=%s, skipped_4d=%s (samples_3d=%d, samples_4d=%d, "
+            "before_3d=%s, after_3d=%s, before_4d=%s, after_4d=%s)",
+            scope,
+            applied_3d,
+            skipped_3d,
+            applied_4d,
+            skipped_4d,
+            analysis["sample_count"],
+            analysis.get("sample_count_4d", 0),
+            before,
+            new_coeff,
+            before_4d,
+            new_coeff_4d,
         )
 
         return {
@@ -1231,13 +1446,27 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             "dry_run": dry_run,
             "force_applied": force,
             "days_back": days_back,
+            "dimension": dimension,
             "sample_count": analysis["sample_count"],
+            "sample_count_4d": analysis.get("sample_count_4d", 0),
             "implied_30d": implied_30d,
+            "implied_30d_4d": implied_30d_4d,
             "stability": stability,
+            "stability_4d": stability_4d,
             "before": before,
             "after": new_coeff,
-            "applied_components": applied_components,
-            "skipped_components": skipped_components,
+            "before_4d": before_4d,
+            "after_4d": new_coeff_4d,
+            # Legacy alias keys preserved for backwards compatibility —
+            # callers reading ``applied_components`` / ``skipped_components``
+            # continue to see the 3D answer (these were the only writeable
+            # dimension pre-#969).
+            "applied_components": applied_3d,
+            "skipped_components": skipped_3d,
+            "applied_3d": applied_3d,
+            "skipped_3d": skipped_3d,
+            "applied_4d": applied_4d,
+            "skipped_4d": skipped_4d,
         }
 
     async def async_migrate_aux_coefficients(self, new_aux_affected_entities: list[str]):
@@ -1537,6 +1766,21 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             days_back=days_back,
             reset_first=reset_first,
             experimental_cop_smear=experimental_cop_smear,
+        )
+
+    async def retrain_unit_from_history(
+        self,
+        entity_id: str,
+        reset_first: bool = False,
+        dry_run: bool = False,
+        days_back: int | None = None,
+    ) -> dict:
+        """Delegates to :class:`retrain.RetrainEngine`."""
+        return await self._retrain.retrain_unit_from_history(
+            entity_id=entity_id,
+            reset_first=reset_first,
+            dry_run=dry_run,
+            days_back=days_back,
         )
 
     def diagnose_model(self, days_back: int = 30) -> dict:
@@ -2138,6 +2382,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             s_vector_w = log.get("solar_vector_w", 0.0)
             s_vector = (s_vector_s, s_vector_e, s_vector_w) if s_vector_s is not None and s_vector_e is not None else None
 
+            # Wind sensitivity ("what-if no wind") — semantically targets
+            # the 3D rollback model.  force_3d keeps the diagnostic
+            # consistent regardless of experimental_4d_primary state.
             res_actual = self.statistics.calculate_total_power(
                 temp=temp,
                 effective_wind=eff_wind,
@@ -2146,7 +2393,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 unit_modes=unit_modes,
                 override_solar_factor=s_factor,
                 override_solar_vector=s_vector,
-                detailed=False
+                detailed=False,
+                force_3d=True,
             )
 
             # Scenario 2: No Wind
@@ -2158,7 +2406,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 unit_modes=unit_modes,
                 override_solar_factor=s_factor,
                 override_solar_vector=s_vector,
-                detailed=False
+                detailed=False,
+                force_3d=True,
             )
 
             # Penalty = Energy(Wind) - Energy(NoWind)
@@ -2172,11 +2421,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             minutes_passed = dt_util.now().minute
             fraction = minutes_passed / 60.0
 
+            # Wind sensitivity — 3D semantics (see comment on res_actual above).
             res_curr = self.statistics.calculate_total_power(
-                current_temp, eff_wind, 0.0, is_aux_active=self.auxiliary_heating_active, detailed=False
+                current_temp, eff_wind, 0.0, is_aux_active=self.auxiliary_heating_active, detailed=False,
+                force_3d=True,
             )
             res_curr_no_wind = self.statistics.calculate_total_power(
-                current_temp, 0.0, 0.0, is_aux_active=self.auxiliary_heating_active, detailed=False
+                current_temp, 0.0, 0.0, is_aux_active=self.auxiliary_heating_active, detailed=False,
+                force_3d=True,
             )
 
             penalty = max(0.0, res_curr["total_kwh"] - res_curr_no_wind["total_kwh"])
@@ -2212,7 +2464,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                  expected_today_sum += entry.get("expected_kwh") or 0.0
                  forecasted_past_sum += entry.get("forecasted_kwh") or entry.get("expected_kwh") or 0.0
                  gross_past_sum += entry.get("forecasted_kwh_gross") or entry.get("forecasted_kwh") or entry.get("expected_kwh") or 0.0
-                 solar_today_sum += entry.get("solar_impact_kwh") or 0.0
+                 solar_today_sum += self.hourly_solar_impact_kwh(entry)
                  if entry.get("auxiliary_active", False):
                      has_past_aux = True
              else:
@@ -2915,7 +3167,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         for entry in self._hourly_log:
             if entry["timestamp"].startswith(today_date_str):
-                accumulated_solar += entry.get("solar_impact_kwh", 0.0)
+                accumulated_solar += self.hourly_solar_impact_kwh(entry)
                 accumulated_guest += entry.get("guest_impact_kwh", 0.0)
                 accumulated_aux += entry.get("aux_impact_kwh", 0.0)
 
@@ -3164,6 +3416,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             tobit_sufficient_stats=self._tobit_sufficient_stats,
             nlms_shadow_coefficients=self._nlms_shadow_coefficients,
             shadow_learning_buffer_solar_per_unit=self._shadow_learning_buffer_solar_per_unit,
+            solar_coefficients_4d_per_unit=self._solar_coefficients_4d_per_unit,
+            learning_buffer_solar_4d_per_unit=self._learning_buffer_solar_4d_per_unit,
         )
 
     # ------------------------------------------------------------------

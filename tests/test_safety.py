@@ -1,19 +1,9 @@
 """Test Safety Mechanisms (Division by Zero, etc)."""
-from unittest.mock import MagicMock
 import pytest
 from custom_components.heating_analytics.statistics import StatisticsManager
 from custom_components.heating_analytics.const import (
-    ATTR_TDD_SO_FAR, ATTR_ENERGY_TODAY, ATTR_TDD_YESTERDAY, ATTR_EFFICIENCY_YESTERDAY
+    ATTR_TDD_SO_FAR, ATTR_ENERGY_TODAY, ATTR_TDD_YESTERDAY
 )
-
-@pytest.fixture
-def mock_coordinator():
-    coord = MagicMock()
-    coord.data = {}
-    coord.balance_point = 17.0
-    # Mock daily history
-    coord._daily_history = {}
-    return coord
 
 def test_efficiency_zero_tdd_so_far(mock_coordinator):
     """Test calculate_realtime_efficiency with 0 TDD."""

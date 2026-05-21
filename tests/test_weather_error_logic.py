@@ -1,19 +1,12 @@
 """Test Weather Error Statistics Logic."""
 import pytest
-from unittest.mock import MagicMock
 from custom_components.heating_analytics.forecast import ForecastManager
 from datetime import timedelta
 from homeassistant.util import dt as dt_util
 
 @pytest.fixture
-def mock_coordinator():
-    coord = MagicMock()
-    coord._hourly_log = []
-    coord.data = {}
-    return coord
-
-@pytest.fixture
 def forecast_manager(mock_coordinator):
+    """Fixture for a real ForecastManager with a mock coordinator."""
     fm = ForecastManager(mock_coordinator)
     fm._forecast_history = []
     return fm

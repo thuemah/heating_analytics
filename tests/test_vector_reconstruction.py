@@ -4,21 +4,10 @@ from unittest.mock import MagicMock
 from datetime import date
 from custom_components.heating_analytics.statistics import StatisticsManager
 
-@pytest.fixture
-def mock_coordinator():
-    coord = MagicMock()
-    coord._daily_history = {}
-    coord._hourly_log = []
-    # Mock balance point for reconstruction logic
-    coord.balance_point = 15.0
-    return coord
-
-@pytest.fixture
-def stats_manager(mock_coordinator):
-    return StatisticsManager(mock_coordinator)
-
-def test_calculate_modeled_energy_uses_vectors(stats_manager, mock_coordinator):
+def test_calculate_modeled_energy_uses_vectors(mock_coordinator):
     """Test that vectors are used when available in daily history."""
+    mock_coordinator.balance_point = 15.0
+    stats_manager = StatisticsManager(mock_coordinator)
 
     # Setup Daily History with Vectors
     # Scenario: Cold Night (High Load), Warm Day (Low Load)
@@ -71,8 +60,10 @@ def test_calculate_modeled_energy_uses_vectors(stats_manager, mock_coordinator):
     # Verify calculate_total_power was called 24 times (once per hour)
     assert stats_manager.calculate_total_power.call_count == 24
 
-def test_calculate_modeled_energy_fallback_legacy(stats_manager, mock_coordinator):
+def test_calculate_modeled_energy_fallback_legacy(mock_coordinator):
     """Test fallback to daily average when vectors are missing."""
+    mock_coordinator.balance_point = 15.0
+    stats_manager = StatisticsManager(mock_coordinator)
 
     mock_coordinator._daily_history = {
         "2023-01-01": {
@@ -103,8 +94,10 @@ def test_calculate_modeled_energy_fallback_legacy(stats_manager, mock_coordinato
     # Verify calculate_total_power was called 1 time (daily avg)
     assert stats_manager.calculate_total_power.call_count == 1
 
-def test_calculate_modeled_energy_fallback_all_none_vectors(stats_manager, mock_coordinator):
+def test_calculate_modeled_energy_fallback_all_none_vectors(mock_coordinator):
     """Test fallback to daily average when vectors exist but are all None."""
+    mock_coordinator.balance_point = 15.0
+    stats_manager = StatisticsManager(mock_coordinator)
 
     # Scenario: Coordinator writes 'None' vectors for downtime days
     vectors = {

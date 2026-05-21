@@ -2,26 +2,24 @@ import pytest
 from unittest.mock import MagicMock, patch
 from custom_components.heating_analytics.storage import StorageManager
 
-@pytest.fixture
-def mock_coordinator():
-    coordinator = MagicMock()
-    coordinator.hass = MagicMock()
-    coordinator.hass.config.path = MagicMock(return_value="/tmp")
-    coordinator.balance_point = 17.0
-    coordinator.learning_rate = 0.1
-    coordinator._correlation_data = {}
-    coordinator._aux_coefficients = {}
-    coordinator._hourly_log = []
-    coordinator._hourly_log_max_entries = 2160
-    coordinator._daily_history = {}
+@pytest.mark.asyncio
+async def test_csv_import_tdd_population(mock_coordinator):
+    """Test that CSV import properly calculates TDD for hourly logs."""
+    # Specialized setup
+    mock_coordinator.hass.config.path = MagicMock(return_value="/tmp")
+    mock_coordinator.balance_point = 17.0
+    mock_coordinator.learning_rate = 0.1
+    mock_coordinator._hourly_log_max_entries = 2160
+    mock_coordinator.solar_enabled = False
+    mock_coordinator.daily_learning_mode = False
+    mock_coordinator.learning_enabled = True
+    mock_coordinator.track_c_enabled = False
 
     # Mock methods used in import
-    coordinator._calculate_effective_wind = MagicMock(return_value=5.0)
-    coordinator._get_wind_bucket = MagicMock(return_value="normal")
-    coordinator._get_predicted_kwh = MagicMock(return_value=1.0)
-    coordinator.learning = MagicMock()
-    coordinator.learning.learn_from_historical_import = MagicMock(return_value={"status": "learned"})
-    coordinator.solar_enabled = False
+    mock_coordinator._calculate_effective_wind = MagicMock(return_value=5.0)
+    mock_coordinator._get_wind_bucket = MagicMock(return_value="normal")
+    mock_coordinator._get_predicted_kwh = MagicMock(return_value=1.0)
+    mock_coordinator.learning.learn_from_historical_import = MagicMock(return_value={"status": "learned"})
 
     # Use the real aggregation method logic or a simplified version to simulate the bug
     def aggregate_daily_logs_side_effect(day_logs):
@@ -40,14 +38,8 @@ def mock_coordinator():
             "temp": avg_temp
         }
 
-    coordinator._aggregate_daily_logs = MagicMock(side_effect=aggregate_daily_logs_side_effect)
-    coordinator._backfill_daily_from_hourly = MagicMock()
-
-    return coordinator
-
-@pytest.mark.asyncio
-async def test_csv_import_tdd_population(mock_coordinator):
-    """Test that CSV import properly calculates TDD for hourly logs."""
+    mock_coordinator._aggregate_daily_logs = MagicMock(side_effect=aggregate_daily_logs_side_effect)
+    mock_coordinator._backfill_daily_from_hourly = MagicMock()
 
     storage = StorageManager(mock_coordinator)
 

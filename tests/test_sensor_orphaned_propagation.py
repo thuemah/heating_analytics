@@ -5,14 +5,13 @@ from custom_components.heating_analytics.sensor import HeatingPotentialSavingsSe
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
 
 @pytest.fixture
-def mock_coordinator_with_orphaned():
-    coord = MagicMock(spec=HeatingDataCoordinator)
+def mock_coordinator_with_orphaned(mock_coordinator):
+    coord = mock_coordinator
     coord.energy_sensors = ["sensor.heater_1"]
     coord.aux_affected_entities = ["sensor.heater_1"]
     coord.auxiliary_heating_active = True
 
     # Mock hass object
-    coord.hass = MagicMock()
     coord.hass.states.get.return_value = MagicMock()
     coord.hass.states.get.return_value.name = "Heater 1"
 
@@ -43,9 +42,6 @@ def mock_coordinator_with_orphaned():
     # Mock Orphaned Accumulators (The Fix)
     coord._daily_orphaned_aux = 3.0
     coord._collector.orphaned_aux = 0.5
-
-    # Mock hourly log to avoid error accessing learning status
-    coord._hourly_log = []
 
     return coord
 

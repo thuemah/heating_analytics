@@ -1,17 +1,14 @@
 
 """Tests for the forecast blending logic in the ForecastManager."""
-
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
+from datetime import timedelta
 
 from custom_components.heating_analytics.const import (
     CONF_SECONDARY_WEATHER_ENTITY,
     CONF_FORECAST_CROSSOVER_DAY,
 )
 from custom_components.heating_analytics.forecast import ForecastManager
-
-# No autouse fixture - we'll patch individually in each test
 
 # Helper function to get the fixed timestamp (for use in tests)
 def get_fixed_now():
@@ -35,30 +32,8 @@ def create_forecast(start_dt, num_days, source_id):
         })
     return forecast
 
-@pytest.fixture
-def mock_coordinator():
-    """Fixture for a mock coordinator."""
-    coordinator = MagicMock()
-    coordinator.hass = MagicMock()
-    coordinator.weather_entity = "weather.primary"
-    coordinator.config_entry = MagicMock()
-    # Use a real dictionary for data so .get() works naturally
-    coordinator.config_entry.data = {
-        CONF_SECONDARY_WEATHER_ENTITY: "weather.secondary",
-        CONF_FORECAST_CROSSOVER_DAY: 4,
-    }
-
-    # Crucial: ForecastManager uses self.coordinator.entry, not self.coordinator.config_entry directly sometimes?
-    # No, it calls self.coordinator.entry.data.
-    # In the coordinator implementation, self.entry = config_entry.
-    # So we must mock this alias.
-    coordinator.entry = coordinator.config_entry
-
-    coordinator.hass.services.async_call = AsyncMock()
-    return coordinator
-
 @pytest.mark.asyncio
-@patch('custom_components.heating_analytics.forecast.dt_util.now')
+@patch("custom_components.heating_analytics.forecast.dt_util.now")
 async def test_forecast_blending_with_crossover(mock_dt_now, mock_coordinator):
     """Test that forecasts are blended correctly with a hard crossover day."""
     FIXED_NOW = get_fixed_now()
@@ -67,13 +42,15 @@ async def test_forecast_blending_with_crossover(mock_dt_now, mock_coordinator):
     # Mock dt_util.now() to return our fixed timestamp
     mock_dt_now.return_value = FIXED_NOW
 
-    fm = ForecastManager(mock_coordinator)
-
-    # Ensure correct data
+    # Configure mock_coordinator for this test
+    mock_coordinator.weather_entity = "weather.primary"
     mock_coordinator.entry.data = {
          CONF_SECONDARY_WEATHER_ENTITY: "weather.secondary",
          CONF_FORECAST_CROSSOVER_DAY: 4,
     }
+    mock_coordinator.hass.services.async_call = AsyncMock()
+
+    fm = ForecastManager(mock_coordinator)
 
     primary_forecast = create_forecast(START_OF_DAY, 5, "primary")
     secondary_forecast = create_forecast(START_OF_DAY, 7, "secondary")
@@ -110,19 +87,20 @@ async def test_forecast_blending_with_crossover(mock_dt_now, mock_coordinator):
             assert item["_source"] == "secondary"
 
 @pytest.mark.asyncio
-@patch('custom_components.heating_analytics.forecast.dt_util.now')
+@patch("custom_components.heating_analytics.forecast.dt_util.now")
 async def test_primary_only_mode(mock_dt_now, mock_coordinator):
     """Test correct operation with only a primary entity."""
     FIXED_NOW = get_fixed_now()
     mock_dt_now.return_value = FIXED_NOW
-    START_OF_DAY = FIXED_NOW.replace(hour=0, minute=0, second=0, microsecond=0)
+    START_OF_DAY = get_start_of_day()
 
-    # Empty dict implies no secondary weather entity and no crossover day
+    # Configure mock_coordinator for this test
+    mock_coordinator.weather_entity = "weather.primary"
     mock_coordinator.entry.data = {}
+    mock_coordinator.hass.services.async_call = AsyncMock()
 
     fm = ForecastManager(mock_coordinator)
 
-    START_OF_DAY = get_start_of_day()
     primary_forecast = create_forecast(START_OF_DAY, 5, "primary")
 
     async def side_effect(*args, **kwargs):
@@ -143,7 +121,7 @@ async def test_primary_only_mode(mock_dt_now, mock_coordinator):
     assert all(item["_source"] == "primary" for item in blended_hourly)
 
 @pytest.mark.asyncio
-@patch('custom_components.heating_analytics.forecast.dt_util.now')
+@patch("custom_components.heating_analytics.forecast.dt_util.now")
 async def test_blending_with_gaps_before_crossover(mock_dt_now, mock_coordinator):
     """Test that the secondary forecast fills gaps in the primary before the crossover."""
     FIXED_NOW = get_fixed_now()
@@ -152,11 +130,13 @@ async def test_blending_with_gaps_before_crossover(mock_dt_now, mock_coordinator
     # Mock dt_util.now() to return our fixed timestamp
     mock_dt_now.return_value = FIXED_NOW
 
-    # Ensure crossover config is present
+    # Configure mock_coordinator for this test
+    mock_coordinator.weather_entity = "weather.primary"
     mock_coordinator.entry.data = {
          CONF_SECONDARY_WEATHER_ENTITY: "weather.secondary",
          CONF_FORECAST_CROSSOVER_DAY: 4,
     }
+    mock_coordinator.hass.services.async_call = AsyncMock()
 
     fm = ForecastManager(mock_coordinator)
     primary_forecast = create_forecast(START_OF_DAY, 2, "primary") + create_forecast(START_OF_DAY + timedelta(days=3), 1, "primary")

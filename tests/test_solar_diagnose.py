@@ -1505,11 +1505,11 @@ class TestElevationDiagnostics:
         coord = self._coord_with_elevations(entries, elevations)
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         ev = result["per_unit"]["sensor.heater1"]["elevation_diagnostics"]["instantaneous"]
-        assert ev["0-15"]["n"] == 6
-        assert ev["15-30"]["n"] == 6
-        assert ev["30-45"]["n"] == 6
-        assert ev["45-60"]["n"] == 6
-        assert ev["60-90"]["n"] == 6
+        assert ev["0-15"]["unsaturated"]["n"] == 6
+        assert ev["15-30"]["unsaturated"]["n"] == 6
+        assert ev["30-45"]["unsaturated"]["n"] == 6
+        assert ev["45-60"]["unsaturated"]["n"] == 6
+        assert ev["60-90"]["unsaturated"]["n"] == 6
 
     def test_zero_bias_yields_zero_residual(self):
         """When implied_solar == modeled_solar exactly, median residual ≈ 0."""
@@ -1522,9 +1522,9 @@ class TestElevationDiagnostics:
         coord = self._coord_with_elevations(entries, elevations)
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         ev = result["per_unit"]["sensor.heater1"]["elevation_diagnostics"]["instantaneous"]
-        assert ev["15-30"]["n"] == 10
-        assert abs(ev["15-30"]["median_residual"]) < 1e-3
-        assert abs(ev["15-30"]["median_residual_normalised"]) < 1e-3
+        assert ev["15-30"]["unsaturated"]["n"] == 10
+        assert abs(ev["15-30"]["unsaturated"]["median_residual"]) < 1e-3
+        assert abs(ev["15-30"]["unsaturated"]["median_residual_normalised"]) < 1e-3
 
     def test_hotspot_signature_negative_at_high_elev(self):
         """Synthetic over-prediction concentrated at high elevation produces
@@ -1548,15 +1548,15 @@ class TestElevationDiagnostics:
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         ev = result["per_unit"]["sensor.heater1"]["elevation_diagnostics"]["instantaneous"]
         # Low-elev bucket clean.
-        assert ev["0-15"]["n"] == 12
-        assert abs(ev["0-15"]["median_residual"]) < 1e-3
+        assert ev["0-15"]["unsaturated"]["n"] == 12
+        assert abs(ev["0-15"]["unsaturated"]["median_residual"]) < 1e-3
         # High-elev bucket: residual = −0.3, normalised = −0.6.
-        assert ev["45-60"]["n"] == 12
-        assert ev["45-60"]["median_residual"] == pytest.approx(-0.3, abs=1e-3)
-        assert ev["45-60"]["median_residual_normalised"] == pytest.approx(-0.6, abs=1e-3)
+        assert ev["45-60"]["unsaturated"]["n"] == 12
+        assert ev["45-60"]["unsaturated"]["median_residual"] == pytest.approx(-0.3, abs=1e-3)
+        assert ev["45-60"]["unsaturated"]["median_residual_normalised"] == pytest.approx(-0.6, abs=1e-3)
         # Untouched buckets remain empty.
-        assert ev["15-30"]["n"] == 0
-        assert ev["30-45"]["n"] == 0
+        assert ev["15-30"]["unsaturated"]["n"] == 0
+        assert ev["30-45"]["unsaturated"]["n"] == 0
 
     def test_min_samples_gate_collapses_small_buckets(self):
         """Buckets with fewer than 5 samples emit only `n`, not the full
@@ -1574,13 +1574,13 @@ class TestElevationDiagnostics:
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         ev = result["per_unit"]["sensor.heater1"]["elevation_diagnostics"]["instantaneous"]
         # Below-threshold bucket: only `n` reported.
-        assert ev["0-15"] == {"n": 4}
+        assert ev["0-15"]["unsaturated"] == {"n": 4}
         # Above-threshold: full block.
-        assert ev["15-30"]["n"] == 10
-        assert "median_residual" in ev["15-30"]
-        assert "mad_residual" in ev["15-30"]
-        assert "mean_potential" in ev["15-30"]
-        assert "median_residual_normalised" in ev["15-30"]
+        assert ev["15-30"]["unsaturated"]["n"] == 10
+        assert "median_residual" in ev["15-30"]["unsaturated"]
+        assert "mad_residual" in ev["15-30"]["unsaturated"]
+        assert "mean_potential" in ev["15-30"]["unsaturated"]
+        assert "median_residual_normalised" in ev["15-30"]["unsaturated"]
 
     def test_cooling_mode_skipped(self):
         """Cooling-mode hours do not populate elevation buckets — Tier 1 is
@@ -1603,7 +1603,8 @@ class TestElevationDiagnostics:
         if "elevation_diagnostics" in per_unit:
             ev = per_unit["elevation_diagnostics"]["instantaneous"]
             for bucket in ev.values():
-                assert bucket["n"] == 0
+                assert bucket["unsaturated"]["n"] == 0
+                assert bucket["saturated"]["n"] == 0
 
     def test_solar_unavailable_no_crash(self):
         """When `get_approx_sun_pos` raises or returns nothing usable, the
@@ -1618,7 +1619,8 @@ class TestElevationDiagnostics:
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         ev = result["per_unit"]["sensor.heater1"]["elevation_diagnostics"]["instantaneous"]
         for bucket_data in ev.values():
-            assert bucket_data["n"] == 0
+            assert bucket_data["unsaturated"]["n"] == 0
+            assert bucket_data["saturated"]["n"] == 0
 
     def test_bucket_boundary_half_open(self):
         """Elevation = 15.0 lands in [15, 30), not [0, 15) — half-open intervals."""
@@ -1630,8 +1632,8 @@ class TestElevationDiagnostics:
         coord = self._coord_with_elevations(entries, elevations)
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         ev = result["per_unit"]["sensor.heater1"]["elevation_diagnostics"]["instantaneous"]
-        assert ev["0-15"]["n"] == 0
-        assert ev["15-30"]["n"] == 10
+        assert ev["0-15"]["unsaturated"]["n"] == 0
+        assert ev["15-30"]["unsaturated"]["n"] == 10
 
     def test_negative_elevation_skipped(self):
         """Sun below horizon (elev < 0) is excluded — no bucket catches it."""
@@ -1644,7 +1646,8 @@ class TestElevationDiagnostics:
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         ev = result["per_unit"]["sensor.heater1"]["elevation_diagnostics"]["instantaneous"]
         for bucket_data in ev.values():
-            assert bucket_data["n"] == 0
+            assert bucket_data["unsaturated"]["n"] == 0
+            assert bucket_data["saturated"]["n"] == 0
 
 
 class TestElevationDiagnosticsLag:

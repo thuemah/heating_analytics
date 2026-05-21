@@ -225,6 +225,14 @@ class LearningConfig:
     # which is the documented mechanism.
     mpc_managed_entities: frozenset[str] = field(default_factory=frozenset)
 
+    # Experimental 4D primary read-path flag (#962).  When True, base
+    # learning uses the 4D-derived ``solar_normalization_delta_4d``
+    # instead of the 3D ``obs.solar_normalization_delta`` as its dark-
+    # equivalent compensation.  Default False = bit-identical to 3D
+    # behaviour.  Set from ``coordinator.experimental_4d_primary`` at
+    # config build time so the flag is captured once per hour.
+    experimental_4d_primary: bool = False
+
 
 @dataclass(frozen=True)
 class HourlyObservation:
@@ -318,6 +326,24 @@ class HourlyObservation:
     # a local EMA over the log; live path fills from coordinator state).
     battery_filtered_potential: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
+    # Raw irradiance averages for the hour (#954).  Sourced from
+    # ObservationCollector at hour boundary.  Optional — installations
+    # without a GHI/DNI/DHI sensor leave these as None and the 4D shadow
+    # learner falls through ``resolve_dni_dhi`` to the cloud_coverage
+    # synthetic path.  Strictly optional: all 3D paths ignore these
+    # fields; only the 4D shadow learner consumes them.
+    dni_avg: float | None = None
+    dhi_avg: float | None = None
+    ghi_avg: float | None = None
+    cloud_avg: float | None = None
+    # Battery-filtered per-direction 4D potential (#954 commit 7).  Same
+    # role as ``battery_filtered_potential`` for the 3D inequality
+    # learner, but carries the four-component vector consumed by the
+    # 4D shadow inequality path.  Defaults to zeros for legacy call paths.
+    battery_filtered_potential_4d: tuple[float, float, float, float] = (
+        0.0, 0.0, 0.0, 0.0,
+    )
+
 
 @dataclass
 class ModelState:
@@ -357,6 +383,15 @@ class ModelState:
     learning_buffer_per_unit: dict = field(default_factory=dict)
     learning_buffer_aux_per_unit: dict = field(default_factory=dict)
     learning_buffer_solar_per_unit: dict = field(default_factory=dict)
+
+    # --- 4D solar coefficients (#954, shadow learner) ---
+    # Parallel structure to ``solar_coefficients_per_unit`` but with a
+    # four-component value per regime: ``{"s", "e", "w", "diffuse",
+    # "learned"}``.  Strictly shadow — no read-path consumer yet.
+    # Optional / None on legacy ModelState construction sites (replay
+    # paths, pre-#954 tests); the 4D learner returns early when None.
+    solar_coefficients_4d_per_unit: dict | None = None
+    learning_buffer_solar_4d_per_unit: dict | None = None
 
     # --- History (read-only references) ---
     daily_history: dict = field(default_factory=dict)

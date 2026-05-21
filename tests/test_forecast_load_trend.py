@@ -1,37 +1,24 @@
 """Test for load trend calculation."""
 import pytest
 from unittest.mock import MagicMock, patch
-from datetime import datetime, timedelta
+from datetime import datetime
 from custom_components.heating_analytics.forecast import ForecastManager
-from homeassistant.util import dt as dt_util
 
-@pytest.fixture
-def mock_coordinator():
-    """Mock Coordinator."""
-    coord = MagicMock()
-    coord.data = {}
-    coord._hourly_log = []
-    # Mock methods required by ForecastManager
-    coord._get_weather_wind_unit.return_value = "km/h"
-    coord._get_cloud_coverage.return_value = 50.0
-    coord._calculate_weighted_inertia.return_value = 10.0
-    coord._calculate_effective_wind.return_value = 5.0
-    coord._get_wind_bucket.return_value = "normal"
-    # Mock statistics
-    coord.statistics = MagicMock()
-    coord.statistics.calculate_total_power.return_value = {
-        "total_kwh": 5.0, # Default future pred
+def test_load_trend_increasing(mock_coordinator):
+    """Test load trend calculation when increasing."""
+    # Specialized setup
+    mock_coordinator._get_weather_wind_unit.return_value = "km/h"
+    mock_coordinator._get_cloud_coverage.return_value = 50.0
+    mock_coordinator._calculate_weighted_inertia.return_value = 10.0
+    mock_coordinator._calculate_effective_wind.return_value = 5.0
+    mock_coordinator._get_wind_bucket.return_value = "normal"
+    mock_coordinator._get_inertia_list.return_value = [10.0, 10.0, 10.0]
+    mock_coordinator.statistics.calculate_total_power.return_value = {
+        "total_kwh": 5.0,
         "breakdown": {"solar_reduction_kwh": 0.0},
         "unit_breakdown": {}
     }
 
-    # Mock inertia list
-    coord._get_inertia_list.return_value = [10.0, 10.0, 10.0]
-
-    return coord
-
-def test_load_trend_increasing(mock_coordinator):
-    """Test load trend calculation when increasing."""
     forecast = ForecastManager(mock_coordinator)
 
     # Setup Past Data (Low Load)
@@ -77,6 +64,19 @@ def test_load_trend_increasing(mock_coordinator):
 
 def test_load_trend_easing(mock_coordinator):
     """Test load trend calculation when decreasing."""
+    # Specialized setup
+    mock_coordinator._get_weather_wind_unit.return_value = "km/h"
+    mock_coordinator._get_cloud_coverage.return_value = 50.0
+    mock_coordinator._calculate_weighted_inertia.return_value = 10.0
+    mock_coordinator._calculate_effective_wind.return_value = 5.0
+    mock_coordinator._get_wind_bucket.return_value = "normal"
+    mock_coordinator._get_inertia_list.return_value = [10.0, 10.0, 10.0]
+    mock_coordinator.statistics.calculate_total_power.return_value = {
+        "total_kwh": 5.0,
+        "breakdown": {"solar_reduction_kwh": 0.0},
+        "unit_breakdown": {}
+    }
+
     forecast = ForecastManager(mock_coordinator)
 
     # Setup Past Data (High Load)
@@ -115,6 +115,19 @@ def test_load_trend_easing(mock_coordinator):
 
 def test_load_trend_stable(mock_coordinator):
     """Test load trend calculation when stable."""
+    # Specialized setup
+    mock_coordinator._get_weather_wind_unit.return_value = "km/h"
+    mock_coordinator._get_cloud_coverage.return_value = 50.0
+    mock_coordinator._calculate_weighted_inertia.return_value = 10.0
+    mock_coordinator._calculate_effective_wind.return_value = 5.0
+    mock_coordinator._get_wind_bucket.return_value = "normal"
+    mock_coordinator._get_inertia_list.return_value = [10.0, 10.0, 10.0]
+    mock_coordinator.statistics.calculate_total_power.return_value = {
+        "total_kwh": 5.0,
+        "breakdown": {"solar_reduction_kwh": 0.0},
+        "unit_breakdown": {}
+    }
+
     forecast = ForecastManager(mock_coordinator)
 
     mock_coordinator.data["current_model_rate"] = 2.0

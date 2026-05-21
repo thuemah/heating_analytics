@@ -39,36 +39,6 @@ from custom_components.heating_analytics.sensor import (
 from datetime import date, datetime
 from homeassistant.util import dt as dt_util
 
-@pytest.fixture
-def mock_coordinator():
-    coordinator = MagicMock()
-    coordinator.data = {}
-    # Initialize internal stats
-    coordinator._hourly_log = []
-    coordinator._collector.bucket_counts = {"with_auxiliary_heating": 0}
-    coordinator._collector.sample_count = 0
-    coordinator._collector.wind_sum = 0.0
-    coordinator.wind_unit = "m/s"
-    coordinator.wind_threshold = 5.5
-    coordinator.extreme_wind_threshold = 10.8
-    coordinator.wind_gust_factor = 0.6
-
-    # Mock helpers
-    coordinator._get_wind_bucket.return_value = "normal"
-    coordinator.forecast.get_future_day_prediction.return_value = (10.0, 0.0, {"temp": 5.0, "wind": 3.0})
-    coordinator.calculate_modeled_energy.return_value = (100.0, 0.0, 5.0, 3.0, 10.0)
-    coordinator.statistics.calculate_historical_actual_sum.return_value = 90.0
-    coordinator.statistics.calculate_hybrid_projection.return_value = (120.0, 5.0)
-    coordinator.forecast.calculate_future_energy.return_value = (10.0, 2.0, None)
-
-    return coordinator
-
-@pytest.fixture
-def mock_entry():
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    entry.title = "Test Heating"
-    return entry
 
 @pytest.mark.asyncio
 async def test_energy_today_sensor(hass: HomeAssistant, mock_coordinator, mock_entry):
@@ -97,12 +67,14 @@ async def test_energy_today_sensor(hass: HomeAssistant, mock_coordinator, mock_e
     assert attrs["unit_contribution_pct"] == {"Heater 1": 60.8, "Heater 2": 39.2}
     assert attrs["active_units_count"] == 2
 
+
 @pytest.mark.asyncio
 async def test_expected_today_sensor(hass: HomeAssistant, mock_coordinator, mock_entry):
     """Test HeatingExpectedEnergyTodaySensor."""
     mock_coordinator.data = {ATTR_EXPECTED_TODAY: 24.0}
     sensor = HeatingExpectedEnergyTodaySensor(mock_coordinator, mock_entry)
     assert sensor.native_value == 24.0
+
 
 @pytest.mark.asyncio
 async def test_predicted_sensor(hass: HomeAssistant, mock_coordinator, mock_entry):
@@ -117,6 +89,7 @@ async def test_predicted_sensor(hass: HomeAssistant, mock_coordinator, mock_entr
     assert sensor.native_value == 30.0
     assert sensor.extra_state_attributes["cached_total_24h"] == 28.0
 
+
 @pytest.mark.asyncio
 async def test_effective_wind_sensor(hass: HomeAssistant, mock_coordinator, mock_entry):
     """Test HeatingEffectiveWindSensor."""
@@ -130,6 +103,7 @@ async def test_effective_wind_sensor(hass: HomeAssistant, mock_coordinator, mock
     attrs = sensor.extra_state_attributes
     assert attrs["running_average_this_hour"] == 4.8
     assert attrs["data_quality"] == "partial" # < 30 samples
+
 
 @pytest.mark.asyncio
 async def test_correlation_data_sensor(hass: HomeAssistant, mock_coordinator, mock_entry):
@@ -150,6 +124,7 @@ async def test_correlation_data_sensor(hass: HomeAssistant, mock_coordinator, mo
     assert "normal_x" in attrs
     # JSON array [ -5, 0 ]
     assert '[-5, 0]' in attrs["normal_x"] or '[-5,0]' in attrs["normal_x"]
+
 
 @pytest.mark.asyncio
 async def test_last_hour_sensors(hass: HomeAssistant, mock_coordinator, mock_entry):
@@ -186,9 +161,14 @@ async def test_last_hour_sensors(hass: HomeAssistant, mock_coordinator, mock_ent
     assert attrs_dev["percentage"] == -10.0
     assert attrs_dev["model_delta"] == "+0.10000"
 
+
 @pytest.mark.asyncio
 async def test_model_comparison_sensors(hass: HomeAssistant, mock_coordinator, mock_entry):
     """Test Model Comparison Sensors."""
+    # Setup mocks specific to comparison
+    mock_coordinator.calculate_modeled_energy.return_value = (100.0, 0.0, 5.0, 3.0, 10.0)
+    mock_coordinator.statistics.calculate_hybrid_projection.return_value = (120.0, 5.0)
+    mock_coordinator._get_wind_bucket.return_value = "normal"
 
     # Mock dt_util.now to avoid MagicMock comparison errors in _calculate_period_stats
     with patch("custom_components.heating_analytics.sensor.dt_util.now") as mock_now:
@@ -229,6 +209,7 @@ async def test_model_comparison_sensors(hass: HomeAssistant, mock_coordinator, m
         # Diff = -80.0
         sensor_month = HeatingModelComparisonMonthSensor(mock_coordinator, mock_entry)
         assert sensor_month.native_value == -80.0
+
 
 @pytest.mark.asyncio
 async def test_week_ahead_forecast_sensor(hass: HomeAssistant, mock_coordinator, mock_entry):

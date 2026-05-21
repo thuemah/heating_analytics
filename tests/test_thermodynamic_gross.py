@@ -73,13 +73,13 @@ async def test_hourly_thermodynamic_gross(hass: HomeAssistant):
         assert log["actual_kwh"] == 5.0
         assert log["aux_impact_kwh"] == 2.0
         # Solar impact is battery-smoothed (EMA): first hour = raw * (1 - decay)
-        assert log["solar_impact_kwh"] == pytest.approx(0.5 * 0.20, abs=0.01)
+        assert log["solar_impact_kwh"] == pytest.approx(0.5 * 0.50, abs=0.01)
 
         # THE NEW FIELD
         # Should be Actual + Aux + Solar (battery-smoothed)
-        # 5.0 + 2.0 + 0.125 = 7.125
+        # 5.0 + 2.0 + 0.25 = 7.25
         assert "thermodynamic_gross_kwh" in log
-        assert log["thermodynamic_gross_kwh"] == pytest.approx(5.0 + 2.0 + 0.5 * 0.20, abs=0.01)
+        assert log["thermodynamic_gross_kwh"] == pytest.approx(5.0 + 2.0 + 0.5 * 0.50, abs=0.01)
 
 
 class TestThermodynamicGrossModeAware:
@@ -151,9 +151,9 @@ class TestThermodynamicGrossModeAware:
         log = coord._hourly_log[-1]
         # Cooling solar was applied additively (solar.calculate_saturation
         # mode-cooling branch returns added=potential).  Battery EMA
-        # smooths it: first hour = 0.5 * 0.20 = 0.1.  All units cooling →
-        # share = 1 cooling, signed_fraction = -1.  gross = actual + 0 - 0.1.
-        assert log["thermodynamic_gross_kwh"] == pytest.approx(5.0 - 0.1, abs=0.01)
+        # smooths it: first hour = 0.5 * 0.50 = 0.25.  All units cooling →
+        # share = 1 cooling, signed_fraction = -1.  gross = actual + 0 - 0.25.
+        assert log["thermodynamic_gross_kwh"] == pytest.approx(5.0 - 0.25, abs=0.01)
 
     @pytest.mark.asyncio
     async def test_residual_battery_no_active_units_drops_adjustment(self, hass: HomeAssistant):

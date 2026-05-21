@@ -1,33 +1,10 @@
 """Test sensors module."""
-from unittest.mock import MagicMock
 import pytest
 import json
-from homeassistant.const import EntityCategory
 from custom_components.heating_analytics.sensor import HeatingCorrelationDataSensor
 from custom_components.heating_analytics.const import ATTR_CORRELATION_DATA
 
-@pytest.fixture
-def mock_hass():
-    """Mock Home Assistant."""
-    return MagicMock()
-
-@pytest.fixture
-def mock_entry():
-    """Mock Config Entry."""
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    return entry
-
-@pytest.fixture
-def mock_coordinator():
-    """Mock Coordinator."""
-    coord = MagicMock()
-    coord.data = {}
-    # FIX: Add _aux_coefficients
-    coord._aux_coefficients = {}
-    return coord
-
-def test_correlation_sensor_attributes(mock_hass, mock_entry, mock_coordinator):
+def test_correlation_sensor_attributes(mock_entry, mock_coordinator):
     """Test that the correlation sensor returns correctly formatted attributes as JSON strings."""
 
     # Mock data in coordinator

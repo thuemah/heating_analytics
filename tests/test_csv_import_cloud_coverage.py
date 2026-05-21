@@ -1,40 +1,25 @@
 """Test CSV Import with Cloud Coverage Support."""
 import pytest
 from unittest.mock import MagicMock, patch, mock_open
-from datetime import datetime
 from custom_components.heating_analytics.storage import StorageManager
-from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
-
-
-@pytest.fixture
-def mock_coordinator():
-    coord = MagicMock(spec=HeatingDataCoordinator)
-    coord.entry = MagicMock()
-    coord.entry.entry_id = "test_entry"
-    coord.hass = MagicMock()
-    coord.hass.async_add_executor_job = lambda fn: fn()
-    coord.balance_point = 15.0
-    coord._hourly_log = []
-    coord._daily_history = {}
-    coord._calculate_effective_wind = lambda ws, wg: ws
-    coord._get_wind_bucket = lambda w: "normal"
-    coord.solar_enabled = True
-    coord.learning_enabled = False
-
-    # Mock solar manager
-    coord.solar = MagicMock()
-    coord.solar.get_approx_sun_pos = MagicMock(return_value=(30.0, 180.0))  # elevation, azimuth
-    coord.solar.calculate_solar_factor = MagicMock(return_value=0.5)  # Mock solar factor
-
-    # Mock aggregation
-    coord._aggregate_daily_logs = MagicMock(return_value={})
-    coord._backfill_daily_from_hourly = MagicMock()
-
-    return coord
 
 
 @pytest.fixture
 def storage_manager(mock_coordinator):
+    """Storage manager with mocked coordinator setup."""
+    mock_coordinator.hass.async_add_executor_job = lambda fn: fn()
+    mock_coordinator.balance_point = 15.0
+    mock_coordinator.learning_enabled = False
+
+    # Mock solar manager
+    mock_coordinator.solar = MagicMock()
+    mock_coordinator.solar.get_approx_sun_pos = MagicMock(return_value=(30.0, 180.0))  # elevation, azimuth
+    mock_coordinator.solar.calculate_solar_factor = MagicMock(return_value=0.5)  # Mock solar factor
+
+    # Mock aggregation
+    mock_coordinator._aggregate_daily_logs = MagicMock(return_value={})
+    mock_coordinator._backfill_daily_from_hourly = MagicMock()
+
     return StorageManager(mock_coordinator)
 
 

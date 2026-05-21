@@ -1,47 +1,33 @@
 """Test CSV Import Weather-Only Mode."""
 import pytest
 from unittest.mock import MagicMock, patch, mock_open
-from datetime import datetime
 from custom_components.heating_analytics.storage import StorageManager
-from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
-from homeassistant.util import dt as dt_util
-
-
-@pytest.fixture
-def mock_coordinator():
-    coord = MagicMock(spec=HeatingDataCoordinator)
-    coord.entry = MagicMock()
-    coord.entry.entry_id = "test_entry"
-    coord.hass = MagicMock()
-    # Mock executor to run immediately
-    async def async_add_executor_job(fn, *args, **kwargs):
-        return fn(*args, **kwargs)
-    coord.hass.async_add_executor_job = async_add_executor_job
-
-    coord.balance_point = 15.0
-    coord._hourly_log = []
-    coord._hourly_log_max_entries = 2160
-    coord._daily_history = {}
-    coord._calculate_effective_wind = lambda ws, wg: ws
-    coord._get_wind_bucket = lambda w: "normal"
-    coord.solar_enabled = True
-    coord.learning_enabled = False
-
-    # Mock solar manager
-    coord.solar = MagicMock()
-    coord.solar.get_approx_sun_pos = MagicMock(return_value=(30.0, 180.0))
-    coord.solar.calculate_solar_factor = MagicMock(return_value=0.5)
-
-    # Mock aggregation
-    coord._aggregate_daily_logs = MagicMock(return_value={})
-    # Mock backfill (should not destroy our manual updates if logic is correct)
-    coord._backfill_daily_from_hourly = MagicMock(return_value=0)
-
-    return coord
 
 
 @pytest.fixture
 def storage_manager(mock_coordinator):
+    """Storage manager with pre-configured coordinator for CSV tests."""
+    # Mock executor to run immediately
+    async def async_add_executor_job(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    mock_coordinator.hass.async_add_executor_job = async_add_executor_job
+
+    mock_coordinator.balance_point = 15.0
+    mock_coordinator._hourly_log_max_entries = 2160
+    mock_coordinator.learning_enabled = False
+    
+    # Mock aggregation and backfill
+    mock_coordinator._aggregate_daily_logs = MagicMock(return_value={})
+    mock_coordinator._backfill_daily_from_hourly = MagicMock(return_value=0)
+    
+    # Functional mocks used by import
+    mock_coordinator._calculate_effective_wind = lambda ws, wg: ws
+    mock_coordinator._get_wind_bucket = lambda w: "normal"
+
+    # Mock solar manager
+    mock_coordinator.solar.get_approx_sun_pos = MagicMock(return_value=(30.0, 180.0))
+    mock_coordinator.solar.calculate_solar_factor = MagicMock(return_value=0.5)
+
     return StorageManager(mock_coordinator)
 
 

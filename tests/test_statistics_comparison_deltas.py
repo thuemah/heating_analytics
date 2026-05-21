@@ -10,12 +10,12 @@ from custom_components.heating_analytics.const import (
     ATTR_SOLAR_PREDICTED,
 )
 
-@pytest.fixture
-def mock_coordinator():
-    coordinator = MagicMock()
+@pytest.mark.asyncio
+async def test_compare_periods_deltas(mock_coordinator):
+    """Test that compare_periods returns deltas and semantic analysis."""
     # Both periods must be in the past relative to conftest now (2023-01-01 12:00 UTC)
     # so that _determine_basis returns "actual" for both.
-    coordinator._daily_history = {
+    mock_coordinator._daily_history = {
         # Reference Period: Dec 1-2, 2021
         "2021-12-01": {"kwh": 10.0, "temp": 5.0, "wind": 2.0, "tdd": 15.0},
         "2021-12-02": {"kwh": 12.0, "temp": 6.0, "wind": 3.0, "tdd": 14.0},
@@ -32,22 +32,21 @@ def mock_coordinator():
         else:
             return (30.0, 0.0, 3.5, 4.5, 33.0)
 
-    coordinator.calculate_modeled_energy = MagicMock(side_effect=side_effect_calc)
+    mock_coordinator.calculate_modeled_energy = MagicMock(side_effect=side_effect_calc)
 
     # Mock forecast for future dates
-    coordinator.forecast = MagicMock()
     def get_forecast_side_effect(date_obj, initial_inertia=None, ignore_aux=False):
         if date_obj.day == 1:
             return (15.0, 0.0, {"temp": 4.0, "wind": 4.0})
         else:
             return (18.0, 0.0, {"temp": 3.0, "wind": 5.0})
-    coordinator.forecast.get_future_day_prediction.side_effect = get_forecast_side_effect
+    mock_coordinator.forecast.get_future_day_prediction.side_effect = get_forecast_side_effect
 
     # Mock calculate_future_energy for Today logic (if hit)
-    coordinator.forecast.calculate_future_energy.return_value = (5.0, 0.0, {})
+    mock_coordinator.forecast.calculate_future_energy.return_value = (5.0, 0.0, {})
 
     # Mock coordinator data for Today logic
-    coordinator.data = {
+    mock_coordinator.data = {
         ATTR_TEMP_ACTUAL_TODAY: 5.0,
         ATTR_WIND_ACTUAL_TODAY: 2.0,
         ATTR_ENERGY_TODAY: 0.0,
@@ -55,12 +54,8 @@ def mock_coordinator():
     }
 
     # Mock helper method
-    coordinator._get_wind_bucket.return_value = "normal"
+    mock_coordinator._get_wind_bucket.return_value = "normal"
 
-    return coordinator
-
-def test_compare_periods_deltas(mock_coordinator):
-    """Test that compare_periods returns deltas and semantic analysis."""
     stats = StatisticsManager(mock_coordinator)
 
     stats.calculate_historical_actual_sum = MagicMock(side_effect=lambda s, e: 22.0 if s.year == 2021 else 33.0)

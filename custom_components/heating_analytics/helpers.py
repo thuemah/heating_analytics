@@ -7,6 +7,7 @@ from homeassistant.const import UnitOfSpeed
 
 _LOGGER = logging.getLogger(__name__)
 
+
 def convert_speed_to_ms(value: float, unit: str | None) -> float:
     """Convert speed to m/s."""
     if not unit:
@@ -105,6 +106,63 @@ def generate_exponential_kernel(tau: float, window_hours: int = 168) -> tuple[fl
     return tuple(w / total for w in reversed(weights))
 
 
+def solve_gauss_jordan(
+    A: list[list[float]],
+    b: list[float],
+    *,
+    ridge: float = 0.0,
+    pivot_eps: float = 1e-12,
+) -> list[float] | None:
+    """Solve ``A · x = b`` via Gauss-Jordan elimination with partial pivoting.
+
+    Dimension-agnostic — handles any square ``N×N`` system.  Returns the
+    solution as a list of length ``N``, or ``None`` if the matrix is
+    singular (any pivot magnitude < ``pivot_eps``).
+
+    ``ridge`` adds a Tikhonov term to the diagonal before elimination
+    (``A[i][i] += ridge``).  Used by the Tobit Newton step to guard
+    rank-deficient Hessians at active-set boundaries.
+
+    Pure Python — no numpy.  Inputs are not mutated; a working copy is
+    built internally.
+    """
+    n = len(A)
+    if n == 0 or len(b) != n:
+        return None
+    # Augmented [A | b] working matrix.
+    M = [list(row) + [b[i]] for i, row in enumerate(A)]
+    if ridge:
+        for i in range(n):
+            M[i][i] += ridge
+
+    for col in range(n):
+        pivot_row = col
+        pivot_val = abs(M[col][col])
+        for r in range(col + 1, n):
+            if abs(M[r][col]) > pivot_val:
+                pivot_val = abs(M[r][col])
+                pivot_row = r
+        if pivot_val < pivot_eps:
+            return None
+        if pivot_row != col:
+            M[col], M[pivot_row] = M[pivot_row], M[col]
+
+        pivot = M[col][col]
+        for j in range(col, n + 1):
+            M[col][j] /= pivot
+
+        for r in range(n):
+            if r == col:
+                continue
+            factor = M[r][col]
+            if factor == 0.0:
+                continue
+            for j in range(col, n + 1):
+                M[r][j] -= factor * M[col][j]
+
+    return [M[i][n] for i in range(n)]
+
+
 def generate_gaussian_kernel(hours: int) -> tuple[float, ...]:
     """Generate a Gaussian/Bell-curve kernel for the given number of hours."""
     if hours == 1:
@@ -122,3 +180,49 @@ def generate_gaussian_kernel(hours: int) -> tuple[float, ...]:
 
     total = sum(weights)
     return tuple(w / total for w in weights)
+
+
+def compute_base_ema_step(
+    current_bucket: float,
+    target: float,
+    learning_rate: float,
+    snr_weight: float,
+) -> tuple[float, float]:
+    """Pure-math kernel for the base-model EMA step (#967).
+
+    The single arithmetic source of truth for the formula
+
+        step       = learning_rate × snr_weight × (target − current_bucket)
+        new_bucket = current_bucket + step
+
+    Centralised here so diagnostic simulations and live learning provably
+    use the same arithmetic — see #967 for the silent-drift hazard that
+    motivated the extraction (if the live formula evolves without the
+    diagnostic being patched in lockstep, ``base_model_4d_shadow`` and
+    the promotion-gate metrics it feeds would silently characterise a
+    model that no longer matches production).
+
+    Caller owns:
+
+    - Target construction (e.g. ``max(0, actual + delta)`` for the lift
+      path, ``total_energy_kwh`` for the legacy path).
+    - ``snr_weight`` computation via :func:`learning.compute_snr_weight`.
+    - Post-step rounding or clamping (live learning rounds to 5 decimals
+      before storing; diagnostic simulations leave the float unrounded).
+    - Buffer-jumpstart vs EMA branching for cold-start (only applies to
+      the live writer; diagnostic seeds from the current bucket).
+
+    Returns ``(new_bucket_value, applied_step_size)``.  The step is
+    returned separately so step-RMS jitter diagnostics can read it
+    without re-deriving from the bucket delta.
+
+    #967 staging: this kernel currently has one consumer in
+    ``diagnostics._compute_base_model_4d_shadow_report``.  The live
+    ``learning.process_learning`` writer applies the same formula inline
+    at ``learning.py:990``; routing it through this helper is deferred
+    until 4D-primary observation has stabilised so a refactor regression
+    does not confound 4D-promotion attribution.  See the TODO marker at
+    that call site.
+    """
+    step = learning_rate * snr_weight * (target - current_bucket)
+    return current_bucket + step, step

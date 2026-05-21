@@ -5,7 +5,7 @@ Stage 3 ships behind the experimental_tobit_live_learner master flag
 gates pass, qualifying-hour samples flow to ``_update_unit_tobit_live``
 which maintains a sliding window of recent (s, e, w, value, censored)
 tuples per (entity, regime) and runs one Newton iteration of
-``_solve_tobit_3d`` over the current window each hour.
+``_solve_tobit`` over the current window each hour.
 
 Coverage in this file:
 
@@ -104,7 +104,7 @@ def test_sliding_window_tobit_matches_batch():
     mask = [s[4] for s in samples_with_mask]
 
     # Batch: directly call the solver on the full list.
-    batch_fit = LearningManager._solve_tobit_3d(samples_4, mask)
+    batch_fit = LearningManager._solve_tobit(samples_4, mask, components=('s', 'e', 'w'))
     assert batch_fit is not None and batch_fit["converged"]
 
     # Sliding-window: simulate the live learner appending one hour at a
@@ -426,7 +426,7 @@ def test_live_update_does_not_censor_cooling():
 # -----------------------------------------------------------------------------
 
 def test_failure_reason_propagates_via_live_update(monkeypatch):
-    """When ``_solve_tobit_3d`` returns ``converged=False`` with a
+    """When ``_solve_tobit`` returns ``converged=False`` with a
     failure_reason, the live update records it on the slot and
     reports applied=False.  Pin contract: caller can rely on
     ``last_step_failure_reason`` for diagnose surfacing.
@@ -445,7 +445,7 @@ def test_failure_reason_propagates_via_live_update(monkeypatch):
         }
     monkeypatch.setattr(
         LearningManager,
-        "_solve_tobit_3d",
+        "_solve_tobit",
         staticmethod(_fake_solver),
     )
 
@@ -519,6 +519,9 @@ def test_reset_solar_learning_clears_tobit_state(monkeypatch):
     coord._shadow_learning_buffer_solar_per_unit = {
         "sensor.test": {"heating": [], "cooling": []},
     }
+    # #954: parallel 4D scaffolding cleared in lock-step.
+    coord._solar_coefficients_4d_per_unit = {"sensor.test": {}}
+    coord._learning_buffer_solar_4d_per_unit = {"sensor.test": {}}
     coord._solar_carryover_state = 0.5
     coord.hass = MagicMock()
     coord.entry = MagicMock()
@@ -549,6 +552,9 @@ def test_reset_all_units_clears_global_tobit_state():
     coord._tobit_sufficient_stats = {"sensor.a": {}, "sensor.b": {}}
     coord._nlms_shadow_coefficients = {"sensor.a": {}, "sensor.b": {}}
     coord._shadow_learning_buffer_solar_per_unit = {"sensor.a": {}, "sensor.b": {}}
+    # #954: parallel 4D scaffolding cleared in lock-step.
+    coord._solar_coefficients_4d_per_unit = {"sensor.a": {}, "sensor.b": {}}
+    coord._learning_buffer_solar_4d_per_unit = {"sensor.a": {}, "sensor.b": {}}
     coord._solar_carryover_state = 0.5
     coord.hass = MagicMock()
     coord.entry = MagicMock()
@@ -796,7 +802,7 @@ def test_plausibility_blocks_no_uncensored_signal(monkeypatch):
         return {"s": 0.05, "e": 0.03, "w": 0.02}
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -840,7 +846,7 @@ def test_plausibility_passes_legitimate_vp(monkeypatch):
         return {"s": 0.33, "e": 0.10, "w": 0.05}
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -888,7 +894,7 @@ def test_plausibility_passes_at_threshold(monkeypatch):
         return {"s": PLAUSIBILITY_MIN_OLS_MAX_DIRECTION, "e": 0.0, "w": 0.0}
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -932,7 +938,7 @@ def test_plausibility_blocks_just_below(monkeypatch):
         }
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -977,7 +983,7 @@ def test_plausibility_skipped_when_tobit_near_zero(monkeypatch):
         return {"s": 0.0, "e": 0.0, "w": 0.0}
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1021,7 +1027,7 @@ def test_plausibility_skipped_when_ols_returns_none(monkeypatch):
         }
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1307,7 +1313,7 @@ def _generate_synthetic_window(
 
 
 def test_production_tobit_converges_from_biased_warmstart():
-    """Production-realistic test: real ``_solve_tobit_3d`` solver,
+    """Production-realistic test: real ``_solve_tobit`` solver,
     biased warm-start coefficient, and the LS-fallback fix.  This is
     the test that would have caught the original Stage-3 architectural
     bug — without LS-fallback, Tobit Newton fails line-search from
@@ -1378,8 +1384,9 @@ def test_production_tobit_converges_from_biased_warmstart():
     final_samples = stats["sensor.test"]["heating"]["samples"]
     samples_4tup = [(s[0], s[1], s[2], s[3]) for s in final_samples]
     mask = [s[4] for s in final_samples]
-    ls_target_fit = LearningManager._solve_tobit_3d(
+    ls_target_fit = LearningManager._solve_tobit(
         samples_4tup, mask, coeff_init=None,
+        components=('s', 'e', 'w'),
     )
     target_w = ls_target_fit["w"]
 
@@ -1468,7 +1475,7 @@ def test_production_tobit_basin_via_ls_fallback():
 
 
 def test_solver_sigma_init_extends_newton_progress_on_biased_warmstart():
-    """Defense-in-depth: when ``_solve_tobit_3d`` is called with a
+    """Defense-in-depth: when ``_solve_tobit`` is called with a
     biased ``coeff_init``, σ-init must come from LS residuals (not
     biased-c residuals).  Pre-fix, σ was inflated 5-10× by the biased
     SSE → Newton over-corrected σ on iter 1 → line search failed
@@ -1503,8 +1510,9 @@ def test_solver_sigma_init_extends_newton_progress_on_biased_warmstart():
     mask = [s[4] for s in samples_with_mask]
     biased_warm = {"s": 0.0, "e": 0.0, "w": 0.55}
 
-    fit = LearningManager._solve_tobit_3d(
+    fit = LearningManager._solve_tobit(
         samples_4tup, mask, coeff_init=biased_warm,
+        components=('s', 'e', 'w'),
     )
     assert fit is not None
     assert fit["iterations"] >= 4, (
@@ -1547,7 +1555,7 @@ def test_plausibility_skipped_on_cooling_regime(monkeypatch):
         )
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1597,7 +1605,7 @@ def test_plausibility_blocks_direction_mismatch(monkeypatch):
         return {"s": 0.0, "e": 0.30, "w": 0.0}
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1644,7 +1652,7 @@ def test_plausibility_passes_aligned_directions(monkeypatch):
         return {"s": 0.0, "e": 0.05, "w": 0.30}
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1697,7 +1705,7 @@ def test_rate_limit_fires_on_large_step(monkeypatch):
         return {"s": 0.0, "e": 0.0, "w": 0.50}  # passes magnitude + direction
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1766,7 +1774,7 @@ def test_no_rate_limit_when_prior_below_cushion_floor(monkeypatch):
         }
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1822,7 +1830,7 @@ def test_rate_limit_multi_hour_soft_convergence(monkeypatch):
         }
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1900,7 +1908,7 @@ def test_rate_limit_fires_on_cooling_too(monkeypatch):
         )
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -1958,7 +1966,7 @@ def test_rate_limit_respects_solar_coeff_cap(monkeypatch):
         }
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,
@@ -2016,7 +2024,7 @@ def test_log_severity_transitions_from_info_to_debug(monkeypatch, caplog):
         }
 
     monkeypatch.setattr(
-        LearningManager, "_solve_tobit_3d", staticmethod(_fake_tobit),
+        LearningManager, "_solve_tobit", staticmethod(_fake_tobit),
     )
     monkeypatch.setattr(
         LearningManager,

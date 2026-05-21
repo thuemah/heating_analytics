@@ -1,25 +1,11 @@
 """Test HeatingModelComparisonWeekSensor for Hybrid correctness."""
 from unittest.mock import MagicMock, patch
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import pytest
 from homeassistant.core import HomeAssistant
-from homeassistant.util import dt as dt_util
 
 from custom_components.heating_analytics.sensors.comparison import HeatingModelComparisonWeekSensor
 from custom_components.heating_analytics.const import ATTR_ENERGY_TODAY, ATTR_SOLAR_PREDICTED, ATTR_TEMP_ACTUAL_TODAY, ATTR_WIND_ACTUAL_TODAY
-
-@pytest.fixture
-def mock_coordinator():
-    coordinator = MagicMock()
-    coordinator.data = {}
-    coordinator._daily_history = {}
-    return coordinator
-
-@pytest.fixture
-def mock_entry():
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    return entry
 
 @pytest.mark.asyncio
 async def test_comparison_sensor_hybrid_calculation(hass: HomeAssistant, mock_coordinator, mock_entry):
@@ -113,3 +99,68 @@ async def test_comparison_sensor_hybrid_calculation(hass: HomeAssistant, mock_co
 
         # Verify Hybrid is DIFFERENT from Model
         assert attrs["current_hybrid_kwh"] != attrs["current_model_kwh"]
+
+
+@pytest.mark.asyncio
+async def test_comparison_sensor_prefetches_log_map_once_per_period(
+    hass: HomeAssistant, mock_coordinator, mock_entry
+):
+    """Regression: month/week sensor must pre-fetch _get_daily_log_map once per
+    period, not once per day. Without this, year-old date lookups re-scan the
+    reversed hourly_log per day and block the HA event loop (~0.7 s for a month).
+    """
+    from custom_components.heating_analytics.sensors.comparison import (
+        HeatingModelComparisonMonthSensor,
+    )
+
+    today = date(2023, 10, 25)
+
+    with patch("homeassistant.util.dt.now", return_value=datetime(2023, 10, 25, 12, 0, 0)):
+        # Populate at least one historical entry in each period so that the
+        # _get_historical_day path actually invokes calculate_modeled_energy.
+        mock_coordinator._daily_history = {
+            "2023-10-01": {"temp": 5.0, "wind": 3.0, "kwh": 100.0},
+            "2022-10-01": {"temp": 5.0, "wind": 3.0, "kwh": 100.0},
+        }
+        mock_coordinator.data = {
+            ATTR_ENERGY_TODAY: 0.0,
+            ATTR_TEMP_ACTUAL_TODAY: 5.0,
+            ATTR_WIND_ACTUAL_TODAY: 3.0,
+            ATTR_SOLAR_PREDICTED: 0.0,
+        }
+        mock_coordinator.forecast.calculate_future_energy.return_value = (0.0, 0.0, {})
+        mock_coordinator.forecast.get_future_day_prediction.side_effect = (
+            lambda d, i=None, ignore_aux=False: (0.0, 0.0, {"temp": 5.0, "wind": 3.0})
+        )
+        mock_coordinator.calculate_modeled_energy.return_value = (0.0, 0.0, 5.0, 3.0, 0.0)
+        mock_coordinator.statistics.calculate_hybrid_projection.return_value = (0.0, 0.0)
+        mock_coordinator.statistics.calculate_historical_actual_sum.return_value = 0.0
+        mock_coordinator.statistics._get_daily_log_map.return_value = {}
+        mock_coordinator._get_wind_bucket.return_value = "normal"
+
+        sensor = HeatingModelComparisonMonthSensor(mock_coordinator, mock_entry)
+        sensor.hass = hass
+        sensor.async_write_ha_state = MagicMock()
+
+        _ = sensor.extra_state_attributes
+
+        # Month has up to 31 days in current period + 31 in last-year period; the
+        # pre-fetch must collapse both into a single call each, not per-day.
+        # Allow a small constant (current + last-year + day-comparison fallback);
+        # the regression we're guarding against would push this to ~62+.
+        assert mock_coordinator.statistics._get_daily_log_map.call_count <= 4, (
+            f"Expected pre-fetch to batch log-map lookups per period; got "
+            f"{mock_coordinator.statistics._get_daily_log_map.call_count} calls"
+        )
+
+        # And calculate_modeled_energy must receive the pre-fetched map for
+        # historical-day calls inside the period build.
+        prefetch_calls = [
+            c
+            for c in mock_coordinator.calculate_modeled_energy.call_args_list
+            if len(c.args) >= 3 and c.args[2] is not None
+        ]
+        assert prefetch_calls, (
+            "calculate_modeled_energy was never called with pre_fetched_logs; "
+            "comparison sensor regressed to per-day log scans"
+        )

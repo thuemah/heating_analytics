@@ -377,11 +377,15 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
         solar_impact = coordinator.data.get(ATTR_SOLAR_IMPACT, 0.0)
 
         # 1. Wind Penalty (Effective Wind vs 0 Wind)
+        # Sensitivity / "what-if" attributes — force_3d keeps the diagnostic
+        # tied to the 3D rollback model regardless of experimental_4d_primary.
         res_actual = stats_mgr.calculate_total_power(
-            current_temp, eff_wind, solar_impact, is_aux_active=coordinator.auxiliary_heating_active
+            current_temp, eff_wind, solar_impact, is_aux_active=coordinator.auxiliary_heating_active,
+            force_3d=True,
         )
         res_no_wind = stats_mgr.calculate_total_power(
-            current_temp, 0.0, solar_impact, is_aux_active=coordinator.auxiliary_heating_active
+            current_temp, 0.0, solar_impact, is_aux_active=coordinator.auxiliary_heating_active,
+            force_3d=True,
         )
         wind_penalty_rate = max(0.0, res_actual["total_kwh"] - res_no_wind["total_kwh"])
 
@@ -402,7 +406,8 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
             res_max_solar = stats_mgr.calculate_total_power(
                 current_temp, eff_wind, solar_impact,
                 is_aux_active=coordinator.auxiliary_heating_active,
-                override_solar_factor=max_solar_factor
+                override_solar_factor=max_solar_factor,
+                force_3d=True,
             )
             max_potential_gain = res_max_solar["breakdown"]["solar_reduction_kwh"]
             solar_deficit_rate = max(0.0, max_potential_gain - solar_gain_rate)
@@ -1111,7 +1116,7 @@ class HeatingLastHourExpectedSensor(HeatingAnalyticsBaseSensor):
 
         last_entry = self.coordinator.model.hourly_log[-1]
         expected = last_entry.get("expected_kwh", 0.0)
-        solar_impact = last_entry.get("solar_impact_kwh", 0.0)
+        solar_impact = self.coordinator.hourly_solar_impact_kwh(last_entry)
 
         # Base Model = Expected (Net) + Solar Deduction
         # Since solar adjustment is subtracted from base: Corrected = Base - Impact
@@ -1154,7 +1159,7 @@ class HeatingLastHourDeviationSensor(HeatingAnalyticsBaseSensor):
         if self.coordinator.model.hourly_log:
             last_entry = self.coordinator.model.hourly_log[-1]
             last_hour_wind_bucket = last_entry.get("wind_bucket")
-            last_hour_solar_impact = last_entry.get("solar_impact_kwh", 0.0)
+            last_hour_solar_impact = self.coordinator.hourly_solar_impact_kwh(last_entry)
             last_hour_aux_impact = last_entry.get("aux_impact_kwh", 0.0)
             last_hour_guest_impact = last_entry.get("guest_impact_kwh", 0.0)
             last_hour_timestamp = last_entry.get("timestamp")
@@ -1607,7 +1612,17 @@ class HeatingDeviceDailySensor(HeatingAnalyticsBaseSensor):
             coeff_present = False
         buffer_len = len(buffer) if isinstance(buffer, (list, tuple)) else 0
 
-        if not coeff_present and buffer_len == 0:
+        is_solar_affected_fn = getattr(
+            self.coordinator, "is_solar_affected", None
+        )
+        if callable(is_solar_affected_fn) and not is_solar_affected_fn(
+            self.source_entity_id
+        ):
+            # Entity is outside CONF_SOLAR_AFFECTED_ENTITIES — solar learning
+            # is intentionally disabled for it, so "cold_start" would be
+            # misleading (it will never warm up).
+            attrs["solar_learning_status"] = "not_applicable"
+        elif not coeff_present and buffer_len == 0:
             attrs["solar_learning_status"] = "cold_start"
         elif not coeff_present:
             # In cold-start buffer accumulation, pre-Cramer.

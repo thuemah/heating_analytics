@@ -185,15 +185,3 @@ def test_apply_correction(calculator, coordinator):
     # Base 10, Impact 2 => 12
     assert calculator.apply_correction(10.0, 2.0, 20.0) == 12.0
 
-def test_normalize_for_learning(calculator, coordinator):
-    # Heating (Temp 10 < 15): Actual was reduced by solar. Add solar back.
-    # Actual 8, Impact 2 => 10
-    assert calculator.normalize_for_learning(8.0, 2.0, 10.0) == 10.0
-
-    # Cooling (Temp 20 > 15): Actual was increased by solar. Subtract solar.
-    # Actual 12, Impact 2 => 10
-    assert calculator.normalize_for_learning(12.0, 2.0, 20.0) == 10.0
-
-    # Clamping
-    assert calculator.normalize_for_learning(1.0, 2.0, 20.0) == 0.0
-

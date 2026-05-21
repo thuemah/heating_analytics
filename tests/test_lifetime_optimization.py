@@ -1,20 +1,7 @@
 """Test Lifetime Sensor Optimization."""
 from unittest.mock import MagicMock
 import pytest
-from homeassistant.core import HomeAssistant
 from custom_components.heating_analytics.sensor import HeatingDeviceLifetimeSensor
-
-@pytest.fixture
-def mock_coordinator():
-    coordinator = MagicMock()
-    coordinator.data = {}
-    return coordinator
-
-@pytest.fixture
-def mock_entry():
-    entry = MagicMock()
-    entry.entry_id = "test_entry"
-    return entry
 
 @pytest.mark.asyncio
 async def test_lifetime_sensor_throttling(mock_coordinator, mock_entry):
