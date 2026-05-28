@@ -150,7 +150,7 @@ class ForecastManager:
                             elif condition and condition in CLOUD_COVERAGE_MAP:
                                  cloud_cov = float(CLOUD_COVERAGE_MAP[condition])
 
-                            elev, azim = self.coordinator.solar.get_approx_sun_pos(f_dt)
+                            elev, azim = self.coordinator.solar.get_approx_sun_pos(f_dt + timedelta(minutes=30))
                             solar_factor = self.coordinator.solar.calculate_solar_factor(elev, azim, cloud_cov)
                             solar_vector = self.coordinator.solar.calculate_solar_vector(elev, azim, cloud_cov)
 
@@ -460,7 +460,7 @@ class ForecastManager:
             if dt_str:
                 f_dt = dt_util.parse_datetime(dt_str)
                 if f_dt:
-                    elev, azim = self.coordinator.solar.get_approx_sun_pos(f_dt)
+                    elev, azim = self.coordinator.solar.get_approx_sun_pos(f_dt + timedelta(minutes=30))
                     f["elevation"] = elev
                     f["azimuth"] = azim
 
@@ -1225,7 +1225,7 @@ class ForecastManager:
                 if dt_str:
                     f_dt = dt_util.parse_datetime(dt_str)
                     if f_dt:
-                        elev, azimuth = self.coordinator.solar.get_approx_sun_pos(f_dt)
+                        elev, azimuth = self.coordinator.solar.get_approx_sun_pos(f_dt + timedelta(minutes=30))
 
             if elev is not None:
                 # Scalar factor for solar optimizer (state classification)
@@ -2011,7 +2011,7 @@ class ForecastManager:
             _sun_elev = None
             if _flag_4d and _log_dt is not None and self.coordinator.solar_enabled:
                 try:
-                    _sun_elev, _ = self.coordinator.solar.get_approx_sun_pos(_log_dt)
+                    _sun_elev, _ = self.coordinator.solar.get_approx_sun_pos(_log_dt + timedelta(minutes=30))
                 except (TypeError, ValueError, AttributeError):
                     _sun_elev = None
 
@@ -2143,7 +2143,7 @@ class ForecastManager:
                 _sun_elev_curr = None
                 if _flag_4d_curr and self.coordinator.solar_enabled:
                     try:
-                        _sun_elev_curr, _ = self.coordinator.solar.get_approx_sun_pos(_curr_dt)
+                        _sun_elev_curr, _ = self.coordinator.solar.get_approx_sun_pos(_curr_dt + timedelta(minutes=30))
                     except (TypeError, ValueError, AttributeError):
                         _sun_elev_curr = None
 

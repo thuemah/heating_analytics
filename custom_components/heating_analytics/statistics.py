@@ -78,6 +78,44 @@ class StatisticsManager:
         self.coordinator = coordinator
         self._daily_savings_cache = {}
 
+    def _resolve_entity_net(
+        self,
+        base_kwh: float,
+        raw_aux_kwh: float,
+        aux_affected: bool,
+        solar_kwh: float,
+        mode: str,
+    ) -> tuple[float, float, float, float, float, float]:
+        """Apply aux subtraction and solar saturation per entity (#996).
+
+        Single source of truth for the per-entity pass-2 logic. Three
+        consumers — ``calculate_total_power`` (3D), ``calculate_total_power_4d``,
+        and ``_calculate_fallback_projection`` (cold-start / post-reset
+        path) — previously duplicated this block, and the fallback variant
+        had drifted on three points (no aux subtraction, MODE_OFF returned
+        ``base`` instead of 0, used legacy ``apply_correction`` instead of
+        mode-aware ``calculate_saturation``).
+
+        ``solar.calculate_saturation`` handles the mode dispatch:
+        MODE_OFF → ``net_final = 0`` (commanded off); heating modes →
+        solar clamped against ``net_after_aux``; cooling modes → solar
+        adds additively; DHW / unknown → fall-through with no solar
+        effect.
+
+        Returns ``(applied_aux, overflow_aux, net_after_aux, solar_applied,
+        solar_wasted, net_final)`` so callers can drive both per-entity
+        breakdown fields and the per-(scope, mode) partition accumulators
+        without redundant arithmetic.
+        """
+        final_aux = raw_aux_kwh if aux_affected else 0.0
+        applied_aux = min(final_aux, base_kwh)
+        overflow_aux = final_aux - applied_aux
+        net_after_aux = base_kwh - applied_aux
+        solar_applied, solar_wasted, net_final = self.coordinator.solar.calculate_saturation(
+            net_after_aux, solar_kwh, mode
+        )
+        return applied_aux, overflow_aux, net_after_aux, solar_applied, solar_wasted, net_final
+
     def calculate_total_power(
         self,
         temp: float,
@@ -633,25 +671,22 @@ class StatisticsManager:
         heating_only_unit_sum_net = 0.0
 
         for entity_id, data in raw_unit_data.items():
-            # Use raw learned aux reduction (No Scaling)
-            # We no longer force the sum of unit reductions to match the global model.
-            # Any discrepancy is reported as 'orphaned_aux_savings' (positive gap)
-            # or implicitly accepted as model disagreement.
-            final_aux = data["raw_aux"]
-            if not data["affected"]:
-                final_aux = 0.0
-
-            # Calculate Net: Base - Aux (Clamp for safety)
-            applied_aux = min(final_aux, data["base"])
-            overflow_aux = final_aux - applied_aux
+            # Per-entity pass-2 via _resolve_entity_net (#996) — single
+            # source of truth shared with calculate_total_power_4d and
+            # _calculate_fallback_projection.  Track A vs Track B
+            # discrepancies still surface as 'orphaned_aux_savings'
+            # (positive overflow) downstream.
+            applied_aux, overflow_aux, net_after_aux, solar_applied, solar_wasted, net_final = (
+                self._resolve_entity_net(
+                    base_kwh=data["base"],
+                    raw_aux_kwh=data["raw_aux"],
+                    aux_affected=data["affected"],
+                    solar_kwh=data["solar"],
+                    mode=data["mode"],
+                )
+            )
             if overflow_aux > 0:
                 unassigned_aux_savings += overflow_aux
-            net_after_aux = data["base"] - applied_aux
-
-            # Apply Solar to Net (with Saturation Logic)
-            solar_applied, solar_wasted, net_final = self.coordinator.solar.calculate_saturation(
-                net_after_aux, data["solar"], data["mode"]
-            )
 
             # Store Breakdown (Only if detailed)
             if detailed:
@@ -659,7 +694,7 @@ class StatisticsManager:
                     "net_kwh": round(net_final, 3),
                     "base_kwh": round(data["base"], 3),
                     "aux_reduction_kwh": round(applied_aux, 3),
-                    "raw_aux_kwh": round(final_aux, 3),
+                    "raw_aux_kwh": round(data["raw_aux"] if data["affected"] else 0.0, 3),
                     "overflow_kwh": round(overflow_aux, 3),
                     "clamped": overflow_aux > 0.001,
                     "solar_reduction_kwh": round(solar_applied, 3),  # Changed from Potential to Applied
@@ -1263,28 +1298,26 @@ class StatisticsManager:
         base_not_in_scope = 0.0
 
         for entity_id, data in raw_unit_data.items():
-            final_aux = data["raw_aux"]
-            if not data["affected"]:
-                final_aux = 0.0
-
-            applied_aux = min(final_aux, data["base"])
-            overflow_aux = final_aux - applied_aux
-            if overflow_aux > 0:
-                unassigned_aux_savings += overflow_aux
-            net_after_aux = data["base"] - applied_aux
-
-            solar_applied, solar_wasted, net_final = (
-                self.coordinator.solar.calculate_saturation(
-                    net_after_aux, data["solar"], data["mode"]
+            # Per-entity pass-2 via _resolve_entity_net (#996) — shared with
+            # 3D calculate_total_power and _calculate_fallback_projection.
+            applied_aux, overflow_aux, net_after_aux, solar_applied, solar_wasted, net_final = (
+                self._resolve_entity_net(
+                    base_kwh=data["base"],
+                    raw_aux_kwh=data["raw_aux"],
+                    aux_affected=data["affected"],
+                    solar_kwh=data["solar"],
+                    mode=data["mode"],
                 )
             )
+            if overflow_aux > 0:
+                unassigned_aux_savings += overflow_aux
 
             if detailed:
                 unit_breakdown[entity_id] = {
                     "net_kwh": round(net_final, 3),
                     "base_kwh": round(data["base"], 3),
                     "aux_reduction_kwh": round(applied_aux, 3),
-                    "raw_aux_kwh": round(final_aux, 3),
+                    "raw_aux_kwh": round(data["raw_aux"] if data["affected"] else 0.0, 3),
                     "overflow_kwh": round(overflow_aux, 3),
                     "clamped": overflow_aux > 0.001,
                     "solar_reduction_kwh": round(solar_applied, 3),
@@ -2824,57 +2857,85 @@ class StatisticsManager:
         minutes_passed: int,
         effective_wind: float | None = None
     ) -> float:
-        """Calculate fallback projection if intra-hour accumulation is missing."""
-        unit_data = self.coordinator.model.correlation_data_per_unit.get(entity_id, {})
+        """Calculate fallback projection if intra-hour accumulation is missing.
+
+        Routes through ``_resolve_entity_net`` (#996) for canonical parity
+        with ``calculate_total_power`` — aux subtraction, MODE_OFF → 0
+        override, and mode-aware solar saturation all flow through the
+        shared helper.  Previously the fallback skipped aux entirely,
+        returned ``base`` for MODE_OFF, and used legacy ``apply_correction``
+        instead of ``calculate_saturation``.
+        """
         unit_mode_fb = self.coordinator.get_unit_mode(entity_id)
         # Per #885: route cooling-mode units to the dedicated bucket.
         if unit_mode_fb in (MODE_COOLING, MODE_GUEST_COOLING):
             wind_bucket = COOLING_WIND_BUCKET
-        unit_base_curr = self._get_prediction_from_model(unit_data, temp_key, wind_bucket, current_temp, self.coordinator.balance_point)
 
-        # Per-entity regime (invariant #6) — never derive mode from outdoor
-        # temperature.  OFF / DHW / unknown → no solar contribution.
+        # Base.
+        unit_data = self.coordinator.model.correlation_data_per_unit.get(entity_id, {})
+        unit_base_curr = self._get_prediction_from_model(
+            unit_data, temp_key, wind_bucket, current_temp, self.coordinator.balance_point
+        )
+
+        # Solar (per-entity regime; invariant #6).  Cooling cold-start
+        # guard preserved — match the gate in ``calculate_total_power``.
         regime = _solar_coeff_regime(unit_mode_fb)
-
-        # Cooling cold-start solar guard — match the gate in
-        # ``calculate_total_power``.  See ``_is_cooling_solar_cold_start``
-        # for rationale.
         cooling_solar_cold_start = (
             regime == "cooling"
             and self._is_cooling_solar_cold_start(entity_id)
         )
+        unit_solar_curr_kw = 0.0
         if self.coordinator.solar_enabled and regime is not None and not cooling_solar_cold_start:
-             curr_solar_factor = self.coordinator.data.get(ATTR_SOLAR_FACTOR, 0.0)
-             unit_coeff = self.coordinator.solar.calculate_unit_coefficient(
-                 entity_id, temp_key, unit_mode_fb
-             )
-             eff_solar_vector = (
-                 self.coordinator.data.get("solar_vector_s", 0.0),
-                 self.coordinator.data.get("solar_vector_e", 0.0),
-                 self.coordinator.data.get("solar_vector_w", 0.0),
-             )
-             # Reconstruct potential vector per direction (#826); coeff
-             # already absorbs avg per-direction transmittance.  Per-entity
-             # screen routing: unscreened units reconstruct against
-             # transmittance=1.0 (see learning._process_per_unit_learning).
-             scr_pct = self.coordinator.solar_correction_percent
-             _scr_fn = getattr(self.coordinator, "screen_config_for_entity", None)
-             scr_cfg = _scr_fn(entity_id) if _scr_fn else getattr(self.coordinator, "screen_config", None)
-             pot_vec = SolarCalculator.reconstruct_potential_vector(
-                 eff_solar_vector, scr_pct, scr_cfg
-             )
-             unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(pot_vec, unit_coeff)
+            unit_coeff = self.coordinator.solar.calculate_unit_coefficient(
+                entity_id, temp_key, unit_mode_fb
+            )
+            eff_solar_vector = (
+                self.coordinator.data.get("solar_vector_s", 0.0),
+                self.coordinator.data.get("solar_vector_e", 0.0),
+                self.coordinator.data.get("solar_vector_w", 0.0),
+            )
+            # Reconstruct potential vector per direction (#826); coeff
+            # already absorbs avg per-direction transmittance.  Per-entity
+            # screen routing: unscreened units reconstruct against
+            # transmittance=1.0 (see learning._process_per_unit_learning).
+            scr_pct = self.coordinator.solar_correction_percent
+            _scr_fn = getattr(self.coordinator, "screen_config_for_entity", None)
+            scr_cfg = _scr_fn(entity_id) if _scr_fn else getattr(self.coordinator, "screen_config", None)
+            pot_vec = SolarCalculator.reconstruct_potential_vector(
+                eff_solar_vector, scr_pct, scr_cfg
+            )
+            unit_solar_curr_kw = self.coordinator.solar.calculate_unit_solar_impact(pot_vec, unit_coeff)
 
-             # Route via per-entity regime, not outdoor temp (invariant #6).
-             correction_mode = MODE_HEATING if regime == "heating" else MODE_COOLING
-             unit_rate_curr = self.coordinator.solar.apply_correction(unit_base_curr, unit_solar_curr_kw, correction_mode)
-        else:
-             # Solar disabled, no-solar regime (OFF/DHW/unknown), or cooling
-             # cold-start (skip phantom additive demand from migration-seeded
-             # cooling coefficient).
-             unit_rate_curr = unit_base_curr
+        # Aux — mirror canonical pass-1 derivation.  Reads
+        # ``coordinator.auxiliary_heating_active`` since the fallback path
+        # is not parameterised with ``is_aux_active``.
+        raw_aux_kwh = 0.0
+        aux_affected = False
+        if getattr(self.coordinator, "auxiliary_heating_active", False):
+            aux_affected_set: set | None = None
+            if hasattr(self.coordinator, "_aux_affected_set"):
+                aux_affected_set = self.coordinator.aux_affected_set
+            elif getattr(self.coordinator, "aux_affected_entities", None):
+                aux_affected_set = set(self.coordinator.aux_affected_entities)
+            if aux_affected_set is not None:
+                aux_affected = entity_id in aux_affected_set
+            elif entity_id in getattr(self.coordinator, "aux_affected_entities", []):
+                aux_affected = True
+            if aux_affected:
+                unit_aux_data = self.coordinator.model.aux_coefficients_per_unit.get(entity_id, {})
+                raw_aux_kwh = self._get_prediction_from_model(
+                    unit_aux_data, temp_key, wind_bucket, current_temp, self.coordinator.balance_point
+                )
 
-        return unit_rate_curr * (minutes_passed / 60.0)
+        # Canonical per-entity resolution (#996).
+        _, _, _, _, _, net_final = self._resolve_entity_net(
+            base_kwh=unit_base_curr,
+            raw_aux_kwh=raw_aux_kwh,
+            aux_affected=aux_affected,
+            solar_kwh=unit_solar_curr_kw,
+            mode=unit_mode_fb,
+        )
+        return net_final * (minutes_passed / 60.0)
 
     def _is_deviation_unusual(self, deviation_kwh, expected_kwh, obs_count):
         """Determine if a deviation is statistically unusual.

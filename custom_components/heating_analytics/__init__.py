@@ -47,6 +47,7 @@ SERVICE_RETRAIN_UNIT_FROM_HISTORY = "retrain_unit_from_history"
 SERVICE_BATCH_FIT_SOLAR = "batch_fit_solar"
 SERVICE_BATCH_FIT_SOLAR_4D = "batch_fit_solar_4d"
 SERVICE_FIT_SOLAR_OBSTRUCTION = "fit_solar_obstruction"
+SERVICE_APPLY_OBSTRUCTION_GATE = "apply_obstruction_gate"
 SERVICE_APPLY_IMPLIED_COEFFICIENT = "apply_implied_coefficient"
 SERVICE_SET_EXPERIMENTAL_TOBIT_LIVE_LEARNER = "set_experimental_tobit_live_learner"
 SERVICE_SET_TOBIT_LIVE_ENTITIES = "set_tobit_live_entities"
@@ -173,6 +174,29 @@ SERVICE_SCHEMA_BATCH_FIT_SOLAR_4D = vol.Schema({
 
 SERVICE_SCHEMA_FIT_SOLAR_OBSTRUCTION = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
+    vol.Optional("unit_entity_id"): cv.entity_id,
+    vol.Optional("days_back"): vol.All(
+        vol.Coerce(int), vol.Range(min=1, max=730)
+    ),
+    vol.Optional("include_cooling", default=True): cv.boolean,
+    vol.Optional("dry_run", default=False): cv.boolean,
+})
+
+# #1020: explicit-accept service for obstruction gate suggestions.
+# ``unit_entity_id`` is required (per-entity gate state).  ``facade``
+# / ``side`` pick the slot.  ``value`` is the elevation to write;
+# pass ``clear: true`` to reset the slot back to "no gate" instead
+# (necessary because HA's number-selector UI cannot send ``null``).
+# When ``clear`` is set, ``value`` is ignored.  Plausibility-range
+# validation happens in the handler (not the schema) so the error
+# message can carry the side-specific range.
+SERVICE_SCHEMA_APPLY_OBSTRUCTION_GATE = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Required("unit_entity_id"): cv.entity_id,
+    vol.Required("facade"): vol.In(("s", "e", "w")),
+    vol.Required("side"): vol.In(("low", "high")),
+    vol.Optional("value"): vol.Any(None, vol.Coerce(float)),
+    vol.Optional("clear", default=False): cv.boolean,
     vol.Optional("dry_run", default=False): cv.boolean,
 })
 
@@ -612,49 +636,323 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
 
-    # Register Fit Solar Obstruction Service (#991)
+    # Register Fit Solar Obstruction Service (#991, per-entity in #1009)
     async def handle_fit_solar_obstruction(call: ServiceCall) -> dict:
-        """Handle the fit-solar-obstruction service call.
+        """Handle the fit-solar-obstruction service call (#1020).
 
-        Per-facade direct-beam critical_elev fit.  Brute-force searches
-        for the sun elevation above which an external overhang /
-        neighbouring structure blocks direct beam on each facade, using
-        the modulating-regime 4D potential against existing per-entity
-        coefficients (held fixed).  Writes ``_critical_elev_per_facade``
-        on success; recommended to run ``batch_fit_solar_4d`` afterwards
-        to refit coefficients on the gated geometry.
+        Per-entity per-facade direct-beam critical_elev fit.  The fit
+        no longer auto-writes — passing gates surface as
+        ``suggested_gates`` only, and the user accepts each
+        suggestion explicitly via ``apply_obstruction_gate``.  Default
+        flow runs three time-window passes (30 / 60 / 90 days) and
+        gates ``applicable`` on multi-window stability + physical
+        plausibility + a stricter SSE-improvement threshold.  When
+        ``days_back`` is explicitly provided the handler degrades to
+        a single-pass debug mode (no stability gate, intended for
+        ad-hoc inspection of a specific window).
         """
+        from .const import (
+            OBSTRUCTION_STABILITY_WINDOWS,
+            OBSTRUCTION_STABILITY_TOLERANCE_DEG,
+            OBSTRUCTION_STABILITY_MIN_AGREEING,
+        )
+
         entity_id = call.data.get("entity_id")
+        unit_entity_id = call.data.get("unit_entity_id")
+        days_back = call.data.get("days_back")
+        include_cooling = call.data.get("include_cooling", True)
         dry_run = call.data.get("dry_run", False)
         coord = _get_target_coordinator(hass, entity_id)
         suffix = " (dry-run)" if dry_run else ""
+        scope = f"unit {unit_entity_id}" if unit_entity_id else "all units"
+        cooling_str = "with cooling" if include_cooling else "heating-only"
+        # Multi-window default; explicit days_back overrides to single-pass.
+        if days_back is not None:
+            windows = (int(days_back),)
+            multi_window = False
+        else:
+            windows = tuple(OBSTRUCTION_STABILITY_WINDOWS)
+            multi_window = True
         _LOGGER.info(
             f"Service called: fit_solar_obstruction{suffix} "
-            f"(coordinator={coord.entry.entry_id})"
+            f"({scope}, windows={list(windows)}, {cooling_str}, "
+            f"coordinator={coord.entry.entry_id})"
         )
-        result = coord.learning.fit_solar_obstruction(
+
+        # Run one fit per window.  Auto-write is gone, so passes are
+        # independent and order-insensitive; we just collect each
+        # pass's per-(entity, facade, side) ``best_critical_elev`` for
+        # the stability decision.
+        per_window_results: dict[int, dict] = {}
+        for w in windows:
+            per_window_results[w] = coord.learning.fit_solar_obstruction(
+                hourly_log=list(coord._hourly_log),
+                coordinator=coord,
+                entity_id=unit_entity_id,
+                days_back=w,
+                include_cooling=include_cooling,
+                dry_run=dry_run,
+                # First pass: stability=True default (all bypass).
+                # Stability is injected on the final pass below.
+            )
+
+        def _gate_value(window_res: dict, eid: str, facade: str, side: str):
+            """Pull ``best_critical_elev`` from a fit result; returns
+            ``None`` when the boundary did not learn (so the stability
+            check naturally excludes non-fits)."""
+            ent = window_res.get(eid)
+            if not isinstance(ent, dict):
+                return None
+            facade_block = ent.get(facade)
+            if not isinstance(facade_block, dict):
+                return None
+            side_block = facade_block.get(side)
+            if not isinstance(side_block, dict):
+                return None
+            if not side_block.get("learned"):
+                return None
+            return side_block.get("best_critical_elev")
+
+        # Pick the longest window as the "primary" (most data → tightest
+        # SSE numbers) and inject stability into a final pass on that
+        # window only.  Multi-pass dispatch above already touched all
+        # windows; the final pass reuses primary_window data to keep
+        # cost predictable.  When ``multi_window=False`` (explicit
+        # days_back) we skip the stability gate entirely and surface
+        # the single pass directly.
+        primary_window = max(windows)
+        primary_result = per_window_results[primary_window]
+
+        # Identify every (eid, facade, side) the user might care about
+        # — anything that learned in the primary pass is a candidate.
+        candidates: set[tuple[str, str, str]] = set()
+        for eid_key, entity_block in primary_result.items():
+            if not isinstance(entity_block, dict):
+                continue
+            if eid_key in ("dry_run", "n_skipped_cooling_unlearned", "suggested_gates"):
+                continue
+            for facade in ("s", "e", "w"):
+                f_block = entity_block.get(facade)
+                if not isinstance(f_block, dict):
+                    continue
+                for side in ("low", "high"):
+                    if isinstance(f_block.get(side), dict):
+                        candidates.add((eid_key, facade, side))
+
+        stability_per_facade_per_entity: dict[
+            str, dict[tuple[str, str], bool]
+        ] = {}
+        stability_summary: dict[str, dict[str, dict[str, dict]]] = {}
+        for eid_key, facade, side in candidates:
+            values = []
+            for w in windows:
+                v = _gate_value(per_window_results[w], eid_key, facade, side)
+                if v is not None:
+                    values.append((w, v))
+            stable = False
+            agreeing_pair = None
+            if multi_window and len(values) >= OBSTRUCTION_STABILITY_MIN_AGREEING:
+                # Find any group of MIN_AGREEING values within tolerance
+                # of one another (transitively — full pairwise check on
+                # 3 elements is trivial).
+                for i in range(len(values)):
+                    near = [values[i]]
+                    for j in range(len(values)):
+                        if i == j:
+                            continue
+                        if (
+                            abs(values[j][1] - values[i][1])
+                            <= OBSTRUCTION_STABILITY_TOLERANCE_DEG
+                        ):
+                            near.append(values[j])
+                    if len(near) >= OBSTRUCTION_STABILITY_MIN_AGREEING:
+                        stable = True
+                        agreeing_pair = sorted(
+                            [(w, round(v, 2)) for w, v in near]
+                        )
+                        break
+            elif not multi_window and len(values) >= 1:
+                # Single-pass debug mode — no stability gate.
+                stable = True
+            stability_per_facade_per_entity.setdefault(eid_key, {})[
+                (facade, side)
+            ] = stable
+            stability_summary.setdefault(eid_key, {}).setdefault(
+                facade, {}
+            )[side] = {
+                "per_window_values": [
+                    {"days_back": w, "value": round(v, 2)} for w, v in values
+                ],
+                "stable_across_windows": stable,
+                "agreeing_pair": agreeing_pair,
+                "tolerance_deg": OBSTRUCTION_STABILITY_TOLERANCE_DEG,
+                "min_agreeing": OBSTRUCTION_STABILITY_MIN_AGREEING,
+            }
+
+        # Final pass on the primary window with stability injected.
+        # This is the result we surface to the user; per_window dict
+        # is kept for transparency / debug.
+        final_result = coord.learning.fit_solar_obstruction(
             hourly_log=list(coord._hourly_log),
             coordinator=coord,
+            entity_id=unit_entity_id,
+            days_back=primary_window,
+            include_cooling=include_cooling,
             dry_run=dry_run,
+            stability_per_facade_per_entity=stability_per_facade_per_entity,
         )
-        learned_count = sum(
-            1 for f in ("s", "e", "w")
-            if isinstance(result.get(f), dict) and result[f].get("learned")
-        )
-        if learned_count and not dry_run:
-            await coord._async_save_data(force=True)
+
+        suggested_gates = final_result.get("suggested_gates", [])
         return {
             "status": "ok",
             "dry_run": dry_run,
-            "learned_count": learned_count,
-            "per_facade": result,
+            "multi_window": multi_window,
+            "primary_window_days": primary_window,
+            "windows_evaluated": list(windows),
+            "suggested_gates": suggested_gates,
+            "suggested_count": len(suggested_gates),
+            "stability": stability_summary,
+            "per_entity": final_result,
+            "per_window": {
+                str(w): per_window_results[w] for w in windows
+            },
         }
 
+    async def handle_apply_obstruction_gate(call: ServiceCall) -> dict:
+        """Handle the apply-obstruction-gate service call (#1020).
+
+        Writes one ``(entity, facade, side)`` slot in
+        ``_critical_elev_per_facade_per_unit``.  Plausibility-range
+        validation matches the auto-suggestion gate; pass ``value=None``
+        to clear a previously-set gate.  ``dry_run=True`` returns the
+        planned change without writing.
+
+        Intended workflow: user runs ``fit_solar_obstruction``, reviews
+        ``suggested_gates``, then calls this service once per accepted
+        suggestion.  The service exists because #1020 removed auto-write
+        from the fit path — the rationale is that obstruction gates are
+        informed decisions, not automatic convergences.
+        """
+        from .const import (
+            OBSTRUCTION_LOW_PLAUSIBLE_RANGE,
+            OBSTRUCTION_HIGH_PLAUSIBLE_RANGE,
+        )
+
+        entity_id = call.data.get("entity_id")
+        unit_entity_id = call.data["unit_entity_id"]
+        facade = call.data["facade"]
+        side = call.data["side"]
+        clear = call.data.get("clear", False)
+        value = call.data.get("value")
+        dry_run = call.data.get("dry_run", False)
+        coord = _get_target_coordinator(hass, entity_id)
+
+        # ``clear=True`` resets the slot to ``None`` (the equivalent of
+        # passing ``value: null``, but reachable through HA's number-
+        # selector UI which cannot send null).  When ``clear`` is set,
+        # ``value`` is ignored — explicit beats implicit, and a user
+        # ticking the clear box does not want to accidentally re-write
+        # a leftover number from the previous service call.
+        if clear:
+            value_f = None
+        elif value is not None:
+            # Plausibility validation: same ranges as the auto-
+            # suggestion gate.  Reject out-of-range values at the
+            # boundary instead of writing them silently — keeps the
+            # storage state consistent with what the auto-fit would
+            # have considered acceptable.
+            if side == "low":
+                lo, hi = OBSTRUCTION_LOW_PLAUSIBLE_RANGE
+            else:
+                lo, hi = OBSTRUCTION_HIGH_PLAUSIBLE_RANGE
+            value_f = float(value)
+            if not (lo <= value_f <= hi):
+                raise ServiceValidationError(
+                    f"apply_obstruction_gate: value {value_f} outside "
+                    f"plausibility range [{lo}, {hi}] for side={side!r}.  "
+                    "If you genuinely have an obstruction outside this "
+                    "range (rare), edit storage directly."
+                )
+        else:
+            raise ServiceValidationError(
+                "apply_obstruction_gate: pass either ``value`` (number) "
+                "to write a gate, or ``clear: true`` to reset the slot. "
+                "Neither was provided."
+            )
+
+        crit_state = coord._critical_elev_per_facade_per_unit
+        if not isinstance(crit_state, dict):
+            crit_state = {}
+            coord._critical_elev_per_facade_per_unit = crit_state
+
+        entity_state = crit_state.get(unit_entity_id)
+        if not isinstance(entity_state, dict):
+            entity_state = {
+                "s": {"low": None, "high": None},
+                "e": {"low": None, "high": None},
+                "w": {"low": None, "high": None},
+            }
+        facade_state = entity_state.get(facade)
+        if not isinstance(facade_state, dict):
+            facade_state = {"low": None, "high": None}
+            entity_state[facade] = facade_state
+
+        before = facade_state.get(side)
+        op = "clear" if clear else "write"
+        _LOGGER.info(
+            f"Service called: apply_obstruction_gate [{op}] "
+            f"unit={unit_entity_id} facade={facade} side={side} "
+            f"{before} → {value_f}{' (dry-run)' if dry_run else ''} "
+            f"(coordinator={coord.entry.entry_id})"
+        )
+
+        if dry_run:
+            return {
+                "status": "ok",
+                "dry_run": True,
+                "entity_id": unit_entity_id,
+                "facade": facade,
+                "side": side,
+                "before": before,
+                "after": value_f,
+                "wrote": False,
+            }
+
+        facade_state[side] = value_f
+        crit_state[unit_entity_id] = entity_state
+        await coord._async_save_data(force=True)
+        return {
+            "status": "ok",
+            "dry_run": False,
+            "entity_id": unit_entity_id,
+            "facade": facade,
+            "side": side,
+            "before": before,
+            "after": value_f,
+            "wrote": True,
+        }
+
+    # #1020: legacy auto-write helper, convergence loop, and stale-
+    # state reconciliation removed.  The convergence loop existed to
+    # bridge the coefficient-bias-self-suppression failure mode when
+    # auto-writes from pass 1 fed batch_fit_solar_4d; with auto-write
+    # gone there is nothing for the loop to converge against.
+    # Coefficient refitting now happens only when the user explicitly
+    # accepts a gate via ``apply_obstruction_gate`` and chooses to
+    # follow up with ``batch_fit_solar_4d``.
     hass.services.async_register(
         DOMAIN,
         SERVICE_FIT_SOLAR_OBSTRUCTION,
         handle_fit_solar_obstruction,
         schema=SERVICE_SCHEMA_FIT_SOLAR_OBSTRUCTION,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_APPLY_OBSTRUCTION_GATE,
+        handle_apply_obstruction_gate,
+        schema=SERVICE_SCHEMA_APPLY_OBSTRUCTION_GATE,
         supports_response=SupportsResponse.ONLY,
     )
 
@@ -1195,6 +1493,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_BATCH_FIT_SOLAR)
             hass.services.async_remove(DOMAIN, SERVICE_BATCH_FIT_SOLAR_4D)
             hass.services.async_remove(DOMAIN, SERVICE_FIT_SOLAR_OBSTRUCTION)
+            hass.services.async_remove(DOMAIN, SERVICE_APPLY_OBSTRUCTION_GATE)
             hass.services.async_remove(DOMAIN, SERVICE_APPLY_IMPLIED_COEFFICIENT)
             # Tobit live-learner controls (#904 stage 3)
             hass.services.async_remove(

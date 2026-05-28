@@ -688,10 +688,8 @@ class HourlyProcessor:
         self.coordinator.data["last_hour_solar_impact_kwh"] = round(effective_solar_impact, 3)
         self.coordinator.data["last_hour_guest_impact_kwh"] = round(guest_impact_kwh, 3)
 
-        if expected_kwh > ENERGY_GUARD_THRESHOLD:
-            self.coordinator.data[ATTR_LAST_HOUR_DEVIATION_PCT] = round(((total_energy_kwh - expected_kwh) / expected_kwh) * 100, 1)
-        else:
-            self.coordinator.data[ATTR_LAST_HOUR_DEVIATION_PCT] = 0.0
+        _denom = max(expected_kwh, ENERGY_GUARD_THRESHOLD, 0.5 * (solar_impact + solar_wasted))
+        self.coordinator.data[ATTR_LAST_HOUR_DEVIATION_PCT] = round(((total_energy_kwh - expected_kwh) / _denom) * 100, 1)
 
         if self.coordinator._collector.sample_count > 0:
             # Determine Learning Eligibility
@@ -894,6 +892,20 @@ class HourlyProcessor:
                 if kwh > 0
             }
 
+            # Per-entity dark-sky baseline for the hour (pre-solar).  Logged
+            # forensically alongside the net ``unit_expected_breakdown`` so
+            # future consumers can recover what live learning saw at
+            # log-time without re-deriving it from the per-unit base model
+            # (which drifts continuously).  fit_solar_obstruction does NOT
+            # read this field — it recalcs from the current base model so
+            # there is a single canonical source — the log field exists
+            # purely for forensic / future use.  See #1005.
+            unit_expected_base_log = {
+                eid: round(kwh, 3)
+                for eid, kwh in self.coordinator._hourly_expected_base_per_unit.items()
+                if kwh > 0
+            }
+
             # Hourly Log Entry
             # Use _hourly_start_time to represent the START of the hour period, not the END
 
@@ -974,6 +986,7 @@ class HourlyProcessor:
                 "tdd": round(tdd_contribution, 3),
                 "unit_breakdown": unit_breakdown,
                 "unit_expected_breakdown": unit_expected_breakdown,
+                "unit_expected_base": unit_expected_base_log,
                 "temp_key": temp_key,
                 "inertia_temp": round(inertia_avg, 2),
                 "effective_wind": round(calculated_effective_wind, 2),
@@ -1002,6 +1015,8 @@ class HourlyProcessor:
                 "solar_vector_w": round(avg_solar_vector[2], 3),
                 "solar_impact_kwh": round(effective_solar_impact, 3),
                 "solar_impact_raw_kwh": round(solar_impact, 3),
+                "solar_heating_applied_kwh": round(res_analysis["breakdown"].get("solar_heating_applied_kwh", 0.0), 3),
+                "solar_cooling_applied_kwh": round(res_analysis["breakdown"].get("solar_cooling_applied_kwh", 0.0), 3),
                 "solar_wasted_kwh": round(solar_wasted, 3),
                 # Heating-only wasted (#896).  Structurally equal to
                 # ``solar_wasted_kwh`` today (cooling saturation returns 0)

@@ -441,18 +441,20 @@ batch_fit_solar_4d:
         boolean:
 
 fit_solar_obstruction:
-  name: Fit Solar Obstruction (per-facade direct-beam gate)
+  name: Fit Solar Obstruction (per-entity per-facade direct-beam gate)
   description: >-
-    Find the sun elevation above which an external overhang or
-    neighbouring structure blocks direct beam on each facade (S, E, W).
-    Brute-force searches a candidate cutoff per facade over the
-    modulating-regime hourly log; a cutoff is committed when the
-    elevation step-function reduces SSE by more than the configured
-    threshold and at least 10 samples sit on each side of it.
-    Per-entity 4D coefficients are held fixed during the fit — once a
-    gate is committed, run ``batch_fit_solar_4d`` afterwards to refit
-    coefficients on the gated geometry.  Building-level invariant —
-    applies to all entities, not gated by ``screen_affected_entities``.
+    Suggest sun-elevation gates for terrain / overhang obstructions per
+    (unit, facade, side).  Two brute-force sweeps per facade — LOW
+    (terrain or neighbours blocking low sun) and HIGH (overhang
+    blocking high sun) — over the modulating-regime hourly log.  The
+    service runs three time-window passes (30 / 60 / 90 days by
+    default) and surfaces ``suggested_gates`` only when SSE
+    improvement, physical plausibility, and multi-window stability
+    all pass; nothing is written automatically.  Apply individual
+    suggestions via ``apply_obstruction_gate``, then run
+    ``batch_fit_solar_4d`` to refit coefficients on the gated
+    geometry.  Per-entity granularity because shading geometry
+    differs across windows owned by different units.
   fields:
     entity_id:
       name: Instance
@@ -460,12 +462,124 @@ fit_solar_obstruction:
       selector:
         entity:
           integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor (optional)
+      description: >-
+        Restrict the fit to a single energy sensor.  Leave empty to fit
+        all solar-affected units in the instance.  Useful when one unit's
+        gates need re-fitting after a change (new screens, removed
+        obstruction) without disturbing the others.
+      selector:
+        entity:
+          domain: sensor
+    days_back:
+      name: Days of History (optional, single-pass debug)
+      description: >-
+        Override the default three-window stability orchestration with
+        a single pass on the specified window.  When provided, no
+        stability gate is applied (single-window fits are surfaced as
+        suggestions if they pass SSE + plausibility).  Use for
+        debugging a specific window — production-style suggestions
+        require the multi-window default (leave empty).
+      selector:
+        number:
+          min: 1
+          max: 730
+          mode: box
+    include_cooling:
+      name: Include cooling-mode samples
+      description: >-
+        When enabled (default), cooling-mode hours contribute to the
+        fit alongside heating-mode hours — the geometric shadow is
+        mode-invariant.  Disable to run a heating-only fit; useful
+        diagnostic for isolating whether cooling contributions are
+        driving spurious gates on installs whose fit results disagree
+        with physical knowledge of the obstruction geometry.
+      default: true
+      selector:
+        boolean:
+    dry_run:
+      name: Dry Run (passthrough field — service never auto-writes)
+      description: >-
+        Cosmetic passthrough flag retained for backward compat.
+        ``fit_solar_obstruction`` is a suggestion service and never
+        writes to state regardless of this flag.  Use
+        ``apply_obstruction_gate`` (also has its own dry_run flag) to
+        commit accepted suggestions.
+      default: false
+      selector:
+        boolean:
+
+apply_obstruction_gate:
+  name: Apply Obstruction Gate (write a single suggestion)
+  description: >-
+    Explicitly accept one obstruction-gate suggestion and write it to
+    state.  Intended workflow: run ``fit_solar_obstruction``, review
+    ``suggested_gates``, call this service once per accepted
+    suggestion.  Plausibility-range validation (LOW ∈ [2°, 20°],
+    HIGH ∈ [20°, 60°]) matches the auto-suggestion gate so
+    out-of-range values are rejected at the service boundary.  To
+    clear a previously-set gate, enable the ``clear`` toggle; the
+    ``value`` field is ignored when clearing.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor
+      description: Energy sensor to write the gate on.
+      required: true
+      selector:
+        entity:
+          domain: sensor
+    facade:
+      name: Facade
+      description: Which facade (S / E / W) the gate applies to.
+      required: true
+      selector:
+        select:
+          options:
+            - "s"
+            - "e"
+            - "w"
+    side:
+      name: Boundary side
+      description: LOW = terrain / neighbour blocks sun below this elevation; HIGH = overhang blocks sun above.
+      required: true
+      selector:
+        select:
+          options:
+            - low
+            - high
+    value:
+      name: Critical elevation (degrees)
+      description: >-
+        Sun elevation cutoff in degrees.  Must lie in the plausibility
+        range for the chosen side (LOW ∈ [2°, 20°], HIGH ∈ [20°, 60°]).
+        Leave empty and enable ``clear`` to reset the slot instead.
+      selector:
+        number:
+          min: 0
+          max: 70
+          step: 0.5
+          mode: box
+    clear:
+      name: Clear gate (reset slot to "no gate")
+      description: >-
+        Enable to reset the chosen ``(facade, side)`` slot back to "no
+        gate".  HA's number-selector UI cannot send null, so this
+        toggle is the supported way to clear a previously-applied
+        gate from the form editor.  When enabled, the ``value`` field
+        is ignored.
+      default: false
+      selector:
+        boolean:
     dry_run:
       name: Dry Run (preview only)
-      description: >-
-        When enabled, run the fit and return per-facade candidate +
-        SSE-improvement diagnostics but write nothing.  Useful for
-        previewing what the gate would do before committing.
+      description: When enabled, return the planned write without committing.
       default: false
       selector:
         boolean:

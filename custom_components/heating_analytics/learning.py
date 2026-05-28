@@ -1,6 +1,7 @@
 """Learning Manager Service."""
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import statistics
@@ -35,12 +36,22 @@ from .const import (
     SOLAR_LEARNING_MIN_BASE,
     SOLAR_SHUTDOWN_MIN_BASE,
     SOLAR_SHUTDOWN_MIN_MAGNITUDE,
-    OBSTRUCTION_FIT_MIN_ELEV_DEG,
-    OBSTRUCTION_FIT_MAX_ELEV_DEG,
+    OBSTRUCTION_FIT_LOW_MIN_ELEV_DEG,
+    OBSTRUCTION_FIT_LOW_MAX_ELEV_DEG,
+    OBSTRUCTION_FIT_HIGH_MIN_ELEV_DEG,
+    OBSTRUCTION_FIT_HIGH_MAX_ELEV_DEG,
     OBSTRUCTION_FIT_STEP_DEG,
     OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE,
     OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD,
     OBSTRUCTION_FIT_DOMINANCE_RATIO,
+    OBSTRUCTION_FIT_MIN_RMS_REDUCTION_KWH,
+    OBSTRUCTION_FIT_MIN_WINDOW_DEG,
+    OBSTRUCTION_FIT_SHUTDOWN_CONSTRAINT_MIN_N,
+    OBSTRUCTION_FIT_WINDOW_K_PER_SIDE,
+    OBSTRUCTION_FIT_WINDOW_MAX_ANGULAR_DEG,
+    OBSTRUCTION_LOW_PLAUSIBLE_RANGE,
+    OBSTRUCTION_HIGH_PLAUSIBLE_RANGE,
+    OBSTRUCTION_FIT_MIN_COOLING_SAMPLES_FOR_HIGH,
     TOBIT_CONV_TOL,
     TOBIT_MAX_ITER,
     TOBIT_MIN_NEFF,
@@ -59,6 +70,70 @@ from .observation import HourlyObservation, ModelState, LearningConfig
 from .solar import SolarCalculator
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# Obstruction apply-gate (#1020).  Replaces the cross-boundary
+# OBSTRUCTION_SKIP_EXPLORED / OBSTRUCTION_SKIP_BLIND tables introduced
+# in #1016.  Rationale: under the tightened primary thresholds
+# (0.30 SSE + physical-plausibility prior + multi-window stability),
+# the primary validation is strong enough that the opposite-side
+# evidence requirement becomes redundant.  It also incorrectly
+# blocked the dominant northern-latitude case of single-sided LOW
+# gates — heating-only data at 60°N structurally cannot populate the
+# HIGH regime, so the opposite-side requirement permanently locked
+# those installs out.  New rule: four local checks per boundary, no
+# cross-boundary lookup.
+def _within_plausibility_range(value: float | None, side: str) -> bool:
+    """Return True when ``value`` sits inside the configured plausibility
+    range for ``side`` (``"low"`` or ``"high"``).  ``None`` → False
+    (no value to evaluate)."""
+    if value is None:
+        return False
+    if side == "low":
+        lo, hi = OBSTRUCTION_LOW_PLAUSIBLE_RANGE
+    elif side == "high":
+        lo, hi = OBSTRUCTION_HIGH_PLAUSIBLE_RANGE
+    else:
+        return False
+    return lo <= value <= hi
+
+
+def _boundary_applicable(
+    boundary: dict,
+    side: str,
+    *,
+    stable_across_windows: bool = True,
+) -> tuple[bool, str | None]:
+    """Apply-gate classification for one obstruction boundary (#1020).
+
+    Four independent local checks; no opposite-side dependency:
+      1. ``learned``: data produced a fit.
+      2. SSE improvement ≥ ``OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD``.
+      3. ``best_critical_elev`` inside the plausibility range for the
+         side (LOW: ``[2°, 20°]``, HIGH: ``[20°, 60°]``).
+      4. ``stable_across_windows``: same boundary appears in
+         ≥ ``OBSTRUCTION_STABILITY_MIN_AGREEING`` of the orchestrated
+         time windows (default 30/60/90 d) within ±3°.  Single-window
+         callers (tests, ad-hoc debug runs) pass ``True`` to bypass.
+
+    Returns ``(applicable, applicable_reason)``.  ``applicable_reason``
+    is the first failing check or ``None`` when all pass.  Stability
+    is the LAST gate so that the diagnostic clearly distinguishes
+    "fit is bad" (SSE / plausibility) from "fit is good but unstable
+    across windows" (single_window_only).
+    """
+    if not boundary.get("learned"):
+        return False, "not_learned"
+    sse = boundary.get("sse_improvement_ratio") or 0.0
+    if sse < OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD:
+        return False, "below_sse_threshold"
+    if not _within_plausibility_range(
+        boundary.get("best_critical_elev"), side,
+    ):
+        return False, "physically_implausible"
+    if not stable_across_windows:
+        return False, "single_window_only"
+    return True, None
 
 
 def _filter_log_by_days_back(
@@ -542,15 +617,16 @@ class LearningManager:
             except Exception:  # pragma: no cover
                 continue
             predicted_4d = c_s * p_s + c_e * p_e + c_w * p_w + c_d * p_d
-            # Per-entity saturation matching 3D / calculate_saturation.
-            if regime_4d == "heating":
-                entity_base = float(unit_expected_base.get(entity_id, 0.0))
-                applied_4d = max(0.0, min(predicted_4d, entity_base))
-                delta_4d += applied_4d
-            else:
-                # Cooling: additive, no clamp (matches MODE_COOLING
-                # branch of ``solar.calculate_saturation``).
-                delta_4d -= max(0.0, predicted_4d)
+            # Per-entity saturation via canonical dispatch (#1008).
+            entity_base = (
+                float(unit_expected_base.get(entity_id, 0.0))
+                if regime_4d == "heating"
+                else 0.0
+            )
+            applied_4d, _wasted_4d, _net_4d = config.solar_calculator.calculate_saturation(
+                entity_base, predicted_4d, unit_mode
+            )
+            delta_4d += applied_4d if regime_4d == "heating" else -applied_4d
             any_qualified = True
 
         if not any_qualified:
@@ -1596,14 +1672,12 @@ class LearningManager:
                             + c4d_w * p4d_w
                             + c4d_d * p4d_d
                         )
-                        if regime_4d == "heating":
-                            applied_4d = max(0.0, min(predicted_4d, expected_unit_base))
-                            total_4d_impact += applied_4d
-                            delta_4d += applied_4d
-                        else:
-                            applied_4d = max(0.0, predicted_4d)
-                            total_4d_impact += applied_4d
-                            delta_4d -= applied_4d
+                        # Per-entity saturation via canonical dispatch (#1008).
+                        applied_4d, _wasted_4d, _net_4d = solar_calculator.calculate_saturation(
+                            expected_unit_base, predicted_4d, unit_mode
+                        )
+                        total_4d_impact += applied_4d
+                        delta_4d += applied_4d if regime_4d == "heating" else -applied_4d
                     self._learn_unit_solar_coefficient(
                         entity_id=entity_id,
                         temp_key=temp_key,
@@ -4941,9 +5015,7 @@ class LearningManager:
         the 3D version.  ``drop_counts`` reuses the 3D keys plus
         ``no_dni_dhi`` and ``sun_below_horizon`` for 4D-specific gates.
         """
-        from datetime import timedelta as _td
-        from datetime import datetime as _dt
-        from .solar import resolve_dni_dhi
+        from .solar import reconstruct_hour_inputs
 
         samples: list[tuple[float, float, float, float, float]] = []
         censored_mask: list[bool] = []
@@ -4996,45 +5068,22 @@ class LearningManager:
                     drop_counts.get("shutdown_kept_censored", 0) + 1
                 )
 
-            ts_raw = entry.get("timestamp")
-            if not isinstance(ts_raw, str):
-                drop_counts["missing_timestamp"] += 1
+            inputs, fail = reconstruct_hour_inputs(entry, solar)
+            if inputs is None:
+                # Preserve pre-#1011 bucketing: sun-pos lookup exceptions
+                # were counted as "sun_below_horizon" in the inline form.
+                bucket = "sun_below_horizon" if fail == "sun_pos_error" else fail
+                drop_counts[bucket] += 1
                 continue
-            try:
-                ts_dt = _dt.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            except (TypeError, ValueError):
-                drop_counts["missing_timestamp"] += 1
-                continue
-            mid_dt = ts_dt + _td(minutes=30)
-            try:
-                sun_elev, sun_az = solar.get_approx_sun_pos(mid_dt)
-            except Exception:
-                drop_counts["sun_below_horizon"] += 1
-                continue
-            if sun_elev <= 0.0:
-                drop_counts["sun_below_horizon"] += 1
-                continue
-
-            day_of_year = ts_dt.timetuple().tm_yday
-            try:
-                dni_v, dhi_v, _src = resolve_dni_dhi(
-                    entry.get("dni"),
-                    entry.get("dhi"),
-                    entry.get("ghi_wm2"),
-                    entry.get("cloud_coverage"),
-                    sun_elev,
-                    day_of_year,
-                )
-            except Exception:
+            # Helper rejects only on source=="none"; preserve the
+            # original stricter zero-gate here (#1011 scope note).
+            if inputs.dni <= 0.0 and inputs.dhi <= 0.0:
                 drop_counts["no_dni_dhi"] += 1
                 continue
-            if dni_v is None and dhi_v is None:
-                drop_counts["no_dni_dhi"] += 1
-                continue
-            if (dni_v or 0.0) <= 0.0 and (dhi_v or 0.0) <= 0.0:
-                drop_counts["no_dni_dhi"] += 1
-                continue
-
+            sun_elev = inputs.sun_elev
+            sun_az = inputs.sun_az
+            dni_v = inputs.dni
+            dhi_v = inputs.dhi
             correction_percent = float(entry.get("correction_percent", 100.0))
             try:
                 potential_4d = solar.calculate_unit_potential_4d(
@@ -5339,65 +5388,153 @@ class LearningManager:
         hourly_log: list[dict],
         coordinator,
         *,
+        entity_id: str | None = None,
+        days_back: int | None = None,
+        include_cooling: bool = True,
         dry_run: bool = False,
+        stability_per_facade_per_entity: (
+            dict[str, dict[tuple[str, str], bool]] | None
+        ) = None,
     ) -> dict:
-        """Per-facade direct-beam obstruction critical_elev fit (#991).
+        """Per-entity per-facade solar-window obstruction fit (v9).
 
-        For each facade (S, E, W) independently, find the sun elevation
-        above which the direct-beam component should be zeroed.  The fit
-        operates on the modulating-regime hourly log: per dominance-
-        filtered sample, brute-force search over candidate cutoffs
-        ``[OBSTRUCTION_FIT_MIN_ELEV_DEG, OBSTRUCTION_FIT_MAX_ELEV_DEG]``
-        at 1° resolution.  SSE-ratio gate
-        (``1 − SSE_best/SSE_flat > OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD``)
-        plus ``OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE`` samples on each
-        side of the candidate cutoff are required for ``learned=True``.
+        For each facade (S, E, W) independently, find TWO critical
+        elevations:
+
+        * ``critical_elev_low`` — below this, terrain / neighbouring
+          buildings block direct beam.  Samples with ``sun_elev < low``
+          are gated (zeroed) in the search.
+        * ``critical_elev_high`` — above this, an overhang / terrace
+          blocks direct beam.  Samples with ``sun_elev > high`` are
+          gated (zeroed) in the search (legacy behaviour, v7/v8).
+
+        Two independent brute-force sweeps are run per facade.  The
+        low sweep searches ``[OBSTRUCTION_FIT_LOW_MIN_ELEV_DEG,
+        OBSTRUCTION_FIT_LOW_MAX_ELEV_DEG]``; the high sweep searches
+        ``[OBSTRUCTION_FIT_HIGH_MIN_ELEV_DEG,
+        OBSTRUCTION_FIT_HIGH_MAX_ELEV_DEG]``.
+
+        Each candidate ``c`` is scored on an adaptive kNN window — the
+        ``OBSTRUCTION_FIT_WINDOW_K_PER_SIDE`` nearest samples below and
+        above ``c`` by elevation distance, subject to a maximum angular
+        span of ``OBSTRUCTION_FIT_WINDOW_MAX_ANGULAR_DEG``.  The local
+        gated SSE is compared against the local null SSE (no gate
+        anywhere in the window).
+
+        **Shutdown-flagged hours** (``solar_dominant_entities``) serve as
+        constraints on the feasible range rather than SSE contributors.
+        A shutdown event at elevation E proves unobstructed sun at E,
+        so ``critical_elev_low < E < critical_elev_high`` must hold.
+        Candidates that would gate a proven-unobstructed elevation are
+        rejected before the SSE comparison.  This uses shutdown hours'
+        strong geometry signal without their saturation bias — shutdown
+        hours carry no information about coefficient magnitude
+        (``actual ≈ 0`` saturates ``actual_impact = base``), so they
+        cannot participate in the SSE comparison without creating
+        spurious obstruction finds at shutdown-rich elevations.
+
+        ``learned=True`` for each boundary requires both: relative
+        improvement above ``OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD``
+        and absolute per-sample RMS reduction above
+        ``OBSTRUCTION_FIT_MIN_RMS_REDUCTION_KWH`` (both computed on
+        the local window).  ``OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE``
+        is the absolute floor.
 
         Samples are computed with the EXISTING per-entity 4D coefficients
         held fixed.  The fit does not refit coefficients — that is the
         ``batch_fit_solar_4d`` service's job, recommended as a follow-up
         once obstruction lands.
 
+        **#1020 — suggestion-not-auto-write.**  This function no longer
+        writes to ``_critical_elev_per_facade_per_unit``.  Boundaries
+        that pass all four local apply-gate checks (``learned`` ∧
+        ``sse_improvement >= 0.30`` ∧ plausible per side ∧ stable
+        across windows) are surfaced as ``suggested_gates`` only; the
+        user accepts each suggestion explicitly via the
+        ``apply_obstruction_gate`` service.  ``dry_run`` is retained as
+        a passthrough field in the result for backward-compat but no
+        longer affects state.  Stability is supplied by the service
+        handler (multi-window orchestration); single-pass callers get
+        ``stable=True`` by default and the stability gate is bypassed.
+
         Potentials are reconstructed inline (not via
         ``calculate_unit_potential_4d``) so the existing gate state does
-        not contaminate the fit input.  Saturated hours are excluded
-        (no slope information).  Heating-mode only — cooling shutdown
-        semantics differ and remain out of scope.
+        not contaminate the fit input.
+
+        Heating and cooling samples enter the same per-facade SSE search
+        (geometric shadow is mode-invariant; #1006).  Sign correction is
+        applied per regime: heating ``actual_impact = expected_base −
+        actual``, cooling ``actual_impact = actual − expected_base``.
+
+        Cooling-specific deviations from the heating path:
+          * Saturation exclusion (``actual_impact ≥ 0.95 × base``) is
+            dropped.  Residential HP cooling capacity ≫ practical load.
+          * ``actual_impact ≤ 0`` IS excluded for the obstruction fit
+            (mirrors the heating skip).
+          * Shutdown constraint is heating-only (cooling has no
+            analogous flag — the ``solar_dominant_entities`` field
+            carries heating-specific shutdown semantics).
+          * Baseline lookup routes to ``COOLING_WIND_BUCKET``.
 
         Args:
-            hourly_log: Coordinator's hourly log (full history; the fit
-                consumes all uncensored modulating-regime entries).
+            hourly_log: Coordinator's hourly log.
             coordinator: For ``solar`` (sun-pos + transmittance),
                 ``_solar_coefficients_4d_per_unit`` (existing coeffs),
                 ``screen_config_for_entity``, ``_solar_affected_set``,
-                ``energy_sensors``, ``_critical_elev_per_facade``
+                ``energy_sensors``, ``critical_elev_for_entity`` (read
+                "before" state), ``_critical_elev_per_facade_per_unit``
                 (written on success unless ``dry_run``).
+            entity_id: When provided, restrict the fit to a single
+                entity.  ``None`` fits all entities.
+            days_back: Restrict to last N days of ``hourly_log``.
+            include_cooling: When False, skip all cooling-mode samples.
+            dry_run: When True, run the analysis but write nothing.
+                #1006 behaviour.  Set False to isolate whether cooling
+                contributions are driving spurious gates on a given
+                fit — useful diagnostic when results disagree with
+                physical knowledge of the install.
             dry_run: When True, run the analysis but write nothing.
 
         Returns:
-            Per-facade dict::
+            Per-entity dict::
 
                 {
-                    "s": {
-                        "learned": bool,
-                        "critical_elev_before": float | None,
-                        "critical_elev_after": float | None,
-                        "best_critical_elev": float,
-                        "sse_improvement_ratio": float,
-                        "sse_flat": float,
-                        "sse_best": float,
-                        "n_samples": int,
-                        "n_below_best": int,
-                        "n_above_best": int,
-                        "skip_reason": str | None,
+                    "<entity_id>": {
+                        "s": {
+                            "learned": bool,
+                            "applicable": bool,
+                            "applicable_reason": str | None,
+                            "critical_elev_before": float | None,
+                            "critical_elev_after": float | None,
+                            "best_critical_elev": float,
+                            "sse_improvement_ratio": float,
+                            "sse_flat": float,
+                            "sse_best": float,
+                            "sse_null_local": float,
+                            "rms_reduction_kwh": float,
+                            "window_elev_lo": float,
+                            "window_elev_hi": float,
+                            "n_samples": int,
+                            "n_heating_samples": int,
+                            "n_cooling_samples": int,
+                            "n_below_best": int,
+                            "n_above_best": int,
+                            "skip_reason": str | None,
+                        },
+                        "e": {...},
+                        "w": {...},
                     },
-                    "e": {...},
-                    "w": {...},
+                    "<other_entity_id>": {...},
+                    "n_skipped_cooling_unlearned": int,
                     "dry_run": bool,
                 }
         """
-        from datetime import datetime as _dt, timedelta as _td
-        from .solar import resolve_dni_dhi
+        from .solar import reconstruct_hour_inputs
+
+        # Time-window filter — see ``_filter_log_by_days_back`` for the
+        # parse-then-compare rationale (lex-compare on ISO strings is
+        # wrong under non-UTC offsets near the cutoff boundary).
+        hourly_log = _filter_log_by_days_back(hourly_log, days_back)
 
         solar = getattr(coordinator, "solar", None)
         coeffs_4d_per_unit = getattr(coordinator, "_solar_coefficients_4d_per_unit", {}) or {}
@@ -5406,25 +5543,70 @@ class LearningManager:
         if not isinstance(solar_affected, (frozenset, set)):
             solar_affected = None
         scr_fn = getattr(coordinator, "screen_config_for_entity", None)
-        crit_state = getattr(coordinator, "_critical_elev_per_facade", None) or {
-            "s": None, "e": None, "w": None,
-        }
+        crit_fn = getattr(coordinator, "critical_elev_for_entity", None)
+        crit_state_per_unit = getattr(
+            coordinator, "_critical_elev_per_facade_per_unit", None
+        )
+        if not isinstance(crit_state_per_unit, dict):
+            crit_state_per_unit = {}
 
-        # Per-facade sample lists: each entry (sun_elev, pot_facade,
-        # baseline_residual) where baseline_residual = actual_impact
-        # minus contributions from the OTHER three components (the two
-        # other facades + diffuse) using existing entity coefficients.
-        # The fit varies only the facade-under-test's contribution.
-        facade_samples: dict[str, list[tuple[float, float, float]]] = {
-            "s": [], "e": [], "w": [],
+        # Recalc fallback for ``unit_expected_base`` (#1005).  Pre-1.3.8
+        # ``hourly_log`` entries only carry ``unit_expected_breakdown``
+        # (net, post-solar); the dark-sky baseline this fit needs was
+        # never persisted.  Reconstruct it on-the-fly from the current
+        # per-unit base model when the logged value is absent — the
+        # geometric obstruction fit holds coefficients fixed and only
+        # needs a stable baseline, so current-model drift relative to
+        # log-time is acceptable (overhang shadow is a step-function in
+        # sun elevation, not a function of base-bucket state).
+        correlation_data_per_unit = getattr(coordinator, "_correlation_data_per_unit", {}) or {}
+        statistics_mgr = getattr(coordinator, "statistics", None)
+        balance_point = getattr(coordinator, "balance_point", 17.0)
+
+        # Candidate entities: either the single ``entity_id`` argument
+        # or all energy sensors filtered by ``_solar_affected_set``.
+        if entity_id is not None:
+            candidate_entities = [entity_id]
+        else:
+            candidate_entities = list(energy_sensors)
+        if solar_affected is not None:
+            candidate_entities = [
+                e for e in candidate_entities if e in solar_affected
+            ]
+        candidate_set = set(candidate_entities)
+
+        # Per-(entity, facade) sample lists, per-regime counters, and
+        # shutdown-constraint elevations.  Shutdown samples participate
+        # in constraint enforcement (hard bound on feasible cutoff range)
+        # but NOT in SSE — see docstring.
+        samples_per_entity: dict[str, dict[str, list[tuple[float, float, float]]]] = {
+            eid: {"s": [], "e": [], "w": []} for eid in candidate_entities
         }
+        shutdown_elevs_per_entity: dict[str, dict[str, list[float]]] = {
+            eid: {"s": [], "e": [], "w": []} for eid in candidate_entities
+        }
+        regime_counts_per_entity: dict[str, dict[str, dict[str, int]]] = {
+            eid: {
+                "s": {"heating": 0, "cooling": 0},
+                "e": {"heating": 0, "cooling": 0},
+                "w": {"heating": 0, "cooling": 0},
+            }
+            for eid in candidate_entities
+        }
+        n_skipped_cooling_unlearned = 0
 
         if solar is None:
             return {
-                "s": {"learned": False, "skip_reason": "no_solar_calculator"},
-                "e": {"learned": False, "skip_reason": "no_solar_calculator"},
-                "w": {"learned": False, "skip_reason": "no_solar_calculator"},
+                eid: {
+                    "s": {"learned": False, "skip_reason": "no_solar_calculator"},
+                    "e": {"learned": False, "skip_reason": "no_solar_calculator"},
+                    "w": {"learned": False, "skip_reason": "no_solar_calculator"},
+                }
+                for eid in candidate_entities
+            } | {
+                "n_skipped_cooling_unlearned": 0,
                 "dry_run": dry_run,
+                "suggested_gates": [],
             }
 
         for entry in hourly_log:
@@ -5433,38 +5615,17 @@ class LearningManager:
             unit_modes = entry.get("unit_modes", {}) or {}
             shutdown_entities = set(entry.get("solar_dominant_entities", []) or [])
 
-            ts_raw = entry.get("timestamp")
-            if not isinstance(ts_raw, str):
+            inputs, _fail = reconstruct_hour_inputs(entry, solar)
+            if inputs is None:
                 continue
-            try:
-                ts_dt = _dt.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            except (TypeError, ValueError):
+            # Helper rejects only on source=="none"; preserve the
+            # original stricter zero-gate here (#1011 scope note).
+            if inputs.dni <= 0.0 and inputs.dhi <= 0.0:
                 continue
-            mid_dt = ts_dt + _td(minutes=30)
-            try:
-                sun_elev, sun_az = solar.get_approx_sun_pos(mid_dt)
-            except Exception:
-                continue
-            if sun_elev <= 0.0:
-                continue
-
-            day_of_year = ts_dt.timetuple().tm_yday
-            try:
-                dni_v, dhi_v, _src = resolve_dni_dhi(
-                    entry.get("dni"),
-                    entry.get("dhi"),
-                    entry.get("ghi_wm2"),
-                    entry.get("cloud_coverage"),
-                    sun_elev,
-                    day_of_year,
-                )
-            except Exception:
-                continue
-            if (dni_v or 0.0) <= 0.0 and (dhi_v or 0.0) <= 0.0:
-                continue
-            dni_v = dni_v or 0.0
-            dhi_v = dhi_v or 0.0
-
+            sun_elev = inputs.sun_elev
+            sun_az = inputs.sun_az
+            dni_v = inputs.dni
+            dhi_v = inputs.dhi
             correction_percent = float(entry.get("correction_percent", 100.0))
             elev_rad = math.radians(sun_elev)
             az_rad = math.radians(sun_az)
@@ -5472,39 +5633,123 @@ class LearningManager:
             dni_horiz = max(0.0, dni_v) * cos_elev
 
             unit_breakdown = entry.get("unit_breakdown", {}) or {}
-            unit_expected_base = entry.get("unit_expected_base", {}) or {}
+            # Per-entity baseline is recalculated from the current per-unit
+            # base model (#1005) — single canonical source independent of
+            # which integration version wrote the log entry.  The logged
+            # ``unit_expected_base`` field (post-1.3.8) is intentionally
+            # NOT consulted here.
+            entry_temp_key = entry.get("temp_key")
+            entry_wind_bucket = entry.get("wind_bucket")
+            try:
+                entry_temp = float(entry.get("temp", balance_point))
+            except (TypeError, ValueError):
+                entry_temp = balance_point
 
-            for entity_id in energy_sensors:
-                if entity_id in shutdown_entities:
-                    continue
-                if solar_affected is not None and entity_id not in solar_affected:
-                    continue
-                if unit_modes.get(entity_id, MODE_HEATING) != MODE_HEATING:
-                    continue
-                if entity_id not in unit_breakdown:
+            for eid in candidate_entities:
+                if eid not in unit_breakdown:
                     continue
 
-                entity_coeffs = coeffs_4d_per_unit.get(entity_id, {}) or {}
-                regime_coeffs = entity_coeffs.get("heating", {}) or {}
+                unit_mode = unit_modes.get(eid, MODE_HEATING)
+                regime = _solar_coeff_regime(unit_mode)
+                if regime is None:
+                    continue  # OFF / DHW / unknown — no learnable solar coeff
+
+                # Cooling opt-out: when include_cooling=False, skip all
+                # cooling-mode samples (heating-only obstruction fit).
+                # Diagnostic flag for isolating cooling contributions.
+                if regime == "cooling" and not include_cooling:
+                    continue
+
+                # Shutdown-flagged heating hours: record the elevation
+                # per dominating facade as a constraint (proves
+                # unobstructed sun at that elevation) but do NOT
+                # collect as an SSE sample — shutdown hours carry
+                # no coefficient-magnitude signal (actual ≈ 0
+                # saturates actual_impact = base).  Cooling has no
+                # analogous flag — see docstring.
+                if regime == "heating" and eid in shutdown_entities:
+                    if scr_fn is not None:
+                        sd_screen = scr_fn(eid)
+                    else:
+                        sd_screen = getattr(coordinator, "screen_config", None)
+                    sd_ts, sd_te, sd_tw = solar._screen_transmittance_vector(
+                        correction_percent, sd_screen
+                    )
+                    sd_ps = dni_horiz * max(0.0, -math.cos(az_rad)) * sd_ts
+                    sd_pe = dni_horiz * max(0.0, math.sin(az_rad)) * sd_te
+                    sd_pw = dni_horiz * max(0.0, -math.sin(az_rad)) * sd_tw
+                    sd_pd = max(0.0, dhi_v) * 0.5 * (sd_ts + sd_te + sd_tw) / 3.0
+                    sd_sum = sd_ps + sd_pe + sd_pw + sd_pd
+                    if sd_sum > 0.0:
+                        for sd_f, sd_pf in (
+                            ("s", sd_ps), ("e", sd_pe), ("w", sd_pw)
+                        ):
+                            if (sd_pf / sd_sum) > OBSTRUCTION_FIT_DOMINANCE_RATIO:
+                                shutdown_elevs_per_entity[eid][sd_f].append(sun_elev)
+                    continue
+
+                entity_coeffs = coeffs_4d_per_unit.get(eid, {}) or {}
+                regime_coeffs = entity_coeffs.get(regime, {}) or {}
                 if not regime_coeffs.get("learned"):
+                    if regime == "cooling":
+                        n_skipped_cooling_unlearned += 1
                     continue
                 c_s = float(regime_coeffs.get("s", 0.0))
                 c_e = float(regime_coeffs.get("e", 0.0))
                 c_w = float(regime_coeffs.get("w", 0.0))
                 c_d = float(regime_coeffs.get("diffuse", 0.0))
 
-                expected_base = float(unit_expected_base.get(entity_id, 0.0) or 0.0)
+                # Baseline: heating reads the entry's wind bucket; cooling
+                # routes to COOLING_WIND_BUCKET regardless of the entry's
+                # wind classification (cooling samples live in the
+                # dedicated cooling bucket per CLAUDE.md).  Per-unit base
+                # model is recalculated (#1005) — the logged
+                # ``unit_expected_base`` field is intentionally NOT
+                # consulted.
+                lookup_bucket = (
+                    COOLING_WIND_BUCKET if regime == "cooling" else entry_wind_bucket
+                )
+                expected_base = 0.0
+                if statistics_mgr is not None and entry_temp_key and lookup_bucket:
+                    unit_data = correlation_data_per_unit.get(eid, {}) or {}
+                    try:
+                        expected_base = float(
+                            statistics_mgr._get_prediction_from_model(
+                                unit_data,
+                                entry_temp_key,
+                                lookup_bucket,
+                                entry_temp,
+                                balance_point,
+                            )
+                            or 0.0
+                        )
+                    except Exception:
+                        expected_base = 0.0
                 if expected_base <= 0.0:
                     continue
-                actual = float(unit_breakdown.get(entity_id, 0.0) or 0.0)
-                actual_impact = expected_base - actual
-                if actual_impact <= 0.0:
-                    continue
-                if actual_impact >= BATCH_FIT_SATURATION_RATIO * expected_base:
-                    continue  # saturated — no slope info for the fit
+                actual = float(unit_breakdown.get(eid, 0.0) or 0.0)
+
+                if regime == "heating":
+                    actual_impact = expected_base - actual
+                    if actual_impact <= 0.0:
+                        continue
+                    if actual_impact >= BATCH_FIT_SATURATION_RATIO * expected_base:
+                        continue  # saturated — no slope info for the fit
+                else:  # cooling
+                    # Sign inverted: solar increases cooling load, so
+                    # actual > expected_base when sun acts normally.
+                    # Saturation gate dropped (cooling capacity ≫ load).
+                    # ``<= 0`` gate APPLIED here (mirrors heating) —
+                    # the binary gate search would otherwise be biased
+                    # toward learning a gate to "hide" negative-impact
+                    # samples (deterministic SSE reduction whenever
+                    # br < 0 and cf_pot > 0).  See docstring.
+                    actual_impact = actual - expected_base
+                    if actual_impact <= 0.0:
+                        continue
 
                 if scr_fn is not None:
-                    entity_screen = scr_fn(entity_id)
+                    entity_screen = scr_fn(eid)
                 else:
                     entity_screen = getattr(coordinator, "screen_config", None)
                 t_s, t_e, t_w = solar._screen_transmittance_vector(
@@ -5535,100 +5780,586 @@ class LearningManager:
                         # Predicted_under_gate = baseline_residual_pred
                         # = (gate_active ? 0 : c_f · pot_f).
                         # We store c_f · pot_f as the facade prediction.
-                        facade_samples[facade].append(
+                        samples_per_entity[eid][facade].append(
                             (sun_elev, c_f * pot_f, baseline_residual)
                         )
+                        regime_counts_per_entity[eid][facade][regime] += 1
 
-        # Per-facade fit
-        n_steps = int(
-            (OBSTRUCTION_FIT_MAX_ELEV_DEG - OBSTRUCTION_FIT_MIN_ELEV_DEG)
-            / OBSTRUCTION_FIT_STEP_DEG
-        ) + 1
+        # Per-(entity, facade) solar-window fit (v9).
+        # Two independent brute-force sweeps per facade:
+        #   LOW  — gate below cutoff (lower horizon: terrain/neighbours)
+        #   HIGH — gate above cutoff (upper horizon: overhang/terrace)
+        # Sweep range is data-adaptive per facade (#1016 Problem 2) —
+        # see ``_data_adaptive_bounds`` below.
 
-        result: dict = {"dry_run": dry_run}
-        for facade in ("s", "e", "w"):
-            samples = facade_samples[facade]
-            facade_result = {
-                "learned": False,
-                "critical_elev_before": crit_state.get(facade),
-                "critical_elev_after": crit_state.get(facade),
-                "best_critical_elev": None,
-                "sse_improvement_ratio": 0.0,
-                "sse_flat": None,
-                "sse_best": None,
-                "n_samples": len(samples),
-                "n_below_best": 0,
-                "n_above_best": 0,
-                "skip_reason": None,
-            }
-            if len(samples) < 2 * OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE:
-                facade_result["skip_reason"] = "insufficient_samples"
-                result[facade] = facade_result
-                continue
+        K = OBSTRUCTION_FIT_WINDOW_K_PER_SIDE
+        K_FLOOR = OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE
+        SPAN_MAX = OBSTRUCTION_FIT_WINDOW_MAX_ANGULAR_DEG
 
-            # SSE under no gate: predicted = baseline_residual_pred + c_f · pot_f.
-            # baseline = actual_impact, prediction = others_pred + c_f · pot_f.
-            # We stored baseline_residual = actual_impact − others_pred,
-            # so residual_flat = baseline_residual − c_f · pot_f.
-            sse_flat = sum(
-                (br - cf_pot) ** 2 for (_elev, cf_pot, br) in samples
-            )
-            if sse_flat <= 0.0:
-                facade_result["skip_reason"] = "zero_residual_flat"
-                result[facade] = facade_result
-                continue
+        def _sweep_boundary(
+            samples_sorted: list[tuple[float, float, float]],
+            elev_arr: list[float],
+            min_elev: float,
+            max_elev: float,
+            n_steps: int,
+            *,
+            is_low: bool,
+            constraint_elev: float | None = None,
+        ) -> dict:
+            """Brute-force sweep for a single boundary (low or high horizon).
 
-            best_sse = sse_flat
+            ``is_low=True``: samples BELOW the candidate cutoff are gated
+            (zeroed) — models a lower horizon where terrain/neighbours
+            block direct beam at low elevations.  ``is_low=False``:
+            samples ABOVE the candidate cutoff are gated — legacy upper
+            horizon where overhang/terrace blocks direct beam at high
+            elevations.
+
+            ``constraint_elev``: when provided, constrains the feasible
+            cutoff range via a hard constraint from shutdown hours.
+            For low search: cutoff must be ≤ constraint_elev (can't
+            claim sun is blocked at an elevation where shutdown proved
+            it was visible).  For high search: cutoff must be ≥
+            constraint_elev.
+            """
+            best_improvement = -math.inf
             best_crit = None
             best_below = 0
             best_above = 0
+            best_sse_gated_local = None
+            best_sse_null_local = None
+            best_window_lo = None
+            best_window_hi = None
             for i in range(n_steps):
-                crit = OBSTRUCTION_FIT_MIN_ELEV_DEG + i * OBSTRUCTION_FIT_STEP_DEG
-                sse = 0.0
-                n_below = 0
-                n_above = 0
-                for (elev, cf_pot, br) in samples:
-                    if elev > crit:
-                        # Gate active: facade contribution zeroed.
-                        residual = br - 0.0
-                        n_above += 1
-                    else:
-                        residual = br - cf_pot
-                        n_below += 1
-                    sse += residual * residual
-                if (
-                    sse < best_sse
-                    and n_below >= OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE
-                    and n_above >= OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE
-                ):
-                    best_sse = sse
+                crit = min_elev + i * OBSTRUCTION_FIT_STEP_DEG
+                # Hard constraint: reject cutoffs that would gate a
+                # proven-unobstructed elevation (shutdown hours).
+                if constraint_elev is not None:
+                    if is_low and crit > constraint_elev:
+                        continue  # can't gate above proven elevation
+                    if not is_low and crit < constraint_elev:
+                        continue  # can't gate below proven elevation
+
+                split = bisect.bisect_right(elev_arr, crit)
+                below_start = max(0, split - K)
+                above_end = min(len(samples_sorted), split + K)
+                n_below = split - below_start
+                n_above = above_end - split
+                if n_below < K_FLOOR or n_above < K_FLOOR:
+                    continue
+                elev_lo = samples_sorted[below_start][0]
+                elev_hi = samples_sorted[above_end - 1][0]
+                if (elev_hi - elev_lo) > SPAN_MAX:
+                    continue
+                sse_gated = 0.0
+                sse_null = 0.0
+                if is_low:
+                    # Low search: samples BELOW cutoff gated (zeroed).
+                    for j in range(below_start, split):
+                        _, cf_pot, br = samples_sorted[j]
+                        sse_gated += br * br
+                        d = br - cf_pot
+                        sse_null += d * d
+                    for j in range(split, above_end):
+                        _, cf_pot, br = samples_sorted[j]
+                        d = br - cf_pot
+                        sse_gated += d * d
+                        sse_null += d * d
+                else:
+                    # High search: samples ABOVE cutoff gated (zeroed).
+                    for j in range(below_start, split):
+                        _, cf_pot, br = samples_sorted[j]
+                        d = br - cf_pot
+                        sse_gated += d * d
+                        sse_null += d * d
+                    for j in range(split, above_end):
+                        _, cf_pot, br = samples_sorted[j]
+                        sse_gated += br * br
+                        d = br - cf_pot
+                        sse_null += d * d
+                if sse_null <= 0.0:
+                    continue
+                improvement = 1.0 - sse_gated / sse_null
+                if improvement > best_improvement:
+                    best_improvement = improvement
                     best_crit = crit
                     best_below = n_below
                     best_above = n_above
+                    best_sse_gated_local = sse_gated
+                    best_sse_null_local = sse_null
+                    best_window_lo = elev_lo
+                    best_window_hi = elev_hi
+            return {
+                "best_crit": best_crit,
+                "best_improvement": best_improvement,
+                "best_below": best_below,
+                "best_above": best_above,
+                "best_sse_gated_local": best_sse_gated_local,
+                "best_sse_null_local": best_sse_null_local,
+                "best_window_lo": best_window_lo,
+                "best_window_hi": best_window_hi,
+            }
 
-            facade_result["sse_flat"] = sse_flat
-            if best_crit is None:
-                facade_result["skip_reason"] = "no_candidate_passed_sample_floor"
-                result[facade] = facade_result
-                continue
-
-            improvement = 1.0 - best_sse / sse_flat
-            facade_result["best_critical_elev"] = best_crit
-            facade_result["sse_best"] = best_sse
-            facade_result["sse_improvement_ratio"] = improvement
-            facade_result["n_below_best"] = best_below
-            facade_result["n_above_best"] = best_above
-
-            if improvement > OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD:
-                facade_result["learned"] = True
-                if not dry_run:
-                    crit_state[facade] = best_crit
-                    facade_result["critical_elev_after"] = best_crit
+        result: dict = {
+            "dry_run": dry_run,
+            "n_skipped_cooling_unlearned": n_skipped_cooling_unlearned,
+        }
+        # #1020: ``suggested_gates`` is the authoritative output for
+        # the handler — auto-write was removed, so the handler builds
+        # its UI from this list rather than diff-ing the gate state.
+        suggested_gates: list[dict] = []
+        # #1020 stability gating: the multi-window orchestrator in
+        # the service handler pre-computes per-(facade, side)
+        # stability and re-runs this fit injecting it via
+        # ``stability_per_facade_per_entity``.  Single-pass callers
+        # (tests, single-window debug runs) pass nothing and every
+        # boundary defaults to stable=True (the stability check is
+        # bypassed).  Keyed per entity so a single fit covering
+        # multiple entities maintains independent stability per
+        # entity.
+        stability_input = stability_per_facade_per_entity or {}
+        for eid in candidate_entities:
+            # "Before" state via the coordinator helper — v9 nested shape
+            # ``{"s": {"low": ..., "high": ...}, ...}``.
+            if callable(crit_fn):
+                entity_crit_before = crit_fn(eid)
             else:
-                facade_result["skip_reason"] = "below_sse_threshold"
+                entity_crit_before = {
+                    "s": {"low": None, "high": None},
+                    "e": {"low": None, "high": None},
+                    "w": {"low": None, "high": None},
+                }
 
-            result[facade] = facade_result
+            entity_result: dict = {}
+            stability_per_facade = stability_input.get(eid, {}) or {}
 
+            for facade in ("s", "e", "w"):
+                samples = samples_per_entity[eid][facade]
+                regime_counts = regime_counts_per_entity[eid][facade]
+                shutdown_elevs = shutdown_elevs_per_entity[eid][facade]
+
+                # Shutdown constraint: shutdown-flagged hours prove the
+                # sun was visible at that elevation, so they establish
+                # hard bounds on the feasible cutoff range.  Using the
+                # raw min/max would let a single false-positive shutdown
+                # classification at an extreme elevation permanently
+                # block the gate (shutdown detection has known noise);
+                # require ``OBSTRUCTION_FIT_SHUTDOWN_CONSTRAINT_MIN_N``
+                # shutdown samples below/above the candidate boundary
+                # before treating it as a constraint.  Below floor →
+                # no constraint (None).
+                n_required = OBSTRUCTION_FIT_SHUTDOWN_CONSTRAINT_MIN_N
+                if len(shutdown_elevs) >= n_required:
+                    sorted_sd = sorted(shutdown_elevs)
+                    # ``shutdown_min`` = elevation of the ``n_required``-th
+                    # lowest shutdown sample → low cutoff must be ≤ this
+                    # (n_required samples have proven sun visible at or
+                    # below it, so a low gate cannot sit higher).
+                    shutdown_min = sorted_sd[n_required - 1]
+                    # Symmetric on the high side.
+                    shutdown_max = sorted_sd[-n_required]
+                else:
+                    shutdown_min = None
+                    shutdown_max = None
+
+                before_gate = entity_crit_before.get(facade)
+                if isinstance(before_gate, dict):
+                    before_low = before_gate.get("low")
+                    before_high = before_gate.get("high")
+                else:
+                    before_low = None
+                    before_high = None
+
+                # Common fields across low + high sub-results.
+                common = {
+                    "n_samples": len(samples),
+                    "n_heating_samples": regime_counts["heating"],
+                    "n_cooling_samples": regime_counts["cooling"],
+                    "n_shutdown_constraints": len(shutdown_elevs),
+                    "shutdown_min_elev": shutdown_min,
+                    "shutdown_max_elev": shutdown_max,
+                }
+
+                if len(samples) < 2 * K_FLOOR:
+                    entity_result[facade] = {
+                        **common,
+                        "low": {
+                            "learned": False,
+                            "applicable": False,
+                            "applicable_reason": "not_learned",
+                            "skip_reason": "insufficient_samples",
+                            "critical_elev_before": before_low,
+                            "critical_elev_after": before_low,
+                            "best_critical_elev": None,
+                            "sse_improvement_ratio": 0.0,
+                            "sse_best": None,
+                            "sse_null_local": None,
+                            "rms_reduction_kwh": 0.0,
+                            "window_elev_lo": None,
+                            "window_elev_hi": None,
+                            "n_below_best": 0,
+                            "n_above_best": 0,
+                        },
+                        "high": {
+                            "learned": False,
+                            "applicable": False,
+                            "applicable_reason": "not_learned",
+                            "skip_reason": "insufficient_samples",
+                            "critical_elev_before": before_high,
+                            "critical_elev_after": before_high,
+                            "best_critical_elev": None,
+                            "sse_improvement_ratio": 0.0,
+                            "sse_best": None,
+                            "sse_null_local": None,
+                            "rms_reduction_kwh": 0.0,
+                            "window_elev_lo": None,
+                            "window_elev_hi": None,
+                            "n_below_best": 0,
+                            "n_above_best": 0,
+                        },
+                    }
+                    continue
+
+                # Global SSE under no gate — diagnostic only.
+                sse_flat = sum(
+                    (br - cf_pot) ** 2 for (_elev, cf_pot, br) in samples
+                )
+
+                # Sort once on elevation.
+                samples_sorted = sorted(samples, key=lambda s: s[0])
+                elev_arr = [s[0] for s in samples_sorted]
+
+                def _finalize_boundary(
+                    sweep: dict,
+                    boundary: str,
+                    learned: bool,
+                    skip_reason: str | None,
+                    crit_before: float | None,
+                ) -> dict:
+                    """Package a single boundary's sweep result."""
+                    best_crit = sweep["best_crit"]
+                    result_d = {
+                        "learned": learned,
+                        "critical_elev_before": crit_before,
+                        "critical_elev_after": (
+                            best_crit if learned else crit_before
+                        ),
+                        "best_critical_elev": best_crit,
+                        "sse_improvement_ratio": (
+                            sweep["best_improvement"]
+                            if sweep["best_improvement"] != -math.inf
+                            else 0.0
+                        ),
+                        "sse_best": sweep["best_sse_gated_local"],
+                        "sse_null_local": sweep["best_sse_null_local"],
+                        "rms_reduction_kwh": 0.0,
+                        "window_elev_lo": sweep["best_window_lo"],
+                        "window_elev_hi": sweep["best_window_hi"],
+                        "n_below_best": sweep["best_below"],
+                        "n_above_best": sweep["best_above"],
+                        "skip_reason": skip_reason,
+                    }
+                    if best_crit is not None and sweep["best_sse_null_local"] is not None:
+                        n_window = sweep["best_below"] + sweep["best_above"]
+                        rms = math.sqrt(
+                            max(
+                                0.0,
+                                sweep["best_sse_null_local"]
+                                - (sweep["best_sse_gated_local"] or 0.0),
+                            )
+                            / max(1, n_window)
+                        )
+                        result_d["rms_reduction_kwh"] = rms
+                    return result_d
+
+                # Data-adaptive sweep bounds (#1016 Problem 2).  A
+                # candidate cutoff can only pass the K_FLOOR constraint
+                # when at least ``K_FLOOR`` samples sit on each side of
+                # it; ``elev_arr[K_FLOOR - 1]`` is the lowest crit with
+                # K_FLOOR samples below, and ``elev_arr[-K_FLOOR]`` is
+                # the highest crit with K_FLOOR samples above.
+                # Intersecting these with the configured search range
+                # gives an honest per-facade range: the configured
+                # range is the policy ceiling, the data range is the
+                # physical floor.  When the data does not reach the
+                # configured side at all (e.g. winter at 60°N with no
+                # sun above ~15°), the corresponding sweep is skipped
+                # explicitly with ``data_does_not_reach_*`` rather
+                # than silently failing K_FLOOR on every candidate.
+                data_min_for_low = elev_arr[K_FLOOR - 1]
+                data_max_for_high = elev_arr[-K_FLOOR]
+                low_min_eff = max(
+                    OBSTRUCTION_FIT_LOW_MIN_ELEV_DEG, data_min_for_low
+                )
+                low_max_eff = OBSTRUCTION_FIT_LOW_MAX_ELEV_DEG
+                high_min_eff = OBSTRUCTION_FIT_HIGH_MIN_ELEV_DEG
+                high_max_eff = min(
+                    OBSTRUCTION_FIT_HIGH_MAX_ELEV_DEG, data_max_for_high
+                )
+
+                # --- LOW boundary sweep ---
+                # Shutdown constraint: low cutoff must be ≤ shutdown_min
+                # (can't claim sun is blocked above where shutdown
+                # proved it was visible).  Same constraint for first
+                # fit and re-fit — the ``before_low`` value does not
+                # change what the data is allowed to prove.
+                if low_min_eff > low_max_eff:
+                    low_learned = False
+                    low_skip = "data_does_not_reach_low_regime"
+                    low_result = _finalize_boundary(
+                        {
+                            "best_crit": None,
+                            "best_improvement": -math.inf,
+                            "best_below": 0, "best_above": 0,
+                            "best_sse_gated_local": None,
+                            "best_sse_null_local": None,
+                            "best_window_lo": None,
+                            "best_window_hi": None,
+                        },
+                        "low", low_learned, low_skip, before_low,
+                    )
+                else:
+                    n_steps_low = int(
+                        (low_max_eff - low_min_eff) / OBSTRUCTION_FIT_STEP_DEG
+                    ) + 1
+                    sweep_low = _sweep_boundary(
+                        samples_sorted, elev_arr,
+                        low_min_eff, low_max_eff, n_steps_low,
+                        is_low=True,
+                        constraint_elev=shutdown_min,
+                    )
+                    if sweep_low["best_crit"] is not None:
+                        passes_rel = sweep_low["best_improvement"] > OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD
+                        n_window_low = sweep_low["best_below"] + sweep_low["best_above"]
+                        rms_low = math.sqrt(
+                            max(
+                                0.0,
+                                (sweep_low["best_sse_null_local"] or 0.0)
+                                - (sweep_low["best_sse_gated_local"] or 0.0),
+                            )
+                            / max(1, n_window_low)
+                        )
+                        passes_abs = rms_low > OBSTRUCTION_FIT_MIN_RMS_REDUCTION_KWH
+                        if passes_rel and passes_abs:
+                            low_learned = True
+                            low_skip = None
+                        elif not passes_rel:
+                            low_learned = False
+                            low_skip = "below_sse_threshold"
+                        else:
+                            low_learned = False
+                            low_skip = "below_rms_amplitude_threshold"
+                    else:
+                        low_learned = False
+                        low_skip = "no_candidate_passed_sample_floor"
+                    low_result = _finalize_boundary(
+                        sweep_low, "low", low_learned, low_skip, before_low,
+                    )
+
+                # --- HIGH boundary sweep ---
+                # Cooling-data floor (#1020).  At northern latitudes
+                # with heating-only data, sun rarely reaches the HIGH
+                # regime — the fit either finds nothing or "finds" a
+                # marginal artifact.  Below the configured cooling-
+                # sample floor for this facade, skip the HIGH sweep
+                # honestly with ``insufficient_cooling_for_high_regime``
+                # rather than letting a low-N fit drive a suggestion.
+                # The check sits before the data-adaptive range check
+                # because data coverage and signal credibility are
+                # distinct concerns — heating-only at 60°N can have
+                # ample LOW-regime data while structurally lacking
+                # HIGH-regime samples to validate any artifact found.
+                if (
+                    regime_counts["cooling"]
+                    < OBSTRUCTION_FIT_MIN_COOLING_SAMPLES_FOR_HIGH
+                ):
+                    high_learned = False
+                    high_skip = "insufficient_cooling_for_high_regime"
+                    high_result = _finalize_boundary(
+                        {
+                            "best_crit": None,
+                            "best_improvement": -math.inf,
+                            "best_below": 0, "best_above": 0,
+                            "best_sse_gated_local": None,
+                            "best_sse_null_local": None,
+                            "best_window_lo": None,
+                            "best_window_hi": None,
+                        },
+                        "high", high_learned, high_skip, before_high,
+                    )
+                # Shutdown constraint mirrors LOW: high cutoff must be
+                # ≥ shutdown_max.
+                elif high_min_eff > high_max_eff:
+                    high_learned = False
+                    high_skip = "data_does_not_reach_high_regime"
+                    high_result = _finalize_boundary(
+                        {
+                            "best_crit": None,
+                            "best_improvement": -math.inf,
+                            "best_below": 0, "best_above": 0,
+                            "best_sse_gated_local": None,
+                            "best_sse_null_local": None,
+                            "best_window_lo": None,
+                            "best_window_hi": None,
+                        },
+                        "high", high_learned, high_skip, before_high,
+                    )
+                else:
+                    n_steps_high = int(
+                        (high_max_eff - high_min_eff) / OBSTRUCTION_FIT_STEP_DEG
+                    ) + 1
+                    sweep_high = _sweep_boundary(
+                        samples_sorted, elev_arr,
+                        high_min_eff, high_max_eff, n_steps_high,
+                        is_low=False,
+                        constraint_elev=shutdown_max,
+                    )
+                    if sweep_high["best_crit"] is not None:
+                        passes_rel = sweep_high["best_improvement"] > OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD
+                        n_window_high = sweep_high["best_below"] + sweep_high["best_above"]
+                        rms_high = math.sqrt(
+                            max(
+                                0.0,
+                                (sweep_high["best_sse_null_local"] or 0.0)
+                                - (sweep_high["best_sse_gated_local"] or 0.0),
+                            )
+                            / max(1, n_window_high)
+                        )
+                        passes_abs = rms_high > OBSTRUCTION_FIT_MIN_RMS_REDUCTION_KWH
+                        if passes_rel and passes_abs:
+                            high_learned = True
+                            high_skip = None
+                        elif not passes_rel:
+                            high_learned = False
+                            high_skip = "below_sse_threshold"
+                        else:
+                            high_learned = False
+                            high_skip = "below_rms_amplitude_threshold"
+                    else:
+                        high_learned = False
+                        high_skip = "no_candidate_passed_sample_floor"
+                    high_result = _finalize_boundary(
+                        sweep_high, "high", high_learned, high_skip, before_high,
+                    )
+
+                facade_result = {
+                    **common,
+                    "sse_flat": sse_flat,
+                    "low": low_result,
+                    "high": high_result,
+                }
+                entity_result[facade] = facade_result
+
+                # Collect writes for this facade.  Sanity-check the
+                # combined window: when both sweeps fire and the gap
+                # ``high - low`` is below ``OBSTRUCTION_FIT_MIN_WINDOW_DEG``
+                # the combined gate would zero direct beam across most
+                # of the facade's elevation range — physically
+                # implausible and a known failure mode when only one
+                # true gate exists (the data above a true high gate
+                # has ``br=0`` everywhere, which the LOW sweep
+                # mathematically interprets as "below a low gate",
+                # and vice versa).  Without shutdown samples, neither
+                # sweep constrains the other.  Keep only the boundary
+                # with stronger evidence (higher SSE improvement
+                # ratio); discard the weaker one as the spurious
+                # mirror finding.  Surface the rejection as
+                # ``skip_reason = combined_window_too_narrow`` so the
+                # diagnostic shows why one side was suppressed.
+                new_low = low_result["best_critical_elev"] if low_learned else before_low
+                new_high = high_result["best_critical_elev"] if high_learned else before_high
+                if (
+                    low_learned
+                    and high_learned
+                    and (new_high - new_low) < OBSTRUCTION_FIT_MIN_WINDOW_DEG
+                ):
+                    reason = "combined_window_too_narrow"
+                    low_imp = low_result["sse_improvement_ratio"] or 0.0
+                    high_imp = high_result["sse_improvement_ratio"] or 0.0
+                    if high_imp >= low_imp:
+                        low_result["learned"] = False
+                        low_result["skip_reason"] = reason
+                        low_result["critical_elev_after"] = before_low
+                        low_learned = False
+                        new_low = before_low
+                    else:
+                        high_result["learned"] = False
+                        high_result["skip_reason"] = reason
+                        high_result["critical_elev_after"] = before_high
+                        high_learned = False
+                        new_high = before_high
+
+                # Apply-gate (#1020).  Four local checks per side
+                # with no cross-boundary dependency: learned ∧
+                # sse_improvement ≥ 0.30 ∧ plausible ∧ stable.
+                # Stability is supplied by the multi-window handler
+                # orchestrator; single-pass callers (tests, ad-hoc
+                # debug runs) get stable=True by default and the
+                # stability gate is effectively bypassed.
+                stable_low = stability_per_facade.get(
+                    (facade, "low"), True,
+                )
+                stable_high = stability_per_facade.get(
+                    (facade, "high"), True,
+                )
+                low_applicable, low_app_reason = _boundary_applicable(
+                    low_result, "low",
+                    stable_across_windows=stable_low,
+                )
+                high_applicable, high_app_reason = _boundary_applicable(
+                    high_result, "high",
+                    stable_across_windows=stable_high,
+                )
+                low_result["applicable"] = low_applicable
+                low_result["applicable_reason"] = low_app_reason
+                high_result["applicable"] = high_applicable
+                high_result["applicable_reason"] = high_app_reason
+
+                # ``critical_elev_after`` reflects what the gate would
+                # be IF the suggestion were accepted.  Auto-write was
+                # removed in #1020 — passing gates surface as
+                # ``suggested_gates`` only, and the user accepts
+                # explicitly via ``apply_obstruction_gate``.  Not-
+                # applicable boundaries reset ``critical_elev_after``
+                # to the pre-fit value for diagnostic clarity.
+                if low_learned and not low_applicable:
+                    low_result["critical_elev_after"] = before_low
+                if high_learned and not high_applicable:
+                    high_result["critical_elev_after"] = before_high
+
+                if low_applicable:
+                    suggested_gates.append({
+                        "entity_id": eid,
+                        "facade": facade,
+                        "side": "low",
+                        "value": low_result["best_critical_elev"],
+                        "before": before_low,
+                        "sse_improvement_ratio": (
+                            low_result["sse_improvement_ratio"]
+                        ),
+                    })
+                if high_applicable:
+                    suggested_gates.append({
+                        "entity_id": eid,
+                        "facade": facade,
+                        "side": "high",
+                        "value": high_result["best_critical_elev"],
+                        "before": before_high,
+                        "sse_improvement_ratio": (
+                            high_result["sse_improvement_ratio"]
+                        ),
+                    })
+
+            result[eid] = entity_result
+
+        # #1020: ``fit_solar_obstruction`` no longer auto-writes to
+        # ``_critical_elev_per_facade_per_unit``.  ``suggested_gates``
+        # is the authoritative output for callers; the handler
+        # surfaces it to the user, who accepts individual gates via
+        # the ``apply_obstruction_gate`` service.  Kept the
+        # ``crit_state_per_unit`` lookup above so ``before_*`` values
+        # reflect the current state for diagnostic transparency.
+        result["suggested_gates"] = suggested_gates
         return result
 
     def compute_implied_for_apply(

@@ -4,6 +4,7 @@ import pytest
 from datetime import datetime
 from homeassistant.core import HomeAssistant
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
+from custom_components.heating_analytics.const import ATTR_LAST_HOUR_DEVIATION_PCT, ENERGY_GUARD_THRESHOLD
 
 @pytest.mark.asyncio
 async def test_hourly_processing_triggers(hass: HomeAssistant):
@@ -203,3 +204,72 @@ async def test_log_retention_preserves_list_identity(hass: HomeAssistant):
 
         # List identity must be preserved (in-place deletion)
         assert id(coordinator._hourly_log) == original_list_id
+
+
+def _make_stats_mock(
+    solar_reduction_kwh: float,
+    base_kwh: float = 0.0,
+    solar_wasted_kwh: float = 0.0,
+) -> MagicMock:
+    """Return a statistics MagicMock whose calculate_total_power yields controlled values."""
+    mock = MagicMock()
+    mock.calculate_total_power.return_value = {
+        "global_base_kwh": base_kwh,
+        "breakdown": {
+            "base_kwh": base_kwh,
+            "solar_reduction_kwh": solar_reduction_kwh,
+            "solar_wasted_kwh": solar_wasted_kwh,
+        },
+    }
+    return mock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "actual_kwh, expected_kwh, solar_reduction_kwh, solar_wasted_kwh, expected_pct",
+    [
+        # Normal hour: expected dominates — formula is unchanged from pre-fix.
+        (2.5, 2.0, 0.3, 0.0, 25.0),
+        # Solar-saturation, large applied (demand ≥ applied): denom = 0.5*(2.0+0) = 1.0.
+        (0.187, 0.0, 2.0, 0.0, 18.7),
+        # Night, no solar: denom collapses to ENERGY_GUARD_THRESHOLD (0.01).
+        (0.05, 0.0, 0.0, 0.0, round(0.05 / ENERGY_GUARD_THRESHOLD * 100, 1)),
+        # Heavy saturation: applied≈0 (demand capped it at 0.05), wasted=2.95 (large
+        # solar potential fully clipped). denom = 0.5*(0.05+2.95) = 1.5 → 3.3 %.
+        # Without the solar_wasted term: denom = max(0, 0.01, 0.025) = 0.025 → 200 %.
+        (0.05, 0.0, 0.05, 2.95, round(0.05 / 1.5 * 100, 1)),
+    ],
+)
+async def test_deviation_pct_floored_denominator(
+    hass: HomeAssistant,
+    actual_kwh,
+    expected_kwh,
+    solar_reduction_kwh,
+    solar_wasted_kwh,
+    expected_pct,
+):
+    """ATTR_LAST_HOUR_DEVIATION_PCT uses a floored denominator so saturation hours
+    never produce ∞ or near-∞ percentages. The floor uses applied+wasted solar
+    (pre-saturation magnitude) so fully-clipped hours are also bounded."""
+    entry = MagicMock()
+    entry.data = {"balance_point": 17.0}
+
+    with patch("custom_components.heating_analytics.storage.Store"):
+        coordinator = HeatingDataCoordinator(hass, entry)
+        coordinator._async_save_data = AsyncMock()
+
+        # Inject controlled actual / expected / solar values.
+        coordinator._collector.energy_hour = actual_kwh
+        coordinator._collector.expected_energy_hour = expected_kwh
+        # sample_count=0 skips learning; deviation_pct is computed before that gate.
+        coordinator._collector.sample_count = 0
+
+        coordinator.statistics = _make_stats_mock(
+            solar_reduction_kwh, base_kwh=expected_kwh, solar_wasted_kwh=solar_wasted_kwh
+        )
+
+        current_time = datetime(2026, 5, 2, 17, 0, 0)
+        await coordinator._process_hourly_data(current_time)
+
+        result = coordinator.data[ATTR_LAST_HOUR_DEVIATION_PCT]
+        assert result == pytest.approx(expected_pct, abs=0.1)

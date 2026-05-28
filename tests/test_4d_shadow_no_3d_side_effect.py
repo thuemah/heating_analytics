@@ -126,6 +126,9 @@ def _make_solar_calc() -> MagicMock:
     # screen helpers (defensive — different code paths consult these).
     calc._screen_transmittance_vector = MagicMock(return_value=(1.0, 1.0, 1.0))
     calc._screen_transmittance = MagicMock(return_value=1.0)
+    # 4D saturation dispatch (#1008).
+    from tests.helpers import mock_calculate_saturation
+    calc.calculate_saturation = MagicMock(side_effect=mock_calculate_saturation)
     return calc
 
 

@@ -367,6 +367,79 @@ def _migrate_v6_to_v7(data: dict) -> dict:
     return data
 
 
+def _migrate_v7_to_v8(data: dict) -> dict:
+    """v7 -> v8: lift obstruction gate from building-level to per-entity (#1009).
+
+    Drops the v7 ``_critical_elev_per_facade`` (single dict shared across
+    all entities) and creates ``_critical_elev_per_facade_per_unit`` as
+    an empty dict.  Per-entity gates default to all-``None`` (no gate)
+    on first read via ``coordinator.critical_elev_for_entity``.
+
+    **Migration semantic: discard, do not seed.**  Carrying the existing
+    building-level value into all entities would preserve current
+    behaviour on load, but for installs whose v7 fit produced a wrong-
+    for-some-units gate (the empirical case motivating #1009), that
+    migration silently propagates the bias until the user reruns the
+    fit.  Discarding forces a refit and reverts to pre-#991 behaviour
+    (unobstructed direct beam) in the interim — safe direction:
+    over-applied gates are model bias, missing gates default to the
+    diffuse-dominated baseline.
+
+    Users must rerun ``heating_analytics.fit_solar_obstruction`` after
+    upgrade to restore per-entity gates.  Document in upgrade notes.
+    """
+    data = dict(data)
+    data.pop("_critical_elev_per_facade", None)
+    data.setdefault("_critical_elev_per_facade_per_unit", {})
+    return data
+
+
+def _migrate_v8_to_v9(data: dict) -> dict:
+    """v8 -> v9: solar-window low+high obstruction gate per facade.
+
+    Wraps each entity's v8 single-float ``critical_elev`` into the v9
+    ``{"low": None, "high": old_value}`` nested shape.  The v8 value was
+    a pure upper-horizon gate (``sun_elev > crit``); the migration maps
+    it to the ``high`` boundary and leaves ``low`` at ``None`` (no lower
+    horizon).  This is bit-identical to pre-v9 behaviour: only the
+    upper-horizon gate fires, and the lower-horizon gate is disabled.
+
+    Per-entity idempotent — running twice on the same input produces
+    the same result.  Already-nested values pass through unchanged.
+    """
+    data = dict(data)
+    raw = data.get("_critical_elev_per_facade_per_unit")
+    if isinstance(raw, dict):
+        migrated: dict = {}
+        for eid, per_facade in raw.items():
+            if not isinstance(per_facade, dict):
+                migrated[eid] = {
+                    "s": {"low": None, "high": None},
+                    "e": {"low": None, "high": None},
+                    "w": {"low": None, "high": None},
+                }
+                continue
+            entity_gates: dict[str, dict[str, float | None]] = {}
+            for f in ("s", "e", "w"):
+                v = per_facade.get(f)
+                if isinstance(v, dict) and ("low" in v or "high" in v):
+                    # Already v9 nested shape — pass through.
+                    entity_gates[f] = {
+                        "low": float(v["low"]) if isinstance(v.get("low"), (int, float)) else None,
+                        "high": float(v["high"]) if isinstance(v.get("high"), (int, float)) else None,
+                    }
+                elif isinstance(v, (int, float)):
+                    # Legacy v8 single float → high-only gate.
+                    entity_gates[f] = {"low": None, "high": float(v)}
+                else:
+                    entity_gates[f] = {"low": None, "high": None}
+            migrated[eid] = entity_gates
+        data["_critical_elev_per_facade_per_unit"] = migrated
+    else:
+        data["_critical_elev_per_facade_per_unit"] = {}
+    return data
+
+
 class StorageManager:
     """Manages data persistence (JSON, CSV)."""
 
@@ -446,6 +519,20 @@ class StorageManager:
                 old_major_version,
             )
             old_data = _migrate_v6_to_v7(old_data)
+
+        if old_major_version < 8:
+            _LOGGER.info(
+                "Heating Analytics: migrating storage v%d -> v8 (per-entity obstruction gate, #1009 — existing gates discarded; rerun fit_solar_obstruction)",
+                old_major_version,
+            )
+            old_data = _migrate_v7_to_v8(old_data)
+
+        if old_major_version < 9:
+            _LOGGER.info(
+                "Heating Analytics: migrating storage v%d -> v9 (solar-window low+high obstruction gate — existing high-only gates preserved as high boundary; low defaults to None)",
+                old_major_version,
+            )
+            old_data = _migrate_v8_to_v9(old_data)
 
         return old_data
 
@@ -728,17 +815,33 @@ class StorageManager:
             else:
                 self.coordinator._learning_buffer_solar_4d_per_unit = {}
 
-            # Per-facade direct-beam obstruction state (#991, storage v7).
-            # Canonical shape emitted by ``_migrate_v6_to_v7``: dict with
-            # keys s/e/w mapping to ``float | None``.  ``None`` = no gate.
-            loaded_crit = data.get("_critical_elev_per_facade", {}) or {}
+            # Solar-window obstruction state (v9).  Canonical shape after
+            # ``_migrate_v8_to_v9``: ``{entity_id: {s|e|w: {"low": float|None, "high": float|None}}}``.
+            # Empty dict = no entity has a gate.  Refit-required after
+            # v7→v8 (gates discarded); v8→v9 preserves existing high-only
+            # gates as ``{"low": None, "high": old_value}``.
+            loaded_crit = data.get("_critical_elev_per_facade_per_unit", {}) or {}
             if isinstance(loaded_crit, dict):
-                self.coordinator._critical_elev_per_facade = {
-                    f: (float(loaded_crit[f]) if isinstance(loaded_crit.get(f), (int, float)) else None)
-                    for f in ("s", "e", "w")
-                }
+                self.coordinator._critical_elev_per_facade_per_unit = {}
+                for eid, v in loaded_crit.items():
+                    if not isinstance(v, dict):
+                        continue
+                    entity_gates: dict[str, dict[str, float | None]] = {}
+                    for f in ("s", "e", "w"):
+                        fv = v.get(f)
+                        if isinstance(fv, dict) and ("low" in fv or "high" in fv):
+                            entity_gates[f] = {
+                                "low": float(fv["low"]) if isinstance(fv.get("low"), (int, float)) else None,
+                                "high": float(fv["high"]) if isinstance(fv.get("high"), (int, float)) else None,
+                            }
+                        elif isinstance(fv, (int, float)):
+                            # Legacy v8 single float → high-only gate
+                            entity_gates[f] = {"low": None, "high": float(fv)}
+                        else:
+                            entity_gates[f] = {"low": None, "high": None}
+                    self.coordinator._critical_elev_per_facade_per_unit[eid] = entity_gates
             else:
-                self.coordinator._critical_elev_per_facade = {"s": None, "e": None, "w": None}
+                self.coordinator._critical_elev_per_facade_per_unit = {}
 
             # Load per-unit min-base thresholds (#871).  Absent on legacy
             # installs → empty dict → all gate sites fall back to the
@@ -1263,8 +1366,8 @@ class StorageManager:
                     # Parallel 4D solar-coefficient state (#954, storage v6).
                     "_solar_coefficients_4d_per_unit": self.coordinator._solar_coefficients_4d_per_unit,
                     "_learning_buffer_solar_4d_per_unit": self.coordinator._learning_buffer_solar_4d_per_unit,
-                    # Per-facade direct-beam obstruction state (#991, storage v7).
-                    "_critical_elev_per_facade": self.coordinator._critical_elev_per_facade,
+                    # Per-entity direct-beam obstruction state (#1009, storage v8).
+                    "_critical_elev_per_facade_per_unit": self.coordinator._critical_elev_per_facade_per_unit,
                     "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
                     "unit_modes": self.coordinator._unit_modes,
                     "solar_optimizer_data": self.coordinator.solar_optimizer.get_data(),
@@ -1364,8 +1467,8 @@ class StorageManager:
             # Parallel 4D solar-coefficient state (#954, storage v6).
             "_solar_coefficients_4d_per_unit": self.coordinator._solar_coefficients_4d_per_unit,
             "_learning_buffer_solar_4d_per_unit": self.coordinator._learning_buffer_solar_4d_per_unit,
-            # Per-facade direct-beam obstruction state (#991, storage v7).
-            "_critical_elev_per_facade": self.coordinator._critical_elev_per_facade,
+            # Per-entity direct-beam obstruction state (#1009, storage v8).
+            "_critical_elev_per_facade_per_unit": self.coordinator._critical_elev_per_facade_per_unit,
             "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
             "last_batch_fit_per_unit": self.coordinator._last_batch_fit_per_unit,
             "solar_battery_state": self.coordinator._solar_battery_state,
@@ -1433,6 +1536,8 @@ class StorageManager:
             data = _migrate_v4_to_v5(data)
             data = _migrate_v5_to_v6(data)  # #954: 4D solar scaffolding
             data = _migrate_v6_to_v7(data)  # #991: per-facade obstruction state
+            data = _migrate_v7_to_v8(data)  # #1009: per-entity obstruction state
+            data = _migrate_v8_to_v9(data)  # v9: solar-window low+high gate
 
             # Apply Data
             self.coordinator._correlation_data.clear()
@@ -1559,15 +1664,28 @@ class StorageManager:
                 if isinstance(v, dict)
             } if isinstance(raw_buffer_solar_4d, dict) else {}
 
-            # Restore per-facade obstruction state (#991, storage v7).
-            raw_crit = data.get("_critical_elev_per_facade", {}) or {}
+            # Restore solar-window obstruction state (v9).
+            raw_crit = data.get("_critical_elev_per_facade_per_unit", {}) or {}
             if isinstance(raw_crit, dict):
-                self.coordinator._critical_elev_per_facade = {
-                    f: (float(raw_crit[f]) if isinstance(raw_crit.get(f), (int, float)) else None)
-                    for f in ("s", "e", "w")
-                }
+                self.coordinator._critical_elev_per_facade_per_unit = {}
+                for eid, v in raw_crit.items():
+                    if not isinstance(v, dict):
+                        continue
+                    entity_gates: dict[str, dict[str, float | None]] = {}
+                    for f in ("s", "e", "w"):
+                        fv = v.get(f)
+                        if isinstance(fv, dict) and ("low" in fv or "high" in fv):
+                            entity_gates[f] = {
+                                "low": float(fv["low"]) if isinstance(fv.get("low"), (int, float)) else None,
+                                "high": float(fv["high"]) if isinstance(fv.get("high"), (int, float)) else None,
+                            }
+                        elif isinstance(fv, (int, float)):
+                            entity_gates[f] = {"low": None, "high": float(fv)}
+                        else:
+                            entity_gates[f] = {"low": None, "high": None}
+                    self.coordinator._critical_elev_per_facade_per_unit[eid] = entity_gates
             else:
-                self.coordinator._critical_elev_per_facade = {"s": None, "e": None, "w": None}
+                self.coordinator._critical_elev_per_facade_per_unit = {}
 
             # Restore Unit Modes
             self.coordinator._unit_modes = data.get("unit_modes", {})

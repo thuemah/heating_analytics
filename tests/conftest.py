@@ -111,6 +111,9 @@ mock_dt = MagicMock(name='mock_dt_real')
 mock_dt.UTC = timezone.utc # Use real UTC object
 mock_dt.as_utc.side_effect = lambda d: d.replace(tzinfo=timezone.utc)
 mock_dt.now.return_value = datetime(2023, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+# utcnow used by _filter_log_by_days_back — must return a real datetime
+# so chronological comparisons work without TypeError.
+mock_dt.utcnow.side_effect = lambda: datetime.now(timezone.utc)
 # Implement parse_datetime to return real datetime objects
 def side_effect_parse_datetime(dt_str):
     try:
@@ -221,7 +224,12 @@ def mock_coordinator(mock_entry):
     mock._aux_coefficients_per_unit = {}
     mock._solar_coefficients_per_unit = {}
     mock._solar_coefficients_4d_per_unit = {}
-    mock._critical_elev_per_facade = {"s": None, "e": None, "w": None}
+    mock._critical_elev_per_facade_per_unit = {}
+    mock.critical_elev_for_entity = lambda _eid: {
+        "s": {"low": None, "high": None},
+        "e": {"low": None, "high": None},
+        "w": {"low": None, "high": None},
+    }
     mock._learning_buffer_global = []
     mock._learning_buffer_per_unit = {}
     mock._learning_buffer_aux_per_unit = {}
@@ -296,6 +304,29 @@ def mock_coordinator(mock_entry):
         return base
         
     mock.solar.apply_correction.side_effect = mock_apply_correction
+
+    def mock_calculate_saturation(net_after_aux, solar, mode):
+        """Mirror solar.calculate_saturation's mode dispatch for fallback
+        path tests (#996) — MODE_OFF returns 0, heating clamps, cooling
+        adds, DHW / unknown falls through unchanged.
+        """
+        from custom_components.heating_analytics.const import (
+            MODE_HEATING, MODE_GUEST_HEATING,
+            MODE_COOLING, MODE_GUEST_COOLING,
+            MODE_OFF,
+        )
+        if mode == MODE_OFF:
+            return 0.0, 0.0, 0.0
+        if mode in (MODE_HEATING, MODE_GUEST_HEATING):
+            applied = min(solar, net_after_aux)
+            wasted = max(0.0, solar - net_after_aux)
+            return applied, wasted, net_after_aux - applied
+        if mode in (MODE_COOLING, MODE_GUEST_COOLING):
+            return solar, 0.0, net_after_aux + solar
+        # DHW / unknown
+        return 0.0, 0.0, net_after_aux
+
+    mock.solar.calculate_saturation.side_effect = mock_calculate_saturation
 
     # Ensure get_model_state() returns the .model proxy built by monkey-patch
     mock.get_model_state.side_effect = lambda: mock.model

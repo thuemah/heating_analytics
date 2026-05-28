@@ -15,7 +15,7 @@ on missed days.  These tests pin that behaviour.
 from __future__ import annotations
 
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -27,8 +27,9 @@ from custom_components.heating_analytics.const import (
 from custom_components.heating_analytics.forecast import ForecastManager
 
 
+@pytest.mark.asyncio
 @patch("custom_components.heating_analytics.forecast.dt_util.now")
-def test_missed_day_clears_stale_attributes(mock_now, mock_coordinator):
+async def test_missed_day_clears_stale_attributes(mock_now, mock_coordinator):
     """Yesterday's snapshot → today is missed → ATTR keys must be cleared.
 
     Direct reproduction of the Codex P1 finding: simulate that the
@@ -64,13 +65,11 @@ def test_missed_day_clears_stale_attributes(mock_now, mock_coordinator):
     mock_now.return_value = datetime(2026, 5, 17, 1, 30, 0)
 
     # Stub fetch so no real API calls happen.
-    fm._fetch_and_blend_forecasts = MagicMock(
-        return_value=__import__("asyncio").Future()
+    fm._fetch_and_blend_forecasts = AsyncMock(
+        return_value=([], [], [], [], [], [])
     )
-    fm._fetch_and_blend_forecasts.return_value.set_result(([], [], [], [], [], []))
 
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(fm.update_daily_forecast())
+    await fm.update_daily_forecast()
 
     # The three ATTR keys must be cleared — sensors will now resolve to
     # the .get(..., 0.0) default rather than yesterday's 42.5 kWh.
@@ -84,8 +83,9 @@ def test_missed_day_clears_stale_attributes(mock_now, mock_coordinator):
     assert fm._midnight_forecast_snapshot.get("date") == "2026-05-17:missed"
 
 
+@pytest.mark.asyncio
 @patch("custom_components.heating_analytics.forecast.dt_util.now")
-def test_valid_today_snapshot_remains_published(mock_now, mock_coordinator):
+async def test_valid_today_snapshot_remains_published(mock_now, mock_coordinator):
     """Today's snapshot present → ATTR keys populated as usual.
 
     Negative control: the clear-path must NOT fire when today's snapshot
@@ -110,13 +110,11 @@ def test_valid_today_snapshot_remains_published(mock_now, mock_coordinator):
 
     mock_now.return_value = datetime(2026, 5, 17, 12, 0, 0)
 
-    fm._fetch_and_blend_forecasts = MagicMock(
-        return_value=__import__("asyncio").Future()
+    fm._fetch_and_blend_forecasts = AsyncMock(
+        return_value=([], [], [], [], [], [])
     )
-    fm._fetch_and_blend_forecasts.return_value.set_result(([], [], [], [], [], []))
 
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(fm.update_daily_forecast())
+    await fm.update_daily_forecast()
 
     assert mock_coordinator.data.get(ATTR_MIDNIGHT_FORECAST) == 38.0
     assert mock_coordinator.data.get(ATTR_MIDNIGHT_UNIT_ESTIMATES) == {"sensor.bar": 9.0}

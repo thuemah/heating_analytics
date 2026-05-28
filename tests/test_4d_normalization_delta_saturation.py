@@ -78,6 +78,8 @@ def _make_solar_calc(*, per_entity_pot_4d, sun_elev=45.0, sun_az=180.0):
         return per_entity_pot_4d.get(entity_id, (0.0, 0.0, 0.0, 0.0))
 
     sc.calculate_unit_potential_4d = MagicMock(side_effect=_potential_4d)
+    from tests.helpers import mock_calculate_saturation
+    sc.calculate_saturation = MagicMock(side_effect=mock_calculate_saturation)
     sc.coordinator = MagicMock()
     return sc
 

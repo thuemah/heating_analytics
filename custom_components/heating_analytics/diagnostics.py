@@ -24,7 +24,12 @@ from .const import (
 )
 from .helpers import compute_base_ema_step
 from .learning import compute_snr_weight, _solar_coeff_regime
-from .solar import SolarCalculator, resolve_dni_dhi
+from .solar import (
+    SolarCalculator,
+    resolve_dni_dhi,
+    reconstruct_hour_inputs,
+    HOUR_INPUT_FAIL_SUN_BELOW_HORIZON,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -3255,7 +3260,7 @@ class DiagnosticsEngine:
                 dt_obj = datetime.fromisoformat(ts)
             except (TypeError, ValueError):
                 continue
-            elev, azim = self.coordinator.solar.get_approx_sun_pos(dt_obj)
+            elev, azim = self.coordinator.solar.get_approx_sun_pos(dt_obj + timedelta(minutes=30))
             if elev <= 0.0:
                 continue
             elev_rad = math.radians(elev)
@@ -4180,12 +4185,6 @@ class DiagnosticsEngine:
         hours (same temporal-mismatch assumption the 3D path implicitly
         makes in this diagnose block).
         """
-        ts = entry.get("timestamp", "")
-        try:
-            ts_dt = datetime.fromisoformat(ts)
-        except (TypeError, ValueError):
-            return None
-
         coord = self.coordinator
         solar_calc = getattr(coord, "solar", None)
         if not isinstance(solar_calc, SolarCalculator):
@@ -4194,31 +4193,14 @@ class DiagnosticsEngine:
             # a no-op fallback here.
             return None
 
-        try:
-            sun_elev, sun_az = solar_calc.get_approx_sun_pos(ts_dt)
-        except Exception:  # noqa: BLE001 - best-effort replay
-            return None
-        if sun_elev <= 0.0:
-            return 0.0  # night — no solar; 4D estimate is exactly 0
-
-        dni_in = entry.get("dni")
-        dhi_in = entry.get("dhi")
-        cloud_in = entry.get("cloud_coverage")
-        ghi_in = entry.get("ghi_wm2")
-        day_of_year = ts_dt.timetuple().tm_yday
-        try:
-            dni, dhi, source = resolve_dni_dhi(
-                dni_in=dni_in,
-                dhi_in=dhi_in,
-                ghi_in=ghi_in,
-                cloud_coverage_pct=cloud_in,
-                sun_elev_deg=sun_elev,
-                day_of_year=day_of_year,
-            )
-        except Exception:  # noqa: BLE001
-            return None
-        if source == "none":
-            return None
+        inputs, fail = reconstruct_hour_inputs(entry, solar_calc)
+        if inputs is None:
+            # Night → 0 (no solar). All other failures → None.
+            return 0.0 if fail == HOUR_INPUT_FAIL_SUN_BELOW_HORIZON else None
+        sun_elev = inputs.sun_elev
+        sun_az = inputs.sun_az
+        dni = inputs.dni
+        dhi = inputs.dhi
 
         correction = float(entry.get("correction_percent", 0.0) or 0.0)
         unit_modes = entry.get("unit_modes") or {}

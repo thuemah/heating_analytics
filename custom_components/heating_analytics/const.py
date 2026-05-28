@@ -96,12 +96,24 @@ DEFAULT_EXPERIMENTAL_4D_PRIMARY = False
 DEFAULT_SOLAR_MIN_TRANSMITTANCE = 0.30
 
 # Per-direction floor for facades that ARE configured as screened
-# (CONF_SCREEN_SOUTH/EAST/WEST = True).  Represents pure screen-fabric × glass
-# transmittance: zip screen G-value ~0.06 combined with low-E triple glazing
-# g-value ~0.5 yields ~0.08 effective.  Source: manufacturer datasheets
-# referenced in issue #826 research.  Tunable in patch releases as summer
-# diagnose_solar data accumulates.
-SCREEN_DIRECT_TRANSMITTANCE = 0.08
+# (CONF_SCREEN_SOUTH/EAST/WEST = True).  Represents the area-weighted
+# composite transmittance of a typical Nordic "screened" facade: zip
+# screen + low-E triple glazing achieve ~0.05-0.10 transmittance on
+# the screened portion of glass, but architectural conventions mean
+# only ~70-85 % of a screened facade's glass area is actually behind
+# motorised screens — terrace doors, kitchen windows, karnapp /
+# utility windows on the same facade typically remain unscreened.
+# Pre-1.3.3 used a single global floor of 0.30 (composite); 1.3.3
+# split per-direction and accidentally set this constant to 0.08
+# (pure material physics, equivalent to assuming 100 % screen
+# coverage on a screened facade — physically unreachable in typical
+# residential construction).  Restored to the area-weighted Nordic
+# composite range 0.28-0.33 (Nordic-residential analysis with
+# manufacturer-datasheet material physics + TEK17/BBR architectural
+# constraints); 0.30 is the empirically validated production value
+# that matches pre-1.3.3 behaviour.  Tunable in patch releases via
+# summer diagnose_solar evidence.
+SCREEN_DIRECT_TRANSMITTANCE = 0.30
 
 CONF_WIND_UNIT = "wind_unit"
 CONF_ENABLE_LIFETIME_TRACKING = "enable_lifetime_tracking"
@@ -408,23 +420,117 @@ DEFAULT_UNCERTAINTY_P50 = 1.0
 DEFAULT_UNCERTAINTY_P95 = 2.0
 
 # Storage
-STORAGE_VERSION = 7  # v7: per-facade direct-beam obstruction critical_elev (#991, see storage.py:_migrate_v6_to_v7)
+STORAGE_VERSION = 9  # v9: solar-window low+high obstruction gate per facade per entity (see storage.py:_migrate_v8_to_v9)
 
-# Direct-beam obstruction gate (#991).  Per-facade critical sun elevation
-# at which an external overhang / neighbouring structure / fixed shading
-# blocks the direct beam.  Above ``critical_elev``, ``pot_dir_facade``
-# is zeroed in ``calculate_unit_potential_4d``; diffuse is unaffected.
-# Each facade is fit independently from elevation-binned residuals via
-# ``fit_solar_obstruction``.  ``None`` = no gate (default, no
-# obstruction detected or insufficient samples).  Applied globally
-# across all entities — bypasses ``screen_affected_entities`` since
-# overhang geometry is a building-level invariant.
-OBSTRUCTION_FIT_MIN_ELEV_DEG = 15.0
-OBSTRUCTION_FIT_MAX_ELEV_DEG = 70.0
+# Solar-window obstruction gate (v9).  Each facade per entity carries
+# two independent critical elevations: ``critical_elev_low`` (below
+# which terrain / neighbouring buildings block direct beam) and
+# ``critical_elev_high`` (above which an overhang / terrace blocks
+# direct beam).  ``pot_dir_facade`` is zeroed in
+# ``calculate_unit_potential_4d`` when ``sun_elev < low`` OR
+# ``sun_elev > high``; diffuse is unaffected.  ``None`` per boundary
+# = no gate on that side (default).  Two independent brute-force
+# searches are run per facade by ``fit_solar_obstruction``: a low-
+# horizon search (inverted gate — samples BELOW cutoff zeroed) and a
+# high-horizon search (samples ABOVE cutoff zeroed, legacy behaviour).
+# Shutdown-flagged hours constrain the feasible range (hard constraint:
+# a shutdown sample at elevation E proves unobstructed sun at E, so
+# ``low < E < high``) but do NOT participate in SSE scoring.
+#
+# MIN_ELEV_DEG lowered from 15° to 5° because real-world fits were
+# clipping on the floor (multiple installs producing best_critical_elev
+# = 15° simultaneously on west facades — pathognomonic for "search range
+# truncates the true minimum").  The per-side sample-count gate
+# (OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE = 10) prevents the lower range
+# from picking up noise on installs that have no low-elevation samples
+# — candidates below the data's elev range fail the n_below gate.
+# LOW / HIGH suffixes distinguish the two independent brute-force
+# sweeps in the v9 solar-window fit.
+OBSTRUCTION_FIT_LOW_MIN_ELEV_DEG = 5.0
+OBSTRUCTION_FIT_LOW_MAX_ELEV_DEG = 40.0   # lower horizon typically ≤ 30-35°
+OBSTRUCTION_FIT_HIGH_MIN_ELEV_DEG = 15.0  # upper horizon typically ≥ 20-25°
+OBSTRUCTION_FIT_HIGH_MAX_ELEV_DEG = 70.0
 OBSTRUCTION_FIT_STEP_DEG = 1.0
 OBSTRUCTION_FIT_MIN_SAMPLES_PER_SIDE = 10
-OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD = 0.10
+# Raised from 0.10 to 0.30 (#1020).  Genuine geometric step-functions
+# produce SSE improvement in the 0.50-0.80 range when data covers them
+# cleanly; the 0.10 floor allowed cosmetic-noise fits to pass.  0.30
+# cuts out the marginal regime where artifacts dominate without
+# losing real-geometry detection.  Combined with the multi-window
+# stability gate, physical-plausibility prior, and suggestion-rather-
+# than-auto-write default, this scopes the obstruction path to
+# informed decisions rather than automatic convergence.
+OBSTRUCTION_FIT_SSE_IMPROVEMENT_THRESHOLD = 0.30
 OBSTRUCTION_FIT_DOMINANCE_RATIO = 0.5
+# Physical-plausibility prior (#1020).  Terrain horizons above 20° are
+# extremely rare (would require fjellvegg or close-neighbour wall);
+# overhangs below 20° are architecturally unusual.  Fits landing
+# outside these bounds are surfaced with ``applicable_reason =
+# "physically_implausible"`` and never produce a suggested gate.
+# Users with genuine outliers (rare) can still write manually via
+# ``apply_obstruction_gate`` (also range-validated; use ``force`` if
+# you really mean it — currently not implemented because no install
+# in the wild has needed it).
+OBSTRUCTION_LOW_PLAUSIBLE_RANGE = (2.0, 20.0)
+OBSTRUCTION_HIGH_PLAUSIBLE_RANGE = (20.0, 60.0)
+# Cooling-data floor for HIGH-gate auto-suggestion (#1020).  At
+# northern latitudes with heating-only data, sun rarely climbs high
+# enough to populate the HIGH regime — the fit will either find
+# nothing or "find" a marginal artifact reflecting noise rather than
+# geometry.  Below this floor of cooling-mode samples per facade,
+# the HIGH sweep is skipped honestly with
+# ``insufficient_cooling_for_high_regime``.  LOW sweep is unaffected
+# (heating-mode data covers low elevations year-round).
+OBSTRUCTION_FIT_MIN_COOLING_SAMPLES_FOR_HIGH = 50
+# Multi-window stability gate (#1020).  The fit is re-run on three
+# overlapping time windows; a boundary becomes ``applicable`` only
+# when ≥ MIN_AGREEING of the windows produce a best_critical_elev
+# within ±TOLERANCE_DEG of each other (and all values pass the
+# plausibility prior).  Single-window agreement is insufficient —
+# only consistency over time is artifact-immune.  Calibration-era
+# transitions (e.g. the SCREEN_DIRECT_TRANSMITTANCE 0.08 → 0.30 fix)
+# leave fingerprints that this gate naturally rejects without
+# explicit era tracking.
+OBSTRUCTION_STABILITY_WINDOWS = (30, 60, 90)
+OBSTRUCTION_STABILITY_TOLERANCE_DEG = 3.0
+OBSTRUCTION_STABILITY_MIN_AGREEING = 2
+# Adaptive kNN-window parameters for the local SSE test.  Shared across
+# both the low-horizon and high-horizon brute-force sweeps.  The window
+# selects the ``K_PER_SIDE`` nearest samples below and above each
+# candidate cutoff (by elevation distance).  This decouples the
+# discontinuity test from samples far from the hypothesised edge — a
+# sample at 65° elevation no longer participates in the score for an
+# edge at 25°.  WINDOW_MAX_ANGULAR_DEG caps the angular span; if the
+# K_PER_SIDE nearest samples on either side fall outside this span,
+# the candidate is skipped.  K_PER_SIDE = 20 balances statistical
+# power against locality; MIN_SAMPLES_PER_SIDE remains the absolute
+# floor.
+OBSTRUCTION_FIT_WINDOW_K_PER_SIDE = 20
+OBSTRUCTION_FIT_WINDOW_MAX_ANGULAR_DEG = 25.0
+# Absolute amplitude gate — defends against the relative-SSE-threshold
+# being too permissive on entities with weak directional signals
+# (diffuse-dominated units where sse_flat itself is in the noise-floor
+# range).  Per-sample RMS reduction must exceed this value in kWh for
+# the gate to be considered learnable, in addition to the relative
+# improvement gate.  0.05 kWh/sample ≈ 50 Wh/hour, around 1-10 % of
+# typical HP electrical input — below this is noise floor.
+OBSTRUCTION_FIT_MIN_RMS_REDUCTION_KWH = 0.05
+# Minimum shutdown-sample count required before the low/high cutoff
+# constraint kicks in.  Shutdown detection has known noise — a single
+# false-positive at an extreme elevation would otherwise permanently
+# block the gate via raw ``min``/``max`` constraint.  Requiring at
+# least N samples to support the constraint (and indexing into the
+# sorted shutdown elevations from the N-th lowest / highest) shields
+# the fit from individual outliers while preserving the hard
+# constraint when the shutdown evidence is real.
+OBSTRUCTION_FIT_SHUTDOWN_CONSTRAINT_MIN_N = 3
+# Minimum gap between learned low and high cutoffs.  Without shutdown
+# data, the two sweeps are independent and noisy small-sample fits
+# can produce inverted or near-inverted windows that gate the entire
+# facade.  The combined-window sanity check refuses to write when
+# ``high - low < MIN_WINDOW_DEG``; conservative default of 10° rules
+# out only physically implausible configurations.
+OBSTRUCTION_FIT_MIN_WINDOW_DEG = 10.0
 STORAGE_KEY = f"{DOMAIN}.storage"
 
 # Solar model version (#904 stage 3 blocker 2 — manual reset hook).  Bump

@@ -818,15 +818,16 @@ class ObservationCollector:
                     self.expected_base_per_unit[entity_id] = 0.0
                 self.expected_base_per_unit[entity_id] += unit_base * fraction
 
-            if entity_id not in self.aux_breakdown:
-                self.aux_breakdown[entity_id] = {
-                    "allocated": 0.0,
-                    "overflow": 0.0,
-                }
             applied_aux = stats.get("aux_reduction_kwh", 0.0)
             overflow_aux = stats.get("overflow_kwh", 0.0)
-            self.aux_breakdown[entity_id]["allocated"] += applied_aux * fraction
-            self.aux_breakdown[entity_id]["overflow"] += overflow_aux * fraction
+            if applied_aux > 0 or overflow_aux > 0:
+                if entity_id not in self.aux_breakdown:
+                    self.aux_breakdown[entity_id] = {
+                        "allocated": 0.0,
+                        "overflow": 0.0,
+                    }
+                self.aux_breakdown[entity_id]["allocated"] += applied_aux * fraction
+                self.aux_breakdown[entity_id]["overflow"] += overflow_aux * fraction
 
         if orphaned_part > 0:
             self.orphaned_aux += orphaned_part * fraction

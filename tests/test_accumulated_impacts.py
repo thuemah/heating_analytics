@@ -77,3 +77,61 @@ def test_live_guest_impact(mock_coordinator):
 
     # Guest units contribute their full consumption as impact (Baseline = 0)
     assert mock_coordinator.data["accumulated_guest_impact_kwh"] == pytest.approx(1.0)
+
+
+def test_accumulated_heating_cooling_split(mock_coordinator):
+    """Hourly + intra-hour split of consumption into heating/cooling buckets."""
+    current_time = dt_util.parse_datetime("2023-01-01T02:30:00+00:00")
+    mock_coordinator._hourly_log = [
+        {
+            "timestamp": "2023-01-01T00:00:00",
+            "unit_breakdown": {
+                "sensor.heat_a": 1.0,
+                "sensor.cool_b": 0.5,
+                "sensor.dhw": 2.0,
+                "sensor.off": 0.1,
+            },
+            "unit_modes": {
+                "sensor.heat_a": "heating",
+                "sensor.cool_b": "cooling",
+                "sensor.dhw": "dhw",
+                "sensor.off": "off",
+            },
+        },
+        {
+            "timestamp": "2023-01-01T01:00:00",
+            "unit_breakdown": {
+                "sensor.heat_a": 0.8,
+                "sensor.guest_h": 0.3,
+                "sensor.guest_c": 0.2,
+            },
+            "unit_modes": {
+                "sensor.heat_a": "heating",
+                "sensor.guest_h": "guest_heating",
+                "sensor.guest_c": "guest_cooling",
+            },
+        },
+    ]
+    # Intra-hour: one heating unit accumulating mid-hour
+    mock_coordinator._hourly_delta_per_unit = {"sensor.heat_a": 0.4}
+
+    def _mode(eid):
+        return {"sensor.heat_a": "heating"}.get(eid, "off")
+    mock_coordinator.get_unit_mode.side_effect = _mode
+
+    mock_coordinator.data = {
+        "accumulated_solar_impact_kwh": 0.0,
+        "accumulated_guest_impact_kwh": 0.0,
+        "accumulated_aux_impact_kwh": 0.0,
+        "solar_impact_kwh": 0.0,
+        "last_hour_aux_impact_kwh": 0.0,
+    }
+    mock_coordinator._collector.aux_impact_hour = 0.0
+
+    HeatingDataCoordinator._update_accumulated_impacts(mock_coordinator, current_time)
+
+    # heating: 1.0 (log0) + 0.8 (log1) + 0.3 (guest_h log1) + 0.4 (live) = 2.5
+    # cooling: 0.5 (log0) + 0.2 (guest_c log1) = 0.7
+    # dhw + off do not contribute to either bucket
+    assert mock_coordinator.data["accumulated_heating_kwh"] == pytest.approx(2.5)
+    assert mock_coordinator.data["accumulated_cooling_kwh"] == pytest.approx(0.7)

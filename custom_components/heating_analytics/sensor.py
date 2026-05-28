@@ -117,6 +117,7 @@ from .const import (
 
     # Mode constants
     MODE_OFF,
+    MODE_HEATING,
     MODE_COOLING,
     MODE_GUEST_HEATING,
     MODE_GUEST_COOLING,
@@ -358,12 +359,10 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
         attrs[ATTR_RECOMMENDATION_STATE] = coordinator.data.get(ATTR_RECOMMENDATION_STATE, "none")
 
         # Solar Details
-        # Potential (Screens Up)
-        attrs[ATTR_SOLAR_POTENTIAL] = coordinator.data.get(ATTR_SOLAR_POTENTIAL, 0.0)
-        # Actual Gain (Screens Configured) - This is ATTR_SOLAR_IMPACT (kW)
-        attrs[ATTR_SOLAR_GAIN_NOW] = coordinator.data.get(ATTR_SOLAR_IMPACT, 0.0)
-        # Heating Load Offset (Effective Impact) - Same as Gain in heating mode
-        attrs[ATTR_HEATING_LOAD_OFFSET] = coordinator.data.get(ATTR_SOLAR_IMPACT, 0.0)
+        attrs["solar_potential_kw"] = coordinator.data.get(ATTR_SOLAR_POTENTIAL, 0.0)
+        attrs["solar_impact_kw"] = coordinator.data.get(ATTR_SOLAR_IMPACT, 0.0)
+        attrs["solar_heating_offset_kw"] = coordinator.data.get("solar_heating_offset_kw", 0.0)
+        attrs["solar_cooling_load_kw"] = coordinator.data.get("solar_cooling_load_kw", 0.0)
 
         # Primary Driver
         # Calculate specific impacts
@@ -428,7 +427,9 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
         # Uses the precise calculation from the coordinator (Past Actuals + Future Forecast)
         # comparing Normal vs No-Wind scenarios.
         attrs["wind_chill_penalty_kwh"] = coordinator.data.get("daily_wind_chill_penalty", 0.0)
-        attrs["solar_gain_kwh"] = round(coordinator.data.get("accumulated_solar_impact_kwh", 0.0), 1)
+        attrs["solar_impact_kwh"] = round(coordinator.data.get("accumulated_solar_impact_kwh", 0.0), 1)
+        attrs["solar_heating_offset_kwh"] = round(coordinator.data.get("accumulated_solar_heating_offset_kwh", 0.0), 1)
+        attrs["solar_cooling_load_kwh"] = round(coordinator.data.get("accumulated_solar_cooling_load_kwh", 0.0), 1)
 
         # === GROUP 4: COMPARATIVE CONTEXT ===
         # Typical Day at this Temp
@@ -756,8 +757,14 @@ class HeatingDeviationSensor(HeatingAnalyticsBaseSensor):
             "thermodynamic_deviation_pct": self.coordinator.data.get("thermodynamic_deviation_pct", 0.0),
 
             # Global Factors
-            "accumulated_solar_impact_kwh": self.coordinator.data.get(
-                "accumulated_solar_impact_kwh", 0.0
+            "solar_impact_kwh": self.coordinator.data.get("accumulated_solar_impact_kwh", 0.0),
+            "solar_heating_offset_kwh": self.coordinator.data.get("accumulated_solar_heating_offset_kwh", 0.0),
+            "solar_cooling_load_kwh": self.coordinator.data.get("accumulated_solar_cooling_load_kwh", 0.0),
+            "accumulated_heating_kwh": round(
+                self.coordinator.data.get("accumulated_heating_kwh", 0.0), 1
+            ),
+            "accumulated_cooling_kwh": round(
+                self.coordinator.data.get("accumulated_cooling_kwh", 0.0), 1
             ),
             "accumulated_guest_impact_kwh": self.coordinator.data.get(
                 "accumulated_guest_impact_kwh", 0.0
@@ -1044,6 +1051,24 @@ class HeatingLastHourActualSensor(HeatingAnalyticsBaseSensor):
             "learning_status": last_entry.get("learning_status"),
         }
 
+        last_unit_modes = last_entry.get("unit_modes", {}) or {}
+        last_heating_kwh = 0.0
+        last_cooling_kwh = 0.0
+        for eid, kwh in (last_entry.get("unit_breakdown", {}) or {}).items():
+            mode = last_unit_modes.get(eid)
+            if mode in (MODE_HEATING, MODE_GUEST_HEATING):
+                last_heating_kwh += kwh
+            elif mode in (MODE_COOLING, MODE_GUEST_COOLING):
+                last_cooling_kwh += kwh
+        attributes["last_hour_heating_kwh"] = round(last_heating_kwh, 3)
+        attributes["last_hour_cooling_kwh"] = round(last_cooling_kwh, 3)
+        attributes["last_hour_solar_heating_offset_kwh"] = round(
+            last_entry.get("solar_heating_applied_kwh", 0.0), 3
+        )
+        attributes["last_hour_solar_cooling_load_kwh"] = round(
+            last_entry.get("solar_cooling_applied_kwh", 0.0), 3
+        )
+
         # Calculate Top Consumers
         unit_breakdown = last_entry.get("unit_breakdown", {})
         total_kwh = last_entry.get("actual_kwh", 0.0)
@@ -1160,6 +1185,8 @@ class HeatingLastHourDeviationSensor(HeatingAnalyticsBaseSensor):
             last_entry = self.coordinator.model.hourly_log[-1]
             last_hour_wind_bucket = last_entry.get("wind_bucket")
             last_hour_solar_impact = self.coordinator.hourly_solar_impact_kwh(last_entry)
+            last_hour_solar_heating_offset = last_entry.get("solar_heating_applied_kwh", 0.0)
+            last_hour_solar_cooling_load = last_entry.get("solar_cooling_applied_kwh", 0.0)
             last_hour_aux_impact = last_entry.get("aux_impact_kwh", 0.0)
             last_hour_guest_impact = last_entry.get("guest_impact_kwh", 0.0)
             last_hour_timestamp = last_entry.get("timestamp")
@@ -1169,6 +1196,8 @@ class HeatingLastHourDeviationSensor(HeatingAnalyticsBaseSensor):
             "last_hour_thermodynamic_gross_kwh": self.coordinator.model.hourly_log[-1].get("thermodynamic_gross_kwh") if self.coordinator.model.hourly_log else None,
             "last_hour_wind_bucket": last_hour_wind_bucket,
             "last_hour_solar_impact_kwh": round(last_hour_solar_impact, 3),
+            "last_hour_solar_heating_offset_kwh": round(last_hour_solar_heating_offset, 3),
+            "last_hour_solar_cooling_load_kwh": round(last_hour_solar_cooling_load, 3),
             "last_hour_aux_impact_kwh": round(last_hour_aux_impact, 3),
             "last_hour_guest_impact_kwh": round(last_hour_guest_impact, 3),
             "last_hour_timestamp": last_hour_timestamp,

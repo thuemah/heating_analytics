@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import logging
 from datetime import datetime, timedelta, date
+from typing import NamedTuple
 
 from homeassistant.util import dt as dt_util
 
@@ -248,6 +249,121 @@ def resolve_dni_dhi_for_forecast(
     return resolve_dni_dhi(dni_in, dhi_in, ghi_in, cloud_cov, sun_elev_deg, day_of_year)
 
 
+class HourInputs(NamedTuple):
+    """Canonical reconstructed inputs for one ``hourly_log`` entry (#1011).
+
+    Produced by :func:`reconstruct_hour_inputs`. Carries the four
+    fields every consumer of the 4D replay path needs before it
+    diverges into consumer-specific post-processing (potential
+    reconstruction, coefficient lookup, saturation, regime routing).
+    """
+
+    ts_dt: datetime
+    mid_dt: datetime
+    sun_elev: float
+    sun_az: float
+    dni: float
+    dhi: float
+    dni_source: str
+
+
+HOUR_INPUT_FAIL_MISSING_TIMESTAMP = "missing_timestamp"
+HOUR_INPUT_FAIL_SUN_BELOW_HORIZON = "sun_below_horizon"
+HOUR_INPUT_FAIL_SUN_POS_ERROR = "sun_pos_error"
+HOUR_INPUT_FAIL_NO_DNI_DHI = "no_dni_dhi"
+
+
+def reconstruct_hour_inputs(
+    entry: dict,
+    solar,
+) -> tuple[HourInputs | None, str | None]:
+    """Rebuild the opening sequence shared by every log-entry replay (#1011).
+
+    Consolidates the parse-timestamp -> hour-midpoint offset ->
+    ``get_approx_sun_pos`` -> ``resolve_dni_dhi`` chain. Was duplicated
+    inline at three call sites (``_collect_batch_fit_samples_4d``,
+    ``fit_solar_obstruction``,
+    ``_compute_total_power_4d_divergence_replay``); see issue #1011 for
+    the motivating #994-class failure (one missing ``+30min`` offset
+    caused silent divergence at 7 sites).
+
+    Args:
+        entry: One ``hourly_log`` dict (``timestamp``, ``dni``, ``dhi``,
+            ``ghi_wm2``, ``cloud_coverage``, ``correction_percent`` —
+            missing keys treated per ``resolve_dni_dhi``'s semantics).
+        solar: ``SolarCalculator`` instance (any object exposing
+            ``get_approx_sun_pos(dt) -> (elev, az)``).
+
+    Returns:
+        ``(inputs, None)`` on success. ``(None, reason)`` on skip,
+        where ``reason`` is one of:
+
+            * ``HOUR_INPUT_FAIL_MISSING_TIMESTAMP``
+            * ``HOUR_INPUT_FAIL_SUN_BELOW_HORIZON``
+            * ``HOUR_INPUT_FAIL_SUN_POS_ERROR`` — exception raised by
+              ``get_approx_sun_pos`` (astral / timezone / mock issue).
+              Distinguished from ``SUN_BELOW_HORIZON`` because a lookup
+              failure has no physical "0 solar" answer; callers should
+              treat as skip, not as a 0-solar hour.
+            * ``HOUR_INPUT_FAIL_NO_DNI_DHI`` — ``resolve_dni_dhi``
+              returned ``source == "none"`` (no signal at all).
+              Callers needing the stricter "both DNI and DHI <= 0"
+              gate apply it themselves on the returned values.
+
+        Callers map these to their own drop-count categories or
+        return-shape conventions (e.g. the divergence replay returns
+        ``0.0`` on ``SUN_BELOW_HORIZON``, ``None`` on the others).
+    """
+    ts_raw = entry.get("timestamp")
+    if not isinstance(ts_raw, str):
+        return (None, HOUR_INPUT_FAIL_MISSING_TIMESTAMP)
+    try:
+        ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return (None, HOUR_INPUT_FAIL_MISSING_TIMESTAMP)
+
+    mid_dt = ts_dt + timedelta(minutes=30)
+    try:
+        sun_elev, sun_az = solar.get_approx_sun_pos(mid_dt)
+    except Exception:  # noqa: BLE001 — defensive against mocks / no-astral
+        # Distinguished from real below-horizon (which has a deterministic
+        # 0-solar physical answer); lookup failure has no physical answer
+        # and callers should skip rather than count as a 0-solar hour.
+        return (None, HOUR_INPUT_FAIL_SUN_POS_ERROR)
+    if sun_elev is None or sun_elev <= 0.0:
+        return (None, HOUR_INPUT_FAIL_SUN_BELOW_HORIZON)
+
+    day_of_year = ts_dt.timetuple().tm_yday
+    try:
+        dni, dhi, source = resolve_dni_dhi(
+            entry.get("dni"),
+            entry.get("dhi"),
+            entry.get("ghi_wm2"),
+            entry.get("cloud_coverage"),
+            sun_elev,
+            day_of_year,
+        )
+    except Exception:  # noqa: BLE001
+        return (None, HOUR_INPUT_FAIL_NO_DNI_DHI)
+    if source == "none":
+        return (None, HOUR_INPUT_FAIL_NO_DNI_DHI)
+    dni_f = dni or 0.0
+    dhi_f = dhi or 0.0
+
+    return (
+        HourInputs(
+            ts_dt=ts_dt,
+            mid_dt=mid_dt,
+            sun_elev=float(sun_elev),
+            sun_az=float(sun_az),
+            dni=dni_f,
+            dhi=dhi_f,
+            dni_source=source,
+        ),
+        None,
+    )
+
+
 def _kasten_cloud_attenuation(cloud_coverage_pct: float) -> float:
     """Kasten & Czeplak (1980) cloud-factor: 1 - 0.75 * (N/8)^3.4.
 
@@ -410,16 +526,18 @@ class SolarCalculator:
         The fixed 0.5 represents a vertical window seeing half the
         hemisphere; per-facade asymmetry is absorbed by ``c_diff``.
 
-        **Direct-beam obstruction gate (#991).**  When the coordinator
-        carries ``_critical_elev_per_facade[f]`` (a float, not None),
-        the corresponding ``pot_dir_facade`` is zeroed whenever
-        ``sun_elev_deg > critical_elev_f``.  This models a fixed
-        external overhang / neighbouring structure / fixed shading that
-        blocks direct beam above a deterministic geometric threshold.
-        Building-level invariant — applies to all entities, not gated by
-        ``screen_affected_entities``.  Diffuse term is intentionally
-        unaffected: a scalar gate cannot reproduce diffuse's smooth
-        hemisphere-fraction dependence on obstruction geometry.
+        **Solar-window obstruction gate (v9).**
+        When ``coordinator.critical_elev_for_entity(entity_id)[f]`` is
+        ``{"low": float|None, "high": float|None}``, the corresponding
+        ``pot_dir_facade`` is zeroed whenever ``sun_elev_deg < low`` OR
+        ``sun_elev_deg > high``.  This models a solar window: a lower
+        horizon (terrain / neighbouring buildings blocks direct beam
+        below) and an upper horizon (overhang / terrace blocks above).
+        Both boundaries are optional (``None`` = no gate on that side).
+        Per-entity because shading geometry differs across windows owned
+        by different units.  Diffuse term is intentionally unaffected:
+        a scalar gate cannot reproduce diffuse's smooth hemisphere-
+        fraction dependence on obstruction geometry.
 
         Args:
             entity_id: Used only for screen_config lookup at call sites
@@ -453,17 +571,27 @@ class SolarCalculator:
         pot_e_dir = dni_horiz * max(0.0, math.sin(az_rad)) * t_e
         pot_w_dir = dni_horiz * max(0.0, -math.sin(az_rad)) * t_w
 
-        crit = getattr(self.coordinator, "_critical_elev_per_facade", None)
-        if isinstance(crit, dict):
-            crit_s = crit.get("s")
-            crit_e = crit.get("e")
-            crit_w = crit.get("w")
-            if crit_s is not None and sun_elev_deg > crit_s:
-                pot_s_dir = 0.0
-            if crit_e is not None and sun_elev_deg > crit_e:
-                pot_e_dir = 0.0
-            if crit_w is not None and sun_elev_deg > crit_w:
-                pot_w_dir = 0.0
+        crit_fn = getattr(self.coordinator, "critical_elev_for_entity", None)
+        if callable(crit_fn) and entity_id is not None:
+            crit = crit_fn(entity_id)
+            if isinstance(crit, dict):
+                pot_by_facade = {"s": pot_s_dir, "e": pot_e_dir, "w": pot_w_dir}
+                for facade in ("s", "e", "w"):
+                    gate = crit.get(facade)
+                    if isinstance(gate, dict):
+                        low = gate.get("low")
+                        high = gate.get("high")
+                        below_low = isinstance(low, (int, float)) and sun_elev_deg < low
+                        above_high = isinstance(high, (int, float)) and sun_elev_deg > high
+                        if below_low or above_high:
+                            pot_by_facade[facade] = 0.0
+                    elif isinstance(gate, (int, float)):
+                        # Legacy v8 single-float gate -> treated as high-only
+                        if sun_elev_deg > gate:
+                            pot_by_facade[facade] = 0.0
+                pot_s_dir = pot_by_facade["s"]
+                pot_e_dir = pot_by_facade["e"]
+                pot_w_dir = pot_by_facade["w"]
 
         pot_diffuse = max(0.0, dhi) * 0.5 * (t_s + t_e + t_w) / 3.0
 

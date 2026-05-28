@@ -192,16 +192,17 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # qualifying hour (later commit).
         self._solar_coefficients_4d_per_unit: dict = {}
 
-        # Per-facade direct-beam obstruction critical elevation (#991).
-        # ``{"s": float|None, "e": float|None, "w": float|None}``.  ``None``
-        # = no gate (default; written by ``fit_solar_obstruction`` after
-        # SSE-ratio threshold passes).  Applied globally across all
-        # entities in ``solar.calculate_unit_potential_4d`` — bypasses
-        # ``screen_affected_entities`` since overhang geometry is a
-        # building-level invariant.
-        self._critical_elev_per_facade: dict[str, float | None] = {
-            "s": None, "e": None, "w": None,
-        }
+        # Solar-window obstruction gate per entity per facade (v9).
+        # ``{entity_id: {"s": {"low": float|None, "high": float|None}, ...}}``.
+        # Each facade carries two independent critical elevations: ``low``
+        # (below which terrain/neighbouring buildings block direct beam)
+        # and ``high`` (above which an overhang/terrace blocks direct beam).
+        # ``None`` per boundary = no gate on that side (default).  Empty
+        # dict = no entity has a gate.  Written per-entity by
+        # ``fit_solar_obstruction``.  Read via :meth:`critical_elev_for_entity`
+        # — unknown entities return all-``None``.  Lifted from building-level
+        # (v7) to per-entity (v8) and extended to solar-window (v9).
+        self._critical_elev_per_facade_per_unit: dict[str, dict[str, dict[str, float | None]]] = {}
 
         # Per-unit min-base thresholds (#871).  Populated from dark-hour
         # p10 by :meth:`_calibrate_per_unit_min_base_thresholds` at startup
@@ -415,9 +416,15 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             ATTR_WIND_ACTUAL_MONTH: None,
             ATTR_SOLAR_FACTOR: 0.0,
             ATTR_SOLAR_IMPACT: 0.0,
+            "solar_heating_offset_kw": 0.0,
+            "solar_cooling_load_kw": 0.0,
             "accumulated_solar_impact_kwh": 0.0,
+            "accumulated_solar_heating_offset_kwh": 0.0,
+            "accumulated_solar_cooling_load_kwh": 0.0,
             "accumulated_guest_impact_kwh": 0.0,
             "accumulated_aux_impact_kwh": 0.0,
+            "accumulated_heating_kwh": 0.0,
+            "accumulated_cooling_kwh": 0.0,
             ATTR_TDD_SO_FAR: 0.0,
             ATTR_DEVIATION_BREAKDOWN: [],
             "hourly_log": [],
@@ -799,6 +806,46 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if entity_id in self._screen_affected_set:
             return self.screen_config
         return (False, False, False)
+
+    def critical_elev_for_entity(
+        self, entity_id: str
+    ) -> dict[str, dict[str, float | None]]:
+        """Return the solar-window obstruction gate for this entity (v9).
+
+        ``{"s": {"low": float|None, "high": float|None}, "e": {...}, "w": {...}}``.
+        Each facade carries two independent critical elevations:
+        ``low`` — below this, terrain / neighbouring buildings block
+        direct beam; ``high`` — above this, an overhang / terrace
+        blocks direct beam.  ``None`` per boundary = no gate on that
+        side.  ``pot_dir_facade`` is zeroed in
+        ``solar.calculate_unit_potential_4d`` when
+        ``sun_elev < low`` OR ``sun_elev > high``.
+
+        Per-entity because overhang/shading geometry is a per-window
+        property — two units served by windows with different shading
+        can carry different critical elevations on the same facade.
+
+        Unknown entities (no entry in ``_critical_elev_per_facade_per_unit``)
+        return all-``None`` — graceful default.
+        """
+        entry = self._critical_elev_per_facade_per_unit.get(entity_id)
+        if not isinstance(entry, dict):
+            return {
+                "s": {"low": None, "high": None},
+                "e": {"low": None, "high": None},
+                "w": {"low": None, "high": None},
+            }
+        result: dict[str, dict[str, float | None]] = {}
+        for f in ("s", "e", "w"):
+            v = entry.get(f)
+            if isinstance(v, dict):
+                result[f] = {
+                    "low": float(v["low"]) if isinstance(v.get("low"), (int, float)) else None,
+                    "high": float(v["high"]) if isinstance(v.get("high"), (int, float)) else None,
+                }
+            else:
+                result[f] = {"low": None, "high": None}
+        return result
 
     async def async_set_unit_mode(self, entity_id: str, mode: str):
         """Set mode for a unit."""
@@ -2215,7 +2262,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
             # Sync solar impact to data for sensor exposure
             if self.solar_enabled:
-                 self.data[ATTR_SOLAR_IMPACT] = result["breakdown"]["solar_reduction_kwh"]
+                self.data[ATTR_SOLAR_IMPACT] = result["breakdown"]["solar_reduction_kwh"]
+                self.data["solar_heating_offset_kw"] = result["breakdown"].get("solar_heating_applied_kwh", 0.0)
+                self.data["solar_cooling_load_kw"] = result["breakdown"].get("solar_cooling_applied_kwh", 0.0)
 
         # Store Current Model Rate and Aux state for gap filling
         self.data["current_model_rate"] = current_prediction_rate
@@ -2342,14 +2391,15 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                     self._hourly_expected_base_per_unit[entity_id] += (unit_base * fraction)
 
                 # Accumulate Gap Aux Breakdown
-                if entity_id not in self._collector.aux_breakdown:
-                    self._collector.aux_breakdown[entity_id] = {"allocated": 0.0, "overflow": 0.0}
-
                 applied_aux = stats.get("aux_reduction_kwh", 0.0)
                 overflow_aux = stats.get("overflow_kwh", 0.0)
 
-                self._collector.aux_breakdown[entity_id]["allocated"] += (applied_aux * fraction)
-                self._collector.aux_breakdown[entity_id]["overflow"] += (overflow_aux * fraction)
+                if applied_aux > 0 or overflow_aux > 0:
+                    if entity_id not in self._collector.aux_breakdown:
+                        self._collector.aux_breakdown[entity_id] = {"allocated": 0.0, "overflow": 0.0}
+
+                    self._collector.aux_breakdown[entity_id]["allocated"] += (applied_aux * fraction)
+                    self._collector.aux_breakdown[entity_id]["overflow"] += (overflow_aux * fraction)
 
     def _calculate_daily_wind_penalty(self) -> float:
         """Calculate the total kWh penalty due to wind for the entire day (Past + Future)."""
@@ -3162,14 +3212,31 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         # 1. Sum impacts from today's completed hourly logs
         accumulated_solar = 0.0
+        accumulated_solar_heating = 0.0
+        accumulated_solar_cooling = 0.0
         accumulated_guest = 0.0
         accumulated_aux = 0.0
+        accumulated_heating = 0.0
+        accumulated_cooling = 0.0
+
+        heating_modes = (MODE_HEATING, MODE_GUEST_HEATING)
+        cooling_modes = (MODE_COOLING, MODE_GUEST_COOLING)
 
         for entry in self._hourly_log:
             if entry["timestamp"].startswith(today_date_str):
                 accumulated_solar += self.hourly_solar_impact_kwh(entry)
+                accumulated_solar_heating += entry.get("solar_heating_applied_kwh", 0.0)
+                accumulated_solar_cooling += entry.get("solar_cooling_applied_kwh", 0.0)
                 accumulated_guest += entry.get("guest_impact_kwh", 0.0)
                 accumulated_aux += entry.get("aux_impact_kwh", 0.0)
+
+                entry_unit_modes = entry.get("unit_modes", {}) or {}
+                for eid, kwh in (entry.get("unit_breakdown", {}) or {}).items():
+                    mode = entry_unit_modes.get(eid)
+                    if mode in heating_modes:
+                        accumulated_heating += kwh
+                    elif mode in cooling_modes:
+                        accumulated_cooling += kwh
 
         # 2. Add live, intra-hour impact
         #    - Solar: Use the current `ATTR_SOLAR_IMPACT` (in kW) and scale by minutes passed.
@@ -3178,9 +3245,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         minutes_fraction = current_time.minute / 60.0
 
         # Live Solar Impact
-        # NOTE: self.data["solar_impact_kwh"] stores instantaneous power in kW due to a legacy naming convention.
+        # NOTE: ATTR_SOLAR_IMPACT stores instantaneous power in kW despite the "kwh" suffix in the const name.
         current_solar_kw = self.data.get(ATTR_SOLAR_IMPACT, 0.0)
         accumulated_solar += current_solar_kw * minutes_fraction
+        accumulated_solar_heating += self.data.get("solar_heating_offset_kw", 0.0) * minutes_fraction
+        accumulated_solar_cooling += self.data.get("solar_cooling_load_kw", 0.0) * minutes_fraction
 
         # Live Aux Impact
         # Use the precise minute-by-minute accumulator
@@ -3193,12 +3262,20 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             unit_mode = self.get_unit_mode(entity_id)
             if unit_mode in (MODE_GUEST_HEATING, MODE_GUEST_COOLING):
                 live_guest_impact += actual_kwh
+            if unit_mode in heating_modes:
+                accumulated_heating += actual_kwh
+            elif unit_mode in cooling_modes:
+                accumulated_cooling += actual_kwh
         accumulated_guest += live_guest_impact
 
         # 3. Update the data dictionary
         self.data["accumulated_solar_impact_kwh"] = round(accumulated_solar, 3)
+        self.data["accumulated_solar_heating_offset_kwh"] = round(accumulated_solar_heating, 3)
+        self.data["accumulated_solar_cooling_load_kwh"] = round(accumulated_solar_cooling, 3)
         self.data["accumulated_guest_impact_kwh"] = round(accumulated_guest, 3)
         self.data["accumulated_aux_impact_kwh"] = round(accumulated_aux, 3)
+        self.data["accumulated_heating_kwh"] = round(accumulated_heating, 3)
+        self.data["accumulated_cooling_kwh"] = round(accumulated_cooling, 3)
 
         # 4. Calculate Thermodynamic Gross Today (Net + Aux +/- Solar)
         accumulated_gross = 0.0

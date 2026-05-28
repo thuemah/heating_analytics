@@ -1,6 +1,34 @@
 """Shared test helpers for coordinator mocking (#775)."""
 
 
+def mock_calculate_saturation(net_demand, solar_potential, val):
+    """Mirror of ``SolarCalculator.calculate_saturation`` for MagicMock setups (#1008).
+
+    Tests that mock the solar calculator now need a working stub for
+    ``calculate_saturation`` because the two 4D inline saturation paths
+    in ``learning.py`` route through it.  This helper reproduces the
+    production heating / cooling / OFF dispatch on a string ``val``
+    (numeric temperature dispatch is not exercised by current tests).
+    """
+    from custom_components.heating_analytics.const import (
+        MODE_HEATING, MODE_COOLING, MODE_GUEST_HEATING, MODE_GUEST_COOLING,
+        MODE_OFF,
+    )
+    if val in (MODE_HEATING, MODE_GUEST_HEATING):
+        limit = max(0.0, net_demand)
+        applied = min(solar_potential, limit)
+        return (
+            round(applied, 3),
+            round(solar_potential - applied, 3),
+            round(max(0.0, net_demand - applied), 3),
+        )
+    if val in (MODE_COOLING, MODE_GUEST_COOLING):
+        return (round(solar_potential, 3), 0.0, round(net_demand + solar_potential, 3))
+    if val == MODE_OFF:
+        return (0.0, 0.0, 0.0)
+    return (0.0, 0.0, round(net_demand, 3))
+
+
 def stratified_coeff(s: float = 0.0, e: float = 0.0, w: float = 0.0,
                      *, cooling_s: float | None = None,
                      cooling_e: float | None = None,

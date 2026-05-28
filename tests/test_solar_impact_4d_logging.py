@@ -27,6 +27,8 @@ def _solar_calc_stub(potential_4d: tuple[float, float, float, float]):
     sc.calculate_unit_coefficient = MagicMock(return_value={"s": 0.0, "e": 0.0, "w": 0.0})
     sc.calculate_unit_solar_impact = MagicMock(return_value=0.0)
     sc._screen_transmittance_vector = MagicMock(return_value=(1.0, 1.0, 1.0))
+    from tests.helpers import mock_calculate_saturation
+    sc.calculate_saturation = MagicMock(side_effect=mock_calculate_saturation)
     sc.coordinator = MagicMock()
     return sc
 
