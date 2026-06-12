@@ -76,6 +76,72 @@ class HourlyProcessor:
             return solar_impact + k_feedback * solar_wasted
         return solar_impact
 
+    def _resolve_4d_boundary_overrides(self, current_time: datetime) -> dict | None:
+        """Build the 4D override bundle for hour-boundary accounting calls (#1024).
+
+        Under ``experimental_4d_primary`` the hour-boundary analysis call
+        (``res_analysis``) and the end-of-hour gap fill must read the same
+        4D model as the live minute loop.  Passing the legacy 3D-only
+        overrides (``override_solar_factor`` / ``override_solar_vector``)
+        would auto-route the ``calculate_total_power`` dispatcher back to
+        the 3D primitive, leaving the applied split, normalization delta,
+        battery charge, and thermodynamic gross on 3D coefficients while
+        ``expected_kwh`` is accumulated from 4D — a mixed-pipeline log row.
+
+        Resolves hour-average DNI/DHI from the collector via the same
+        ``resolve_dni_dhi`` ladder the 4D learner and potential battery
+        use, plus hour-midpoint sun position and hour-average screen
+        correction.  Returns a kwargs dict for ``calculate_total_power``
+        (4D-only overrides), or ``None`` when the flag is off or the
+        bundle cannot be built (mock coordinators, missing sun helpers) —
+        callers then fall back to the legacy 3D override form.
+
+        Solar-disabled installs and dark hours resolve to
+        ``override_dni_dhi == (0.0, 0.0)`` so the 4D solar contribution
+        collapses to 0, matching what the live 4D loop produced during
+        the hour.
+        """
+        if getattr(self.coordinator, "experimental_4d_primary", False) is not True:
+            return None
+        try:
+            from .solar import resolve_dni_dhi
+
+            col = self.coordinator._collector
+            start = col.start_time if col.start_time is not None else current_time
+            mid_dt = start + timedelta(minutes=30)
+            sun_elev, sun_az = self.coordinator.solar.get_approx_sun_pos(mid_dt)
+
+            if col.sample_count > 0:
+                correction = col.correction_sum / col.sample_count
+            else:
+                correction = self.coordinator.solar_correction_percent
+
+            dni, dhi = 0.0, 0.0
+            if self.coordinator.solar_enabled and sun_elev > 0:
+                dni_avg = (col.dni_sum / col.dni_count) if col.dni_count > 0 else None
+                dhi_avg = (col.dhi_sum / col.dhi_count) if col.dhi_count > 0 else None
+                ghi_avg = (col.ghi_sum / col.ghi_count) if col.ghi_count > 0 else None
+                cloud_avg = (
+                    col.cloud_coverage_sum / col.cloud_coverage_count
+                    if col.cloud_coverage_count > 0
+                    else None
+                )
+                dni, dhi, _src = resolve_dni_dhi(
+                    dni_avg, dhi_avg, ghi_avg, cloud_avg,
+                    sun_elev, mid_dt.timetuple().tm_yday,
+                )
+
+            return {
+                "override_now": mid_dt,
+                "override_sun_pos": (float(sun_elev), float(sun_az)),
+                "override_dni_dhi": (float(dni), float(dhi)),
+                "override_correction_percent": float(correction),
+            }
+        except Exception:
+            # Defensive: malformed collector state / mock coordinator.
+            # Falling back to the legacy 3D call keeps the hour processed.
+            return None
+
     def build_observation(
         self,
         current_time: datetime,
@@ -301,6 +367,11 @@ class HourlyProcessor:
              if aux_fraction >= 0.80:
                  is_aux_dominant = True
 
+        # 4D override bundle for the hour-boundary accounting calls
+        # (gap fill below + res_analysis).  None when the flag is off —
+        # both call sites then use the legacy 3D override form (#1024).
+        overrides_4d = self._resolve_4d_boundary_overrides(current_time)
+
         # 0. Close any gap from the end of the previous hour
         # Use Mean Imputation (Aggregates) to ensure consistency with logged hour stats
         if self.coordinator._collector.last_minute_processed is not None:
@@ -310,7 +381,8 @@ class HourlyProcessor:
                  avg_temp=avg_temp,
                  avg_wind=calculated_effective_wind,
                  avg_solar=avg_solar_factor,
-                 is_aux_active=is_aux_dominant
+                 is_aux_active=is_aux_dominant,
+                 overrides_4d=overrides_4d,
              )
 
         # Save Last Hour Stats for Sensors
@@ -443,16 +515,33 @@ class HourlyProcessor:
 
         # OPTIMIZATION: Call once with correct aux/solar context.
         # This returns BOTH the base values (unaffected by aux) AND the aux/solar reduction.
-        res_analysis = self.coordinator.statistics.calculate_total_power(
-            inertia_avg, # Use inertia temp (float)
-            calculated_effective_wind,
-            0.0, # This arg is ignored by calculate_total_power
-            is_aux_active=is_aux_dominant,
-            detailed=False,
-            override_solar_factor=avg_solar_factor,
-            override_solar_vector=avg_solar_vector,
-            known_aux_impact_kwh=aux_impact_kwh,
-        )
+        if overrides_4d is not None:
+            # experimental_4d_primary (#1024): route the boundary analysis
+            # through the 4D pipeline like the live minute loop.  The 3D
+            # overrides below would auto-route the dispatcher back to 3D
+            # (they are 3D-only kwargs), computing the applied split /
+            # normalization delta / gross with coefficients the live
+            # prediction no longer uses.
+            res_analysis = self.coordinator.statistics.calculate_total_power(
+                inertia_avg, # Use inertia temp (float)
+                calculated_effective_wind,
+                0.0, # This arg is ignored by calculate_total_power
+                is_aux_active=is_aux_dominant,
+                detailed=False,
+                known_aux_impact_kwh=aux_impact_kwh,
+                **overrides_4d,
+            )
+        else:
+            res_analysis = self.coordinator.statistics.calculate_total_power(
+                inertia_avg, # Use inertia temp (float)
+                calculated_effective_wind,
+                0.0, # This arg is ignored by calculate_total_power
+                is_aux_active=is_aux_dominant,
+                detailed=False,
+                override_solar_factor=avg_solar_factor,
+                override_solar_vector=avg_solar_vector,
+                known_aux_impact_kwh=aux_impact_kwh,
+            )
 
         # Global Stabilizer: Use Global Base for learning Track A
         # Prevents feedback loop from Unit Sums

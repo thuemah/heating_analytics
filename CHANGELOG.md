@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.9] - 2026-06-12
+
+### Added
+
+### Changed
+
+### Fixed
+- **`diagnose_solar`'s Tobit estimate (`implied_coefficient_tobit_30d`) no longer fails silently on every unit.**  The diagnose-side Tobit computation referenced a variable that did not exist in its scope — a call-site line mirrored from the batch-fit caller during a refactor — so every invocation raised `NameError`, which the defensive exception guard in the diagnose per-unit block swallowed into `skip_reason: "exception"` with no further detail.  Symptom: `implied_coefficient_tobit_30d: null` with `tobit_diagnostics.skip_reason: "exception"` on all units of all installs, while batch-fit Tobit (which has the variable in scope) kept working on the same data.  The live coefficients are now resolved from the coordinator (model view with private-attribute fallback) and threaded into the sample collector, restoring the MAD outlier-baseline parity with batch-fit.  The exception guard additionally records the exception class and message in `tobit_diagnostics.failure_reason`, so any future swallowed failure is diagnosable directly from the service response instead of requiring a code dive.
+- **Hour-boundary accounting now follows the 4D pipeline when `experimental_4d_primary` is enabled.**  The hour-boundary analysis call and the end-of-hour gap fill passed 3D-only solar overrides (`override_solar_factor` / `override_solar_vector`), which auto-route the `calculate_total_power` dispatcher back to the 3D primitive regardless of the flag.  Result under flag=on: `expected_kwh` was accumulated from the live 4D minute loop while `solar_heating/cooling_applied_kwh`, the logged `solar_normalization_delta`, the solar battery charge, and `thermodynamic_gross_kwh` were computed from 3D coefficients in the same log row — a mixed-pipeline hour.  Observed symptom: phantom cooling-solar of 0.10-0.19 kWh/h from stale 3D cooling coefficients (which the 3D learners keep re-learning from on-hours only, while prediction applies them to all hours) and unphysical negative `thermodynamic_gross_kwh` on sunny midday hours.  Both call sites now build a 4D override bundle under the flag — hour-average DNI/DHI via the same `resolve_dni_dhi` ladder the 4D learner uses, hour-midpoint sun position, and hour-average screen correction — so the boundary accounting reads the same model as the live prediction.  Flag off is bit-identical to previous behaviour.  Dark hours and solar-disabled installs resolve to zero irradiance (solar contribution 0, matching the live loop).  Note: the in-learning normalization delta already followed 4D under the flag; this fix aligns the *logged* delta, the applied split, the battery, and gross with it.
+
 ## [1.3.8] - 2026-05-28
 
 ### Changed

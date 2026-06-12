@@ -7114,6 +7114,26 @@ class LearningManager:
             screen_cfg_for_entity = scr_fn(entity_id)
         else:
             screen_cfg_for_entity = getattr(coordinator, "screen_config", None)
+
+        # Current live coefficients feed the #919 MAD outlier pre-filter
+        # inside the sample collector — same convention as the
+        # batch_fit_solar caller (which receives the dict as a function
+        # parameter; this entry point receives the coordinator instead,
+        # so resolve via the model view with private-attribute fallback).
+        # Falls back to None — MAD baseline skipped, prior-free sanity
+        # check still applies — only when neither surface exposes a dict
+        # (ad-hoc test fixtures).
+        try:
+            solar_coefficients_per_unit = coordinator.model.solar_coefficients_per_unit
+        except AttributeError:
+            solar_coefficients_per_unit = None
+        if not isinstance(solar_coefficients_per_unit, dict):
+            solar_coefficients_per_unit = getattr(
+                coordinator, "_solar_coefficients_per_unit", None
+            )
+        if not isinstance(solar_coefficients_per_unit, dict):
+            solar_coefficients_per_unit = None
+
         entry_potentials: list[tuple[float, float, float, float]] = []
         for entry in filtered_log:
             (pot_s, pot_e, pot_w), magnitude = self._reconstruct_potential(

@@ -2327,7 +2327,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         avg_wind: float = 0.0,
         avg_solar: float = 0.0,
         is_aux_active: bool = False,
-        avg_solar_vector: tuple[float, float, float] | None = None
+        avg_solar_vector: tuple[float, float, float] | None = None,
+        overrides_4d: dict | None = None,
     ):
         """Close the gap at hour boundary by filling missing minutes.
 
@@ -2351,15 +2352,29 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         fraction = minutes_missing / 60.0
 
         # Calculate Gap Power using Aggregates
-        result = self.statistics.calculate_total_power(
-            avg_temp,
-            avg_wind,
-            0.0, # solar_impact (ignored when override is used)
-            is_aux_active=is_aux_active,
-            override_solar_factor=avg_solar,
-            override_solar_vector=avg_solar_vector,
-            detailed=True
-        )
+        if overrides_4d is not None:
+            # experimental_4d_primary (#1024): gap minutes accumulate into
+            # the same expected_per_unit totals the live 4D loop feeds —
+            # the 3D overrides below would pin this call to the 3D
+            # primitive and re-introduce the mixed-pipeline hour.
+            result = self.statistics.calculate_total_power(
+                avg_temp,
+                avg_wind,
+                0.0, # solar_impact (ignored when override is used)
+                is_aux_active=is_aux_active,
+                detailed=True,
+                **overrides_4d,
+            )
+        else:
+            result = self.statistics.calculate_total_power(
+                avg_temp,
+                avg_wind,
+                0.0, # solar_impact (ignored when override is used)
+                is_aux_active=is_aux_active,
+                override_solar_factor=avg_solar,
+                override_solar_vector=avg_solar_vector,
+                detailed=True
+            )
 
         current_rate = result["total_kwh"]
         unit_breakdown = result["unit_breakdown"]

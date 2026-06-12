@@ -2041,11 +2041,15 @@ class DiagnosticsEngine:
                     unit_min_base=self.coordinator._per_unit_min_base_thresholds or None,
                     days_back=days_back,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 # Defensive: shadow diagnostic must never break diagnose_solar.
+                # Record the exception class/message so a swallowed failure
+                # is diagnosable from the service response alone — a bare
+                # "exception" label hid a structural NameError for weeks.
                 tobit_fit = {
                     "coefficient": None,
                     "skip_reason": "exception",
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
                 }
             tobit_coeff = tobit_fit.get("coefficient")
             tobit_diagnostics = {
