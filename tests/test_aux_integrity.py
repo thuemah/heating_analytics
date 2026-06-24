@@ -157,15 +157,18 @@ def test_aux_integrity_no_scaling(integrity_coordinator):
         is_aux_active=True
     )
 
-    # Verify Global Integrity.  Post-#992 c2: ``total_kwh`` is the
-    # per-(scope, mode) partition sum, NOT Track A's
-    # ``max(0, global_base − global_aux_reduction)``.  h3 is out of
-    # ``aux_affected_entities`` so its 10 kWh base flows through to the
-    # total — pre-fix it was silently absorbed by the Track A clamp
-    # whenever ``global_aux_reduction > Σ aux_affected base``, which is
-    # exactly the scenario this test sets up (global aux=10 vs
-    # per-entity sum aux=4).
-    assert result["total_kwh"] == 26.0 # 8 (h1) + 8 (h2) + 10 (h3)
+    # Verify Global Integrity.  #1035 restores the global-led anchor:
+    # ``total_kwh`` tracks the global base magnitude, NOT the per-unit
+    # sum (#992 c2 reverted).  Anchor = max(0, global_base −
+    # min(global_aux_reduction, Σ base_aux_affected)) = max(0, 30 −
+    # min(10, 20)) = 20.  The scoped clamp is inert here (10 < 20), so
+    # the anchor is the plain Track A net.  The anchor is then allocated
+    # across the partitions by net_after_aux share (shares sum to 1) so
+    # the total equals the anchor exactly.  h3's out-of-aux-scope base
+    # is preserved in the per-unit breakdown (attribution); the global
+    # vs. per-entity divergence surfaces as unspecified_kwh, not as
+    # silent absorption.
+    assert result["total_kwh"] == 20.0
     assert result["global_aux_reduction_kwh"] == 10.0
 
     # Verify NO Scaling (Honest Reporting)
@@ -192,9 +195,10 @@ def test_aux_integrity_no_scaling(integrity_coordinator):
     assert result["breakdown"]["aux_reduction_kwh"] == 4.0
     assert result["breakdown"]["orphaned_aux_savings"] == pytest.approx(6.0)
 
-    # Verify Unspecified kWh.  Post-c2 this is the gap between the
-    # partition aggregate (26.0) and the per-entity net sum (26.0) —
-    # which is ~0 on consistent state, since the partition base is
-    # built directly from per-entity net_after_aux values.  Pre-c2 it
-    # was −6 because Track A under-counted by absorbing h3's base.
-    assert result["breakdown"]["unspecified_kwh"] == pytest.approx(0.0)
+    # Verify Unspecified kWh.  #1035 restores its original meaning: the
+    # gap between the global anchor (20.0) and the per-entity net
+    # attribution sum (8 + 8 + 10 = 26.0) = −6.0.  This is the same
+    # magnitude as orphaned_aux_savings (6.0): Track A believes aux
+    # saves 10 but the per-entity models only attribute 4 saved, so the
+    # per-entity sum overshoots the global anchor by exactly that gap.
+    assert result["breakdown"]["unspecified_kwh"] == pytest.approx(-6.0)

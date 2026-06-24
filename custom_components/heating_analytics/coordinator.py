@@ -3247,7 +3247,15 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
                 entry_unit_modes = entry.get("unit_modes", {}) or {}
                 for eid, kwh in (entry.get("unit_breakdown", {}) or {}).items():
-                    mode = entry_unit_modes.get(eid)
+                    # ``unit_modes`` is sparse — only entities whose mode was
+                    # explicitly set are present.  Default-heating units (never
+                    # touched via the mode select) are absent and must fall back
+                    # to MODE_HEATING, matching get_unit_mode and the log-replay
+                    # paths (e.g. statistics._calculate_historical_expectations).
+                    # Without the default they classified as None and dropped out
+                    # of BOTH accumulators — a default-heating heat pump's nightly
+                    # consumption vanished from accumulated_heating.
+                    mode = entry_unit_modes.get(eid, MODE_HEATING)
                     if mode in heating_modes:
                         accumulated_heating += kwh
                     elif mode in cooling_modes:

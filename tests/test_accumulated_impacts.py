@@ -135,3 +135,45 @@ def test_accumulated_heating_cooling_split(mock_coordinator):
     # dhw + off do not contribute to either bucket
     assert mock_coordinator.data["accumulated_heating_kwh"] == pytest.approx(2.5)
     assert mock_coordinator.data["accumulated_cooling_kwh"] == pytest.approx(0.7)
+
+
+def test_accumulated_heating_defaults_missing_mode_to_heating(mock_coordinator):
+    """Units absent from the sparse ``unit_modes`` map must classify as heating.
+
+    ``unit_modes`` only carries entities whose mode was explicitly set via the
+    select.  A default-heating unit (never touched) is absent, so its logged
+    consumption must fall back to MODE_HEATING — not drop out of both buckets.
+    Regression for accumulated_heating reading 0 while a default-heating heat
+    pump ran all night.
+    """
+    current_time = dt_util.parse_datetime("2023-01-01T01:30:00+00:00")
+    mock_coordinator._hourly_log = [
+        {
+            "timestamp": "2023-01-01T00:00:00",
+            "unit_breakdown": {
+                "sensor.default_heat": 1.2,   # absent from unit_modes
+                "sensor.explicit_cool": 0.5,
+            },
+            "unit_modes": {
+                # default_heat deliberately omitted (sparse map)
+                "sensor.explicit_cool": "cooling",
+            },
+        },
+    ]
+    mock_coordinator._hourly_delta_per_unit = {}
+    mock_coordinator.get_unit_mode.side_effect = lambda eid: "off"
+
+    mock_coordinator.data = {
+        "accumulated_solar_impact_kwh": 0.0,
+        "accumulated_guest_impact_kwh": 0.0,
+        "accumulated_aux_impact_kwh": 0.0,
+        "solar_impact_kwh": 0.0,
+        "last_hour_aux_impact_kwh": 0.0,
+    }
+    mock_coordinator._collector.aux_impact_hour = 0.0
+
+    HeatingDataCoordinator._update_accumulated_impacts(mock_coordinator, current_time)
+
+    # default_heat (absent mode) → heating; explicit_cool → cooling.
+    assert mock_coordinator.data["accumulated_heating_kwh"] == pytest.approx(1.2)
+    assert mock_coordinator.data["accumulated_cooling_kwh"] == pytest.approx(0.5)
