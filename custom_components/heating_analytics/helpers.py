@@ -216,13 +216,17 @@ def compute_base_ema_step(
     returned separately so step-RMS jitter diagnostics can read it
     without re-deriving from the bucket delta.
 
-    #967 staging: this kernel currently has one consumer in
-    ``diagnostics._compute_base_model_4d_shadow_report``.  The live
-    ``learning.process_learning`` writer applies the same formula inline
-    at ``learning.py:990``; routing it through this helper is deferred
-    until 4D-primary observation has stabilised so a refactor regression
-    does not confound 4D-promotion attribution.  See the TODO marker at
-    that call site.
+    Consumers: the live writer (``learning.process_learning``), the
+    retrain path (``learning.learn_from_historical_import``), and the
+    diagnostic simulation (``diagnostics._compute_base_model_4d_shadow_report``).
+    Call-form convention: callers that have already folded the SNR
+    weight into an effective rate pass ``(effective_rate, 1.0)`` —
+    multiplication by 1.0 is exact in IEEE-754, so the result is
+    bit-identical to ``bucket + effective_rate × (target − bucket)``
+    no matter how the effective rate was constructed.  Callers holding
+    the factors separately (diagnostics) pass them as-is; Python's
+    left-to-right evaluation makes ``lr × w × diff`` identical to
+    ``(lr × w) × diff``.
     """
     step = learning_rate * snr_weight * (target - current_bucket)
     return current_bucket + step, step

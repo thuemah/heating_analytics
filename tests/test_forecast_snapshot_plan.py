@@ -41,9 +41,9 @@ def test_snapshot_generation_includes_hourly_plan(mock_now, mock_start_of_day, m
     def process_side_effect(item, *args, **kwargs):
         temp = float(item["temperature"])
         if temp == 10.0:
-            return (1.5, 0.0, 5.0, 10.0, 0.0, 0.0, {}, 0.0, 0.0, None)
+            return (1.5, 0.0, 5.0, 10.0, 0.0, 0.0, {}, 0.0, 0.0, None, 0.0, 0.0)
         else:
-            return (2.0, 0.0, 4.0, 9.0, 0.0, 0.0, {}, 0.0, 0.0, None)
+            return (2.0, 0.0, 4.0, 9.0, 0.0, 0.0, {}, 0.0, 0.0, None, 0.0, 0.0)
 
     with patch.object(fm, '_process_forecast_item', side_effect=process_side_effect) as mock_process:
         snapshot = fm._capture_daily_forecast_snapshot()
@@ -116,10 +116,10 @@ def test_snapshot_captures_4d_inputs_when_flag_on(mock_now, mock_start_of_day, m
         temp = float(item["temperature"])
         if temp == 10.0:
             # Night-time hour: no 4D dispatch, meta=None
-            return (1.5, 0.0, 5.0, 10.0, 0.0, 0.0, {}, 0.0, 0.0, None)
+            return (1.5, 0.0, 5.0, 10.0, 0.0, 0.0, {}, 0.0, 0.0, None, 0.0, 0.0)
         else:
             # Mid-day hour: 4D dispatched, meta populated
-            return (2.0, 0.0, 4.0, 9.0, 0.0, 0.0, {}, 0.0, 0.0, populated_meta)
+            return (2.0, 0.0, 4.0, 9.0, 0.0, 0.0, {}, 0.0, 0.0, populated_meta, 0.0, 0.0)
 
     with patch.object(fm, '_process_forecast_item', side_effect=process_side_effect):
         snapshot = fm._capture_daily_forecast_snapshot()

@@ -275,6 +275,31 @@ class HourlyProcessor:
             ),
         )
 
+    def _forecast_point_kwh(
+        self, item, inertia_seed, weather_wind_unit, current_cloud, ignore_aux=False
+    ):
+        """Single-point forecast kWh for one weather item (shadow path).
+
+        Reads ``result[0]`` rather than destructuring the full
+        ``_process_forecast_item`` return so this consumer is decoupled
+        from the tuple arity — that tuple has grown 8 → 9 → 10 → 12, and
+        an explicit N-underscore unpack here crashed the coordinator's
+        update loop live on the #1037 widening.  Extracted from the inline
+        ``process()`` closure so the consumption path is unit-testable with
+        a *populated* item — the production-wiring gap that let that
+        regression ship (every existing test passed only because it fed
+        ``None`` items, which short-circuit before the call).
+        """
+        if not item:
+            return None
+        return self.coordinator.forecast._process_forecast_item(
+            item,
+            list(inertia_seed),
+            weather_wind_unit,
+            current_cloud,
+            ignore_aux=ignore_aux,
+        )[0]
+
     async def process(self, current_time: datetime):
         """Process the accumulated data for the past hour.
 
@@ -470,15 +495,14 @@ class HourlyProcessor:
         weather_wind_unit = self.coordinator._get_weather_wind_unit()
         current_cloud = self.coordinator._get_cloud_coverage()
 
-        # Helper to process an item
+        # Helper to process an item — delegates to the testable
+        # _forecast_point_kwh method (see there for the arity-decoupling
+        # rationale).
         def _get_f_kwh(item, ignore_aux=False):
-            if not item: return None
-            # 10-tuple return as of #980 (9th element added by #899); we only
-            # need the predicted kWh here (single-point query, no trajectory).
-            val, _, _, _, _, _, _, _, _, _ = self.coordinator.forecast._process_forecast_item(
-                item, list(local_inertia_seed), weather_wind_unit, current_cloud, ignore_aux=ignore_aux
+            return self._forecast_point_kwh(
+                item, local_inertia_seed, weather_wind_unit, current_cloud,
+                ignore_aux=ignore_aux,
             )
-            return val
 
         # Calculate values
         # Net Forecasts (Shadow) - Tracks expected consumption including Aux reduction

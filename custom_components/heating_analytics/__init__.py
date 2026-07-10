@@ -267,6 +267,7 @@ SERVICE_SCHEMA_GET_FORECAST = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=14)),
     vol.Optional("isolate_sensor"): cv.entity_id,
+    vol.Optional("human_readable", default=False): cv.boolean,
 })
 
 SERVICE_SCHEMA_DIAGNOSE = vol.Schema({
@@ -303,6 +304,99 @@ def _get_target_coordinator(
     if coordinators:
         return coordinators[0]
     raise ValueError("No Heating Analytics instance found.")
+
+
+def _build_human_readable_forecast(hass: HomeAssistant, hours: list[dict]) -> dict:
+    """Condense the raw hourly forecast into a glanceable structure (#1037).
+
+    The raw ``get_forecast`` payload is shaped for an MPC solver: a nested
+    ``unit_breakdown`` per hour, including the many zero-consumption units.
+    The ``human_readable`` flag trades that detail for legibility:
+
+    * per-unit breakdown collapses to a ``top`` string of the 3 largest
+      contributors by net kWh, using friendly names, zero-net units dropped;
+    * solar is split into ``solar_offset_kwh`` (heating reduction) and
+      ``solar_load_kwh`` (cooling addition), each shown only when non-zero —
+      the single ``solar_kwh`` figure mislabels additive cooling solar;
+    * the blend ``source`` is carried per hour;
+    * a day-level ``forecast_summary`` header is added.
+
+    The default (flag off) path is untouched, so MPC consumers see no change.
+    """
+    def _friendly(entity_id: str) -> str:
+        state = hass.states.get(entity_id)
+        if state:
+            name = state.attributes.get("friendly_name")
+            if name:
+                return name
+        return entity_id
+
+    compact: list[dict] = []
+    total_kwh = 0.0
+    total_offset = 0.0
+    total_load = 0.0
+    temps: list[float] = []
+    aux_hours = 0
+    peak: tuple[float, str] | None = None
+
+    for hour in hours:
+        dt_str = hour.get("datetime")
+        parsed = dt_util.parse_datetime(dt_str) if dt_str else None
+        time_label = parsed.strftime("%Y-%m-%d %H:%M") if parsed else dt_str
+        kwh = hour.get("kwh", 0.0)
+        offset = hour.get("solar_offset_kwh", 0.0)
+        load = hour.get("solar_load_kwh", 0.0)
+
+        breakdown = hour.get("unit_breakdown", {})
+        contributors = sorted(
+            (
+                (sid, stats.get("net_kwh", 0.0))
+                for sid, stats in breakdown.items()
+                if stats.get("net_kwh", 0.0) > 0.0
+            ),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        top = " · ".join(f"{_friendly(sid)} {net:.2f}" for sid, net in contributors[:3])
+
+        entry: dict = {
+            "time": time_label,
+            "kwh": kwh,
+            "temp": hour.get("temp"),
+            "wind": hour.get("wind_speed"),
+            "source": hour.get("source"),
+        }
+        if offset:
+            entry["solar_offset_kwh"] = offset
+        if load:
+            entry["solar_load_kwh"] = load
+        if hour.get("aux_expected"):
+            entry["aux"] = True
+            aux_hours += 1
+        if top:
+            entry["top"] = top
+        compact.append(entry)
+
+        total_kwh += kwh
+        total_offset += offset
+        total_load += load
+        if hour.get("temp") is not None:
+            temps.append(hour["temp"])
+        if peak is None or kwh > peak[0]:
+            peak = (kwh, time_label)
+
+    summary = {
+        "range": f"{compact[0]['time']} → {compact[-1]['time']}" if compact else None,
+        "hours": len(compact),
+        "total_kwh": round(total_kwh, 2),
+        "avg_temp": round(sum(temps) / len(temps), 1) if temps else None,
+        "solar_offset_kwh": round(total_offset, 2),
+        "solar_load_kwh": round(total_load, 2),
+        "peak_hour": f"{peak[1]} ({peak[0]:.2f} kWh)" if peak else None,
+        "aux_hours": aux_hours,
+    }
+    return {"forecast_summary": summary, "forecast": compact}
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Heating Analytics from a config entry."""
@@ -1327,6 +1421,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entity_id = call.data.get("entity_id")
         days = call.data.get("days", 1)
         isolate_sensor = call.data.get("isolate_sensor")
+        human_readable = call.data.get("human_readable", False)
 
         target_coordinator = _get_target_coordinator(hass, entity_id)
         _LOGGER.debug("Handling get_forecast for %d days (coordinator: %s)", days, target_coordinator.entry.entry_id)
@@ -1352,6 +1447,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hour_entry["kwh"] = round(isolated, 2)
                 hour_entry["isolated_for"] = isolate_sensor
                 hour_entry["subtracted_kwh"] = round(other_sum, 2)
+
+        if human_readable:
+            return _build_human_readable_forecast(hass, result)
 
         return {"forecast": result}
 

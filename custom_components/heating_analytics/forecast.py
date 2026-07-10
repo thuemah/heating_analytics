@@ -757,7 +757,7 @@ class ForecastManager:
 
         # 3. Call the internal processing function to get the kWh value
         # We pass a copy of inertia_history because _process_forecast_item modifies it.
-        predicted_kwh, _, _, _, _, _, unit_breakdown, _, _, _ = self._process_forecast_item(
+        predicted_kwh, _, _, _, _, _, unit_breakdown, _, _, _, _, _ = self._process_forecast_item(
             item=forecast_item,
             inertia_history=list(inertia_history),
             wind_unit=weather_wind_unit,
@@ -1102,7 +1102,7 @@ class ForecastManager:
                 current_offset += 1
 
             (predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms,
-             _, _, predicted_wasted, _) = self._process_forecast_item(
+             _, _, predicted_wasted, _, _, _) = self._process_forecast_item(
                 f, local_inertia_history, weather_wind_unit, current_cloud,
                 ignore_aux=ignore_aux,
                 carryover_state_override=local_carryover,
@@ -1167,7 +1167,11 @@ class ForecastManager:
 
         Returns:
             (predicted_kwh, solar_kwh, inertia_val, raw_temp, wind_speed_raw, wind_speed_ms,
-             unit_breakdown, aux_impact_kwh, solar_heating_wasted_kwh, dni_dhi_meta)
+             unit_breakdown, aux_impact_kwh, solar_heating_wasted_kwh, dni_dhi_meta,
+             solar_offset_kwh, solar_load_kwh)
+
+            ``solar_offset_kwh`` is the heating-mode solar reduction (lowers demand);
+            ``solar_load_kwh`` is the cooling-mode solar addition (raises demand).
 
             ``dni_dhi_meta`` is a dict capturing the 4D-leg inputs actually fed to
             ``calculate_total_power_4d`` (see #980), or None when the 4D leg was
@@ -1334,6 +1338,15 @@ class ForecastManager:
 
         predicted = res["total_kwh"]
         solar_kwh = res["breakdown"]["solar_reduction_kwh"]
+        # Solar heating/cooling split (#1037).  ``solar_reduction_kwh``
+        # lumps every unit's applied solar into one figure, but cooling
+        # solar is ADDITIVE (it raises demand) — so on a cooling day the
+        # single "reduction" number is mislabelled.  Surface the two
+        # canonical breakdown components separately so the forecast can
+        # report offset (heating reduction) vs load (cooling addition),
+        # mirroring the Deviation Today sensor.
+        solar_offset_kwh = res["breakdown"].get("solar_heating_applied_kwh", 0.0)
+        solar_load_kwh = res["breakdown"].get("solar_cooling_applied_kwh", 0.0)
         unit_breakdown = res["unit_breakdown"]
         aux_impact_kwh = res["breakdown"]["aux_reduction_kwh"]
         # Heating-only wasted exposed for forecast trajectory threading
@@ -1364,7 +1377,7 @@ class ForecastManager:
                 "sun_elev_deg": round(float(elev), 2) if elev is not None else None,
             }
 
-        return predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown, aux_impact_kwh, solar_heating_wasted, dni_dhi_meta
+        return predicted, solar_kwh, inertia_val, raw_temp, w_speed, w_speed_ms, unit_breakdown, aux_impact_kwh, solar_heating_wasted, dni_dhi_meta, solar_offset_kwh, solar_load_kwh
 
     def _calculate_from_daily_forecast(
         self,
@@ -1715,6 +1728,12 @@ class ForecastManager:
                 w_speed = res[4]
                 unit_breakdown = res[6]
                 aux_impact = res[7]
+                solar_offset = res[10]
+                solar_load = res[11]
+                # Blend source ('primary' / 'secondary') set on the item
+                # during _blend_forecasts; surfaced per hour so consumers
+                # can see which provider each hour came from.
+                hour_source = f.get("_source")
 
                 total_energy += predicted
                 total_solar += solar_kwh
@@ -1735,6 +1754,9 @@ class ForecastManager:
                     "temp": round(raw_temp, 1),
                     "wind_speed": round(w_speed, 1),
                     "solar_kwh": round(solar_kwh, 2),
+                    "solar_offset_kwh": round(solar_offset, 2),
+                    "solar_load_kwh": round(solar_load, 2),
+                    "source": hour_source,
                     "inertia_temp": round(inertia_val, 1),
                     "aux_expected": is_aux_used,
                     "aux_impact_kwh": round(aux_impact, 2),

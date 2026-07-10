@@ -1532,7 +1532,7 @@ class TestSumForecastEnergyCarryoverThreading:
             captured_overrides.append(kwargs.get("carryover_state_override"))
             # Return 10-tuple including wasted (9th) and dni_dhi_meta (10th).
             # Wasted=0 means no charge regardless of k.
-            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0, None)
+            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0, None, 0.0, 0.0)
 
         helper._process_forecast_item = _spy
         now = dt_util.now()
@@ -1591,7 +1591,7 @@ class TestSumForecastEnergyCarryoverThreading:
         def _spy(item, history, wind_unit, cloud, **kwargs):
             captured.append(kwargs.get("carryover_state_override"))
             # Sustained wasted = 1.0 per forecast hour (sunny day).
-            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 1.0, None)
+            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 1.0, None, 0.0, 0.0)
 
         helper._process_forecast_item = _spy
         now = dt_util.now()
@@ -1633,7 +1633,7 @@ class TestSumForecastEnergyCarryoverThreading:
 
         def _spy(item, history, wind_unit, cloud, **kwargs):
             captured.append(kwargs.get("carryover_state_override"))
-            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0, None)
+            return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, 0.0, 0.0, None, 0.0, 0.0)
 
         helper._process_forecast_item = _spy
         now = dt_util.now()
@@ -1784,23 +1784,25 @@ class TestReleaseDistributionEdgeCases:
 
 
 class TestProcessForecastItemReturnArity:
-    """Pin the 10-tuple contract on ``_process_forecast_item``.
+    """Pin the 12-tuple contract on ``_process_forecast_item``.
 
     #899 expanded the return tuple from 8 to 9 elements (added
     ``solar_heating_wasted_kwh``).  #980 extended it to 10 (added
-    ``dni_dhi_meta`` for midnight-snapshot persistence).  Production
-    call sites destructure this tuple explicitly — if a future refactor
-    reverts the arity those sites raise ``ValueError`` on the next
-    hourly cycle.  These tests pin the arity so a revert is caught at
-    test time.
+    ``dni_dhi_meta`` for midnight-snapshot persistence).  #1037 extended
+    it to 12 (added ``solar_offset_kwh`` / ``solar_load_kwh`` so the
+    forecast can report the heating-reduction vs cooling-addition solar
+    split).  Production call sites destructure this tuple explicitly — if
+    a future refactor reverts the arity those sites raise ``ValueError``
+    on the next hourly cycle.  These tests pin the arity so a revert is
+    caught at test time.
     """
 
-    def test_return_tuple_has_ten_elements(self):
-        """Direct invocation of _process_forecast_item returns 10 elements.
+    def test_return_tuple_has_twelve_elements(self):
+        """Direct invocation of _process_forecast_item returns 12 elements.
 
         Synthesises a minimal valid item; we only check the return
         shape.  All call sites — production and test — must destructure
-        a 10-tuple.
+        a 12-tuple.
         """
         from custom_components.heating_analytics.forecast import ForecastManager
 
@@ -1817,6 +1819,8 @@ class TestProcessForecastItemReturnArity:
                 "solar_reduction_kwh": 0.0,
                 "aux_reduction_kwh": 0.0,
                 "solar_heating_wasted_kwh": 0.5,
+                "solar_heating_applied_kwh": 0.0,
+                "solar_cooling_applied_kwh": 0.0,
             },
             "unit_breakdown": {},
         }
@@ -1829,15 +1833,21 @@ class TestProcessForecastItemReturnArity:
             wind_unit="m/s",
             default_cloud=50.0,
         )
-        assert len(result) == 10, (
-            f"_process_forecast_item must return a 10-tuple "
+        assert len(result) == 12, (
+            f"_process_forecast_item must return a 12-tuple "
             f"(predicted, solar_kwh, inertia_val, raw_temp, w_speed, "
             f"w_speed_ms, unit_breakdown, aux_impact_kwh, "
-            f"solar_heating_wasted, dni_dhi_meta); got {len(result)} "
+            f"solar_heating_wasted, dni_dhi_meta, solar_offset_kwh, "
+            f"solar_load_kwh); got {len(result)} "
             f"elements.  Production call sites in hourly_processor.py "
-            f"and forecast.py destructure 10 elements explicitly — a "
+            f"and forecast.py destructure 12 elements explicitly — a "
             f"revert here will crash live with ValueError on the next "
             f"hourly cycle."
         )
-        # Last element should be the heating wasted from breakdown.
+        # Element [8] is the heating wasted from breakdown.
         assert result[8] == pytest.approx(0.5)
+        # Element [0] is the predicted kWh.  hourly_processor._get_f_kwh
+        # reads result[0] directly (arity-decoupled after the #1037
+        # 12-tuple regression crashed that site) — pin that contract so a
+        # consumer that single-points the forecast can rely on it.
+        assert result[0] == pytest.approx(1.0)

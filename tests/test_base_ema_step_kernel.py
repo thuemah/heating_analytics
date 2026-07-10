@@ -1,15 +1,18 @@
-"""Tests for ``helpers.compute_base_ema_step`` (#967 Stage 1).
+"""Tests for ``helpers.compute_base_ema_step`` (#967).
 
 The kernel is the single arithmetic source-of-truth for the base-model
-EMA step.  These tests pin:
+EMA step, consumed by the live writer (``learning.process_learning``),
+the retrain path (``learning.learn_from_historical_import``), and the
+diagnostic simulation.  These tests pin:
 
 1. The formula itself (step = lr · w · (target − bucket); new = bucket + step).
-2. Byte-identity against the inline forms currently in
-   ``learning.process_learning`` (live writer) and
-   ``learning.learn_from_historical_import`` (retrain) — when those call
-   sites are migrated through the helper (#967 Stage 2), the migration
-   must produce bit-identical numeric output.  These tests guarantee a
-   regression in the migration would be caught immediately.
+2. Byte-identity against the pre-migration inline forms of the live
+   writer and the retrain path (#967 Stage 2 replaced those inline
+   expressions with kernel calls; these tests prove the swap is
+   bit-identical, so any future kernel change that would silently move
+   production buckets is caught immediately).
+3. The exact ``(effective_rate, 1.0)`` call form used by the live and
+   retrain call sites, where the SNR weight is pre-folded into the rate.
 """
 from __future__ import annotations
 
@@ -46,14 +49,15 @@ class TestBaseEmaStepKernel:
         assert new_bucket == pytest.approx(0.48, abs=1e-9)
 
     def test_inline_forms_byte_identical_byte_match(self):
-        """Pin: helper output == inline forms used by live + retrain.
+        """Pin: helper output == the pre-migration inline forms.
 
-        ``learning.py:999`` (live):
+        Live (pre-Stage-2 ``process_learning``):
             new_base_prediction = base_expected_kwh + base_effective_rate × (base_target − base_expected_kwh)
-        ``learning.py:2734`` (retrain):
+        Retrain (pre-Stage-2 ``learn_from_historical_import``):
             new_pred = current_pred + effective_rate × (target − current_pred)
 
-        Both reduce to the same arithmetic.  Migration regression caught here.
+        Both reduce to the same arithmetic.  A kernel change that breaks
+        this pin would silently move production buckets — caught here.
         """
         # Synthetic case sweep — values spread across realistic regime.
         cases = [
@@ -88,3 +92,32 @@ class TestBaseEmaStepKernel:
             # computes ``step`` once and returns ``bucket + step`` so the
             # two values are FP-consistent within ~1 ULP.
             assert step == pytest.approx(new_bucket - bucket, abs=1e-15)
+
+    def test_folded_rate_call_form_bit_identical(self):
+        """Pin the exact call form used by the live + retrain call sites.
+
+        Both sites fold the SNR weight into an effective rate before the
+        kernel call and pass ``(effective_rate, 1.0)``.  Multiplication
+        by 1.0 is exact in IEEE-754, so the kernel must be bit-identical
+        to ``bucket + effective_rate × (target − bucket)`` for any
+        effective rate, however it was constructed (lr × snr_w,
+        lr × max(0, w), or bare lr).
+        """
+        cases = [
+            # (bucket, target, effective_rate) — rates built the ways the
+            # call sites build them.
+            (0.30, 0.50, 0.01 * 0.83),          # live: learning_rate * snr_w
+            (0.426, 0.317, 0.01),               # live: bare learning_rate branch
+            (0.043, 0.235, 0.02 * max(0.0, 0.6)),  # retrain: lr * max(0, w)
+            (1.734, 1.529, 0.03 * 0.999999),    # near-unity weight fold
+            (0.0001, 2.5, 0.01 * 1e-6),         # tiny effective rate
+        ]
+        for bucket, target, eff_rate in cases:
+            new_bucket, step = compute_base_ema_step(bucket, target, eff_rate, 1.0)
+            inline = bucket + eff_rate * (target - bucket)
+            assert new_bucket == inline, (
+                f"folded-rate call form diverges at "
+                f"({bucket=}, {target=}, {eff_rate=}): "
+                f"helper={new_bucket!r}, inline={inline!r}"
+            )
+            assert step == eff_rate * (target - bucket)

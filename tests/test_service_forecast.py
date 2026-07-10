@@ -5,8 +5,88 @@ import pytest
 
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.util import dt as dt_util
-from custom_components.heating_analytics import async_setup_entry, DOMAIN
+from custom_components.heating_analytics import (
+    async_setup_entry,
+    DOMAIN,
+    _build_human_readable_forecast,
+)
 from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
+
+
+def test_build_human_readable_forecast_condenses():
+    """human_readable mode: summary header, top contributors with friendly
+    names (zero-net dropped), solar offset/load split, source per hour."""
+    hass = MagicMock()
+
+    friendly = {"sensor.vp_stue": "Varmepumpe Stue", "sensor.bad": "Varmekabel Bad"}
+
+    def _state(eid):
+        if eid in friendly:
+            st = MagicMock()
+            st.attributes = {"friendly_name": friendly[eid]}
+            return st
+        return None
+
+    hass.states.get.side_effect = _state
+
+    hours = [
+        {
+            "datetime": "2026-06-25T07:00:00+02:00",
+            "hour": 7, "kwh": 0.16, "temp": 15.8, "wind_speed": 8.3,
+            "solar_kwh": 0.11, "solar_offset_kwh": 0.14, "solar_load_kwh": 0.0,
+            "source": "primary", "aux_expected": False, "aux_impact_kwh": 0.0,
+            "unit_breakdown": {
+                "sensor.vp_stue": {"net_kwh": 0.10},
+                "sensor.bad": {"net_kwh": 0.05},
+                "sensor.zero": {"net_kwh": 0.0},
+            },
+        },
+        {
+            "datetime": "2026-06-25T14:00:00+02:00",
+            "hour": 14, "kwh": 0.40, "temp": 21.0, "wind_speed": 2.0,
+            "solar_kwh": 0.0, "solar_offset_kwh": 0.0, "solar_load_kwh": 0.26,
+            "source": "secondary", "aux_expected": True, "aux_impact_kwh": 0.1,
+            "unit_breakdown": {"sensor.vp_stue": {"net_kwh": 0.40}},
+        },
+    ]
+
+    out = _build_human_readable_forecast(hass, hours)
+
+    s = out["forecast_summary"]
+    assert s["hours"] == 2
+    assert s["total_kwh"] == pytest.approx(0.56)
+    assert s["avg_temp"] == pytest.approx(18.4)
+    assert s["solar_offset_kwh"] == pytest.approx(0.14)
+    assert s["solar_load_kwh"] == pytest.approx(0.26)
+    assert s["aux_hours"] == 1
+    assert "0.40" in s["peak_hour"]
+
+    f = out["forecast"]
+    # Hour 1: zero-net unit dropped, friendly names, offset shown not load.
+    assert f[0]["top"] == "Varmepumpe Stue 0.10 · Varmekabel Bad 0.05"
+    assert f[0]["solar_offset_kwh"] == 0.14
+    assert "solar_load_kwh" not in f[0]
+    assert "aux" not in f[0]
+    assert f[0]["source"] == "primary"
+    # Hour 2: cooling load shown, aux flagged, offset omitted.
+    assert f[1]["solar_load_kwh"] == 0.26
+    assert "solar_offset_kwh" not in f[1]
+    assert f[1]["aux"] is True
+
+
+def test_build_human_readable_falls_back_to_entity_id():
+    """Missing friendly_name falls back to the raw entity_id."""
+    hass = MagicMock()
+    hass.states.get.return_value = None
+    hours = [{
+        "datetime": "2026-06-25T07:00:00+02:00",
+        "kwh": 0.1, "temp": 10.0, "wind_speed": 1.0,
+        "solar_offset_kwh": 0.0, "solar_load_kwh": 0.0, "source": "primary",
+        "aux_expected": False,
+        "unit_breakdown": {"sensor.unknown": {"net_kwh": 0.1}},
+    }]
+    out = _build_human_readable_forecast(hass, hours)
+    assert out["forecast"][0]["top"] == "sensor.unknown 0.10"
 
 @pytest.mark.asyncio
 async def test_get_forecast_service(hass: HomeAssistant):

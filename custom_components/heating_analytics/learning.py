@@ -65,7 +65,7 @@ from .const import (
     HARD_OUTLIER_CAP_FACTOR,
     HARD_OUTLIER_SANITY_MULTIPLIER,
 )
-from .helpers import solve_gauss_jordan
+from .helpers import compute_base_ema_step, solve_gauss_jordan
 from .observation import HourlyObservation, ModelState, LearningConfig
 from .solar import SolarCalculator
 
@@ -1091,17 +1091,16 @@ class LearningManager:
                             new_base_prediction = 0.0
 
                     else:
-                        # EMA Update
-                        # #967: inline EMA step.  ``helpers.compute_base_ema_step``
-                        # is the named source-of-truth this expression matches;
-                        # diagnostics already routes through it.  Migration of
-                        # the live writer is deferred until 4D-primary
-                        # observation has stabilised (refactor here during
-                        # the observation window would confound attribution
-                        # of any deviation drift).  When migrating, the
-                        # round(_, 5) post-step clamp stays caller-side
-                        # per the helper's contract.
-                        new_base_prediction = base_expected_kwh + base_effective_rate * (base_target - base_expected_kwh)
+                        # EMA Update via the shared kernel.  The SNR weight is
+                        # already folded into base_effective_rate (both branches
+                        # above), so weight is passed as 1.0 — multiplication by
+                        # 1.0 is exact, keeping the output bit-identical to the
+                        # pre-kernel inline form regardless of how the rate was
+                        # built.  round(_, 5) stays caller-side per the
+                        # helper's contract.
+                        new_base_prediction, _ = compute_base_ema_step(
+                            base_expected_kwh, base_target, base_effective_rate, 1.0
+                        )
                         if temp_key not in correlation_data:
                             correlation_data[temp_key] = {}
                         correlation_data[temp_key][wind_bucket] = round(new_base_prediction, 5)
@@ -2837,11 +2836,12 @@ class LearningManager:
                     target = dark_target
                 else:
                     target = actual_kwh
-                # #967: inline EMA step.  ``helpers.compute_base_ema_step`` is the
-                # named source-of-truth; this retrain path will be migrated in the
-                # same pass as ``process_learning`` once 4D-primary observation
-                # has stabilised.
-                new_pred = current_pred + effective_rate * (target - current_pred)
+                # EMA step via the shared kernel; the SNR weight is already
+                # folded into effective_rate, so weight is passed as 1.0
+                # (exact — see the kernel's docstring).
+                new_pred, _ = compute_base_ema_step(
+                    current_pred, target, effective_rate, 1.0
+                )
             else:
                 # Cold start: first non-zero sample seeds the bucket.
                 # Seed with the dark-equivalent when the lift gate is open;

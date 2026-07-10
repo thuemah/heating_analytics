@@ -733,6 +733,17 @@ get_forecast:
       selector:
         entity:
           domain: sensor
+    human_readable:
+      name: Human Readable
+      description: >-
+        Return a condensed, glanceable forecast instead of the full
+        MPC-shaped payload: a day-level summary, top contributors per hour
+        with friendly names (zero-consumption units dropped), solar split
+        into offset (heating reduction) and load (cooling addition), and the
+        weather source per hour. Leave off for MPC/automation consumers.
+      default: false
+      selector:
+        boolean:
 
 calibrate_wind_thresholds:
   name: Calibrate Wind Thresholds

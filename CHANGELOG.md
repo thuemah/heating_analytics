@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.11] - 2026-07-10
+
+### Changed
+- **Live base-model learning and historical retrain now route through the shared EMA kernel.**  The base-model EMA step has had a single named arithmetic source of truth in `helpers.compute_base_ema_step` since it was extracted for the diagnostic shadow simulations, but the live learning writer and the historical-retrain path still carried their own inline copies of the same formula, deferred so the refactor could not confound attribution during the 4D-primary observation window.  That window has passed, and both call sites now call the kernel directly.  The change is bit-identical by construction: both sites pre-fold the signal-quality weight into an effective learning rate and pass it with a weight of exactly 1.0, which IEEE-754 multiplication leaves untouched — pinned by a dedicated test sweeping the exact call form.  No learned values, predictions, or diagnostics change; this closes the drift hazard where a future change to the live learning formula could silently diverge from the formula the diagnostic simulations report on.
+
+### Added
+- **`get_forecast` gains an optional `human_readable` mode.**  The default response is shaped for an MPC solver — a full nested per-unit breakdown every hour, including the many zero-consumption units — which is hard to read at a glance on a dashboard.  With `human_readable: true` the service returns a condensed payload instead: a day-level summary (range, total, average temperature, peak hour, aux hours), and one compact line per hour carrying the top three contributing units by name (zero-consumption units dropped), the temperature, wind, weather source, and the solar split.  The default (flag off) response is unchanged, so existing MPC and automation consumers are unaffected.
+
+### Fixed
+- **Forecast solar is no longer reported as a single mislabelled "reduction".**  Each hourly forecast entry exposed only `solar_reduction_kwh`, which sums every unit's applied solar into one figure — but cooling-mode solar is *additive* (it raises demand), so on a cooling day that number mislabels added load as a reduction.  Forecast entries now also carry `solar_offset_kwh` (heating-mode reduction) and `solar_load_kwh` (cooling-mode addition) as separate fields, mirroring the Deviation Today sensor's offset/load split.  The total energy figure was already correct; this only fixes the per-hour solar attribution that an MPC or dashboard reads.  Each hourly entry additionally carries its weather `source` (primary or secondary) so the active provider is visible per hour.
+
 ## [1.3.10] - 2026-06-24
 
 ### Fixed
