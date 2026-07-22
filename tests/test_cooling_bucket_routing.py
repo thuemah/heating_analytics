@@ -276,6 +276,50 @@ class TestPredictionFallbackGuard:
         )
         assert resolved is None
 
+    def test_resolve_bucket_extreme_prefers_high_wind_over_normal(self):
+        """Interim #1022 fix: a missing extreme_wind request resolves to the
+        nearest windier-adjacent bucket (high_wind), not the calmest (normal).
+
+        The pre-fix fixed order returned "normal" here, systematically
+        under-predicting wind loss on cold storm nights (the cold-regime
+        extrapolation path bypasses the mild-regime wind fallback).
+        """
+        stats = self._stats()
+        resolved = stats._resolve_bucket_for_extrapolation(
+            {"normal": 1.5, "high_wind": 1.8}, "extreme_wind"
+        )
+        assert resolved == "high_wind"
+
+    def test_resolve_bucket_extreme_falls_to_normal_when_no_high_wind(self):
+        """extreme_wind with only normal present still resolves to normal."""
+        stats = self._stats()
+        resolved = stats._resolve_bucket_for_extrapolation(
+            {"normal": 1.5}, "extreme_wind"
+        )
+        assert resolved == "normal"
+
+    def test_resolve_bucket_high_wind_prefers_normal(self):
+        """high_wind request keeps normal as its lower-wind neighbour —
+        falling *up* to extreme_wind would over-predict.  Unchanged by the fix.
+        """
+        stats = self._stats()
+        resolved = stats._resolve_bucket_for_extrapolation(
+            {"normal": 1.5, "extreme_wind": 2.2}, "high_wind"
+        )
+        assert resolved == "normal"
+
+    def test_resolve_bucket_normal_request_order_unchanged(self):
+        """normal request behaviour is byte-identical to pre-fix: exact match
+        wins, and it never resolves to a windier bucket when normal is present.
+        """
+        stats = self._stats()
+        assert (
+            stats._resolve_bucket_for_extrapolation(
+                {"normal": 1.5, "high_wind": 1.8}, "normal"
+            )
+            == "normal"
+        )
+
 
 class TestCoolingSolarColdStart:
     """Cooling-regime cold-start guard: when an entity has never had

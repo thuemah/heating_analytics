@@ -1,4 +1,13 @@
-"""Model Comparison sensors for Heating Analytics."""
+"""Model Comparison sensors for Heating Analytics.
+
+State is served from a precomputed snapshot: the heavy period computation
+(past-day model evaluations, hybrid projection, period day-lists, explanation
+formatting) runs in an executor thread and the property getters only read the
+stored result.  The getters must never compute — the cold path takes 0.5-1.6 s
+and stalls the event loop when run inline (slow-state-update warnings after
+restart).  The first build is deferred to EVENT_HOMEASSISTANT_STARTED so it
+never competes with startup; until then the sensors report unknown.
+"""
 from __future__ import annotations
 
 import logging
@@ -8,7 +17,7 @@ import calendar
 from ..helpers import get_last_year_iso_date
 
 from homeassistant.components.sensor import SensorStateClass
-from homeassistant.const import UnitOfEnergy
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, UnitOfEnergy
 from homeassistant.util import dt as dt_util
 
 from ..const import (
@@ -54,13 +63,137 @@ def weighted_avg(val1, w1, val2, w2):
 
 
 class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
-    """Base class for Model Comparison Sensors."""
+    """Base class for Model Comparison Sensors.
+
+    See the module docstring for the snapshot architecture.  Subclasses
+    implement `_compute_native_value` / `_compute_extra_attributes` (the
+    former property bodies); the base owns scheduling and the getters.
+    """
 
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_icon = "mdi:chart-timeline-variant"
 
-    def _get_or_calculate_stats(self, start_date, period_type="day", total_days_in_period=1):
+    def __init__(self, coordinator, entry) -> None:
+        super().__init__(coordinator, entry)
+        self._snapshot: dict | None = None
+        self._refresh_in_flight = False
+        self._cached_ly_days: list[dict] | None = None
+        self._cached_ly_days_key: tuple | None = None
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the snapshot state; None until the first background build."""
+        if self._snapshot is None:
+            return None
+        return self._snapshot["native_value"]
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        """Return the snapshot attributes; None until the first background build."""
+        if self._snapshot is None:
+            return None
+        return self._snapshot["attributes"]
+
+    async def async_added_to_hass(self) -> None:
+        """Register listeners and schedule the first snapshot build."""
+        await super().async_added_to_hass()
+        if self.hass.is_running:
+            self._schedule_snapshot_refresh()
+        else:
+            # Defer the cold-path build until startup congestion has passed.
+            # The sensor reports unknown until the first snapshot lands.
+            self.async_on_remove(
+                self.hass.bus.async_listen_once(
+                    EVENT_HOMEASSISTANT_STARTED, self._on_hass_started
+                )
+            )
+
+    async def _on_hass_started(self, _event) -> None:
+        # Must be async: the event bus runs plain sync listeners as executor
+        # jobs, and _schedule_snapshot_refresh uses loop-only APIs.  A
+        # coroutine listener is scheduled on the event loop.
+        self._schedule_snapshot_refresh()
+
+    def _handle_coordinator_update(self) -> None:
+        """Schedule an off-loop snapshot rebuild instead of computing inline.
+
+        Overrides CoordinatorEntity's default, which writes state (and with
+        it evaluates the properties) synchronously.  State is written by
+        `_async_refresh_snapshot` when the executor build completes.
+        Pre-start ticks are skipped; the EVENT_HOMEASSISTANT_STARTED
+        listener schedules the first build.
+        """
+        if self.hass.is_running:
+            self._schedule_snapshot_refresh()
+
+    def _schedule_snapshot_refresh(self) -> None:
+        if self._refresh_in_flight:
+            # A build is already running; this tick's data lands on the next
+            # coordinator update, at most a minute away.
+            return
+        self._refresh_in_flight = True
+        try:
+            self.hass.async_create_background_task(
+                self._async_refresh_snapshot(),
+                name=f"heating_analytics.{type(self).__name__}.snapshot",
+            )
+        except Exception:
+            # A flag stuck True would coalesce-skip every future refresh and
+            # leave the sensor unknown permanently.
+            self._refresh_in_flight = False
+            raise
+
+    async def _async_refresh_snapshot(self) -> None:
+        try:
+            snapshot = await self.hass.async_add_executor_job(self._build_snapshot)
+        except Exception as err:  # noqa: BLE001
+            # Parity with the previous inline flow, where a raising property
+            # aborted the state write and HA logged it: keep the last good
+            # snapshot and report.
+            _LOGGER.error(
+                "Comparison snapshot build failed for %s: %s",
+                self._attr_name, err, exc_info=True,
+            )
+            return
+        finally:
+            self._refresh_in_flight = False
+        self._snapshot = snapshot
+        self.async_write_ha_state()
+
+    def _build_snapshot(self) -> dict:
+        """Compute the full state snapshot.  Runs in an executor thread.
+
+        Pure read of coordinator state — must not mutate anything outside
+        this sensor's private caches, which only this builder touches and
+        which `_refresh_in_flight` serializes.  Attributes are computed
+        first so the period day-list they build primes the hour-bucket
+        stats cache; the native value is then a cache hit.
+        """
+        attributes = self._compute_extra_attributes()
+        return {
+            "native_value": self._compute_native_value(),
+            "attributes": attributes,
+        }
+
+    def _get_last_year_period_days(self, ly_start: date, ly_end: date) -> list[dict]:
+        """Per-calendar-day cached wrapper around `_build_last_year_period_days`.
+
+        The rows read only last-year history (daily_history plus year-old
+        hourly-log entries), which is stable within a calendar day —
+        rebuilding every tick re-scans the hourly log for nothing.
+        Consumers must not mutate the returned rows.
+        """
+        today = dt_util.now().date()
+        key = (today, ly_start, ly_end)
+        if self._cached_ly_days is not None and self._cached_ly_days_key == key:
+            return self._cached_ly_days
+        days = self._build_last_year_period_days(ly_start, ly_end)
+        self._cached_ly_days = days
+        self._cached_ly_days_key = key
+        return days
+
+    def _get_or_calculate_stats(self, start_date, period_type="day", total_days_in_period=1, current_period_days=None):
         """Get cached stats or calculate them."""
         now = dt_util.now()
 
@@ -74,7 +207,9 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
             return self._cached_stats
 
         try:
-            stats = self._calculate_period_stats(start_date, period_type, total_days_in_period)
+            stats = self._calculate_period_stats(
+                start_date, period_type, total_days_in_period, current_period_days
+            )
             self._cached_stats = stats
             self._cached_time = now
             return stats
@@ -92,8 +227,14 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
             # Fallback: Current Hybrid=0, Last Model=0, Last Actual=0, Current Debug=0, Metadata
             return 0.0, 0.0, 0.0, 0.0, empty_weather_stats
 
-    def _calculate_period_stats(self, start_date, period_type, total_days_in_period):
+    def _calculate_period_stats(self, start_date, period_type, total_days_in_period, current_period_days=None):
         """Calculate stats for a period (Current vs Last Year) using the iterative modeled energy.
+
+        Args:
+            current_period_days: optional pre-built day list for the current
+                period (from `_build_current_period_days`), so a snapshot
+                build that already made the list for the attribute path does
+                not build it twice.  None → built internally.
 
         Returns:
             (model_curr_total, model_last_total, last_year_actual_kwh, current_model_kwh, metadata)
@@ -208,7 +349,8 @@ class HeatingModelComparisonBaseSensor(HeatingAnalyticsBaseSensor):
         # Calculate Full Period Weighted Average (Past + Today + Future)
         # Use helper to build the full period data list (handles Past, Today, and Future fallback internally)
         end_date = start_date + timedelta(days=total_days_in_period - 1)
-        current_period_days = self._build_current_period_days(start_date, end_date)
+        if current_period_days is None:
+            current_period_days = self._build_current_period_days(start_date, end_date)
 
         temps = [d['temp'] for d in current_period_days if d.get('temp') is not None]
         winds = [d['wind'] for d in current_period_days if d.get('wind') is not None]
@@ -426,15 +568,13 @@ class HeatingModelComparisonDaySensor(HeatingModelComparisonBaseSensor):
 
     _attr_name = SENSOR_MODEL_COMPARISON_DAY
 
-    @property
-    def native_value(self) -> float:
+    def _compute_native_value(self) -> float:
         now = dt_util.now()
         today = now.date()
         curr, last, _, _, _ = self._get_or_calculate_stats(today, "day", 1)
         return round(curr - last, 1)
 
-    @property
-    def extra_state_attributes(self):
+    def _compute_extra_attributes(self):
         now = dt_util.now()
         today = now.date()
         curr, last, actual, model, w_stats = self._get_or_calculate_stats(today, "day", 1)
@@ -463,7 +603,10 @@ class HeatingModelComparisonDaySensor(HeatingModelComparisonBaseSensor):
             if w_stats.get("curr_solar") is not None:
                 day_curr["solar_kwh"] = w_stats["curr_solar"]
 
-            day_last = self._get_historical_day(ly_date)
+            # Per-day cached + routed through the prefetched hourly-log map;
+            # an un-prefetched lookup re-scans the log every tick for a
+            # year-old date.
+            day_last = self._get_last_year_period_days(ly_date, ly_date)[0]
 
             # Analyze
             analyzer = WeatherImpactAnalyzer(self.coordinator)
@@ -504,36 +647,20 @@ class HeatingModelComparisonWeekSensor(HeatingModelComparisonBaseSensor):
 
     _attr_name = SENSOR_MODEL_COMPARISON_WEEK
 
-    @property
-    def native_value(self) -> float:
+    def _compute_native_value(self) -> float:
         now = dt_util.now()
         today = now.date()
         start_week = today - timedelta(days=today.weekday())
         curr, last, _, _, _ = self._get_or_calculate_stats(start_week, "week", 7)
         return round(curr - last, 1)
 
-    @property
-    def extra_state_attributes(self):
+    def _compute_extra_attributes(self):
         now = dt_util.now()
         today = now.date()
         start_week = today - timedelta(days=today.weekday())
-        curr, last, actual, model, w_stats = self._get_or_calculate_stats(start_week, "week", 7)
 
         # Get ISO week number
         _, week_num, _ = now.isocalendar()
-
-        # Calculate Deltas
-        t_delta = None
-        if w_stats["curr_temp"] is not None and w_stats["ref_temp"] is not None:
-            t_delta = round(w_stats["curr_temp"] - w_stats["ref_temp"], 1)
-
-        w_delta = None
-        if w_stats["curr_wind"] is not None and w_stats["ref_wind"] is not None:
-            w_delta = round(w_stats["curr_wind"] - w_stats["ref_wind"], 1)
-
-        s_delta = None
-        if w_stats["curr_solar"] is not None and w_stats["ref_solar"] is not None:
-            s_delta = round(w_stats["curr_solar"] - w_stats["ref_solar"], 1)
 
         # === Build data lists for comparison ===
         # Last year ISO week
@@ -548,13 +675,32 @@ class HeatingModelComparisonWeekSensor(HeatingModelComparisonBaseSensor):
 
         try:
             current_days = self._build_current_period_days(start_week, end_week)
-            last_year_days = self._build_last_year_period_days(ly_start, ly_end)
+            last_year_days = self._get_last_year_period_days(ly_start, ly_end)
         except (TypeError, ValueError, KeyError, AttributeError) as e:
             # TypeError covers round(None, 2) on degenerate last-year lookups.
             _LOGGER.warning(f"Failed to build period data for week comparison: {e}")
             # If we can't build the lists, use empty lists for hybrid calculation
             current_days = []
             last_year_days = []
+
+        # The day list doubles as the stats input (built once per snapshot);
+        # on build failure the stats path falls back to its own internal build.
+        curr, last, actual, model, w_stats = self._get_or_calculate_stats(
+            start_week, "week", 7, current_period_days=current_days or None
+        )
+
+        # Calculate Deltas
+        t_delta = None
+        if w_stats["curr_temp"] is not None and w_stats["ref_temp"] is not None:
+            t_delta = round(w_stats["curr_temp"] - w_stats["ref_temp"], 1)
+
+        w_delta = None
+        if w_stats["curr_wind"] is not None and w_stats["ref_wind"] is not None:
+            w_delta = round(w_stats["curr_wind"] - w_stats["ref_wind"], 1)
+
+        s_delta = None
+        if w_stats["curr_solar"] is not None and w_stats["ref_solar"] is not None:
+            s_delta = round(w_stats["curr_solar"] - w_stats["ref_solar"], 1)
 
         # === Generate explanation ===
         try:
@@ -625,8 +771,7 @@ class HeatingModelComparisonMonthSensor(HeatingModelComparisonBaseSensor):
 
     _attr_name = SENSOR_MODEL_COMPARISON_MONTH
 
-    @property
-    def native_value(self) -> float:
+    def _compute_native_value(self) -> float:
         now = dt_util.now()
         today = now.date()
         start_month = today.replace(day=1)
@@ -639,8 +784,7 @@ class HeatingModelComparisonMonthSensor(HeatingModelComparisonBaseSensor):
         curr, last, _, _, _ = self._get_or_calculate_stats(start_month, "month", days_in_month)
         return round(curr - last, 1)
 
-    @property
-    def extra_state_attributes(self):
+    def _compute_extra_attributes(self):
         now = dt_util.now()
         today = now.date()
         start_month = today.replace(day=1)
@@ -649,21 +793,6 @@ class HeatingModelComparisonMonthSensor(HeatingModelComparisonBaseSensor):
         year = now.year
         is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
         days_in_month = 31 if month in [1,3,5,7,8,10,12] else 30 if month in [4,6,9,11] else (29 if is_leap else 28)
-
-        curr, last, actual, model, w_stats = self._get_or_calculate_stats(start_month, "month", days_in_month)
-
-        # Calculate Deltas
-        t_delta = None
-        if w_stats["curr_temp"] is not None and w_stats["ref_temp"] is not None:
-            t_delta = round(w_stats["curr_temp"] - w_stats["ref_temp"], 1)
-
-        w_delta = None
-        if w_stats["curr_wind"] is not None and w_stats["ref_wind"] is not None:
-            w_delta = round(w_stats["curr_wind"] - w_stats["ref_wind"], 1)
-
-        s_delta = None
-        if w_stats["curr_solar"] is not None and w_stats["ref_solar"] is not None:
-            s_delta = round(w_stats["curr_solar"] - w_stats["ref_solar"], 1)
 
         # === Build data lists for comparison ===
         # Last year month start
@@ -683,13 +812,32 @@ class HeatingModelComparisonMonthSensor(HeatingModelComparisonBaseSensor):
 
         try:
             current_days = self._build_current_period_days(start_month, end_month)
-            last_year_days = self._build_last_year_period_days(ly_start, ly_end)
+            last_year_days = self._get_last_year_period_days(ly_start, ly_end)
         except (TypeError, ValueError, KeyError, AttributeError) as e:
             # TypeError covers round(None, 2) on degenerate last-year lookups.
             _LOGGER.warning(f"Failed to build period data for month comparison: {e}")
             # If we can't build the lists, use empty lists for hybrid calculation
             current_days = []
             last_year_days = []
+
+        # The day list doubles as the stats input (built once per snapshot);
+        # on build failure the stats path falls back to its own internal build.
+        curr, last, actual, model, w_stats = self._get_or_calculate_stats(
+            start_month, "month", days_in_month, current_period_days=current_days or None
+        )
+
+        # Calculate Deltas
+        t_delta = None
+        if w_stats["curr_temp"] is not None and w_stats["ref_temp"] is not None:
+            t_delta = round(w_stats["curr_temp"] - w_stats["ref_temp"], 1)
+
+        w_delta = None
+        if w_stats["curr_wind"] is not None and w_stats["ref_wind"] is not None:
+            w_delta = round(w_stats["curr_wind"] - w_stats["ref_wind"], 1)
+
+        s_delta = None
+        if w_stats["curr_solar"] is not None and w_stats["ref_solar"] is not None:
+            s_delta = round(w_stats["curr_solar"] - w_stats["ref_solar"], 1)
 
         # === Generate explanation ===
         try:

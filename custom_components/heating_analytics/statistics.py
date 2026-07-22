@@ -1570,9 +1570,22 @@ class StatisticsManager:
 
         Priority:
         1. Requested Bucket (Exact Match)
-        2. Normal (Most robust baseline)
-        3. High Wind (If normal missing)
-        4. Extreme Wind (Last resort)
+        2. A missing ``extreme_wind`` request resolves to ``high_wind`` (the
+           nearest windier-adjacent bucket) before ``normal`` — mirroring the
+           mild-regime wind fallback in ``_get_prediction_from_model``.
+           Resolving a storm hour to the calmest bucket systematically
+           under-predicts wind loss on the coldest nights.  (This whole
+           ``extreme_wind`` concept is removed in 1.4.0 — #1022; the guard
+           below is the interim fix for the 1.3.x cold-regime path.)
+        3. Normal (Most robust baseline)
+        4. High Wind (If normal missing)
+        5. Extreme Wind (Last resort)
+
+        ``high_wind`` and ``normal`` requests keep the fixed order below:
+        ``normal`` is the correct lower-wind neighbour for a missing
+        ``high_wind`` cell, and falling *up* to a windier bucket for a
+        ``normal`` request would over-predict — only reached here as a
+        deep last-resort against returning 0.
 
         Per #885: "cooling" is a distinct wind-bucket dedicated to
         cooling-mode per-unit samples.  If the cooling bucket is missing
@@ -1584,6 +1597,8 @@ class StatisticsManager:
             return requested_bucket
         if requested_bucket == COOLING_WIND_BUCKET:
             return None
+        if requested_bucket == "extreme_wind" and "high_wind" in bucket_data:
+            return "high_wind"
         if "normal" in bucket_data:
             return "normal"
         if "high_wind" in bucket_data:

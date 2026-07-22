@@ -69,7 +69,9 @@ async def test_comparison_sensor_hybrid_calculation(hass: HomeAssistant, mock_co
         sensor.hass = hass
         sensor.async_write_ha_state = MagicMock()
 
-        # Force update (trigger property access)
+        # Build the snapshot (what the background refresh does) and read
+        # the trivial property getter.
+        sensor._snapshot = sensor._build_snapshot()
         attrs = sensor.extra_state_attributes
 
         # Assertions
@@ -142,7 +144,7 @@ async def test_comparison_sensor_prefetches_log_map_once_per_period(
         sensor.hass = hass
         sensor.async_write_ha_state = MagicMock()
 
-        _ = sensor.extra_state_attributes
+        _ = sensor._build_snapshot()
 
         # Month has up to 31 days in current period + 31 in last-year period; the
         # pre-fetch must collapse both into a single call each, not per-day.

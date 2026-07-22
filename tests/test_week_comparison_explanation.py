@@ -88,7 +88,8 @@ class TestWeekComparisonExplanation:
                 }
             ))
 
-            # ACT
+            # ACT — build the snapshot as the background refresh would.
+            sensor._snapshot = sensor._build_snapshot()
             attrs = sensor.extra_state_attributes
 
             # ASSERT
@@ -117,6 +118,7 @@ class TestWeekComparisonExplanation:
              # #878 narrowed this handler to (ValueError, KeyError, AttributeError).
              sensor._build_current_period_days = MagicMock(side_effect=ValueError("Boom"))
 
+             sensor._snapshot = sensor._build_snapshot()
              attrs = sensor.extra_state_attributes
 
              assert "weekly_summary" in attrs

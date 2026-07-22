@@ -419,6 +419,15 @@ DEVIATION_MATURITY_COUNT = 20.0     # Observations for full maturity
 DEFAULT_UNCERTAINTY_P50 = 1.0
 DEFAULT_UNCERTAINTY_P95 = 2.0
 
+# Week-horizon forecast accuracy.  The 7-day plan is snapshotted every
+# midnight and later scored as a week SUM against daily_history actuals —
+# measuring "what do we usually miss by for a week" directly instead of
+# constructing it from day-ahead errors (which underrepresent days 2-7
+# and ignore day-to-day error correlation).
+WEEK_PLAN_RETENTION_DAYS = 120        # stored midnight 7-day plans (8 floats/day)
+WEEK_HORIZON_STATS_WINDOW_DAYS = 90   # trailing percentile window — keeps errors in the current load regime
+WEEK_HORIZON_MIN_WINDOWS = 14         # scorable windows before the range band is surfaced (~2 independent weeks of evidence; rolling windows overlap)
+
 # Storage
 STORAGE_VERSION = 9  # v9: solar-window low+high obstruction gate per facade per entity (see storage.py:_migrate_v8_to_v9)
 

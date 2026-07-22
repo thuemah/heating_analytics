@@ -8,7 +8,9 @@ import logging
 import math
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.storage import Store
 
@@ -465,6 +467,42 @@ class StorageManager:
         self._last_save_time = None
         self._save_debounce_seconds = 60
         self._save_lock = asyncio.Lock()
+        # Disallowed CSV auto-log paths already reported (warn once, not hourly).
+        self._csv_paths_warned: set[str] = set()
+
+    def _validate_external_path(self, file_path: str) -> str:
+        """Validate a user-supplied file path before any file access.
+
+        Paths inside the Home Assistant config directory are allowed
+        implicitly (the integration's defaults and documented service
+        examples live there), EXCEPT the internal ``.storage`` directory —
+        HA's own state (auth store, registries) must never be a
+        backup/CSV target.  Anything else must be covered by
+        ``allowlist_external_dirs`` (``hass.config.is_allowed_path``).
+        ``Path.resolve()`` collapses ``..`` traversal and symlinks first,
+        so ``/config/../etc/passwd`` is judged by where it actually points.
+
+        Returns the resolved path; raises HomeAssistantError otherwise.
+        """
+        hass = self.coordinator.hass
+        resolved = Path(file_path).resolve()
+        config_dir = Path(hass.config.path()).resolve()
+        storage_dir = config_dir / ".storage"
+
+        if resolved == storage_dir or storage_dir in resolved.parents:
+            raise HomeAssistantError(
+                f"Path not allowed: {file_path} — the Home Assistant .storage "
+                "directory holds internal state and cannot be a file target."
+            )
+        if resolved == config_dir or config_dir in resolved.parents:
+            return str(resolved)
+        if hass.config.is_allowed_path(str(resolved)):
+            return str(resolved)
+        raise HomeAssistantError(
+            f"Path not allowed: {file_path}. Use a path inside the Home Assistant "
+            "config directory, or add the directory to allowlist_external_dirs "
+            "in configuration.yaml."
+        )
 
     async def _async_migrate(
         self,
@@ -1177,6 +1215,14 @@ class StorageManager:
                                         "abs_error": entry.get("abs_error_kwh", 0.0)
                                     }
                                 }
+            # Week-horizon plan log — additive optional key (no STORAGE_VERSION
+            # bump): absent on pre-existing stores and old backups, defaulting
+            # to [] is exactly what a migration would seed.
+            raw_week_plans = data.get("week_plan_history", [])
+            self.coordinator.forecast._week_plan_history = (
+                raw_week_plans if isinstance(raw_week_plans, list) else []
+            )
+
             if "midnight_forecast_snapshot" in data:
                 self.coordinator.forecast._midnight_forecast_snapshot = data["midnight_forecast_snapshot"]
                 # Publish to coordinator.data immediately so sensors have values before first update_daily_forecast
@@ -1341,6 +1387,7 @@ class StorageManager:
                     "cached_long_term_daily": self._minify_forecast_data(self.coordinator.forecast._cached_long_term_daily),
                     "cached_forecast_date": self.coordinator.forecast._cached_forecast_date,
                     "forecast_history": self.coordinator.forecast._forecast_history,
+                    "week_plan_history": self.coordinator.forecast._week_plan_history,
                     "midnight_forecast_snapshot": self.coordinator.forecast._midnight_forecast_snapshot,
                     "reference_forecast": self._minify_forecast_data(self.coordinator.forecast._reference_forecast),
                     "primary_reference_forecast": self._minify_forecast_data(self.coordinator.forecast._primary_reference_forecast),
@@ -1418,6 +1465,7 @@ class StorageManager:
 
     async def async_backup_data(self, file_path: str):
         """Backup full system state to JSON file."""
+        file_path = self._validate_external_path(file_path)
         _LOGGER.info(f"Starting full system backup to {file_path}")
 
         data = {
@@ -1509,6 +1557,7 @@ class StorageManager:
 
     async def async_restore_data(self, file_path: str):
         """Restore full system state from JSON file."""
+        file_path = self._validate_external_path(file_path)
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
@@ -1764,6 +1813,17 @@ class StorageManager:
 
     def _append_to_csv_with_schema_evolution(self, file_path: str, row: dict):
         """Append a row to CSV with schema evolution and safe writing."""
+        # Auto-log paths come from the config entry, not a service call, but
+        # they are the same validation class.  Skip-and-report instead of
+        # raise — this runs from the hourly/daily loop, and a bad configured
+        # path must not break processing.  Warn once per path, not hourly.
+        try:
+            file_path = self._validate_external_path(file_path)
+        except HomeAssistantError as err:
+            if file_path not in self._csv_paths_warned:
+                self._csv_paths_warned.add(file_path)
+                _LOGGER.error("CSV auto-logging skipped: %s", err)
+            return
         # Defensive check: filter out None keys to prevent CSV writer errors
         invalid_keys = [k for k in row.keys() if k is None or not isinstance(k, str)]
         if invalid_keys:
@@ -1913,6 +1973,7 @@ class StorageManager:
 
     async def export_csv_data(self, file_path: str, export_type: str):
         """Export data to CSV."""
+        file_path = self._validate_external_path(file_path)
         _LOGGER.info(f"Exporting {export_type} data to {file_path}")
 
         def _write_csv():
@@ -2031,6 +2092,7 @@ class StorageManager:
 
     async def import_csv_data(self, file_path: str, mapping: dict, update_model: bool = True):
         """Import historical data from CSV."""
+        file_path = self._validate_external_path(file_path)
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"CSV file not found: {file_path}")
 

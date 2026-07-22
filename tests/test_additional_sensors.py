@@ -191,6 +191,9 @@ async def test_model_comparison_sensors(hass: HomeAssistant, mock_coordinator, m
         # IMPORTANT: Fix the mocked return of calculate_modeled_energy to prevent unpacking errors if logic changed.
         # The sensor expects 4 values: model_past, solar_past, temp_past, wind_past
 
+        # Build snapshots as the background refresh would, then read the
+        # trivial property getters.
+        sensor_day._snapshot = sensor_day._build_snapshot()
         val = sensor_day.native_value
         assert val == 20.0 # 120 (curr) - 100 (last - from cache or calc)
 
@@ -202,12 +205,14 @@ async def test_model_comparison_sensors(hass: HomeAssistant, mock_coordinator, m
         # Current = 120.
         # Diff = -80.0
         sensor_week = HeatingModelComparisonWeekSensor(mock_coordinator, mock_entry)
+        sensor_week._snapshot = sensor_week._build_snapshot()
         assert sensor_week.native_value == -80.0
 
         # Month Sensor
         # Last Year = 100 (So Far) + 100 (Remaining) = 200.
         # Diff = -80.0
         sensor_month = HeatingModelComparisonMonthSensor(mock_coordinator, mock_entry)
+        sensor_month._snapshot = sensor_month._build_snapshot()
         assert sensor_month.native_value == -80.0
 
 

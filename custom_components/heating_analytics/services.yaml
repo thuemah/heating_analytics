@@ -10,7 +10,7 @@ import_from_csv:
           integration: heating_analytics
     file_path:
       name: File path
-      description: The absolute path to the CSV file on the server.
+      description: The absolute path to the CSV file on the server. Must be inside the Home Assistant config directory or a directory listed in allowlist_external_dirs.
       required: true
       selector:
         text:
@@ -43,7 +43,7 @@ export_to_csv:
           integration: heating_analytics
     file_path:
       name: File path
-      description: The absolute path where the CSV file will be saved (e.g., /config/heating_data.csv).
+      description: The absolute path where the CSV file will be saved (e.g., /config/heating_data.csv). Must be inside the Home Assistant config directory or a directory listed in allowlist_external_dirs.
       required: true
       selector:
         text:
@@ -187,7 +187,7 @@ backup_data:
           integration: heating_analytics
     file_path:
       name: File path
-      description: The absolute path where the backup JSON file will be saved (e.g., /config/heating_backup.json).
+      description: The absolute path where the backup JSON file will be saved (e.g., /config/heating_backup.json). Must be inside the Home Assistant config directory or a directory listed in allowlist_external_dirs.
       required: true
       selector:
         text:
@@ -204,7 +204,7 @@ restore_data:
           integration: heating_analytics
     file_path:
       name: File path
-      description: The absolute path to the backup JSON file.
+      description: The absolute path to the backup JSON file. Must be inside the Home Assistant config directory or a directory listed in allowlist_external_dirs.
       required: true
       selector:
         text:

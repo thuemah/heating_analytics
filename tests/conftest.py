@@ -27,6 +27,14 @@ sys.modules["homeassistant.util"] = MagicMock()
 # Mock specific submodules that might be imported directly
 sys.modules["homeassistant.const"] = MagicMock()
 
+# HomeAssistantError must be a real exception class: production code raises
+# and excepts it (storage path validation, forecast), and `raise MagicMock()`
+# is a TypeError.  Same pattern as MockUnitOfSpeed below.
+class MockHomeAssistantError(Exception):
+    pass
+
+sys.modules["homeassistant.exceptions"].HomeAssistantError = MockHomeAssistantError
+
 # Mock UnitOfSpeed for use in code
 class MockUnitOfSpeed:
     KILOMETERS_PER_HOUR = "km/h"
@@ -92,6 +100,16 @@ class MockDataUpdateCoordinator:
 class MockCoordinatorEntity(MockEntityMixin):
     def __init__(self, coordinator):
         self.coordinator = coordinator
+        self._on_remove_callbacks = []
+
+    async def async_added_to_hass(self):
+        pass
+
+    def async_on_remove(self, func):
+        self._on_remove_callbacks.append(func)
+
+    def async_write_ha_state(self):
+        pass
 
 mock_coord_module = MagicMock()
 mock_coord_module.DataUpdateCoordinator = MockDataUpdateCoordinator

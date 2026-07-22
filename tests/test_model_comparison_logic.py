@@ -101,7 +101,9 @@ async def test_day_sensor_calendar_logic(mock_coordinator, mock_entry):
         assert actual == 5.5
         assert model == 10.0
 
-        # Verify attributes (must be inside patch context)
+        # Verify attributes (must be inside patch context) — build the
+        # snapshot as the background refresh would, then read the getter.
+        sensor._snapshot = sensor._build_snapshot()
         attrs = sensor.extra_state_attributes
         assert "last_year_actual_kwh" in attrs
         assert attrs["last_year_actual_kwh"] == 5.5
@@ -156,5 +158,6 @@ async def test_last_year_actual_missing_data(mock_coordinator, mock_entry):
         assert actual is None
 
         # Verify attribute handling
+        sensor._snapshot = sensor._build_snapshot()
         attrs = sensor.extra_state_attributes
         assert attrs["last_year_actual_kwh"] is None

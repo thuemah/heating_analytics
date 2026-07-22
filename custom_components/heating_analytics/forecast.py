@@ -43,6 +43,9 @@ from .const import (
     ATTR_WEEK_END_DATE,
     DEFAULT_CLOUD_COVERAGE,
     SOLAR_BATTERY_DECAY,
+    WEEK_PLAN_RETENTION_DAYS,
+    WEEK_HORIZON_STATS_WINDOW_DAYS,
+    WEEK_HORIZON_MIN_WINDOWS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -67,6 +70,8 @@ class ForecastManager:
         self._cached_reference_map = None # Cache for weather deviation calculation {hour: data}
         self._forecast_history = [] # List of {date, forecast_kwh, actual_kwh, error_kwh}
         self._midnight_forecast_snapshot = {} # {date, kwh, ...}
+        self._week_plan_history = [] # List of {made_on, planned_kwh[7], primary_entity}
+        self._cached_week_horizon_stats = None # (date_iso, stats) — day-keyed, see _calculate_week_horizon_stats
 
         # Cached Week Ahead Stats
         self._cached_week_ahead_stats = None
@@ -309,6 +314,14 @@ class ForecastManager:
                     snapshot["hourly_inputs_4d"] = inputs_4d
                 self._midnight_forecast_snapshot = snapshot
                 _LOGGER.info(f"Captured Midnight Forecast Snapshot: {full_day_forecast:.2f} kWh (Source: {snapshot_source})")
+                # Week-horizon accuracy: persist the full 7-day plan as of
+                # this midnight so week-sum error can be measured directly
+                # once actuals exist.  Must run AFTER the snapshot is set —
+                # the week-ahead stats use it for today's full-day value.
+                # The computation runs in an executor (same off-event-loop
+                # pattern as the comparison sensors) — the midnight tick
+                # already carries the daily rollover processing.
+                await self._async_capture_week_plan(today_str)
         elif needs_capture and now.hour >= 1 and self.coordinator.hass.is_running:
             # Past the 00:00-00:20 window without a successful capture — record a sentinel
             # so we don't keep retrying (and don't log the warning every minute).
@@ -2420,12 +2433,15 @@ class ForecastManager:
             })
 
         self._cached_forecast_uncertainty = None
+        self._cached_week_horizon_stats = None
         _LOGGER.info(f"Backfilled {len(self._forecast_history)} days of history.")
 
     def reset_forecast_history(self):
         """Reset the forecast history."""
         self._forecast_history = []
+        self._week_plan_history = []
         self._cached_forecast_uncertainty = None
+        self._cached_week_horizon_stats = None
         # We also reset the midnight snapshot for consistency
         self._midnight_forecast_snapshot = {}
         _LOGGER.info("Forecast history reset.")
@@ -2596,7 +2612,131 @@ class ForecastManager:
                 self._forecast_history.pop(0)
 
             self._cached_forecast_uncertainty = None
+            self._cached_week_horizon_stats = None
             _LOGGER.info(f"Forecast Accuracy Logged for {date_key}: Error={error:.2f} kWh (Source: {dominant_source})")
+
+    async def _async_capture_week_plan(self, today_str: str) -> None:
+        """Capture the 7-day plan for week-horizon scoring, off the event loop.
+
+        The stats computation is a pure read and runs as an executor job
+        (the comparison-sensor pattern from 1.3.12); all mutation — the
+        week-ahead cache seed and the plan append — happens back on the
+        event loop, so nothing races the sensor reads or storage saves.
+        A failure must never break the update loop.
+        """
+        try:
+            stats = await self.coordinator.hass.async_add_executor_job(
+                self._calculate_week_ahead_stats_internal
+            )
+        except Exception as e:  # noqa: BLE001 — capture is best-effort
+            if self.coordinator.hass.is_running:
+                _LOGGER.warning("Week plan capture failed for %s: %s", today_str, e)
+            return
+
+        # Seed the 5-minute stats cache: the week-ahead sensor's hour-keyed
+        # cache expires exactly at the 23->0 change, so without this the
+        # identical full computation reruns within the next minute.
+        self._cached_week_ahead_stats = stats
+        self._cached_week_ahead_timestamp = dt_util.now()
+
+        self._store_week_plan(today_str, stats)
+
+    def _store_week_plan(self, today_str: str, stats: dict) -> None:
+        """Store the 7-day plan extracted from freshly computed week stats.
+
+        Stores exactly what the Week Ahead sensor displays (including
+        history-fallback days), so the scored error measures the product
+        the user actually sees.
+        """
+        if any(p.get("made_on") == today_str for p in self._week_plan_history):
+            return
+
+        daily = stats.get(ATTR_DAILY_FORECAST) or []
+        if len(daily) != 7:
+            return
+
+        self._week_plan_history.append({
+            "made_on": today_str,
+            "planned_kwh": [d.get("kwh", 0.0) for d in daily],
+            "primary_entity": self._midnight_forecast_snapshot.get("primary_entity"),
+        })
+        if len(self._week_plan_history) > WEEK_PLAN_RETENTION_DAYS:
+            del self._week_plan_history[:-WEEK_PLAN_RETENTION_DAYS]
+        _LOGGER.info(
+            "Captured 7-day plan for week-horizon accuracy: %.1f kWh",
+            sum(self._week_plan_history[-1]["planned_kwh"]),
+        )
+
+    def _calculate_week_horizon_stats(self) -> dict:
+        """Measure week-sum forecast error from stored 7-day midnight plans.
+
+        For each plan old enough to have completed (made_on <= today - 7)
+        within the trailing WEEK_HORIZON_STATS_WINDOW_DAYS, the week error is
+        |sum(planned) - sum(gross actual)| over the 7 covered days.  Because
+        the SUM is measured directly, horizon decay, day-to-day error
+        correlation, and model bias are baked into the distribution — none
+        of which the day-ahead history can represent.
+
+        Actuals come from ``_forecast_history[i]["actual_kwh"]`` — the gross
+        value (kwh + aux - guest) log_accuracy already stores per scored day
+        — so the week scorer is definitionally identical to the day-ahead
+        scorer, and the Kelvin protocol comes for free: log_accuracy skips
+        learning-disabled days, so those dates are absent and the affected
+        windows drop rather than scoring against partial data.
+
+        Cached per calendar day (inputs change at most daily: plan capture,
+        log_accuracy, and history rollover all happen at midnight);
+        log_accuracy / backfill / reset invalidate explicitly.
+        """
+        today = dt_util.now().date()
+        today_iso = today.isoformat()
+        cached = self._cached_week_horizon_stats
+        if cached is not None and cached[0] == today_iso:
+            return cached[1]
+
+        cutoff = (today - timedelta(days=WEEK_HORIZON_STATS_WINDOW_DAYS)).isoformat()
+        last_scorable = (today - timedelta(days=7)).isoformat()
+
+        scored_actuals: dict[str, float] = {}
+        for h in self._forecast_history:
+            d = h.get("date")
+            a = h.get("actual_kwh")
+            if d and isinstance(a, (int, float)):
+                scored_actuals[d] = a
+        current_primary = self.coordinator.weather_entity
+
+        abs_week_errors = []
+        for plan in self._week_plan_history:
+            made_on = plan.get("made_on")
+            if not made_on or made_on < cutoff or made_on > last_scorable:
+                continue
+            if plan.get("primary_entity") != current_primary:
+                continue
+            planned = plan.get("planned_kwh")
+            if not isinstance(planned, list) or len(planned) != 7:
+                continue
+            try:
+                start = date.fromisoformat(made_on)
+            except ValueError:
+                continue
+
+            actual_sum = 0.0
+            complete = True
+            for k in range(7):
+                day_key = (start + timedelta(days=k)).isoformat()
+                actual = scored_actuals.get(day_key)
+                if actual is None:
+                    complete = False
+                    break
+                actual_sum += actual
+            if not complete:
+                continue
+
+            abs_week_errors.append(abs(sum(planned) - actual_sum))
+
+        result = self._calculate_uncertainty_from_errors(abs_week_errors)
+        self._cached_week_horizon_stats = (today_iso, result)
+        return result
 
     def calculate_week_ahead_stats(self) -> dict:
         """Get week ahead stats with caching to prevent expensive recalculation."""
@@ -2826,11 +2966,8 @@ class ForecastManager:
         vs_typical_pct = analysis['delta_pct']
 
         uncertainty = self.calculate_uncertainty_stats()
-        p95_error_per_day = uncertainty.get("p95_abs_error", 2.0)
         p50_error_per_day = uncertainty.get("p50_abs_error", 1.0)
         samples = uncertainty.get("samples", 0)
-
-        week_margin = p95_error_per_day * 7
 
         if samples < 7:
             confidence_level = "low"
@@ -2861,8 +2998,20 @@ class ForecastManager:
         stats[ATTR_TYPICAL_WEEK_KWH] = round(typical_kwh, 1)
         stats[ATTR_VS_TYPICAL_KWH] = round(vs_typical_kwh, 1)
         stats[ATTR_VS_TYPICAL_PCT] = round(vs_typical_pct, 1)
-        stats[ATTR_FORECAST_RANGE_MIN] = round(total_kwh - week_margin, 1)
-        stats[ATTR_FORECAST_RANGE_MAX] = round(total_kwh + week_margin, 1)
+        # forecast_range_min/max is the p95 of MEASURED week-sum errors
+        # (stored 7-day midnight plans vs gross actuals).  The former
+        # p95_daily × 7 construction triple-counted uncertainty (independent
+        # errors grow ~√7, not ×7) and applied winter-dominated daily errors
+        # to low-load summer weeks.  Day-ahead history cannot substitute —
+        # days 2-7 carry strictly larger, unmeasured horizon errors — so the
+        # band is omitted entirely until enough scorable windows exist.
+        week_horizon = self._calculate_week_horizon_stats()
+        if week_horizon["samples"] >= WEEK_HORIZON_MIN_WINDOWS:
+            p95_week = week_horizon["p95_abs_error"]
+            stats[ATTR_FORECAST_RANGE_MIN] = max(0.0, round(total_kwh - p95_week, 1))
+            stats[ATTR_FORECAST_RANGE_MAX] = round(total_kwh + p95_week, 1)
+            stats["week_error_samples"] = week_horizon["samples"]
+
         stats["confidence_level"] = confidence_level
 
         stats[ATTR_DAILY_FORECAST] = daily_details
