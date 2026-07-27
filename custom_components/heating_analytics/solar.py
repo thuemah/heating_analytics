@@ -121,6 +121,56 @@ def erbs_decomposition(
     return (dni, dhi)
 
 
+def derive_dni_dhi_source_label(
+    ghi_avg: float | None,
+    dni_avg: float | None,
+    dhi_avg: float | None,
+    cloud_avg: float | None,
+) -> str:
+    """Label which ladder branch an hour's inputs resolve through.
+
+    Sun-blind counterpart to :func:`resolve_dni_dhi`, for the
+    hour-boundary logger: it answers "which branch did this hour take?"
+    without needing the sun position.
+
+    Takes the **same averaged values** the 4D learner feeds to
+    :func:`resolve_dni_dhi` (``obs.ghi_avg`` / ``dni_avg`` / ``dhi_avg``
+    / ``cloud_avg``) and applies the **same branch conditions in the
+    same order**, so the label cannot disagree with the branch actually
+    taken.  In particular the GHI branch requires a *positive* reading,
+    not merely a configured sensor: a stuck or covered pyranometer
+    averaging 0 during daylight falls through to native / Kasten inside
+    ``resolve_dni_dhi``, and labelling those hours ``erbs_from_ghi``
+    would report a real DNI/DHI source to
+    ``diagnose_solar.dni_dhi_source_mix`` on an install whose pipeline
+    is running Kasten.
+
+    Lives next to :func:`resolve_dni_dhi` so the two stay read together;
+    ``test_dni_dhi_source_mix`` pins their agreement branch-for-branch,
+    including the zero-GHI case.
+
+    **Never returns** ``"no_sun"``.  The sun gate belongs to
+    :func:`resolve_dni_dhi` (and to the 4D learner, which disables
+    itself below the horizon), so a night hour is labelled by whatever
+    inputs were sampled — typically ``"kasten_synthetic"`` on an install
+    with cloud-coverage data.  Consumers counting these labels MUST
+    filter to daylight hours first, or the mix is diluted with darkness
+    on every install.
+
+    Returns:
+        One of ``"erbs_from_ghi"``, ``"native"``, ``"kasten_synthetic"``,
+        ``"none"`` — the value-path subset of :func:`resolve_dni_dhi`'s
+        return excluding ``"no_sun"``.
+    """
+    if ghi_avg is not None and ghi_avg > 0:
+        return "erbs_from_ghi"
+    if dni_avg is not None and dhi_avg is not None:
+        return "native"
+    if cloud_avg is not None:
+        return "kasten_synthetic"
+    return "none"
+
+
 def resolve_dni_dhi(
     dni_in: float | None,
     dhi_in: float | None,
@@ -389,6 +439,34 @@ def _clear_sky_elevation_factor(elevation_deg: float) -> float:
     intensity = 0.7 ** am
     raw_elev_factor = max(0.0, math.cos(elev_rad))
     return raw_elev_factor * intensity
+
+
+def coefficients_4d_are_learned(regime_coeff) -> bool:
+    """Does this 4D (entity, regime) slot fire on the live read path?
+
+    **The** predicate — not a copy of one.
+    :meth:`SolarCalculator.calculate_unit_coefficient_4d` calls this to
+    decide between the stored coefficients and the zero-vector, and
+    every readiness / gating consumer calls the same function rather
+    than restating the condition.  That is deliberate: an unlearned 4D
+    regime predicts *zero solar* (unlike 3D, which falls back to a
+    seeded ``DEFAULT_SOLAR_COEFF_HEATING`` / ``_COOLING``), so a
+    readiness check whose predicate drifted from the read path's would
+    silently stop matching the cliff it exists to prevent.  If the fire
+    condition below changes, every consumer follows automatically.
+
+    Fires only when the slot is explicitly marked ``learned`` AND
+    carries at least one non-zero component — an empty or
+    freshly-initialised dict is not a model.
+
+    Accepts any object; a non-dict (missing entity, missing regime,
+    corrupt storage) is simply not learned.
+    """
+    if not isinstance(regime_coeff, dict):
+        return False
+    if not regime_coeff.get("learned"):
+        return False
+    return any(regime_coeff.get(k) for k in ("s", "e", "w", "diffuse"))
 
 
 class SolarCalculator:
@@ -832,11 +910,10 @@ class SolarCalculator:
 
         # Fire only when explicitly learned AND at least one non-zero
         # component.  Empty / freshly-initialised dicts return zero.
-        learned = bool(regime_coeff.get("learned"))
-        any_nonzero = any(
-            regime_coeff.get(k) for k in ("s", "e", "w", "diffuse")
-        )
-        if learned and any_nonzero:
+        # The condition lives in :func:`coefficients_4d_are_learned` so
+        # the 4D readiness gate mirrors this read path instead of
+        # re-deriving it — see that function's docstring.
+        if coefficients_4d_are_learned(regime_coeff):
             return {
                 "s": float(regime_coeff.get("s", 0.0)),
                 "e": float(regime_coeff.get("e", 0.0)),

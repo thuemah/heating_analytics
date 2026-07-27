@@ -151,7 +151,7 @@
       },
       "reconfigure_advanced": {
         "title": "Rediger: Avanserte innstillinger",
-        "description": "Juster modellparametere og valgfrie funksjoner. Funksjoner som krever ekstra inndata konfigureres på neste side.",
+        "description": "Juster modellparametere og valgfrie funksjoner. Funksjoner som krever ekstra inndata konfigureres på neste side.{four_d_readiness}",
         "data": {
           "daily_learning_mode": "Daglig læringsmodus (Track B)",
           "overnight_load_shift_correction": "Nattlig lastforskyvningskorreksjon",
@@ -169,7 +169,7 @@
           "solar_hotspot_attenuation_gamma": "Sol-hotspot-attenuering (γ)",
           "solar_redistribution_alpha": "Sol-haleomfordeling (α)",
           "solar_redistribution_tau_hours": "Tidskonstant for sol-hale (τ)",
-          "experimental_4d_primary": "Eksperimentelt: 4D solpipeline primær",
+          "experimental_4d_primary": "Bruk 4D-solmodellen (krever direkte/diffus solstråling fra værleverandøren din)",
           "csv_auto_logging": "Aktiver CSV-logging",
           "max_energy_delta": "Terskel for pigg-beskyttelse",
           "hourly_log_retention_days": "Oppbevaring av timelogg"
@@ -191,7 +191,7 @@
           "solar_hotspot_attenuation_gamma": "Eksperimentell. Dimensjonsløs multiplikativ attenuering (1 − γ) som påføres predikert solinnstråling for skjerm-påvirkede enheter når solen står høyt (elevasjon > 30°) og skjermene er aktivt utplassert (slider < 80 %). Kompenserer for restvarmetap (hotspot/skylight) som per-retning skjerm-transmittans ikke fanger. La stå på 0.0 (standard, ingen atferdsendring). Empirisk område fra feltmålinger: 0.2–0.4. Gjelder kun enheter hvis sone har minst én skjerm-fasade.",
           "solar_redistribution_alpha": "Eksperimentell. Andel av den predikerte sol-reduksjonen som temporært omfordeles fra opprinnelsestimen til de 3 foregående timene (eksponentielt avtagende kjerne). Gjelder kun lavt-elevasjon-timer (sol < 30°) der haleeffekten er empirisk observert. Energien bevares — dette er omfordeling, ikke forsterkning eller demping. La stå på 0.0 (standard, ingen atferdsendring). Empirisk område fra feltmålinger: 0.4–0.6.",
           "solar_redistribution_tau_hours": "Tidskonstant (timer) for eksponentialkjernen som omfordeler sol-halen. Større τ sprer mer vekt til eldre lag; mindre τ konsentrerer vekten på siste time. Standard 2.0 t gir en balansert 3-timers hale. Aktiv kun når α > 0.",
-          "experimental_4d_primary": "Ruter prediksjon, base-læring, batteri og aux-normalisering gjennom 4D-skygge-solpipelinen. Av som standard. Se dokumentasjon for promoteringskriterium.",
+          "experimental_4d_primary": "4D-modellen skiller direkte og diffust sollys, noe som er mer nøyaktig — men bare hvis værleverandøren din faktisk leverer disse dataene. Der de mangler, utledes verdiene fra skydekket, og 3D-modellen er det beste valget. Kjør tjenesten «diagnose_solar» og se på «four_d_readiness» for å finne ut hvor din installasjon står. Det er trygt å bytte begge veier: begge modellene fortsetter å lære parallelt.",
           "csv_auto_logging": "Skriv detaljerte time- og dagslgger til CSV-filer for ekstern analyse.",
           "max_energy_delta": "Timesverdier over denne grensen (kWh) ignoreres for å hindre sensorfeil i å ødelegge modellen.",
           "hourly_log_retention_days": "Antall dager med timeoppløsning som beholdes. Lengre oppbevaring gir bedre sesongbasert retrening og dypere diagnostikk. 90 dager er konservativt (anbefalt for Raspberry Pi); 365 dager bruker ca. 9 MB lagringsplass. Å redusere denne verdien sletter permanent timesdata utover den nye grensen — daglige oppsummeringer påvirkes ikke."

@@ -14,6 +14,8 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     ENERGY_GUARD_THRESHOLD,
+    DNI_DHI_REAL_SOURCE_DOMINANCE_MIN,
+    DNI_DHI_SOURCE_MIX_MIN_HOURS,
     MODE_COOLING,
     MODE_DHW,
     MODE_GUEST_COOLING,
@@ -23,7 +25,11 @@ from .const import (
     SOLAR_BATTERY_DECAY,
 )
 from .helpers import compute_base_ema_step
-from .learning import compute_snr_weight, _solar_coeff_regime
+from .learning import (
+    compute_snr_weight,
+    evaluate_4d_learning_readiness,
+    _solar_coeff_regime,
+)
 from .solar import (
     SolarCalculator,
     resolve_dni_dhi,
@@ -2935,15 +2941,71 @@ class DiagnosticsEngine:
                 "current_decay": self.coordinator.solar_battery_decay,
                 "verdict": "no_data",
             }
+        # Computed before the summary so its verdict can raise the
+        # top-level one — ``enabled_but_unsupported`` is a live
+        # misconfiguration (4D routed on an install whose input cannot
+        # feed it, silently degrading predictions), and a summary that
+        # reports ``no_action_needed`` over it defeats the point of
+        # having the gate.
+        source_mix = self._compute_dni_dhi_source_mix(days_back)
+        readiness_4d = self._compute_4d_readiness(days_back, source_mix=source_mix)
         # Top-level verdict: only ``no_action_needed`` when every signal
         # source is clean.  Otherwise the user should look at one of the
         # detail blocks the summary points at.
+        #
+        # Three 4D conditions raise the verdict; the history matters
+        # because one of them reverses an earlier decision (#1062
+        # reversing #1061), and without the reason written down the
+        # reversal reads as a regression:
+        #
+        # * ``enabled_but_unsupported`` (input half) — a live
+        #   misconfiguration: 4D routed on an install whose input cannot
+        #   feed it, silently degrading predictions.  A summary reporting
+        #   ``no_action_needed`` over it defeats the gate.
+        # * ``enabled_but_not_ready`` (both halves) — strictly wider, and
+        #   catches the case the input half cannot see: flag on, provider
+        #   fine, but 4D untrained, so the read path returns the
+        #   zero-vector and prediction runs with **no solar at all**.
+        #   Because the combiner is three-valued, a definitive
+        #   ``supports_4d = False`` always reaches this verdict, so it
+        #   now *subsumes* the input-half condition above rather than
+        #   merely overlapping it.  The narrower condition is kept
+        #   deliberately as defence-in-depth: the two are computed from
+        #   different predicates, and a future change to either shape
+        #   should not be able to silence a live misconfiguration on its
+        #   own.  (It was originally retained on the different grounds
+        #   that an undeterminable learning half would collapse the
+        #   composite to ``insufficient_data`` and swallow the input
+        #   misconfiguration — true before the combiner was made
+        #   three-valued, no longer the reason it is here.)
+        # * ``ready_to_enable`` — #1061 deliberately did NOT fire on the
+        #   old ``disabled_but_supported``, on the grounds that it merely
+        #   meant "your weather provider is good" and would pin every
+        #   well-sourced install at ``review_recommended`` forever,
+        #   nagging users toward a flag they had not opted into.  That
+        #   reasoning is weakened once the learning half is added: the
+        #   signal no longer means "your provider is fine", it means
+        #   "your input is good *and* your 4D model is trained — you are
+        #   ready", which is actionable in a way the input half alone was
+        #   not.  It is NOT, however, rare: ``learned`` is stamped on the
+        #   first coefficient write and the 4D cold-start buffer is 5
+        #   samples per (entity, regime), so a well-sourced install
+        #   satisfies condition 2 within about a week of sunny weather
+        #   and never un-satisfies it.  ``ready_to_enable`` is therefore
+        #   an *absorbing* state whose only exit is enabling the flag —
+        #   #1061's objection is delayed, not removed, and an install
+        #   that deliberately declines 4D sits at ``review_recommended``
+        #   indefinitely with no dismiss mechanism.  Accepted (the action
+        #   is a single setting) rather than overlooked; a suppression
+        #   path is the lever if the nag proves unwelcome.
         any_action = (
             bool(global_flags)
             or bool(units_with_flags)
             or battery_feedback_summary["verdict"].startswith("consider_")
             or battery_decay_summary["verdict"].startswith("consider_")
             or battery_decay_summary["verdict"] in ("too_fast", "too_slow")
+            or source_mix.get("verdict") == "enabled_but_unsupported"
+            or readiness_4d.get("verdict") in ("ready_to_enable", "enabled_but_not_ready")
         )
         summary = {
             "verdict": "review_recommended" if any_action else "no_action_needed",
@@ -2953,6 +3015,25 @@ class DiagnosticsEngine:
             "units_with_flags": units_with_flags,
             "battery_feedback": battery_feedback_summary,
             "battery_decay": battery_decay_summary,
+            "dni_dhi_source": {
+                "dominant_source": source_mix.get("dominant_source"),
+                "experimental_4d_primary_enabled": source_mix.get(
+                    "experimental_4d_primary_enabled"
+                ),
+                "supports_4d_primary": source_mix.get("supports_4d_primary"),
+                "verdict": source_mix.get("verdict", "unavailable"),
+            },
+            # Both halves of the gate: input support AND 4D having
+            # actually learned.  ``dni_dhi_source`` above reports the
+            # input half alone and is not sufficient on its own.
+            "four_d_readiness": {
+                "ready": readiness_4d.get("ready"),
+                "verdict": readiness_4d.get("verdict"),
+                "learning_ready": readiness_4d.get("learning", {}).get("ready"),
+                "entities_not_learned": readiness_4d.get("learning", {}).get(
+                    "entities_not_learned", []
+                ),
+            },
         }
 
         return {
@@ -2987,11 +3068,229 @@ class DiagnosticsEngine:
             },
             "per_unit": per_unit,
             "per_unit_thresholds": per_unit_thresholds,
+            "dni_dhi_source_mix": source_mix,
+            "four_d_readiness": readiness_4d,
             "dni_dhi_shadow": self._compute_dni_dhi_shadow_report(days_back),
             "base_model_4d_shadow": self._compute_base_model_4d_shadow_report(days_back),
             "total_power_4d_divergence": self._compute_total_power_4d_divergence_report(days_back),
             "shoulder_saturation_blast_radius": self._compute_shoulder_saturation_blast_radius(days_back),
             "ghi_signal_agreement": self._compute_ghi_signal_agreement(days_back),
+        }
+
+    def _compute_dni_dhi_source_mix(self, days_back: int) -> dict:
+        """Which ladder branch this install actually resolves through.
+
+        The per-install gate for ``experimental_4d_primary``.  4D is the
+        superior pipeline wherever a real DNI/DHI source exists and is
+        *inferior* on the ``kasten_synthetic`` branch, where its fourth
+        degree of freedom re-encodes ``cloud_coverage`` and the Erbs
+        split trades a ~1 % constant bias for a ``kT``-dependent one (see
+        CLAUDE.md > Solar Model > 4D shadow learner).  Since supplying
+        DNI/DHI is never a requirement, that branch is permanent — so
+        the only question a per-install gate has to answer is which
+        branch *this* install is on.
+
+        Counts the ``dni_dhi_source`` label written on every
+        ``hourly_log`` entry, restricted to **daylight** hours.  The
+        daylight filter is load-bearing, not hygiene: the label is
+        derived from collector sample counts and never emits
+        ``"no_sun"`` (see :func:`solar.derive_dni_dhi_source_label`), so
+        an unfiltered count reports every night hour as
+        ``kasten_synthetic`` on any install with cloud-coverage data and
+        would make a perfectly-sourced install look mixed.
+        ``solar_factor > 0`` is the daylight test — it is zero below the
+        horizon by construction and is logged on every entry.
+
+        Entries predating the ``dni_dhi_source`` field are counted as
+        ``unlabelled_hours`` rather than silently dropped, so a thin mix
+        on a freshly-upgraded install is visibly thin rather than
+        looking like a verdict.
+
+        Strict diagnostic — reads ``hourly_log`` only, writes nothing.
+        """
+        cutoff = (dt_util.now() - timedelta(days=days_back)).date().isoformat()
+
+        counts: dict[str, int] = {}
+        unlabelled = 0
+        n_night_skipped = 0
+
+        for entry in self.coordinator._hourly_log:
+            ts = entry.get("timestamp", "")
+            if ts[:10] < cutoff:
+                continue
+            try:
+                if float(entry.get("solar_factor") or 0.0) <= 0.0:
+                    n_night_skipped += 1
+                    continue
+            except (TypeError, ValueError):
+                n_night_skipped += 1
+                continue
+            source = entry.get("dni_dhi_source")
+            if not source:
+                unlabelled += 1
+                continue
+            counts[source] = counts.get(source, 0) + 1
+
+        total = sum(counts.values())
+        if total == 0:
+            return {
+                "available": False,
+                "reason": "no_labelled_daylight_hours",
+                "days_back": days_back,
+                "daylight_hours_total": 0,
+                "unlabelled_hours": unlabelled,
+                "night_hours_excluded": n_night_skipped,
+            }
+
+        by_source = {
+            src: {"hours": n, "pct": round(100.0 * n / total, 1)}
+            for src, n in sorted(counts.items(), key=lambda kv: -kv[1])
+        }
+        real_hours = counts.get("native", 0) + counts.get("erbs_from_ghi", 0)
+        real_share = real_hours / total
+        dominant_source = max(counts.items(), key=lambda kv: kv[1])[0]
+
+        flag_on = bool(
+            getattr(self.coordinator, "experimental_4d_primary", False)
+        )
+
+        if total < DNI_DHI_SOURCE_MIX_MIN_HOURS:
+            supports_4d = None
+            verdict = "insufficient_data"
+        else:
+            supports_4d = real_share >= DNI_DHI_REAL_SOURCE_DOMINANCE_MIN
+            if supports_4d and flag_on:
+                verdict = "enabled_and_supported"
+            elif supports_4d and not flag_on:
+                verdict = "disabled_but_supported"
+            elif not supports_4d and flag_on:
+                verdict = "enabled_but_unsupported"
+            else:
+                verdict = "disabled_and_unsupported"
+
+        return {
+            "available": True,
+            "days_back": days_back,
+            "daylight_hours_total": total,
+            "unlabelled_hours": unlabelled,
+            "night_hours_excluded": n_night_skipped,
+            "by_source": by_source,
+            "dominant_source": dominant_source,
+            "real_source_share": round(real_share, 4),
+            "experimental_4d_primary_enabled": flag_on,
+            "supports_4d_primary": supports_4d,
+            "verdict": verdict,
+            "verdict_thresholds": {
+                "real_source_dominance_min": DNI_DHI_REAL_SOURCE_DOMINANCE_MIN,
+                "min_labelled_daylight_hours": DNI_DHI_SOURCE_MIX_MIN_HOURS,
+                "real_sources": ["native", "erbs_from_ghi"],
+            },
+        }
+
+    def _compute_4d_readiness(self, days_back: int, source_mix: dict | None = None) -> dict:
+        """Both halves of the ``experimental_4d_primary`` gate (#1062).
+
+        Readiness is two conditions, and either one alone is misleading:
+
+        1. **Input supports it** — ``dni_dhi_source_mix.supports_4d_primary``.
+           4D is superior wherever a real DNI/DHI source exists and
+           inferior on the permanent ``kasten_synthetic`` branch.
+        2. **4D has actually learned** —
+           :func:`learning.evaluate_4d_learning_readiness`, which fires the
+           live read path's own predicate.  Without this, an install with a
+           perfect weather provider can be routed to 4D before its 4D
+           coefficients exist and predict zero solar, silently.
+
+        Verdicts pair the two conditions against the flag's current state:
+
+        ``enabled_and_ready``
+            Flag on, both conditions met.  Nothing to do.
+        ``ready_to_enable``
+            Flag off, both conditions met.  Actionable — this raises the
+            summary verdict (see ``diagnose_solar``).  Note it is an
+            **absorbing state**: the only exit is enabling the flag, so a
+            well-sourced install that declines 4D sits at
+            ``review_recommended`` indefinitely.  Accepted, not overlooked.
+        ``enabled_but_not_ready``
+            Flag on, a condition definitively unmet.  A **live**
+            degradation, not an opportunity: prediction is running
+            through an input that cannot feed it, an untrained model that
+            returns the zero-vector, or both.  Raises the summary verdict.
+        ``not_ready``
+            Flag off, a condition definitively unmet.  The ordinary
+            resting state.
+        ``insufficient_data``
+            Nothing definitive on either side — too few labelled daylight
+            hours *and* no in-scope entity in an active solar regime.  A
+            definitive ``False`` from either half outranks an unknown
+            from the other; see the combiner below.
+
+        Strict diagnostic: reads state, writes nothing.  Kept as a pure
+        combiner over the two halves so the same call can serve the
+        config flow (via ``coordinator.evaluate_4d_readiness``) and, later,
+        an automatic router.
+        """
+        if source_mix is None:
+            source_mix = self._compute_dni_dhi_source_mix(days_back)
+
+        supports_4d = source_mix.get("supports_4d_primary")
+        flag_on = bool(getattr(self.coordinator, "experimental_4d_primary", False))
+
+        learning = evaluate_4d_learning_readiness(
+            getattr(self.coordinator, "_solar_coefficients_4d_per_unit", None),
+            getattr(self.coordinator, "_solar_affected_set", None),
+            getattr(self.coordinator, "_unit_modes", None),
+        )
+        learned_ready = learning.get("ready")
+
+        # Three-valued AND, not "any operand unknown → unknown".  A
+        # definitive ``False`` on either half is decisive regardless of
+        # the other, and collapsing it to ``insufficient_data`` would
+        # hide the exact live degradation this gate exists to catch: the
+        # learning half needs no history window, so it can say "4D is
+        # untrained" — meaning the read path is returning the
+        # zero-vector and prediction is running with no solar at all —
+        # during the first 3-9 days of an install, while the input half
+        # is still accumulating its 50 labelled daylight hours.  That
+        # window also covers *every* upgrading install, whose retained
+        # log predates the ``dni_dhi_source`` field entirely.  Only when
+        # nothing definitive is known on either side is the answer
+        # genuinely unknown.
+        ready: bool | None
+        if supports_4d is False or learned_ready is False:
+            ready = False
+        elif supports_4d is None or learned_ready is None:
+            ready = None
+        else:
+            ready = True
+
+        if ready is None:
+            verdict = "insufficient_data"
+        elif ready:
+            verdict = "enabled_and_ready" if flag_on else "ready_to_enable"
+        else:
+            verdict = "enabled_but_not_ready" if flag_on else "not_ready"
+
+        return {
+            "ready": ready,
+            "verdict": verdict,
+            "experimental_4d_primary_enabled": flag_on,
+            "input": {
+                "supports_4d_primary": supports_4d,
+                "dominant_source": source_mix.get("dominant_source"),
+                "real_source_share": source_mix.get("real_source_share"),
+                "daylight_hours_total": source_mix.get("daylight_hours_total"),
+                "verdict": source_mix.get("verdict", "unavailable"),
+            },
+            "learning": learning,
+            "accepted_limitation": (
+                "Only each entity's currently active regime is checked.  A unit "
+                "switching into a regime 4D has not trained yet predicts zero "
+                "solar for roughly 5 qualifying sunny hours (the 4D cold-start "
+                "buffer per entity and regime) before NLMS takes over.  Bounded "
+                "and self-healing; gating on all regimes instead would never "
+                "pass for a unit that only ever cools."
+            ),
         }
 
     def _compute_ghi_signal_agreement(self, days_back: int) -> dict:

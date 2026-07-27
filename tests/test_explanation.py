@@ -12,6 +12,11 @@ from custom_components.heating_analytics.explanation import (
 class MockCoordinator(CoordinatorModelMixin):
     def __init__(self):
         self.solar_azimuth = 180
+        self.thermal_regime = "heating"
+
+    def thermal_regime_for_day(self, date_key):
+        """No recorded daily split — the analyzer falls back to heating."""
+        return None
 
     def _get_wind_bucket(self, wind_speed, ignore_aux=False):
         if wind_speed >= 10.8:
@@ -71,6 +76,63 @@ def test_analyze_day_wind_impact(analyzer):
 
     assert res['wind_impact'] == 'significant' # Normal -> High
     assert res['causality']['wind_explains'] is True
+
+@pytest.mark.parametrize("curr_wind,curr_bucket", [
+    (3.0, 'normal'),
+    (7.0, 'high_wind'),
+    (12.0, 'extreme_wind'),
+])
+def test_analyze_day_missing_baseline_wind_is_not_attributed(analyzer, curr_wind, curr_bucket):
+    """A baseline day with no recorded weather must not read as dead calm.
+
+    ``sensors/comparison.py`` returns ``wind=None, wind_bucket=None`` for a day
+    with no data.  Inferring a bucket from the ``or 0.0`` default fabricated a
+    calm baseline, so every windy day compared against a data-less year-ago day
+    reported a wind change that no evidence supports.  Mirrors the temperature
+    path, which already requires both sides to be present.
+    """
+    day = {'temp': 5.0, 'wind': curr_wind, 'wind_bucket': curr_bucket, 'kwh': 40.0}
+    base = {'temp': None, 'wind': None, 'wind_bucket': None, 'kwh': 0.0, 'solar_kwh': 0.0}
+
+    res = analyzer.analyze_day(day, base)
+
+    assert res['wind_impact'] == 'normal'
+    assert res['wind_delta'] == 0.0
+    # No baseline wind means wind cannot explain the consumption delta either.
+    assert res['causality']['wind_explains'] is False
+    # The temperature path already guarded this; assert the two now agree.
+    assert res['temp_impact'] == 'normal'
+    assert res['temp_delta'] == 0.0
+
+def test_analyze_day_baseline_wind_without_bucket_still_inferred(analyzer):
+    """A baseline carrying wind but no bucket keeps using coordinator inference.
+
+    Only a fully data-less baseline (wind is None) suppresses attribution — a
+    known wind speed with an absent bucket label must still be classified.
+    """
+    day = {'temp': 0.0, 'wind': 12.0, 'wind_bucket': 'extreme_wind', 'kwh': 45.0}
+    base = {'temp': 0.0, 'wind': 3.0, 'kwh': 35.0}  # no 'wind_bucket' key at all
+
+    res = analyzer.analyze_day(day, base)
+
+    assert res['wind_impact'] == 'extreme'  # normal -> extreme_wind, 2 levels
+    assert res['wind_delta'] == 9.0
+
+def test_analyze_day_missing_baseline_wind_without_coordinator():
+    """The no-coordinator fallback path takes the same guard."""
+    bare = WeatherImpactAnalyzer(coordinator=None)
+    day = {'temp': 5.0, 'wind': 12.0, 'wind_bucket': 'extreme_wind', 'kwh': 40.0}
+    base = {'temp': None, 'wind': None, 'wind_bucket': None, 'kwh': 0.0}
+
+    res = bare.analyze_day(day, base)
+
+    assert res['wind_impact'] == 'normal'
+    assert res['wind_delta'] == 0.0
+
+    # ...while a populated baseline still classifies via the default constants.
+    base_windy = {'temp': 5.0, 'wind': 2.0, 'kwh': 30.0}
+    res2 = bare.analyze_day(day, base_windy)
+    assert res2['wind_impact'] == 'extreme'  # normal -> extreme_wind
 
 def test_week_ahead_jan_2026(analyzer, formatter):
     """Real-world test case from production (Jan 1-7)."""
@@ -162,10 +224,19 @@ def test_analyze_day_with_none_values(analyzer):
     assert res['kwh_delta'] == -40.0  # None treated as 0.0: 0.0 - 40.0 = -40.0
 
 def test_format_day_comparison(formatter):
-    """Test formatting of day comparison."""
+    """Test formatting of day comparison.
+
+    The weather deltas are part of the contract: the wording names the
+    weather from its own sign, so an analysis that claims temperature
+    explains a rise must also say which way the temperature moved.  A real
+    ``analyze_day`` result always carries them — the causality rule cannot
+    fire below the relevance threshold — and the formatter no longer infers
+    direction from the consumption delta, which only worked under heating.
+    """
     # Cold day
     analysis = {
         'delta_kwh': 5.5,
+        'temp_delta': -5.0,
         'causality': {'temp_explains': True},
         'temp_impact': 'significant'
     }
@@ -176,6 +247,7 @@ def test_format_day_comparison(formatter):
     # Windy day
     analysis = {
         'delta_kwh': 3.5,
+        'wind_delta': 4.0,
         'causality': {'wind_explains': True},
         'wind_impact': 'significant'
     }

@@ -96,7 +96,7 @@ class TestSnapshotScheduling:
     async def test_added_to_hass_defers_first_build_to_started_event(
         self, mock_coordinator, mock_entry
     ):
-        import asyncio
+        import inspect
 
         from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 
@@ -113,7 +113,7 @@ class TestSnapshotScheduling:
         # The listener must be a coroutine function: the event bus runs plain
         # sync listeners as executor jobs, off the loop, where the loop-only
         # scheduling APIs are unavailable.
-        assert asyncio.iscoroutinefunction(sensor._on_hass_started)
+        assert inspect.iscoroutinefunction(sensor._on_hass_started)
 
         # Firing the startup event schedules the first build.
         await sensor._on_hass_started(None)

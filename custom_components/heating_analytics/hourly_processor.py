@@ -1082,15 +1082,17 @@ class HourlyProcessor:
             # retrospective replays can separate Kasten-bias contribution
             # from native / GHI-sensor contribution without re-deriving
             # which path the 4D pipeline would have taken at log time.
-            collector = self.coordinator._collector
-            if collector.ghi_count > 0:
-                dni_dhi_source = "erbs_from_ghi"
-            elif collector.dni_count > 0 and collector.dhi_count > 0:
-                dni_dhi_source = "native"
-            elif collector.cloud_coverage_count > 0:
-                dni_dhi_source = "kasten_synthetic"
-            else:
-                dni_dhi_source = "none"
+            from .solar import derive_dni_dhi_source_label
+
+            # Same averaged values the 4D learner hands to
+            # ``resolve_dni_dhi`` (learning.py), so the logged label
+            # cannot disagree with the branch the pipeline took.
+            dni_dhi_source = derive_dni_dhi_source_label(
+                getattr(obs, "ghi_avg", None),
+                getattr(obs, "dni_avg", None),
+                getattr(obs, "dhi_avg", None),
+                getattr(obs, "cloud_avg", None),
+            )
 
             log_entry = {
                 "timestamp": self.coordinator._collector.start_time.isoformat() if self.coordinator._collector.start_time else current_time.isoformat(),

@@ -14,6 +14,7 @@ from .const import (
     MODES_EXCLUDED_FROM_GLOBAL_LEARNING,
     MODE_HEATING,
 )
+from .learning import regime_energy_split
 from .thermodynamics import ThermodynamicEngine
 
 _LOGGER = logging.getLogger(__name__)
@@ -112,11 +113,31 @@ class DailyProcessor:
         unit_breakdown = {}
         unit_expected = {}
 
+        # Thermal-regime energy split (#1051).  Accumulated per hour against
+        # that hour's own modes, so a day that switches mode part-way through
+        # attributes each hour correctly instead of stamping the whole day
+        # with its end-of-day state.
+        #
+        # The split is persisted rather than the label: a future change to
+        # THERMAL_REGIME_DOMINANCE_SHARE then reclassifies history instead of
+        # leaving stale labels behind.  Absent keys mean "predates recording"
+        # and must stay distinguishable from a recorded 0/0, which is a real
+        # "idle" classification — see coordinator.thermal_regime_for_day.
+        regime_heating_kwh = 0.0
+        regime_cooling_kwh = 0.0
+
         for e in day_logs:
             for uid, val in e.get("unit_breakdown", {}).items():
                 unit_breakdown[uid] = unit_breakdown.get(uid, 0.0) + val
             for uid, val in e.get("unit_expected_breakdown", {}).items():
                 unit_expected[uid] = unit_expected.get(uid, 0.0) + val
+
+            hour_heating, hour_cooling = regime_energy_split(
+                e.get("unit_modes", {}) or {},
+                e.get("unit_breakdown", {}) or {},
+            )
+            regime_heating_kwh += hour_heating
+            regime_cooling_kwh += hour_cooling
 
         # Averages
         avg_temp = sum(e["temp"] for e in day_logs) / len(day_logs)
@@ -223,6 +244,8 @@ class DailyProcessor:
             "solar_factor": round(avg_solar, 3),
             "unit_breakdown": {k: round(v, 3) for k, v in unit_breakdown.items()},
             "unit_expected_breakdown": {k: round(v, 3) for k, v in unit_expected.items()},
+            "regime_heating_kwh": round(regime_heating_kwh, 3),
+            "regime_cooling_kwh": round(regime_cooling_kwh, 3),
             "primary_entity": primary,
             "secondary_entity": secondary,
             "crossover_day": crossover,

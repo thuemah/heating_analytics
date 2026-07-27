@@ -20,7 +20,13 @@ from .helpers import (
 from .solar import SolarCalculator
 from .forecast import ForecastManager
 from .statistics import StatisticsManager
-from .learning import LearningManager, compute_snr_weight, count_active_learnable_units
+from .learning import (
+    LearningManager,
+    classify_thermal_regime_from_split,
+    compute_snr_weight,
+    count_active_learnable_units,
+    dominant_thermal_regime_from_split,
+)
 from .daily_processor import DailyProcessor
 from .diagnostics import DiagnosticsEngine
 from .hourly_processor import HourlyProcessor
@@ -75,7 +81,6 @@ from .const import (
     ATTR_FORECAST_DETAILS,
     ATTR_SOLAR_POTENTIAL,
     ATTR_SOLAR_GAIN_NOW,
-    ATTR_HEATING_LOAD_OFFSET,
     ATTR_RECOMMENDATION_STATE,
     RECOMMENDATION_MAXIMIZE_SOLAR,
     RECOMMENDATION_INSULATE,
@@ -751,6 +756,62 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Get current mode for a unit."""
         return self._unit_modes.get(entity_id, MODE_HEATING)
 
+    @property
+    def _today_regime_split(self) -> tuple[float, float]:
+        """Today's (heating_kwh, cooling_kwh), attributed as it was consumed.
+
+        Reads the accumulators maintained by ``_update_accumulated_impacts``,
+        which sum each completed hour against *that hour's* logged modes and
+        add the running hour against current modes.
+
+        Deliberately not ``classify_thermal_regime(_unit_modes,
+        _daily_individual)``: that pairs the modes active *now* with energy
+        accumulated all day, so a heat pump that used 20 kWh heating overnight
+        and then switched to cooling for 1 kWh would have all 21 kWh counted
+        as cooling — flipping both this label and the driver's regime branch
+        to cooling physics on a heating-dominated day.  These accumulators
+        already carry the per-hour split the daily-history path records, so
+        the live and historical answers agree by construction.
+        """
+        return (
+            self.data.get("accumulated_heating_kwh", 0.0) or 0.0,
+            self.data.get("accumulated_cooling_kwh", 0.0) or 0.0,
+        )
+
+    @property
+    def thermal_regime(self) -> str:
+        """Building-level thermal regime label (#1051)."""
+        return classify_thermal_regime_from_split(*self._today_regime_split)
+
+    @property
+    def dominant_thermal_regime(self) -> str | None:
+        """Regime whose semantics apply, collapsing "mixed" to its side."""
+        return dominant_thermal_regime_from_split(*self._today_regime_split)
+
+    def thermal_regime_for_day(self, date_key: str) -> str | None:
+        """Thermal regime of a stored day, or ``None`` if never recorded.
+
+        ``None`` is emphatically NOT ``"idle"``.  A day aggregated before the
+        regime split was recorded carries no evidence either way, while a
+        recorded 0/0 genuinely means the building did nothing.  Consumers
+        picking a sign convention from history must treat ``None`` as "fall
+        back to the default framing", not as a classification — otherwise
+        every pre-upgrade day silently becomes an idle building.
+
+        Days older than the hourly-log retention window can never gain the
+        field: the source rows are already trimmed.  Days still inside it
+        pick it up on the next ``backfill_from_hourly``.
+        """
+        entry = self._daily_history.get(date_key)
+        if not isinstance(entry, dict):
+            return None
+        if "regime_heating_kwh" not in entry or "regime_cooling_kwh" not in entry:
+            return None
+        return classify_thermal_regime_from_split(
+            entry.get("regime_heating_kwh") or 0.0,
+            entry.get("regime_cooling_kwh") or 0.0,
+        )
+
     def hourly_solar_impact_kwh(self, entry: dict) -> float:
         """Read solar impact for display aggregation (#962).
 
@@ -776,13 +837,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
     @property
     def experimental_4d_primary(self) -> bool:
-        """Whether the experimental 4D solar pipeline is the primary read path (#962).
+        """Whether the 4D solar pipeline is the primary read path (#962).
 
-        Read seam for the forthcoming read-path wiring.  This commit
-        introduces the flag only — no live consumer reads it yet, so the
-        property is a no-op end-to-end until the follow-up PR routes the
-        five read sites (prediction, base learning, battery, aux
-        normalisation, display sensors) through the 4D pipeline.
+        Live: prediction (``statistics``), base learning, the battery,
+        aux normalisation, forecasting and the hour boundary all route on
+        this flag.  The ``experimental_`` prefix in the config key is
+        historical and no longer describes the setting — see the note at
+        ``CONF_EXPERIMENTAL_4D_PRIMARY`` in ``const.py``.  Readiness to
+        turn it on is :meth:`evaluate_4d_readiness`.
 
         Read from ``entry.data`` on every access — no cache field on the
         coordinator.  Toggling via reconfigure-advanced takes effect on
@@ -1849,6 +1911,19 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
     def diagnose_solar(self, days_back: int = 30, apply_battery_decay: bool = False) -> dict:
         """Delegates to :class:`diagnostics.DiagnosticsEngine`."""
         return self._diagnostics.diagnose_solar(days_back, apply_battery_decay)
+
+    def evaluate_4d_readiness(self, days_back: int = 30) -> dict:
+        """Both halves of the ``experimental_4d_primary`` gate (#1062).
+
+        Public entry point for consumers that need the readiness verdict
+        without running the whole of ``diagnose_solar`` — currently the
+        reconfigure flow, which surfaces it at the point of decision, and
+        the natural call site for a future automatic router.  Cheap: one
+        pass over ``_hourly_log`` plus a per-entity coefficient lookup.
+
+        Delegates to :class:`diagnostics.DiagnosticsEngine`.
+        """
+        return self._diagnostics._compute_4d_readiness(days_back)
 
     def _get_float_state(self, entity_id: str) -> float | None:
         """Helper to get float state from an entity."""

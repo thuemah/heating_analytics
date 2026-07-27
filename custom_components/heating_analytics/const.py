@@ -43,6 +43,12 @@ DEFAULT_THERMAL_INERTIA_HOURS = 4
 DEFAULT_SOLAR_ENABLED = True
 DEFAULT_SOLAR_CORRECTION = 100
 ENERGY_GUARD_THRESHOLD = 0.01  # 10 Wh - Consistent guard against division by zero
+
+# Share of thermal demand one regime must hold before the building-level
+# thermal_regime label commits to it (#1051).  Deliberately well above a bare
+# majority: the label decides whether one regime's sign conventions may be
+# applied to the whole building, and at a 60/40 split they may not.
+THERMAL_REGIME_DOMINANCE_SHARE = 0.8
 DEFAULT_SOLAR_LEARNING_RATE = 0.01
 DEFAULT_AUX_LEARNING_RATE = 0.01
 
@@ -73,16 +79,23 @@ SOLAR_BATTERY_DECAY = 0.50
 CONF_BATTERY_THERMAL_FEEDBACK_K = "battery_thermal_feedback_k"
 DEFAULT_BATTERY_THERMAL_FEEDBACK_K = 0.0
 
-# Experimental: route the live solar read-path (prediction, base
-# learning, the legacy battery, aux normalisation, display sensors)
-# through the existing 4D shadow pipeline (#962).  Default off — flag
-# is a read-path route only.  Toggle does NOT reset
-# ``_solar_coefficients_per_unit``; the 3D shadow continues to learn
-# in parallel so rollback is symmetric.  See ``CLAUDE.md > Solar
-# Model > 4D shadow learner > Promotion criterion`` for the gates.
-# NOTE: this commit introduces the flag only — no read-path wiring is
-# performed.  The flag is a no-op end-to-end until follow-up patches
-# wire the five live read sites.
+# Route the live solar read-path (prediction, base learning, the
+# legacy battery, aux normalisation, display sensors) through the 4D
+# pipeline (#962).  Default off — flag is a read-path route only.
+# Toggle does NOT reset ``_solar_coefficients_per_unit``; the other
+# pipeline continues to learn in parallel so rollback is symmetric.
+#
+# NOTE: the ``experimental_`` prefix in the key is **historical** and no
+# longer describes the setting (#1062).  The condition is not maturity
+# but input: 4D is superior wherever a real DNI/DHI source exists and
+# inferior on the permanent ``kasten_synthetic`` branch, so this is a
+# property of the user's weather provider, not a beta opt-in.  The
+# user-facing strings say so; the key is deliberately left alone
+# because renaming it buys nothing and costs a config-entry migration.
+# Readiness (input support AND 4D having actually learned) is
+# ``coordinator.evaluate_4d_readiness`` / ``diagnose_solar``'s
+# ``four_d_readiness``.  See ``CLAUDE.md > Solar Model > 4D shadow
+# learner > Promotion`` for the gate.
 CONF_EXPERIMENTAL_4D_PRIMARY = "experimental_4d_primary"
 DEFAULT_EXPERIMENTAL_4D_PRIMARY = False
 
@@ -615,7 +628,6 @@ ATTR_FORECAST_DETAILS = "forecast_details"
 
 ATTR_SOLAR_POTENTIAL = "solar_potential_kw"
 ATTR_SOLAR_GAIN_NOW = "solar_gain_now_kw"
-ATTR_HEATING_LOAD_OFFSET = "heating_load_offset"
 ATTR_RECOMMENDATION_STATE = "recommendation_state"
 
 # Recommendation States
@@ -766,3 +778,24 @@ HOURLY_LOG_RETENTION_OPTIONS = [90, 180, 365]
 # Track B distributes daily energy across 24 hours using per-hour COP weights
 # instead of flat daily average. Provides Track A/C resolution without thermal sensors.
 ENABLE_TRACK_B_COP_SMEARING = False
+
+# --- DNI/DHI ladder source mix (diagnose_solar.dni_dhi_source_mix) ---
+# The per-install gate for ``experimental_4d_primary``.  4D is superior
+# wherever a real DNI/DHI source exists and inferior on the
+# ``kasten_synthetic`` branch (one scalar cannot become two independent
+# signals; the Erbs split trades a ~1 % constant bias for a kT-dependent
+# one) — so the only question a per-install gate must answer is whether
+# this install resolves through a real source.
+#
+# Dominance bar for "real source": share of DAYLIGHT hours resolving via
+# ``native`` or ``erbs_from_ghi``.  Set high because the failure mode is
+# asymmetric — enabling 4D on a predominantly-Kasten install degrades the
+# model, while leaving it off on a borderline install costs only the
+# improvement.  An install genuinely fed by a weather provider with
+# DNI/DHI sits near 1.0; anything mixed is a sign the provider drops the
+# fields intermittently.
+DNI_DHI_REAL_SOURCE_DOMINANCE_MIN = 0.80
+# Minimum labelled daylight hours before a verdict is offered.  Two
+# daylight days is far too thin to characterise a provider that drops
+# fields under some conditions; ~1 week of daylight hours is the floor.
+DNI_DHI_SOURCE_MIX_MIN_HOURS = 50

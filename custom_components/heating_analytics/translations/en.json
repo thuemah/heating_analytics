@@ -151,7 +151,7 @@
       },
       "reconfigure_advanced": {
         "title": "Edit: Advanced Options",
-        "description": "Adjust model tuning and optional features. Features that require additional input will be configured on the next page.",
+        "description": "Adjust model tuning and optional features. Features that require additional input will be configured on the next page.{four_d_readiness}",
         "data": {
           "daily_learning_mode": "Daily Learning Mode (Track B)",
           "overnight_load_shift_correction": "Overnight Load Shift Correction",
@@ -169,7 +169,7 @@
           "solar_hotspot_attenuation_gamma": "Solar Hotspot Attenuation (γ)",
           "solar_redistribution_alpha": "Solar Tail Redistribution (α)",
           "solar_redistribution_tau_hours": "Solar Tail Time Constant (τ)",
-          "experimental_4d_primary": "Experimental: 4D solar pipeline primary",
+          "experimental_4d_primary": "Use the 4D solar model (requires direct/diffuse irradiance from your weather provider)",
           "csv_auto_logging": "Enable CSV Logging",
           "max_energy_delta": "Spike Protection Threshold",
           "hourly_log_retention_days": "Hourly Log Retention"
@@ -191,7 +191,7 @@
           "solar_hotspot_attenuation_gamma": "Experimental opt-in. Dimensionless multiplicative attenuation (1 − γ) applied to predicted solar gain for screened-facade units when the sun is high (elevation > 30°) and screens are actively deployed (slider < 80%). Compensates for residual hotspot/sky-light loss not captured by the per-direction screen transmittance. Leave at 0.0 (default, no behavioural change). Empirical envelope from field measurements puts useful values in the 0.2–0.4 range. Only applies to entities whose zone has at least one screened facade.",
           "solar_redistribution_alpha": "Experimental opt-in. Fraction of the per-unit predicted solar gain that is temporally redistributed from the originator hour to the prior 3 hours (exponential-decay kernel). Applies only to low-elevation (sun < 30°) eligible hours where the empirical battery-tail effect was observed. Energy is conserved — this is redistribution, not amplification or attenuation. Leave at 0.0 (default, no behavioural change). Empirical envelope from field measurements puts useful values in the 0.4–0.6 range.",
           "solar_redistribution_tau_hours": "Time constant (hours) of the exponential-decay kernel used by the tail redistribution. Larger τ spreads more weight to older lags; smaller τ concentrates weight on the most recent hour. Default 2.0 h gives a balanced 3-hour tail. Only active when α > 0.",
-          "experimental_4d_primary": "Routes prediction, base learning, battery, and aux normalisation through the 4D shadow solar pipeline. Off by default. See documentation for promotion criterion.",
+          "experimental_4d_primary": "The 4D model separates direct and diffuse sunlight, which is more accurate — but only if your weather provider actually supplies that data. Where it does not, the values are derived from cloud cover and the 3D model is the better choice. Run the 'diagnose_solar' service and check 'four_d_readiness' to see where your installation stands. Switching either way is safe: both models keep learning in parallel.",
           "csv_auto_logging": "Write detailed hourly and daily logs to CSV files for external analysis.",
           "max_energy_delta": "Hourly readings above this value (kWh) are ignored to prevent sensor glitches from corrupting the model.",
           "hourly_log_retention_days": "How many days of hourly-resolution data to keep. Longer retention enables cross-seasonal retraining and deeper diagnostics. 90 days is conservative (recommended for Raspberry Pi); 365 days uses approximately 9 MB of storage. Reducing this value permanently deletes hourly data beyond the new limit — daily summaries are not affected."

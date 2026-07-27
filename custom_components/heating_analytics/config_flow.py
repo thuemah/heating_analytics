@@ -24,6 +24,12 @@ No ``strings.json`` — HA loads translations directly.  Config flow steps
 ``advanced`` and ``reconfigure_advanced`` have **identical data/data_description
 keys** — both must be updated when adding a new field.  Use ``replace_all``
 when editing both blocks simultaneously.
+
+One deliberate exception: ``experimental_4d_primary`` exists only on
+``reconfigure_advanced`` (the initial wizard never renders it).  Likewise the
+``{four_d_readiness}`` placeholder belongs only to that step's description —
+``advanced`` supplies no ``description_placeholders`` and would render it
+literally.  Both are pinned by ``tests/test_translations_4d_readiness.py``.
 """
 from __future__ import annotations
 
@@ -97,6 +103,88 @@ _CONF_LOAD_SHIFT = "overnight_load_shift_correction"
 # UI-only key — not stored. Derived from wind_speed_sensor presence on load.
 _CONF_DEDICATED_WIND = "use_dedicated_wind_sensor"
 
+# Readiness lines for the 4D solar setting (#1062), surfaced in the
+# reconfigure_advanced step description via ``description_placeholders``.
+#
+# Kept as a language-keyed dict rather than translation keys because HA
+# substitutes placeholders as literal strings — a placeholder value cannot
+# itself be a translation key.  The alternative (one English line inside
+# otherwise-Norwegian prose) would be worst on exactly the field whose whole
+# purpose is to remove confusion about what the setting asks.  Falls back to
+# English for any language without an entry here.
+#
+# Warn, never refuse: a user who has just connected a GHI sensor is right to
+# enable 4D before the 30-day window catches up, so no verdict produces a
+# form error.  ``insufficient_data`` deliberately renders nothing — a fresh
+# install has nothing useful to say and a "we don't know yet" line is noise.
+_FOUR_D_READINESS_LINES: dict[str, dict[str, str]] = {
+    "en": {
+        "ready_to_enable": (
+            "\n\n✅ 4D solar: your installation is ready. Your weather provider "
+            "supplies direct/diffuse irradiance and the 4D model has learned all "
+            "units currently in use — you can turn on the 4D solar model below."
+        ),
+        "enabled_and_ready": (
+            "\n\n✅ 4D solar: enabled and working as intended — your weather data "
+            "supports it and the model is trained."
+        ),
+        "enabled_but_not_ready": (
+            "\n\n⚠️ 4D solar is enabled, but this installation does not meet the "
+            "conditions for it ({reason}). Solar prediction may currently be "
+            "degraded. Consider turning it off below, or run the 'diagnose_solar' "
+            "service and check 'four_d_readiness' for details."
+        ),
+        "not_ready": (
+            "\n\nℹ️ 4D solar: this installation is not ready for it ({reason}). "
+            "Leaving the setting off is recommended. Details in the "
+            "'diagnose_solar' service under 'four_d_readiness'."
+        ),
+    },
+    "nb": {
+        "ready_to_enable": (
+            "\n\n✅ 4D-sol: installasjonen din er klar. Værleverandøren din gir "
+            "direkte/diffus solstråling, og 4D-modellen har lært alle enheter som "
+            "er i bruk nå — du kan slå på 4D-solmodellen nedenfor."
+        ),
+        "enabled_and_ready": (
+            "\n\n✅ 4D-sol: slått på og fungerer som tiltenkt — værdataene dine "
+            "støtter den, og modellen er opplært."
+        ),
+        "enabled_but_not_ready": (
+            "\n\n⚠️ 4D-sol er slått på, men denne installasjonen oppfyller ikke "
+            "vilkårene for den ({reason}). Solprediksjonen kan være svekket nå. "
+            "Vurder å slå den av nedenfor, eller kjør tjenesten «diagnose_solar» "
+            "og se på «four_d_readiness» for detaljer."
+        ),
+        "not_ready": (
+            "\n\nℹ️ 4D-sol: denne installasjonen er ikke klar for den ({reason}). "
+            "Det anbefales å la innstillingen stå av. Detaljer i tjenesten "
+            "«diagnose_solar» under «four_d_readiness»."
+        ),
+    },
+}
+
+# Why a readiness verdict is negative, in user terms.  Both halves can fail
+# at once, so the reasons compose.
+_FOUR_D_REASON_TEXT: dict[str, dict[str, str]] = {
+    "en": {
+        "input": "your weather provider does not supply direct/diffuse irradiance",
+        "learning": "the 4D model has not learned enough yet",
+        "both": (
+            "your weather provider does not supply direct/diffuse irradiance, and "
+            "the 4D model has not learned enough yet"
+        ),
+    },
+    "nb": {
+        "input": "værleverandøren din gir ikke direkte/diffus solstråling",
+        "learning": "4D-modellen har ikke lært nok ennå",
+        "both": (
+            "værleverandøren din gir ikke direkte/diffus solstråling, og "
+            "4D-modellen har ikke lært nok ennå"
+        ),
+    },
+}
+
 
 class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Heating Analytics."""
@@ -119,6 +207,61 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if defaults and key in defaults:
             return defaults[key]
         return default
+
+    def _four_d_readiness_placeholder(self) -> str:
+        """Readiness line for the 4D solar setting, or "" (#1062).
+
+        Surfaces the verdict where the decision is actually made, so the
+        user is not asked a question about their weather provider with
+        nothing at the point of decision telling them the answer.
+
+        Advisory only — never blocks the form.  Returns the empty string
+        whenever readiness cannot be established or the coordinator is
+        unreachable: a config flow that raises while rendering a hint is
+        strictly worse than one that renders no hint.
+        """
+        try:
+            coordinator = self.hass.data.get(DOMAIN, {}).get(self.context["entry_id"])
+            if coordinator is None:
+                return ""
+            readiness = coordinator.evaluate_4d_readiness()
+        except Exception:  # noqa: BLE001 — a hint must never break the form
+            # Warning, not debug: swallowing the exception is required (the
+            # form must open regardless), but a genuine bug in
+            # ``evaluate_4d_readiness`` would otherwise be invisible at the
+            # default log level and present only as a silently missing hint.
+            # Reconfigure is a manual, one-shot flow, so this cannot spam.
+            _LOGGER.warning(
+                "4D readiness could not be evaluated; the reconfigure form "
+                "will render without the readiness hint",
+                exc_info=True,
+            )
+            return ""
+
+        verdict = readiness.get("verdict")
+        lang = getattr(self.hass.config, "language", None) or "en"
+        # HA language codes can be regional ("nb-NO"); match on the base tag.
+        lines = _FOUR_D_READINESS_LINES.get(
+            lang.split("-")[0].lower(), _FOUR_D_READINESS_LINES["en"]
+        )
+        template = lines.get(verdict)
+        if not template:
+            return ""
+        if "{reason}" not in template:
+            return template
+
+        input_ok = readiness.get("input", {}).get("supports_4d_primary") is True
+        learning_ok = readiness.get("learning", {}).get("ready") is True
+        reasons = _FOUR_D_REASON_TEXT.get(
+            lang.split("-")[0].lower(), _FOUR_D_REASON_TEXT["en"]
+        )
+        if not input_ok and not learning_ok:
+            reason = reasons["both"]
+        elif not input_ok:
+            reason = reasons["input"]
+        else:
+            reason = reasons["learning"]
+        return template.format(reason=reason)
 
     def _validate_basics(self, user_input: dict) -> dict[str, str]:
         """Validate step 1: weather entity exists and has temperature if no sensor."""
@@ -337,16 +480,35 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         (feature_config) so no dynamic re-render is ever needed.
 
         ``include_experimental_4d`` adds the ``CONF_EXPERIMENTAL_4D_PRIMARY``
-        toggle.  Only the reconfigure path opts in — the flag is for users
-        who already understand the integration and is deliberately absent
-        from the initial setup wizard.
+        toggle **as the first field**, so it renders directly beneath the
+        readiness verdict that ``async_step_reconfigure_advanced`` injects
+        into the step description.  Only the reconfigure path opts in — the
+        initial setup wizard never shows it.
+
+        Field order is dict insertion order and is load-bearing for that one
+        field; the rest of the page runs high-priority toggles first and the
+        ``--- Lower-priority fields at the bottom ---`` group last.
         """
         g = lambda k, d=None: self._v(user_input, defaults, k, d)
 
         # Derive load-shift default from whether indoor_temp_sensor is already configured
         load_shift = g(_CONF_LOAD_SHIFT, bool(g(CONF_INDOOR_TEMP_SENSOR)))
 
-        schema: dict = {
+        schema: dict = {}
+        # Solar model route (#962, #1062).  FIRST field on the page, because
+        # the readiness verdict it answers to is rendered in the step
+        # description immediately above it — the two must read as one unit.
+        # Previously this sat 17 fields down, so the verdict at the top of
+        # the page referred to a control the user had to scroll to find.
+        # Dict insertion order is the rendered field order, hence the
+        # separate insert ahead of the literal below.
+        # Reconfigure-only — the initial setup wizard never exposes this.
+        if include_experimental_4d:
+            schema[vol.Optional(
+                CONF_EXPERIMENTAL_4D_PRIMARY,
+                default=bool(g(CONF_EXPERIMENTAL_4D_PRIMARY, DEFAULT_EXPERIMENTAL_4D_PRIMARY)),
+            )] = selector.BooleanSelector()
+        schema.update({
             vol.Optional(CONF_DAILY_LEARNING_MODE, default=g(CONF_DAILY_LEARNING_MODE, False)): selector.BooleanSelector(),
             vol.Optional(_CONF_LOAD_SHIFT, default=bool(load_shift)): selector.BooleanSelector(),
             vol.Optional(CONF_TRACK_C, default=g(CONF_TRACK_C, False)): selector.BooleanSelector(),
@@ -407,7 +569,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             # Derive dedicated-wind default from whether a wind sensor is already configured
             vol.Optional(_CONF_DEDICATED_WIND, default=bool(g("wind_speed_sensor"))): selector.BooleanSelector(),
-        }
+        })
         schema[vol.Optional(
             CONF_SECONDARY_WEATHER_ENTITY,
             description={"suggested_value": g(CONF_SECONDARY_WEATHER_ENTITY)},
@@ -443,14 +605,9 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 min=0.5, max=6.0, step=0.5, unit_of_measurement="h", mode="slider"
             )
         )
-        # Experimental: route the live solar read-path through the 4D shadow
-        # pipeline (#962).  No-op until follow-up read-path wiring lands.
-        # Reconfigure-only — initial setup wizard never exposes this.
-        if include_experimental_4d:
-            schema[vol.Optional(
-                CONF_EXPERIMENTAL_4D_PRIMARY,
-                default=bool(g(CONF_EXPERIMENTAL_4D_PRIMARY, DEFAULT_EXPERIMENTAL_4D_PRIMARY)),
-            )] = selector.BooleanSelector()
+        # (CONF_EXPERIMENTAL_4D_PRIMARY was here; it is now inserted first so
+        # it sits directly under the readiness verdict in the step
+        # description — see the top of this method.)
         # --- Lower-priority fields at the bottom ---
         schema[vol.Optional("csv_auto_logging", default=g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING))] = selector.BooleanSelector()
         schema[vol.Optional("max_energy_delta", default=g("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA))] = (
@@ -733,6 +890,12 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="reconfigure_advanced",
             data_schema=self._schema_advanced(None, self._flow_data, include_experimental_4d=True),
+            # 4D readiness at the point of decision (#1062).  Warn, don't
+            # refuse — a user who just connected a GHI sensor is correct to
+            # enable 4D before the 30-day source window catches up.
+            description_placeholders={
+                "four_d_readiness": self._four_d_readiness_placeholder(),
+            },
         )
 
     async def async_step_reconfigure_feature_config(self, user_input=None) -> FlowResult:

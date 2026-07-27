@@ -17,6 +17,7 @@ from .const import (
     INEQUALITY_MARGIN,
     INEQUALITY_STEP_SIZE,
     LEARNING_BUFFER_THRESHOLD,
+    THERMAL_REGIME_DOMINANCE_SHARE,
     MODE_HEATING,
     MODE_COOLING,
     MODE_OFF,
@@ -67,7 +68,7 @@ from .const import (
 )
 from .helpers import compute_base_ema_step, solve_gauss_jordan
 from .observation import HourlyObservation, ModelState, LearningConfig
-from .solar import SolarCalculator
+from .solar import SolarCalculator, coefficients_4d_are_learned
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -212,6 +213,262 @@ def _solar_coeff_regime(unit_mode: str) -> str | None:
     if unit_mode in (MODE_COOLING, MODE_GUEST_COOLING):
         return "cooling"
     return None
+
+
+def evaluate_4d_learning_readiness(
+    coeffs_4d_per_unit,
+    solar_affected_entities,
+    unit_modes: dict[str, str] | None = None,
+) -> dict:
+    """Has 4D actually learned enough to be routed live? (#1062)
+
+    The second of the two conditions guarding ``experimental_4d_primary``.
+    The first — does this install's weather input support 4D at all — is
+    ``diagnose_solar.dni_dhi_source_mix``.  Input support alone is not
+    sufficient, because 4D needs more learning than 3D and fails
+    *differently* when it hasn't got it: an unlearned 3D regime falls back
+    to a seeded ``DEFAULT_SOLAR_COEFF_HEATING`` / ``_COOLING``, while an
+    unlearned 4D regime returns the zero-vector.  Routing an untrained
+    install to 4D therefore predicts **zero solar**, silently.
+
+    Fires the read path's own predicate,
+    :func:`solar.coefficients_4d_are_learned`, rather than restating the
+    condition here — if the read path's fire condition changes, this gate
+    follows automatically instead of quietly ceasing to match the cliff it
+    guards.  Note it reads the **4D** coefficient dict: a unit reporting
+    ``current_coefficient_cooling.learned`` in diagnose is describing its
+    3D state and says nothing about 4D readiness.
+
+    Only the **currently active** regime of each entity is checked.  This
+    accepts a bounded transient: a unit that cooled all summer passes on
+    its cooling regime and, on switching to heating, gets zero solar until
+    the heating regime trains — roughly 5 qualifying sunny hours (the 4D
+    cold-start buffer per (entity, regime)), after which NLMS takes over.
+    It is self-healing.  Requiring *all* regimes instead would never pass
+    for a unit that only ever cools, which is strictly worse.
+
+    Entities whose current mode has no solar regime (OFF, DHW — see
+    :func:`_solar_coeff_regime`) **abstain**: they are neither ready nor
+    blocking, because they have no live 4D read to degrade.  When every
+    in-scope entity abstains the verdict is ``None``, not ``False`` — no
+    evidence is not negative evidence, the same distinction
+    ``thermal_regime_for_day`` draws between ``None`` and ``idle``.
+
+    Pure function over data — no coordinator, no I/O — so it can serve
+    diagnose, the config flow, and (later) an automatic router alike.
+
+    Args:
+        coeffs_4d_per_unit: ``_solar_coefficients_4d_per_unit``-shaped map.
+        solar_affected_entities: entities in the solar scope
+            (``coordinator._solar_affected_set``).
+        unit_modes: sparse ``{entity_id: mode}``; absent entities default
+            to ``MODE_HEATING``, matching ``coordinator.get_unit_mode``.
+
+    Returns:
+        dict with ``ready`` (``True`` / ``False`` / ``None``), the entity
+        partition, and per-entity detail.
+    """
+    modes = unit_modes if isinstance(unit_modes, dict) else {}
+    coeffs = coeffs_4d_per_unit if isinstance(coeffs_4d_per_unit, dict) else {}
+    scope = sorted(solar_affected_entities or [])
+
+    per_entity: dict[str, dict] = {}
+    learned_entities: list[str] = []
+    not_learned_entities: list[str] = []
+    abstained_entities: list[str] = []
+
+    for entity_id in scope:
+        mode = modes.get(entity_id, MODE_HEATING)
+        regime = _solar_coeff_regime(mode)
+        if regime is None:
+            # OFF / DHW — no live 4D read on this entity, so it neither
+            # qualifies nor blocks.
+            abstained_entities.append(entity_id)
+            per_entity[entity_id] = {
+                "mode": mode,
+                "regime": None,
+                "learned_4d": None,
+            }
+            continue
+        entity_coeffs = coeffs.get(entity_id)
+        regime_coeff = (
+            entity_coeffs.get(regime) if isinstance(entity_coeffs, dict) else None
+        )
+        learned = coefficients_4d_are_learned(regime_coeff)
+        (learned_entities if learned else not_learned_entities).append(entity_id)
+        per_entity[entity_id] = {
+            "mode": mode,
+            "regime": regime,
+            "learned_4d": learned,
+        }
+
+    n_evaluated = len(learned_entities) + len(not_learned_entities)
+    if n_evaluated == 0:
+        ready: bool | None = None
+        reason = "no_entities_in_active_regime" if scope else "no_entities_in_solar_scope"
+    elif not_learned_entities:
+        ready = False
+        reason = "regimes_not_learned"
+    else:
+        ready = True
+        reason = "all_active_regimes_learned"
+
+    return {
+        "ready": ready,
+        "reason": reason,
+        "entities_in_scope": len(scope),
+        "entities_evaluated": n_evaluated,
+        "entities_learned": learned_entities,
+        "entities_not_learned": not_learned_entities,
+        "entities_abstained": abstained_entities,
+        "per_entity": per_entity,
+    }
+
+
+def regime_energy_split(
+    unit_modes: dict[str, str],
+    unit_energy_kwh: dict[str, float],
+) -> tuple[float, float]:
+    """Sum per-unit energy into (heating_kwh, cooling_kwh) by regime.
+
+    Iterates the *energy* map and resolves each entity's mode with a
+    ``MODE_HEATING`` default, rather than iterating ``unit_modes``.  Both
+    mode maps in this codebase are **sparse**: ``coordinator._unit_modes``
+    starts empty and is written only when the user explicitly sets a mode
+    via the select entity, and ``hourly_log[...]["unit_modes"]`` filters
+    ``MODE_HEATING`` out deliberately to reduce log clutter.  Iterating the
+    mode map would therefore skip every default-mode unit — on a heating-only
+    install where nobody has touched a select, it would see nothing at all
+    and report an idle building forever.  Same trap, same fix as the
+    heating-active gate in ``hourly_processor`` (see its comment); the
+    default matches ``coordinator.get_unit_mode``.
+
+    Routes through ``_solar_coeff_regime`` so the mode → regime mapping has
+    one source; ``None`` modes (OFF, DHW, unknown) are excluded from *both*
+    sides.  DHW in particular must not count: it consumes real energy but is
+    not driven by outdoor conditions at all, so including it would make a
+    DHW-heavy summer day read as though it carried heating demand.
+
+    Guest modes DO count, unlike in global learning
+    (``MODES_EXCLUDED_FROM_GLOBAL_LEARNING``).  This is a reporting split,
+    not a learning one — guest units consume, and the user experiences that
+    consumption as part of the building's behaviour.
+    """
+    heating_kwh = 0.0
+    cooling_kwh = 0.0
+
+    for entity_id, energy in unit_energy_kwh.items():
+        energy = energy or 0.0
+        if energy <= 0.0:
+            continue
+        regime = _solar_coeff_regime(unit_modes.get(entity_id, MODE_HEATING))
+        if regime is None:
+            continue
+        if regime == "heating":
+            heating_kwh += energy
+        else:
+            cooling_kwh += energy
+
+    return heating_kwh, cooling_kwh
+
+
+def classify_thermal_regime_from_split(
+    heating_kwh: float,
+    cooling_kwh: float,
+) -> str:
+    """Apply the regime label rule to an already-computed energy split.
+
+    Split out so stored daily splits classify by exactly the same rule as
+    live state, and so a future change to
+    ``THERMAL_REGIME_DOMINANCE_SHARE`` reclassifies history rather than
+    leaving stale labels behind — which is why ``daily_history`` persists
+    the split and not the label.
+    """
+    total = heating_kwh + cooling_kwh
+
+    if total < ENERGY_GUARD_THRESHOLD:
+        return "idle"
+
+    # Each share is compared against the threshold directly rather than one
+    # against `1 - threshold`: the subtraction is not exact in binary
+    # (1.0 - 0.8 == 0.19999999999999996), which would make an exact 20/80
+    # split miss the cooling branch and fall through to "mixed".
+    if heating_kwh / total >= THERMAL_REGIME_DOMINANCE_SHARE:
+        return "heating"
+    if cooling_kwh / total >= THERMAL_REGIME_DOMINANCE_SHARE:
+        return "cooling"
+    return "mixed"
+
+
+def dominant_thermal_regime_from_split(
+    heating_kwh: float,
+    cooling_kwh: float,
+) -> str | None:
+    """Dominant side of an already-computed energy split, or None if idle."""
+    if heating_kwh + cooling_kwh < ENERGY_GUARD_THRESHOLD:
+        return None
+    return "heating" if heating_kwh >= cooling_kwh else "cooling"
+
+
+def classify_thermal_regime(
+    unit_modes: dict[str, str],
+    unit_energy_kwh: dict[str, float],
+) -> str:
+    """Classify the building-level thermal regime for reporting (#1051).
+
+    Returns ``"heating"``, ``"cooling"``, ``"mixed"`` or ``"idle"``.
+
+    **The modes must be the ones in force while that energy was consumed.**
+    Pairing current modes with energy accumulated over a longer span
+    misattributes the whole span to whatever mode happens to be active now —
+    a unit that heated 20 kWh overnight and then cooled 1 kWh would classify
+    as 21 kWh of cooling.  Callers spanning more than one mode period must
+    accumulate the split per hour (see ``regime_energy_split`` +
+    ``classify_thermal_regime_from_split``) rather than calling this with a
+    running total.
+
+    The split is weighted by *demand*, not by unit count: six radiators
+    heating alongside one hard-running AC is not "mostly heating" if the AC
+    dominates consumption.
+
+    ``THERMAL_REGIME_DOMINANCE_SHARE`` (0.8) rather than a bare majority,
+    because the point of the label is to decide whether one regime's sign
+    conventions can be applied to the whole building.  At a 60/40 split they
+    cannot — the minority regime's demand is far too large to describe with
+    the majority's semantics — so that case is ``"mixed"`` and callers are
+    expected to avoid directional claims rather than pick a side.
+
+    Pure function over (modes, energies) so historical callers can classify
+    a past day from logged ``unit_modes`` + ``unit_breakdown`` with the same
+    rule the live path uses.
+    """
+    return classify_thermal_regime_from_split(
+        *regime_energy_split(unit_modes, unit_energy_kwh)
+    )
+
+
+def dominant_thermal_regime(
+    unit_modes: dict[str, str],
+    unit_energy_kwh: dict[str, float],
+) -> str | None:
+    """Which regime's semantics to apply, collapsing ``mixed`` to its side.
+
+    Returns ``"heating"``, ``"cooling"`` or ``None`` (no thermal demand).
+
+    Separate from :func:`classify_thermal_regime` because the two answer
+    different questions.  The label is what gets *reported* — ``"mixed"``
+    honestly says the building is doing both.  This one is what a consumer
+    that must pick a single convention should use.  Magnitude-style
+    consumers (which stressor is largest) can act on the dominant side even
+    when the split is not clean; directional consumers (does sun raise or
+    lower consumption) should branch on the label instead and decline to
+    assert a direction under ``"mixed"``.
+    """
+    heating_kwh, cooling_kwh = regime_energy_split(unit_modes, unit_energy_kwh)
+
+    if heating_kwh + cooling_kwh < ENERGY_GUARD_THRESHOLD:
+        return None
+    return "heating" if heating_kwh >= cooling_kwh else "cooling"
 
 
 def _resolve_min_base(

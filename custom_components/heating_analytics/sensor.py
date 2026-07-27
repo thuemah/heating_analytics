@@ -110,7 +110,6 @@ from .const import (
     ATTR_SOLAR_IMPACT,
     ATTR_SOLAR_POTENTIAL,
     ATTR_SOLAR_GAIN_NOW,
-    ATTR_HEATING_LOAD_OFFSET,
     ATTR_RECOMMENDATION_STATE,
 
     # Mode constants
@@ -373,53 +372,94 @@ class HeatingExpectedEnergyTodaySensor(HeatingAnalyticsBaseSensor):
         eff_wind = coordinator.data.get("effective_wind", 0.0)
         solar_impact = coordinator.data.get(ATTR_SOLAR_IMPACT, 0.0)
 
-        # 1. Wind Penalty (Effective Wind vs 0 Wind)
+        # Each stressor is a *marginal* contribution measured against one
+        # common reference state, so the terms are directly comparable and
+        # sum exactly to the load above that reference.
+        #
+        # Previously the comparison mixed scales: "Temp" carried the whole
+        # zero-wind load (a level, baseload included) while wind and solar
+        # carried deltas.  "Wind" could then only win the max() if
+        # `res_actual > 2 * res_no_wind` — wind more than doubling total
+        # consumption, structurally unreachable — so the attribute was
+        # effectively pinned to "Temp".
+        #
+        # The reference is the *least-demanding* state for the active regime,
+        # which keeps every term non-negative in both:
+        #   heating — balance point, no wind, clear sky (sun offsets demand)
+        #   cooling — balance point, no sun          (sun adds demand)
+        # Attribution is sequential; each term is the cost of relaxing one
+        # condition toward the actual state.
+        #
         # Sensitivity / "what-if" attributes — force_3d keeps the diagnostic
         # tied to the 3D rollback model regardless of experimental_4d_primary.
-        res_actual = stats_mgr.calculate_total_power(
-            current_temp, eff_wind, solar_impact, is_aux_active=coordinator.auxiliary_heating_active,
-            force_3d=True,
-        )
-        res_no_wind = stats_mgr.calculate_total_power(
-            current_temp, 0.0, solar_impact, is_aux_active=coordinator.auxiliary_heating_active,
-            force_3d=True,
-        )
-        wind_penalty_rate = max(0.0, res_actual["total_kwh"] - res_no_wind["total_kwh"])
+        regime = coordinator.thermal_regime
+        # "mixed" resolves to its dominant side: the driver names a magnitude,
+        # not a direction, so the dominant regime's framing is still
+        # informative.  Directional consumers must branch on `regime` itself.
+        is_cooling = coordinator.dominant_thermal_regime == "cooling"
 
-        # 2. Temp Load (Thermodynamic Base Load)
-        # res_no_wind represents the thermal load at 0 wind.
-        temp_load_rate = res_no_wind["total_kwh"]
-
-        # 3. Solar Deficit (Max Potential Solar - Actual Solar)
-        # "Why is heating high? Because it's dark/cloudy."
-        solar_deficit_rate = 0.0
-        solar_gain_rate = res_actual["breakdown"]["solar_reduction_kwh"]
-
+        ref_sky_kwargs = {}
         if coordinator.solar_enabled:
-            # Calculate Theoretical Max Solar (Cloud = 0)
-            elev, azim = coordinator.solar.get_approx_sun_pos(now)
-            max_solar_factor = coordinator.solar.calculate_solar_factor(elev, azim, cloud_coverage=0.0)
+            if is_cooling:
+                ref_sky_kwargs["override_solar_factor"] = 0.0
+            else:
+                elev, azim = coordinator.solar.get_approx_sun_pos(now)
+                ref_sky_kwargs["override_solar_factor"] = coordinator.solar.calculate_solar_factor(
+                    elev, azim, cloud_coverage=0.0
+                )
 
-            res_max_solar = stats_mgr.calculate_total_power(
-                current_temp, eff_wind, solar_impact,
+        def _driver_power(temp: float, wind: float, ref_sky: bool) -> float:
+            return stats_mgr.calculate_total_power(
+                temp, wind, solar_impact,
                 is_aux_active=coordinator.auxiliary_heating_active,
-                override_solar_factor=max_solar_factor,
                 force_3d=True,
-            )
-            max_potential_gain = res_max_solar["breakdown"]["solar_reduction_kwh"]
-            solar_deficit_rate = max(0.0, max_potential_gain - solar_gain_rate)
+                **(ref_sky_kwargs if ref_sky else {}),
+            )["total_kwh"]
 
-        # Determine Primary Driver
-        # Instruction: max(wind_penalty, solar_deficit, temp_deviation)
-        # We compare the relative impact (kW) of each stressor.
-        drivers = {
-            "Temp": temp_load_rate,
-            "Wind": wind_penalty_rate,
-            "Solar_Deficit": solar_deficit_rate
-        }
-        primary_driver = max(drivers, key=drivers.get) if any(drivers.values()) else "None"
+        if is_cooling:
+            # Wind is deliberately absent from the cooling driver set.  Under
+            # cooling it is a mitigator, not a stressor — but there is also no
+            # signal to report: per-unit cooling samples route to the dedicated
+            # COOLING_WIND_BUCKET regardless of actual wind, so the per-unit
+            # cooling model is wind-independent by construction.  Any wind term
+            # here would come from the global model's heating-shaped wind
+            # response and would invert the physics.  Holding wind fixed across
+            # the reference and temp evaluations keeps it out of attribution
+            # instead of misattributing it.
+            ref_kwh = _driver_power(coordinator.balance_point, eff_wind, ref_sky=True)
+            temp_kwh = _driver_power(current_temp, eff_wind, ref_sky=True)
+            actual_kwh = _driver_power(current_temp, eff_wind, ref_sky=False)
+
+            drivers = {
+                # Warmth above the balance point.
+                "Temp": max(0.0, temp_kwh - ref_kwh),
+                # Sun as measured load, not as a deficit against clear sky.
+                "Solar_Load": max(0.0, actual_kwh - temp_kwh),
+            }
+        else:
+            ref_kwh = _driver_power(coordinator.balance_point, 0.0, ref_sky=True)
+            temp_kwh = _driver_power(current_temp, 0.0, ref_sky=True)
+            temp_wind_kwh = _driver_power(current_temp, eff_wind, ref_sky=True)
+            actual_kwh = _driver_power(current_temp, eff_wind, ref_sky=False)
+
+            drivers = {
+                # Cost of being away from the balance point.
+                "Temp": max(0.0, temp_kwh - ref_kwh),
+                # Cost of the wind on top of that.
+                "Wind": max(0.0, temp_wind_kwh - temp_kwh),
+                # Cost of the sky being darker than clear.  Zero by
+                # construction when solar is disabled (no override, so both
+                # calls run identical conditions) and at night (factor 0).
+                "Solar_Deficit": max(0.0, actual_kwh - temp_wind_kwh),
+            }
+
+        # Every term clamps at 0, so max() on an all-quiet state is meaningless
+        # — report "None" rather than an arbitrary winner among zeros.
+        top_driver = max(drivers, key=drivers.get)
+        primary_driver = top_driver if drivers[top_driver] > ENERGY_GUARD_THRESHOLD else "None"
 
         attrs["primary_driver"] = primary_driver
+        attrs["thermal_regime"] = regime
 
         # Wind Chill Penalty kWh (Daily Impact)
         # Uses the precise calculation from the coordinator (Past Actuals + Future Forecast)
@@ -764,6 +804,12 @@ class HeatingDeviationSensor(HeatingAnalyticsBaseSensor):
             "accumulated_cooling_kwh": round(
                 self.coordinator.data.get("accumulated_cooling_kwh", 0.0), 1
             ),
+            # Label for the two figures above, so a consumer reading the
+            # heating/cooling pair does not have to re-derive the dominance
+            # rule.  Same day scope as they are — deliberately not added to
+            # the last-hour sensors, which describe a different span than
+            # this label covers.
+            "thermal_regime": self.coordinator.thermal_regime,
             "accumulated_guest_impact_kwh": self.coordinator.data.get(
                 "accumulated_guest_impact_kwh", 0.0
             ),

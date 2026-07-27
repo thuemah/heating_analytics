@@ -22,6 +22,55 @@ from .const import (
     DEFAULT_EXTREME_WIND_THRESHOLD,
 )
 
+# Expected sign of the correlation between a weather delta and the resulting
+# consumption delta, per thermal regime (#1051).
+#
+#   -1  the two move oppositely (colder -> more heating; less sun -> more heating)
+#   +1  the two move together   (warmer -> more cooling; more sun -> more cooling)
+# None no directional claim may be made
+#
+# One map serves both the causality test and the prose, so the two cannot
+# drift into disagreeing about which direction counts as an explanation.
+#
+# Wind is None under cooling deliberately.  Physically it relieves cooling
+# demand, but there is no signal to back a claim either way: per-unit cooling
+# samples route to COOLING_WIND_BUCKET regardless of actual wind, so the
+# cooling model is wind-independent by construction (see CLAUDE.md, and the
+# matching exclusion from the cooling driver set in sensor.py).
+#
+# "mixed" carries no entry at all: with both regimes running at comparable
+# scale, neither set of signs describes the building, so every directional
+# claim is withheld rather than resolved to the larger side.  Magnitude
+# categorisation is unaffected — it never depended on direction.
+REGIME_WEATHER_CORRELATION: dict[str, dict[str, int | None]] = {
+    "heating": {"temp": -1, "wind": +1, "solar": -1},
+    "cooling": {"temp": +1, "wind": None, "solar": +1},
+    "mixed": {"temp": None, "wind": None, "solar": None},
+}
+
+# Regime assumed when none can be resolved — an unrecorded historical day, an
+# install with no coordinator attached, or an idle day.  Matches the
+# integration's default-mode-is-heating convention and keeps pre-#1051
+# behaviour intact.
+DEFAULT_THERMAL_REGIME = "heating"
+
+
+def _weather_correlation(regime: str | None, factor: str) -> int | None:
+    """Expected weather/consumption correlation for a factor under a regime.
+
+    Only ``"mixed"`` suppresses claims wholesale, and it does so because the
+    building genuinely ran both ways.  Anything unrecognised — ``None``,
+    ``"idle"``, a value from some future release — falls back to heating
+    rather than muting the explanation layer.  Silently withholding every
+    directional claim on an unknown label would be a failure mode that hides:
+    the prose degrades to bare "Higher consumption" with nothing to indicate
+    why.
+    """
+    if regime not in REGIME_WEATHER_CORRELATION:
+        regime = DEFAULT_THERMAL_REGIME
+    return REGIME_WEATHER_CORRELATION[regime].get(factor)
+
+
 # Thresholds for categorization
 # These match the design spec but can be adjusted later via config if needed.
 class CategoryThresholds:
@@ -118,6 +167,38 @@ class WeatherImpactAnalyzer:
         self.coordinator = coordinator
         self.thresholds = CategoryThresholds()
 
+    def _resolve_regime(self, date_str: str | None) -> str | None:
+        """Thermal regime of the day being explained, or None if unknown.
+
+        The regime that matters is the one for the period being *described*,
+        not the baseline it is measured against — the baseline is a reference
+        point, not a thing whose consumption we are attributing.  That matters
+        practically: the current side is always inside the hourly-log
+        retention window, while a year-ago baseline usually is not.
+
+        Falls back to live coordinator state for today, which has no
+        ``daily_history`` entry until midnight.  Returns None — not a guess —
+        for any other unrecorded day, and callers treat None as the default
+        heating framing.
+        """
+        if not self.coordinator:
+            return None
+
+        regime = None
+        if date_str:
+            regime = self.coordinator.thermal_regime_for_day(date_str)
+
+        if regime is None and date_str:
+            try:
+                from homeassistant.util import dt as dt_util
+
+                if date_str == dt_util.now().date().isoformat():
+                    regime = self.coordinator.thermal_regime
+            except Exception:  # pragma: no cover - defensive, HA always present
+                pass
+
+        return regime
+
     def analyze_day(self, day_data: Dict, baseline_data: Dict) -> Dict:
         """Analyze single day's weather impact vs baseline.
 
@@ -128,6 +209,7 @@ class WeatherImpactAnalyzer:
         Returns:
             Analysis dict with impacts and deltas.
         """
+        regime = self._resolve_regime(day_data.get('date'))
         # Temperature Analysis
         curr_temp = day_data.get('temp')
         base_temp = baseline_data.get('temp')
@@ -152,26 +234,37 @@ class WeatherImpactAnalyzer:
         wind_delta = curr_wind - base_wind
 
         curr_bucket = day_data.get('wind_bucket', 'normal')
-
-        # If baseline bucket isn't provided, infer from wind speed using coordinator logic (if available)
-        # or simplified fallback
         base_bucket = baseline_data.get('wind_bucket')
-        if not base_bucket and self.coordinator:
-            # Use coordinator to get bucket for baseline wind
-            base_bucket = self.coordinator._get_wind_bucket(base_wind)
-        elif not base_bucket:
-             # Fallback if no coordinator attached (e.g. tests)
-             # Mimic default thresholds using constants
-             if base_wind >= DEFAULT_EXTREME_WIND_THRESHOLD: base_bucket = 'extreme_wind'
-             elif base_wind >= DEFAULT_WIND_THRESHOLD: base_bucket = 'high_wind'
-             else: base_bucket = 'normal'
 
-        wind_impact = self.thresholds.get_wind_impact(curr_bucket, base_bucket)
+        if baseline_data.get('wind') is None and not base_bucket:
+            # A baseline day with no recorded weather carries wind=None and
+            # wind_bucket=None (see sensors/comparison.py).  Inferring a bucket
+            # from the `or 0.0` default above would fabricate a dead-calm
+            # baseline and attribute the whole of the current day's wind as a
+            # change — reporting "wind was significantly higher than last year"
+            # when the truth is that last year has no data.  Mirror the
+            # temperature path, which already requires both sides to be present.
+            wind_delta = 0.0
+            wind_impact = 'normal'
+        else:
+            # If baseline bucket isn't provided, infer from wind speed using coordinator logic (if available)
+            # or simplified fallback
+            if not base_bucket and self.coordinator:
+                # Use coordinator to get bucket for baseline wind
+                base_bucket = self.coordinator._get_wind_bucket(base_wind)
+            elif not base_bucket:
+                # Fallback if no coordinator attached (e.g. tests)
+                # Mimic default thresholds using constants
+                if base_wind >= DEFAULT_EXTREME_WIND_THRESHOLD: base_bucket = 'extreme_wind'
+                elif base_wind >= DEFAULT_WIND_THRESHOLD: base_bucket = 'high_wind'
+                else: base_bucket = 'normal'
 
-        # Refine wind impact: if buckets are same but speed diff is large?
-        # Let's say if bucket matches but speed is significantly higher (+2.5 m/s), treat as moderate
-        if wind_impact == 'normal' and wind_delta >= 2.5:
-             wind_impact = 'moderate'
+            wind_impact = self.thresholds.get_wind_impact(curr_bucket, base_bucket)
+
+            # Refine wind impact: if buckets are same but speed diff is large?
+            # Let's say if bucket matches but speed is significantly higher (+2.5 m/s), treat as moderate
+            if wind_impact == 'normal' and wind_delta >= 2.5:
+                wind_impact = 'moderate'
 
         # Solar Analysis
         curr_solar = day_data.get('solar_kwh') or 0.0
@@ -193,7 +286,9 @@ class WeatherImpactAnalyzer:
         delta_kwh = curr_kwh - base_kwh
 
         # Check Causality (Did weather cause this?)
-        causality = self.check_causality(delta_kwh, temp_delta, wind_delta, solar_delta)
+        causality = self.check_causality(
+            delta_kwh, temp_delta, wind_delta, solar_delta, regime=regime
+        )
 
         return {
             'date': day_data.get('date'),
@@ -206,43 +301,52 @@ class WeatherImpactAnalyzer:
             'combined_severity': combined,
             'kwh_delta': delta_kwh,
             'delta_kwh': delta_kwh, # Alias for consistency with period analysis
-            'causality': causality
+            'causality': causality,
+            'thermal_regime': regime,
         }
 
-    def check_causality(self, kwh_delta: float, temp_delta: float, wind_delta: float, solar_delta: float) -> Dict:
-        """Check if weather changes explain consumption change."""
-        # Logic:
-        # Colder (negative temp_delta) -> Should increase consumption (positive kwh_delta)
-        # Warmer (positive temp_delta) -> Should decrease consumption (negative kwh_delta)
-        # More Wind (positive wind_delta) -> Should increase consumption
-        # More Solar (positive solar_delta) -> Should decrease consumption (negative kwh_delta)
+    def check_causality(
+        self,
+        kwh_delta: float,
+        temp_delta: float,
+        wind_delta: float,
+        solar_delta: float,
+        regime: str | None = None,
+    ) -> Dict:
+        """Check if weather changes explain consumption change.
 
-        temp_driver = False
-        temp_contradicts = False
+        Direction is resolved per thermal regime via
+        ``REGIME_WEATHER_CORRELATION``.  Under heating, colder / windier /
+        darker raise consumption; under cooling, warmer and sunnier raise it
+        while wind carries no defensible direction.  Under ``mixed`` — and
+        for any factor whose correlation is ``None`` — no claim is made in
+        either direction.
 
-        if abs(temp_delta) >= self.thresholds.TEMP_MODERATE:
-            if temp_delta < 0 and kwh_delta > 0: temp_driver = True
-            elif temp_delta > 0 and kwh_delta < 0: temp_driver = True
-            elif temp_delta > 0 and kwh_delta > 0: temp_contradicts = True
-            elif temp_delta < 0 and kwh_delta < 0: temp_contradicts = True
+        Bit-identical to the pre-#1051 logic when ``regime`` resolves to
+        heating, which is also what an unresolvable regime falls back to.
+        """
 
-        wind_driver = False
-        wind_contradicts = False
+        def _classify(delta: float, threshold: float, factor: str) -> tuple[bool, bool]:
+            correlation = _weather_correlation(regime, factor)
+            if correlation is None or abs(delta) < threshold:
+                return False, False
+            # Aligned when the weather moved in the direction that this regime
+            # says produces the observed consumption change.
+            if delta * correlation * kwh_delta > 0:
+                return True, False
+            if delta != 0 and kwh_delta != 0:
+                return False, True
+            return False, False
 
-        if abs(wind_delta) >= self.thresholds.WIND_RELEVANCE:
-            if wind_delta > 0 and kwh_delta > 0: wind_driver = True
-            elif wind_delta < 0 and kwh_delta < 0: wind_driver = True
-            elif wind_delta < 0 and kwh_delta > 0: wind_contradicts = True
-            elif wind_delta > 0 and kwh_delta < 0: wind_contradicts = True
-
-        solar_driver = False
-        solar_contradicts = False
-
-        if abs(solar_delta) >= self.thresholds.SOLAR_RELEVANCE:
-            if solar_delta < 0 and kwh_delta > 0: solar_driver = True # Less sun -> More energy
-            elif solar_delta > 0 and kwh_delta < 0: solar_driver = True # More sun -> Less energy
-            elif solar_delta > 0 and kwh_delta > 0: solar_contradicts = True
-            elif solar_delta < 0 and kwh_delta < 0: solar_contradicts = True
+        temp_driver, temp_contradicts = _classify(
+            temp_delta, self.thresholds.TEMP_MODERATE, "temp"
+        )
+        wind_driver, wind_contradicts = _classify(
+            wind_delta, self.thresholds.WIND_RELEVANCE, "wind"
+        )
+        solar_driver, solar_contradicts = _classify(
+            solar_delta, self.thresholds.SOLAR_RELEVANCE, "solar"
+        )
 
         return {
             'temp_explains': temp_driver,
@@ -338,6 +442,31 @@ class WeatherImpactAnalyzer:
                 primary_factor, primary_impact = potential_drivers[0]
                 self._increment_driver(driver_counts, primary_factor, primary_impact)
 
+        # Period regime: the days' own regimes, collapsed.  Two kinds of day
+        # abstain rather than voting:
+        #
+        #   None  — no recorded regime, so no evidence either way.
+        #   idle  — the building did no heating or cooling that day.  An idle
+        #           day carries no sign convention to contribute, and letting
+        #           it count would collapse the period to "mixed" and suppress
+        #           the characterization for every other day: a single day
+        #           away over a cold week would hide "Significantly Colder".
+        #
+        # Disagreement among the days that *do* carry a convention means the
+        # period ran both ways, and no single set of signs describes it —
+        # "mixed", which withholds directional claims.
+        voting_regimes = {
+            res.get('thermal_regime')
+            for res in daily_analysis
+            if res.get('thermal_regime') not in (None, 'idle')
+        }
+        if not voting_regimes:
+            period_regime = None
+        elif len(voting_regimes) == 1:
+            period_regime = voting_regimes.pop()
+        else:
+            period_regime = "mixed"
+
         # Structure Drivers List
         drivers_list = []
 
@@ -353,7 +482,16 @@ class WeatherImpactAnalyzer:
                     'factor': factor,
                     'impact': imp,
                     'affected_days': count,
-                    'details': driver_counts[factor]
+                    'details': driver_counts[factor],
+                    # Aggregate weather delta for this factor, so the prose can
+                    # name the weather from its own sign rather than inferring
+                    # it from the consumption delta (which only works under
+                    # heating).  See format_day_comparison for the same fix.
+                    'weather_delta': {
+                        'temp': period_temp_delta,
+                        'wind': period_wind_delta,
+                        'solar': period_solar_delta,
+                    }[factor],
                 })
 
         # Sort drivers by impact severity then count
@@ -367,63 +505,61 @@ class WeatherImpactAnalyzer:
         elif day_counts['notable'] > 2: variability = 'medium'
 
         # Characterization (for summary text)
+        #
+        # The direction a driver is *expected* to point is `correlation *
+        # consumption direction`, resolved per regime.  Under heating with
+        # consumption up that reproduces the original hard-coded framing
+        # exactly (cold, windier, cloudier); under cooling it flips to warmth
+        # and sun, and wind drops out entirely because it carries no
+        # defensible direction there.
+        #
+        # The contradiction margins are deliberately NOT unified: temp and
+        # wind require the expected direction to be clearly present (0.5),
+        # while solar only objects when the opposite direction is clearly
+        # present (-0.5).  That asymmetry predates this change and is
+        # preserved verbatim rather than tidied — normalising it would move
+        # heating-install output, which is out of scope here.
+        contradiction_margin = {'temp': 0.5, 'wind': 0.5, 'solar': -0.5}
+        period_deltas = {
+            'temp': period_temp_delta,
+            'wind': period_wind_delta,
+            'solar': period_solar_delta,
+        }
+        # Long form for the headline, short form for the "N of M days" fallback.
+        direction_words = {
+            ('temp', -1): ("Significantly Colder", "colder"),
+            ('temp', +1): ("Significantly Warmer", "warmer"),
+            ('wind', -1): ("Calmer period", "calmer"),
+            ('wind', +1): ("Windier period", "windier"),
+            ('solar', -1): ("Cloudier period", "cloudier"),
+            ('solar', +1): ("Sunnier period", "sunnier"),
+        }
+
         characterization = "Similar to last year"
-        if delta_pct > 5.0:
+        if abs(delta_pct) > 5.0:
+            fallback = "Higher consumption" if delta_pct > 0 else "Lower consumption"
+            characterization = fallback
+
             if drivers_list:
                 top_driver = drivers_list[0]
                 top = top_driver['factor']
                 count = top_driver['affected_days']
 
-                # Check for contradiction with aggregate weather
-                contradiction = False
-                if top == 'temp':
-                    # Driven by Cold, but Period is Warmer (or not clearly colder)
-                    if period_temp_delta > -0.5: contradiction = True
-                    characterization = "Significantly Colder"
-                elif top == 'wind':
-                    # Driven by Wind, but Period is Calmer
-                    if period_wind_delta < 0.5: contradiction = True
-                    characterization = "Windier period"
-                elif top == 'solar':
-                    # Driven by Cloud (low solar), but Period is Sunnier (high solar)
-                    if period_solar_delta > 0.5: contradiction = True
-                    characterization = "Cloudier period"
-                else:
-                    characterization = "Higher consumption"
+                consumption_direction = 1 if delta_pct > 0 else -1
+                correlation = _weather_correlation(period_regime, top)
 
-                if contradiction:
-                    day_word = "day" if count == 1 else "days"
-                    characterization = f"{count} of {valid_days} {day_word} {'colder' if top == 'temp' else 'windier' if top == 'wind' else 'cloudier'}"
-            else:
-                characterization = "Higher consumption"
-        elif delta_pct < -5.0:
-            if drivers_list:
-                top_driver = drivers_list[0]
-                top = top_driver['factor']
-                count = top_driver['affected_days']
+                if correlation is not None and top in period_deltas:
+                    expected_sign = correlation * consumption_direction
+                    long_word, short_word = direction_words[(top, expected_sign)]
+                    characterization = long_word
 
-                # Check for contradiction with aggregate weather
-                contradiction = False
-                if top == 'temp':
-                    # Driven by Warmth, but Period is Colder
-                    if period_temp_delta < 0.5: contradiction = True
-                    characterization = "Significantly Warmer"
-                elif top == 'wind':
-                    # Driven by Calm, but Period is Windier
-                    if period_wind_delta > -0.5: contradiction = True
-                    characterization = "Calmer period"
-                elif top == 'solar':
-                    # Driven by Sun, but Period is Cloudier
-                    if period_solar_delta < -0.5: contradiction = True
-                    characterization = "Sunnier period"
-                else:
-                    characterization = "Lower consumption"
-
-                if contradiction:
-                    day_word = "day" if count == 1 else "days"
-                    characterization = f"{count} of {valid_days} {day_word} {'warmer' if top == 'temp' else 'calmer' if top == 'wind' else 'sunnier'}"
-            else:
-                 characterization = "Lower consumption"
+                    # Contradiction: the aggregate weather does not actually
+                    # move the way the per-day drivers claim.
+                    if period_deltas[top] * expected_sign < contradiction_margin[top]:
+                        day_word = "day" if count == 1 else "days"
+                        characterization = (
+                            f"{count} of {valid_days} {day_word} {short_word}"
+                        )
 
         # Overwrite characterization for forecast context if needed
         if context == 'week_ahead':
@@ -560,48 +696,57 @@ class ExplanationFormatter:
         temp_imp = analysis.get('temp_impact')
         temp_delta = analysis.get('temp_delta', 0.0)
 
+        # Wording describes the *weather*, so it is derived from the weather
+        # delta's own sign rather than from the consumption delta.  The
+        # weather does not change meaning with the regime — only whether it
+        # explains the consumption does, and that is already settled by
+        # `causality`.  Under heating this is bit-identical to deriving from
+        # `delta`, because the causality rule only fires when the two signs
+        # correspond; under cooling, deriving from `delta` would have called
+        # a hot day "colder weather".
+        colder = temp_delta < 0
+
         if causality.get('temp_explains'):
-            if delta > 0: drivers.append("extreme cold" if temp_imp == 'extreme' else "colder weather")
+            if colder: drivers.append("extreme cold" if temp_imp == 'extreme' else "colder weather")
             else: drivers.append("extreme warmth" if temp_imp == 'extreme' else "warmer weather")
         elif causality.get('temp_contradicts'):
             # Check significance for contradiction
             if abs(temp_delta) >= CategoryThresholds.CONTRADICTION_TEMP_DELTA:
-                if delta > 0: contradictions.append("warmer weather") # Usage UP, despite warmth
-                else: contradictions.append("colder weather") # Usage DOWN, despite cold
+                if colder: contradictions.append("colder weather")
+                else: contradictions.append("warmer weather")
 
         # Wind Analysis
         wind_imp = analysis.get('wind_impact')
         wind_delta = analysis.get('wind_delta', 0.0)
 
+        windier = wind_delta > 0
+
+        def _windy_phrase() -> str:
+            if wind_imp == 'extreme': return "stormy weather"
+            if wind_imp == 'significant': return "high wind"
+            return "windy weather"
+
         if causality.get('wind_explains'):
-            if delta > 0:
-                if wind_imp == 'extreme': drivers.append("stormy weather")
-                elif wind_imp == 'significant': drivers.append("high wind")
-                else: drivers.append("windy weather")
-            else:
-                if wind_imp == 'extreme': drivers.append("very calm weather")
-                else: drivers.append("calm weather")
+            if windier: drivers.append(_windy_phrase())
+            else: drivers.append("very calm weather" if wind_imp == 'extreme' else "calm weather")
         elif causality.get('wind_contradicts'):
             # Check significance
             if abs(wind_delta) >= CategoryThresholds.CONTRADICTION_WIND_DELTA:
-                if delta > 0: contradictions.append("calmer weather") # Usage UP, despite calm
-                else:
-                    if wind_imp == 'extreme': contradictions.append("stormy weather")
-                    elif wind_imp == 'significant': contradictions.append("high wind")
-                    else: contradictions.append("windy weather") # Usage DOWN, despite wind
+                # Comparative form on the calm side reads better in the
+                # "offset by ..." clause, and is the pre-#1051 wording.
+                if windier: contradictions.append(_windy_phrase())
+                else: contradictions.append("calmer weather")
 
         # Solar Analysis
         solar_delta = analysis.get('solar_delta', 0.0)
+        sunnier = solar_delta > 0
 
         if causality.get('solar_explains'):
-            solar_imp = analysis.get('solar_impact')
-            if delta > 0: drivers.append("cloudier weather")
-            else: drivers.append("sunny weather")
+            drivers.append("sunny weather" if sunnier else "cloudier weather")
         elif causality.get('solar_contradicts'):
              # Check significance for contradiction
              if abs(solar_delta) >= CategoryThresholds.CONTRADICTION_SOLAR_KWH:
-                 if delta > 0: contradictions.append("sunny weather") # Usage UP, despite sun
-                 else: contradictions.append("cloudy weather") # Usage DOWN, despite clouds
+                 contradictions.append("sunny weather" if sunnier else "cloudy weather")
 
         sign = "+" if delta > 0 else ""
 
@@ -634,7 +779,9 @@ class ExplanationFormatter:
 
         reasons = []
         for d in drivers:
-            reasons.append(self._get_factor_description(d['factor'], d['impact'], delta_kwh))
+            reasons.append(self._get_factor_description(
+                d['factor'], d['impact'], delta_kwh, d.get('weather_delta')
+            ))
 
         reason_text = " + ".join(reasons)
         return f"Driven by {day_text} ({reason_text})."
@@ -647,23 +794,44 @@ class ExplanationFormatter:
         parts = []
         for d in drivers:
             count = d['affected_days']
-            desc = self._get_factor_description(d['factor'], d['impact'], delta_kwh)
+            desc = self._get_factor_description(
+                d['factor'], d['impact'], delta_kwh, d.get('weather_delta')
+            )
             day_word = "day" if count == 1 else "days"
             parts.append(f"{count} {desc} {day_word}")
 
         return "Driven by " + " and ".join(parts)
 
-    def _get_factor_description(self, factor, impact, delta_kwh):
-        """Get description string for factor/impact."""
+    def _get_factor_description(self, factor, impact, delta_kwh, weather_delta=None):
+        """Get description string for factor/impact.
+
+        Names the weather from its own aggregate delta when available.  Under
+        heating that is equivalent to reading it off ``delta_kwh`` — the
+        causality rule only counts a factor as a driver when the two signs
+        correspond — but under cooling the consumption delta points the other
+        way, and inferring from it would describe a hot week as "cold".
+
+        ``weather_delta=None`` keeps the legacy consumption-delta inference
+        for any caller that has not been updated.
+        """
+        if weather_delta is None:
+            colder = delta_kwh > 0
+            windier = delta_kwh > 0
+            sunnier = delta_kwh <= 0
+        else:
+            colder = weather_delta < 0
+            windier = weather_delta > 0
+            sunnier = weather_delta > 0
+
         if factor == 'temp':
-            if delta_kwh > 0: return "extreme cold" if impact == 'extreme' else "cold"
+            if colder: return "extreme cold" if impact == 'extreme' else "cold"
             else: return "extreme warmth" if impact == 'extreme' else "warm"
         elif factor == 'wind':
-            if delta_kwh > 0: return "stormy" if impact == 'extreme' else "windy"
+            if windier: return "stormy" if impact == 'extreme' else "windy"
             else: return "very calm" if impact == 'extreme' else "calm"
         elif factor == 'solar':
-            if delta_kwh > 0: return "cloudy" # More usage -> Less sun
-            else: return "sunny" # Less usage -> More sun
+            if sunnier: return "sunny"
+            else: return "cloudy"
         return factor
 
     def format_comparison_summary(self, comparison: Dict) -> str:

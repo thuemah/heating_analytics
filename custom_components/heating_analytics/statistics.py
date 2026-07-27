@@ -70,6 +70,127 @@ _LOGGER = logging.getLogger(__name__)
 # 0.1 TDD ~ 2.4 Degree-Hours (e.g., 2.4C delta for 1 hour, or 12C delta for 12 mins)
 MIN_STABLE_TDD = 0.1
 
+
+def allocate_anchor_partitions(
+    *,
+    global_base: float,
+    global_aux_reduction: float,
+    global_solar_effect: float,
+    unit_sum_base: float,
+    sum_base_aux_affected: float,
+    base_heating_in_scope: float,
+    base_cooling_in_scope: float,
+    base_not_in_scope: float,
+    sum_applied_heating: float,
+    sum_applied_cooling: float,
+) -> tuple[float, float, float]:
+    """Allocate the global anchor across the per-(scope, mode) partitions.
+
+    Shared by ``calculate_total_power`` (3D) and
+    ``calculate_total_power_4d``.  The two pipelines differ only in how
+    pass 1 computes solar; this allocation is pipeline-agnostic
+    arithmetic on already-computed aggregates and must stay identical
+    between them, otherwise the ``4D − 3D`` comparison surfaces mix
+    accounting divergence into what is meant to be a pure attribution
+    metric.
+
+    The global model is the magnitude anchor for ``total_kwh`` (#1035 —
+    Component Boundary Invariant #8).  #1035 reverts #992 commit 2's
+    per-unit-sum anchor (which lacked the global U-curve's
+    self-correction above the balance point and was vulnerable to
+    thermostatic-load contamination — inflating warm/shoulder-day
+    predictions) while keeping commit 1's solar partitions.  Per-unit
+    base is attribution only (``unit_breakdown``); the global base
+    governs the magnitude.
+
+    Anchor: ``max(0, global_base − min(global_aux_reduction,
+    global_base × (Σ base_aux_affected / Σ base)))``.  The ``min()`` is
+    the scoped-aux clamp that closes the leak commit 2 was justified by:
+    aux can reduce demand by at most the aux-affected entities' share of
+    base, so the global aux reduction can never delete out-of-scope
+    base.  This is the narrow clamp the leak actually called for — not
+    an architecture swap.
+
+    The ceiling is expressed in the GLOBAL anchor scale (#1035
+    follow-up, bug 1).  ``sum_base_aux_affected`` is a per-unit base sum
+    while ``global_aux_reduction`` / ``global_base`` are global-model
+    scale; comparing them directly over-clamps whenever ``global_base``
+    diverges above the per-unit sum (aux-active hours, partially-learned
+    or newly-added units), discarding valid global aux savings and
+    over-predicting.  Re-expressing the ceiling as the aux-affected
+    FRACTION of base scaled to the anchor degenerates to no clamp when
+    every unit is aux-affected (frac → 1), while still protecting
+    out-of-scope base from Track A's global aux belief.
+
+    The anchor is allocated across the three partitions
+    (heating-in-scope / cooling-in-scope / not-in-scope) by each
+    partition's share of Σ ``net_after_aux`` — commit 1's original
+    design (see ``test_per_scope_mode_solar_clamp`` docstring).  Solar
+    is then applied per partition: heating clamps at 0 (solar only
+    reduces in-scope heating demand), cooling adds, not-in-scope passes
+    through.  Shares sum to 1, so the pre-solar partition sum equals the
+    anchor exactly; with un-clamped heating the result reduces to
+    ``anchor + global_solar_effect`` — identical to the cold-start
+    fallback.
+
+    Heating solar is re-saturated against the SCALED allocation (#1035
+    follow-up, bug 2).  ``sum_applied_heating`` was saturated against
+    the raw per-unit base inside ``_resolve_entity_net``; when the
+    anchor sits below the per-unit sum (the warm/contaminated-bucket
+    case) that raw applied exceeds the demand that actually exists at
+    the anchor scale.  ``global_net`` already clamps at 0, so the
+    prediction magnitude is unchanged — but the raw
+    ``sum_applied_heating`` over-reports applied solar and under-reports
+    wasted, and those aggregates feed dark-sky normalization (global
+    base learning) and the battery EMA.  Cap applied at the allocation
+    and reclassify the excess as wasted so the learning/battery
+    aggregates stay energy-consistent.  Per-entity ``unit_breakdown``
+    stays raw per-unit (attribution only; divergence surfaces via
+    ``unspecified_kwh`` — option A).
+
+    Cold-start / no-per-unit-data fallback: when the partition
+    accumulators sum to zero (no ``energy_sensors`` configured, or empty
+    ``_correlation_data_per_unit``), the per-(scope, mode) split has no
+    information.  Falls back to the legacy Track A formula ``max(0,
+    global_base − global_aux_reduction) + global_solar_effect`` clamped
+    at 0 — bit-identical pre-#992 behaviour for installs that have not
+    yet learned per-entity buckets.
+
+    Returns:
+        ``(global_net, applied_heating_eff, wasted_heating_clip)``.
+        ``wasted_heating_clip`` is the extra heating solar reclassified
+        applied → wasted by the anchor clip; zero on the fallback path
+        where there is no anchor scaling.
+    """
+    unit_partition_total = (
+        base_heating_in_scope + base_cooling_in_scope + base_not_in_scope
+    )
+    wasted_heating_clip = 0.0
+    if unit_partition_total > 1e-9:
+        frac_aux = (
+            sum_base_aux_affected / unit_sum_base if unit_sum_base > 0 else 0.0
+        )
+        scoped_aux_reduction = min(global_aux_reduction, global_base * frac_aux)
+        anchor = max(0.0, global_base - scoped_aux_reduction)
+        anchor_per_unit_base = anchor / unit_partition_total
+        alloc_heating = base_heating_in_scope * anchor_per_unit_base
+        alloc_cooling = base_cooling_in_scope * anchor_per_unit_base
+        alloc_not_in_scope = base_not_in_scope * anchor_per_unit_base
+        applied_heating_eff = min(sum_applied_heating, alloc_heating)
+        wasted_heating_clip = sum_applied_heating - applied_heating_eff
+        heating_in_scope_net = alloc_heating - applied_heating_eff
+        cooling_in_scope_net = alloc_cooling + sum_applied_cooling
+        global_net = (
+            heating_in_scope_net + cooling_in_scope_net + alloc_not_in_scope
+        )
+    else:
+        applied_heating_eff = sum_applied_heating
+        global_net_after_aux = max(0.0, global_base - global_aux_reduction)
+        global_net = max(0.0, global_net_after_aux + global_solar_effect)
+
+    return global_net, applied_heating_eff, wasted_heating_clip
+
+
 class StatisticsManager:
     """Manages statistics and analytics calculations."""
 
@@ -827,63 +948,20 @@ class StatisticsManager:
         # global_solar_effect`` clamped at 0 — bit-identical pre-#992
         # behaviour for installs that have not yet learned per-entity
         # buckets.
-        unit_partition_total = (
-            base_heating_in_scope + base_cooling_in_scope + base_not_in_scope
+        global_net, applied_heating_eff, wasted_heating_clip = (
+            allocate_anchor_partitions(
+                global_base=global_base,
+                global_aux_reduction=global_aux_reduction,
+                global_solar_effect=global_solar_effect,
+                unit_sum_base=unit_sum_base,
+                sum_base_aux_affected=sum_base_aux_affected,
+                base_heating_in_scope=base_heating_in_scope,
+                base_cooling_in_scope=base_cooling_in_scope,
+                base_not_in_scope=base_not_in_scope,
+                sum_applied_heating=sum_applied_heating,
+                sum_applied_cooling=sum_applied_cooling,
+            )
         )
-        # Extra heating solar reclassified applied → wasted by the anchor
-        # clip (#1035 follow-up, bug 2).  Zero on the fallback path where
-        # there is no anchor scaling.
-        wasted_heating_clip = 0.0
-        if unit_partition_total > 1e-9:
-            # Scoped aux clamp expressed in the GLOBAL anchor scale (#1035
-            # follow-up, bug 1).  ``sum_base_aux_affected`` is a per-unit
-            # base sum, but ``global_aux_reduction`` / ``global_base`` are
-            # global-model scale.  Comparing them directly over-clamps the
-            # aux reduction whenever global_base diverges above the per-unit
-            # sum (aux-active hours, partially-learned or newly-added
-            # units), discarding valid global aux savings and over-
-            # predicting.  Re-express the ceiling as the aux-affected
-            # FRACTION of base scaled to the anchor: ``global_base ×
-            # (Σ base_aux_affected / Σ base)``.  Degenerates to no clamp
-            # when every unit is aux-affected (frac → 1), while still
-            # protecting out-of-scope base from Track A's global aux belief
-            # (the leak the clamp exists for).
-            frac_aux = (
-                sum_base_aux_affected / unit_sum_base if unit_sum_base > 0 else 0.0
-            )
-            scoped_aux_reduction = min(global_aux_reduction, global_base * frac_aux)
-            anchor = max(0.0, global_base - scoped_aux_reduction)
-            anchor_per_unit_base = anchor / unit_partition_total
-            alloc_heating = base_heating_in_scope * anchor_per_unit_base
-            alloc_cooling = base_cooling_in_scope * anchor_per_unit_base
-            alloc_not_in_scope = base_not_in_scope * anchor_per_unit_base
-            # Re-saturate heating solar against the SCALED allocation
-            # (#1035 follow-up, bug 2).  ``sum_applied_heating`` was
-            # saturated against the raw per-unit base inside
-            # ``_resolve_entity_net``; when the anchor sits below the
-            # per-unit sum (the warm/contaminated-bucket case this change
-            # targets) that raw applied exceeds the demand that actually
-            # exists at the anchor scale.  ``global_net`` already clamps at
-            # 0, so the prediction magnitude is unchanged — but the raw
-            # ``sum_applied_heating`` over-reports applied solar and under-
-            # reports wasted, and those aggregates feed dark-sky
-            # normalization (global base learning) and the battery EMA.
-            # Cap applied at the allocation and reclassify the excess as
-            # wasted so the learning/battery aggregates stay energy-
-            # consistent.  Per-entity ``unit_breakdown`` stays raw per-unit
-            # (attribution only; divergence surfaces via ``unspecified_kwh``
-            # — option A).
-            applied_heating_eff = min(sum_applied_heating, alloc_heating)
-            wasted_heating_clip = sum_applied_heating - applied_heating_eff
-            heating_in_scope_net = alloc_heating - applied_heating_eff
-            cooling_in_scope_net = alloc_cooling + sum_applied_cooling
-            global_net = (
-                heating_in_scope_net + cooling_in_scope_net + alloc_not_in_scope
-            )
-        else:
-            applied_heating_eff = sum_applied_heating
-            global_net_after_aux = max(0.0, global_base - global_aux_reduction)
-            global_net = max(0.0, global_net_after_aux + global_solar_effect)
 
         # 4b. Solar carry-over reservoir release (#896 follow-up).
         #
@@ -1431,41 +1509,20 @@ class StatisticsManager:
                 unassigned_aux_savings += remaining
 
         global_solar_effect = sum_applied_cooling - sum_applied_heating
-        # Global-led anchor + per-(scope, mode) solar partitions — see
-        # 3D implementation for the full rationale (#992 c1 + #1035).
-        # Cold-start fallback to the legacy Track A formula when no
-        # per-entity base has been learned yet.
-        unit_partition_total = (
-            base_heating_in_scope + base_cooling_in_scope + base_not_in_scope
+        global_net, applied_heating_eff, wasted_heating_clip = (
+            allocate_anchor_partitions(
+                global_base=global_base,
+                global_aux_reduction=global_aux_reduction,
+                global_solar_effect=global_solar_effect,
+                unit_sum_base=unit_sum_base,
+                sum_base_aux_affected=sum_base_aux_affected,
+                base_heating_in_scope=base_heating_in_scope,
+                base_cooling_in_scope=base_cooling_in_scope,
+                base_not_in_scope=base_not_in_scope,
+                sum_applied_heating=sum_applied_heating,
+                sum_applied_cooling=sum_applied_cooling,
+            )
         )
-        # Extra heating solar reclassified applied → wasted by the anchor
-        # clip (#1035 follow-up, bug 2).  Zero on the fallback path.
-        wasted_heating_clip = 0.0
-        if unit_partition_total > 1e-9:
-            # Scoped aux clamp in the global anchor scale — see the 3D path
-            # for the full rationale (#1035 follow-up, bug 1).
-            frac_aux = (
-                sum_base_aux_affected / unit_sum_base if unit_sum_base > 0 else 0.0
-            )
-            scoped_aux_reduction = min(global_aux_reduction, global_base * frac_aux)
-            anchor = max(0.0, global_base - scoped_aux_reduction)
-            anchor_per_unit_base = anchor / unit_partition_total
-            alloc_heating = base_heating_in_scope * anchor_per_unit_base
-            alloc_cooling = base_cooling_in_scope * anchor_per_unit_base
-            alloc_not_in_scope = base_not_in_scope * anchor_per_unit_base
-            # Re-saturate heating solar against the scaled allocation — see
-            # the 3D path for the full rationale (#1035 follow-up, bug 2).
-            applied_heating_eff = min(sum_applied_heating, alloc_heating)
-            wasted_heating_clip = sum_applied_heating - applied_heating_eff
-            heating_in_scope_net = alloc_heating - applied_heating_eff
-            cooling_in_scope_net = alloc_cooling + sum_applied_cooling
-            global_net = (
-                heating_in_scope_net + cooling_in_scope_net + alloc_not_in_scope
-            )
-        else:
-            applied_heating_eff = sum_applied_heating
-            global_net_after_aux = max(0.0, global_base - global_aux_reduction)
-            global_net = max(0.0, global_net_after_aux + global_solar_effect)
 
         # Carryover release (#896) is intentionally NOT applied in the 4D
         # shadow path — see method docstring.  Fixed at 0 so the field
