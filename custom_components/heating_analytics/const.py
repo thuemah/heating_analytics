@@ -79,6 +79,92 @@ SOLAR_BATTERY_DECAY = 0.50
 CONF_BATTERY_THERMAL_FEEDBACK_K = "battery_thermal_feedback_k"
 DEFAULT_BATTERY_THERMAL_FEEDBACK_K = 0.0
 
+# --- Battery recommendation noise floor (#1066) ---
+# Every battery sweep picks its winner with ``< best - 1e-6``.  That
+# epsilon is a guard against float equality, and it is correct for
+# *selection* — argmin should pick the minimum.  What was missing is a
+# separate question: is the winning margin larger than the noise it was
+# measured against?  Without one, a converged install reports
+# ``review_recommended`` permanently over differences in the
+# milliwatt-hour range, and a verdict that is always on stops being read.
+#
+# The replays are PAIRED — same hours, different parameter — so the
+# statistic is the per-hour difference of squared residuals:
+#
+#     d_h = residual_baseline[h]^2 - residual_candidate[h]^2
+#     t   = mean(d) / SE(d)
+#
+# Computed on the squared-residual scale rather than the RMSE scale
+# deliberately: that is where the loss is defined and what the replay
+# minimises.  RMSE improvement is still reported; it just no longer
+# decides.  Unlike a bare kWh floor this scales with the data's own
+# dispersion, so it does not need per-install validation to mean
+# something.
+#
+# THIS IS A SCREEN, NOT A CALIBRATED p-VALUE.  An earlier revision of
+# this constant described 2.0 as "the conventional ~95 % two-sided bar".
+# That claim was wrong as implemented and has been removed.  The
+# candidate under test is the ARGMIN over the whole sweep grid, then
+# tested on the very residuals that selected it — textbook post-selection
+# inference.  Measured against a pure-noise null (200 trials, n=180,
+# 110 candidates, zero true effect) the unadjusted t >= 2.0 bar fired on
+# 56 % of trials.  Two adjustments in ``paired_loss_improvement`` bring
+# that down; neither makes the number a p-value:
+#
+#   1. Selection penalty.  The threshold is raised by sqrt(2 ln m) for m
+#      candidates considered — the leading term in the expected maximum
+#      of m standard normals, which is what an argmin-then-test procedure
+#      is actually up against.  At m = 110 that is ~3.07, so the
+#      effective bar is ~5.07 rather than 2.0.  Deliberately
+#      conservative: a missed real improvement costs the value of a
+#      calibration nobody asked for, a false one costs the credibility
+#      of every verdict the service emits.
+#   2. Serial-correlation inflation.  The post-sunset residuals are
+#      POST_SUNSET_REPLAY_HOURS consecutive hours per day driven by a
+#      recursive EMA, so d_h is autocorrelated while var/n assumes
+#      independence.  SE is inflated by sqrt((1+r1)/(1-r1)) on the lag-1
+#      autocorrelation r1 when positive — the standard first-order
+#      correction.
+#
+# Read the pair as "this margin survived a deliberately harsh screen",
+# not as "p < 0.05".
+BATTERY_RECOMMENDATION_MIN_T = 2.0
+# Floor on paired hours before the screen may pass at all.  The bare
+# n >= 2 guard is mathematically sufficient to compute a t statistic and
+# nowhere near enough to trust one: at n = 2 the 95 % two-sided critical
+# value is 12.7, so a fixed threshold is meaningless there.
+BATTERY_RECOMMENDATION_MIN_PAIRED_HOURS = 10
+# Post-sunset mean-residual magnitude above which the battery is judged
+# to be decaying too fast / too slow.  Previously a bare ``0.05`` literal
+# inline in the assessment expression.
+BATTERY_RESIDUAL_BIAS_KWH = 0.05
+# Minimum qualifying post-sunset hours before the bias flag may fire.
+# Without it a handful of hours can produce a mean far from zero and the
+# flag reads as a real bias rather than a thin-sample artefact.
+BATTERY_BIAS_MIN_HOURS = 30
+# Companion relative gate, applied IN ADDITION to the absolute kWh floor
+# above — both must pass before the bias flag fires.
+#
+# The absolute floor alone means different things on different installs
+# and in different seasons: 0.05 kWh against a 0.3 kWh post-sunset hour
+# is a 17 % miss worth acting on, while the same 0.05 kWh against a 3 kWh
+# midwinter hour is under 2 % and sits inside the base model's own noise.
+# Firing on both as if they were the same finding is what made the flag
+# permanent on a converged install.  Same principle as the Analysis
+# Standards rule that an error is measured in its own regime — here the
+# regime is the size of the hour.
+#
+# 0.10 is a starting point, not a calibrated value: a 10 % systematic
+# miss on the post-sunset tail is the smallest deviation that survives
+# being described to a user as worth a look.  ``relative_deviation`` is
+# reported in ``diagnose_solar.battery_decay_health`` beside the mean, so
+# an install that disagrees can read its own number and this can be
+# re-tuned against evidence rather than argument.
+#
+# Because both gates must pass, raising this can only ever narrow what
+# fires relative to the absolute-only behaviour it replaces.
+BATTERY_RESIDUAL_BIAS_RELATIVE = 0.10
+
 # Route the live solar read-path (prediction, base learning, the
 # legacy battery, aux normalisation, display sensors) through the 4D
 # pipeline (#962).  Default off — flag is a read-path route only.
@@ -799,3 +885,43 @@ DNI_DHI_REAL_SOURCE_DOMINANCE_MIN = 0.80
 # daylight days is far too thin to characterise a provider that drops
 # fields under some conditions; ~1 week of daylight hours is the floor.
 DNI_DHI_SOURCE_MIX_MIN_HOURS = 50
+
+# --- DNI/DHI outage repair issue (#1070) ---
+# Alert, not a routing decision.  Deliberately does NOT reuse the two
+# constants above: ``supports_4d_primary`` is a 30-day / 80 % / 50-hour
+# gate because routing an install is a slow, considered choice.  This is
+# the opposite question — "did my provider stop publishing irradiance in
+# the last day or two?" — and a 30-day window would take weeks to notice.
+# Two different questions, two different windows.
+#
+# Counted in DAYLIGHT hours, not wall-clock hours.  Mandatory, not
+# hygiene: ``derive_dni_dhi_source_label`` never emits ``"no_sun"``, so a
+# night hour is labelled ``kasten_synthetic`` on any install with
+# cloud-coverage data and a wall-clock window would fire every night on a
+# perfectly healthy install.  Same trap ``_compute_dni_dhi_source_mix``
+# guards with ``solar_factor > 0``; the same filter is reused.
+#
+# Seasonal consequence at ~60 °N, and it is the intended behaviour: 24
+# daylight hours is ~1.3 days in June (~18 h daylight) and ~4 days in
+# December (~6 h).  The window measures *evidence*, not elapsed time.  Do
+# not "fix" this into wall-clock hours.
+REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS = 24
+# Asymmetric by design, so a provider that drops the fields intermittently
+# cannot create and delete the repair on alternating days.  Between the
+# two shares the state is sticky: neither raised nor cleared, whatever it
+# already was persists.
+#
+# The raise bar is a slack allowance, not a statistical claim.  A provider
+# that stops publishing collapses to exactly 0.0 — the failure is sharp,
+# not gradual — so 0.10 exists only to tolerate a single stray hour
+# slipping through a genuine outage.  Neither number has been validated
+# against a real outage on a real install; they are starting points.
+REPAIR_DNI_DHI_OUTAGE_RAISE_BELOW = 0.10
+REPAIR_DNI_DHI_OUTAGE_CLEAR_AT = 0.50
+# No verdict at all until the window is fully populated.  Without this a
+# freshly-configured 4D install raises the repair on its first day, before
+# any evidence exists that anything is wrong.
+REPAIR_DNI_DHI_OUTAGE_MIN_HOURS = 24
+# Issue ID registered with HA's issue registry.  Stable across restarts —
+# the registry persists, and re-registering the same ID is idempotent.
+REPAIR_ISSUE_DNI_DHI_OUTAGE = "dni_dhi_outage_4d_active"

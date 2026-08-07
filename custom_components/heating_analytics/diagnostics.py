@@ -14,8 +14,17 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     ENERGY_GUARD_THRESHOLD,
+    BATTERY_BIAS_MIN_HOURS,
+    BATTERY_RECOMMENDATION_MIN_PAIRED_HOURS,
+    BATTERY_RECOMMENDATION_MIN_T,
+    BATTERY_RESIDUAL_BIAS_KWH,
+    BATTERY_RESIDUAL_BIAS_RELATIVE,
     DNI_DHI_REAL_SOURCE_DOMINANCE_MIN,
     DNI_DHI_SOURCE_MIX_MIN_HOURS,
+    REPAIR_DNI_DHI_OUTAGE_CLEAR_AT,
+    REPAIR_DNI_DHI_OUTAGE_MIN_HOURS,
+    REPAIR_DNI_DHI_OUTAGE_RAISE_BELOW,
+    REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS,
     MODE_COOLING,
     MODE_DHW,
     MODE_GUEST_COOLING,
@@ -47,6 +56,377 @@ _LOGGER = logging.getLogger(__name__)
 ELEVATION_BUCKETS: tuple[tuple[int, int], ...] = (
     (0, 15), (15, 30), (30, 45), (45, 60), (60, 90),
 )
+
+
+def paired_loss_improvement(
+    baseline_residuals: list[float],
+    candidate_residuals: list[float],
+    *,
+    n_candidates_considered: int = 1,
+) -> dict:
+    """Paired improvement screen for one battery sweep candidate (#1066).
+
+    A **screen, not a calibrated significance test.**  See
+    ``const.BATTERY_RECOMMENDATION_MIN_T`` for the full reasoning; the
+    short version is that the candidate handed to this function is the
+    argmin over the sweep grid and is then tested on the same residuals
+    that selected it, so the raw t statistic is not a p-value and must
+    not be presented as one.  Two adjustments below make the screen
+    harsh enough to be useful anyway.
+
+    The replays are *paired*: the same hours are replayed under two
+    parameter settings, so ``baseline_residuals[h]`` and
+    ``candidate_residuals[h]`` describe the same hour and differ only by
+    the parameter.  That makes the per-hour difference of squared
+    residuals the right statistic — it removes the hour-to-hour variance
+    that dominates the raw RMSE and would otherwise swamp the effect.
+
+        d_h = residual_baseline[h]^2 - residual_candidate[h]^2
+
+    Positive ``d_h`` means the candidate fit that hour better.
+
+    Deliberately on the **squared-residual** scale rather than the RMSE
+    scale: that is where the replay's loss is defined and what the sweep
+    minimises.  RMSE improvement remains reported alongside; it simply no
+    longer decides whether a recommendation is worth showing.
+
+    Args:
+        baseline_residuals: per-hour residuals under the reference
+            parameter — the LIVE setting, not an arbitrary grid corner.
+        candidate_residuals: per-hour residuals under the candidate.
+            Index-aligned with the baseline; see ``_replay_score``.
+        n_candidates_considered: how many candidates the argmin chose
+            from.  Drives the selection penalty.  The default of 1 means
+            "no selection took place" and applies no penalty — only pass
+            that for a genuinely pre-specified comparison.
+
+    Returns a dict carrying ``mean_improvement``, ``std_error`` (after
+    serial-correlation inflation), ``t_statistic``, the
+    ``threshold_applied`` it was judged against, and ``significant``.
+    ``significant`` is False below
+    ``BATTERY_RECOMMENDATION_MIN_PAIRED_HOURS`` and for a degenerate
+    zero-variance difference, which is what an identical candidate
+    produces — an exact tie is not evidence of improvement.
+    """
+    n = min(len(baseline_residuals), len(candidate_residuals))
+    # Selection penalty: sqrt(2 ln m) is the leading term in the expected
+    # maximum of m standard normals, which is what argmin-then-test faces.
+    threshold = BATTERY_RECOMMENDATION_MIN_T
+    if n_candidates_considered > 1:
+        threshold += (2.0 * math.log(n_candidates_considered)) ** 0.5
+
+    if n < BATTERY_RECOMMENDATION_MIN_PAIRED_HOURS:
+        return {
+            "n_paired_hours": n,
+            "mean_improvement": None,
+            "std_error": None,
+            "t_statistic": None,
+            "threshold_applied": round(threshold, 3),
+            "n_candidates_considered": n_candidates_considered,
+            "significant": False,
+            "declined_reason": "too_few_paired_hours",
+        }
+
+    diffs = [
+        baseline_residuals[i] * baseline_residuals[i]
+        - candidate_residuals[i] * candidate_residuals[i]
+        for i in range(n)
+    ]
+    mean_d = sum(diffs) / n
+    # Sample variance (n-1): these hours are a sample of the install's
+    # behaviour, not the population of all hours it will ever see.
+    var = sum((d - mean_d) ** 2 for d in diffs) / (n - 1)
+
+    if var <= 0.0:
+        # Zero dispersion.  Either every hour improved by exactly the
+        # same amount (not physically plausible) or the candidate is the
+        # baseline.  Neither is evidence, so decline rather than divide.
+        return {
+            "n_paired_hours": n,
+            "mean_improvement": round(mean_d, 8),
+            "std_error": 0.0,
+            "t_statistic": None,
+            "threshold_applied": round(threshold, 3),
+            "n_candidates_considered": n_candidates_considered,
+            "significant": False,
+            "declined_reason": "zero_dispersion",
+        }
+
+    # Serial-correlation inflation.  The window is consecutive
+    # post-sunset hours driven by a recursive EMA, so d_h carries the
+    # autocorrelation of the underlying model residual while var/n
+    # assumes independence.  Standard first-order correction on the lag-1
+    # autocorrelation; only applied when positive, since negative r1
+    # would *deflate* the SE and this is a screen, not an estimator.
+    lag1_cov = sum(
+        (diffs[i] - mean_d) * (diffs[i + 1] - mean_d) for i in range(n - 1)
+    ) / (n - 1)
+    r1 = lag1_cov / var if var > 0 else 0.0
+    r1 = max(0.0, min(0.95, r1))
+    inflation = ((1.0 + r1) / (1.0 - r1)) ** 0.5
+
+    std_err = ((var / n) ** 0.5) * inflation
+    t_stat = mean_d / std_err
+    return {
+        "n_paired_hours": n,
+        "mean_improvement": round(mean_d, 8),
+        "std_error": round(std_err, 8),
+        "t_statistic": round(t_stat, 3),
+        "lag1_autocorrelation": round(r1, 3),
+        "se_inflation_factor": round(inflation, 3),
+        "threshold_applied": round(threshold, 3),
+        "n_candidates_considered": n_candidates_considered,
+        "significant": t_stat >= threshold,
+    }
+
+
+def _coerce_scalar(value, default: float) -> float:
+    """Config-sourced scalar as a float, or ``default`` if it is not one.
+
+    One helper rather than an inline guard per read site, because the
+    defect this exists for is *disagreement between read sites*, not any
+    single read: ``battery_thermal_feedback_k`` was read four times in
+    ``diagnose_solar`` and hardening two of them produced a payload
+    reporting three different answers for one setting.
+
+    ``isinstance`` rather than ``float()``/``except``: a numeric string
+    means something upstream is wrong, and the configured default is the
+    safe reading of "wrong".  ``bool`` is excluded because it is a
+    subclass of ``int`` and ``True`` would otherwise silently become
+    ``1.0`` — a deliberate tightening of the ``forecast.py`` guard this
+    follows, not a copy of it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value)
+
+
+def _assess_battery_bias(
+    residuals: list[float],
+    expected: list[float],
+) -> dict:
+    """Post-sunset residual bias, filtered as a deviation against current.
+
+    Answers one question: is the post-sunset mean residual far enough
+    from zero, *relative to what the model is currently predicting for
+    those hours*, to be worth telling the user about?
+
+    **Why relative and not a bare kWh floor.**  The pre-existing gate was
+    ``|mean_residual| > BATTERY_RESIDUAL_BIAS_KWH`` (0.05 kWh), an
+    absolute number that means very different things on different
+    installs and in different seasons: 0.05 kWh against a 0.3 kWh
+    post-sunset hour is a 17 % miss and worth acting on; the same 0.05
+    kWh against a 3 kWh midwinter hour is under 2 % and is inside the
+    noise of the base model itself.  Reporting both as the same finding
+    is what made the flag fire on a converged install.  Direct
+    application of the Analysis Standards rule that errors are measured
+    in their own regime — here the regime is the size of the hour.
+
+    Both gates must pass.  The absolute floor is retained unchanged as a
+    documented default, so this can only ever *narrow* what fires
+    relative to the previous behaviour, never widen it:
+
+    * ``|mean_residual| > BATTERY_RESIDUAL_BIAS_KWH`` (0.05 kWh)
+    * ``|mean_residual| / mean(expected) > BATTERY_RESIDUAL_BIAS_RELATIVE``
+
+    ``mean(expected)`` is the mean predicted consumption over the same
+    hours the residuals came from, so the ratio is a like-for-like
+    fractional miss on the post-sunset tail.  It is a ratio of means
+    rather than a mean of ratios deliberately: the latter is dominated by
+    the smallest-denominator hours, which on the post-sunset tail are
+    exactly the hours whose absolute error carries least energy.
+
+    Returns the assessment plus every input that produced it, so a reader
+    can see *why* it abstained rather than having to infer it.
+    ``insufficient_data`` below ``BATTERY_BIAS_MIN_HOURS`` — no evidence
+    is not evidence of health.
+    """
+    n = len(residuals)
+    if n == 0:
+        return {
+            "assessment": "insufficient_data",
+            "n_hours": 0,
+            "mean_residual_kwh": None,
+            "mean_expected_kwh": None,
+            "relative_deviation": None,
+            "std_residual_kwh": None,
+            "std_error_kwh": None,
+        }
+
+    mean_residual = sum(residuals) / n
+    if n > 1:
+        _var = sum((r - mean_residual) ** 2 for r in residuals) / (n - 1)
+        std_residual = _var ** 0.5
+        std_error_residual = (_var / n) ** 0.5
+    else:
+        std_residual = None
+        std_error_residual = None
+
+    paired = min(n, len(expected))
+    mean_expected = (
+        sum(expected[:paired]) / paired if paired > 0 else 0.0
+    )
+    relative = (
+        abs(mean_residual) / mean_expected if mean_expected > 0.0 else None
+    )
+
+    result = {
+        "n_hours": n,
+        "mean_residual_kwh": round(mean_residual, 4),
+        "mean_expected_kwh": round(mean_expected, 4) if paired else None,
+        "relative_deviation": round(relative, 4) if relative is not None else None,
+        "std_residual_kwh": (
+            round(std_residual, 4) if std_residual is not None else None
+        ),
+        "std_error_kwh": (
+            round(std_error_residual, 4) if std_error_residual is not None else None
+        ),
+    }
+
+    if n < BATTERY_BIAS_MIN_HOURS:
+        result["assessment"] = "insufficient_data"
+        return result
+    # ``relative is None`` means no usable expectation to divide by.  The
+    # absolute reading alone cannot be put in context, so abstain rather
+    # than fall back to it — falling back is the behaviour being fixed.
+    if relative is None:
+        result["assessment"] = "insufficient_data"
+        return result
+    if (
+        abs(mean_residual) > BATTERY_RESIDUAL_BIAS_KWH
+        and relative > BATTERY_RESIDUAL_BIAS_RELATIVE
+    ):
+        # Negative residual = actual < expected = battery under-credits
+        # post-sunset = decays too fast.  Positive = opposite.
+        result["assessment"] = "too_slow" if mean_residual > 0 else "too_fast"
+    else:
+        result["assessment"] = "ok"
+    return result
+
+
+def battery_feedback_verdict(
+    optimum_k: float,
+    optimum_at_sweep_boundary: bool,
+    significant: bool,
+    current_k: float = 0.0,
+) -> str:
+    """Verdict for the thermal-feedback (k) sweep (#1066).
+
+    Extracted from the summary block so the suppressing conditions are a
+    named, testable mapping rather than a decision procedure buried
+    mid-method.  The bug this replaces was precisely that the sweep's own
+    ``rmse_improvement_kwh`` was computed, reported, and never read by
+    the verdict — an easy thing to miss inline and hard to miss here.
+
+    **This verdict never asks the user to act, and that is deliberate.**
+    ``battery_thermal_feedback_k`` was retired in 1.3.5 — there is no UI
+    for it, ``coordinator.__init__`` strips the key from ``entry.data`` on
+    every init, and the apply path no longer writes it.  A verdict of
+    ``consider_k_1.0`` would therefore name a value the user has no
+    supported way to set, and it used to raise the summary to
+    ``review_recommended`` over exactly that.  The winning candidate is
+    reported as ``research_optimum_k_*`` instead: same information, no
+    implied instruction, and it does not feed ``any_action``.
+
+    The sweep is kept rather than deleted because it is the evidence base
+    for the retirement decision itself.  Deleting it would make "does k
+    earn its place" unanswerable with data, and a retirement that cannot
+    be re-examined is a worse outcome than one that costs a diagnostic
+    block.
+
+    ``current_k`` is what "no change" means.  The first check used to be
+    ``optimum_k == 0.0``, which is only the same question on an install
+    running the default; on an install that has adopted k > 0, comparing
+    against 0.0 makes the sweep either recommend its own live value as a
+    finding or report ``no_improvement_available`` for what is in fact a
+    proposed *reduction* to zero.
+
+    Order matters: a boundary optimum is reported as such even when the
+    margin clears the screen, because "the sweep did not bracket the
+    optimum" describes the result more accurately than any statement
+    about the edge value.
+    """
+    if optimum_k == current_k:
+        return "no_improvement_available"
+    if optimum_at_sweep_boundary:
+        return "optimum_at_sweep_boundary"
+    if not significant:
+        return "improvement_below_noise_floor"
+    # ``research_`` prefix, not ``consider_``: the ``any_action`` test is
+    # ``verdict.startswith("consider_")``, so the prefix is what decides
+    # whether this raises the summary.  Renaming it is the mechanism, not
+    # cosmetics — do not "restore" the old string.
+    return f"research_optimum_k_{optimum_k}"
+
+
+def battery_decay_verdict(
+    current_decay: float | None,
+    recommended_decay: float | None,
+    withheld_reason: str | None,
+    sweep_produced_evidence: bool = True,
+    bias_assessment: str | None = None,
+) -> str:
+    """Verdict for the (decay, k) calibration sweep (#1066).
+
+    ``withheld_reason`` is computed where the sweep ran — it needs the
+    residuals and both window surfaces — and carries the three
+    suppressing conditions in priority order.  This maps it onto the
+    user-facing verdict so both battery verdicts have the same shape.
+
+    ``sweep_produced_evidence`` is load-bearing and not cosmetic.
+    ``best`` is initialised to the *live* ``(decay, k)`` and only replaced
+    by a candidate clearing ``MIN_POST_SUNSET_HOURS_FOR_RECOMMENDATION``,
+    so a sweep that qualified **no** candidate still produces a truthy
+    ``calibration`` block whose ``recommended_decay == current_decay``.
+    Reading that as ``"ok"`` turns "the sweep saw nothing" into "the
+    sweep says the current value is optimal".
+
+    **Be precise about what this changed: the threshold, not the
+    instrument.**  An earlier revision gated on ``hours_evaluated <= 0``.
+    The effective condition here is
+    ``n_post_sunset >= BATTERY_RECOMMENDATION_MIN_PAIRED_HOURS`` (10) —
+    still an hour count, ten instead of zero.  The ``bool(surface)`` term
+    at the call site cannot change the answer (``best_rmse`` starts at
+    ``inf``, so any qualifying candidate fills ``best_residuals``, and an
+    empty surface therefore always declines with
+    ``too_few_paired_hours``); it is kept as a guard so the two cannot
+    decouple silently, not because it discriminates.  What the change buys
+    is real but narrower than "a boolean, not a count": ``<= 0`` missed
+    the 1–4 hour window that populated no surface at all, and it missed
+    the 5–9 band where the surface populates but the paired screen
+    declines before measuring anything — where ``below_noise_floor``
+    implies a measurement that was never made and ``insufficient_data``
+    is the honest label.
+
+    ``bias_assessment`` is the post-sunset mean-residual reading from
+    ``battery_decay_health``, already filtered to a *relative* deviation
+    against current consumption (see ``_assess_battery_bias``).  It is
+    consulted **only** when the sweep produced no evidence, and it is the
+    only evidence there is in that case.
+
+    **It must not displace a sweep answer, and the reason is concrete.**
+    An earlier revision returned the bias from the ``withheld_reason``
+    branch too.  That branch is reached with a non-null
+    ``recommended_decay`` sitting in the summary beside the verdict, so a
+    user saw ``recommended_decay: 0.85`` next to ``verdict: too_fast``
+    and no trace of the fact that 0.85 had been *withheld* for
+    ``windows_disagree`` — the one thing that says "do not act on this
+    number".  ``apply_battery_decay: true`` would then refuse to write
+    the value the payload appeared to endorse.  The bias still reaches
+    ``any_action``, but as its own operand there rather than by
+    overwriting this verdict; see the ``any_action`` comment.  Two
+    readings of one residual are reported side by side, never one in
+    place of the other.
+    """
+    if not sweep_produced_evidence:
+        if bias_assessment in ("too_fast", "too_slow"):
+            return bias_assessment
+        return "insufficient_data"
+    if recommended_decay == current_decay:
+        return "ok"
+    if withheld_reason:
+        return withheld_reason
+    return f"consider_decay_{recommended_decay}"
 
 
 class DiagnosticsEngine:
@@ -785,6 +1165,7 @@ class DiagnosticsEngine:
         day_sequences: dict[str, list[tuple]] = {}
         # Battery health: post-sunset hours (using current decay)
         battery_residuals: list[float] = []
+        battery_expected: list[float] = []
 
         # Screen stratification
         screen_closed_errors: list[float] = []  # correction < 50, solar_factor > 0.3
@@ -856,6 +1237,11 @@ class DiagnosticsEngine:
                 expected_total = entry.get("expected_kwh", 0.0)
                 if expected_total > 0.05:
                     battery_residuals.append(actual_total - expected_total)
+                    # Paired expectation, for the relative-deviation gate
+                    # in ``_assess_battery_bias``.  Index-aligned with
+                    # ``battery_residuals`` by construction — both append
+                    # inside this one branch.
+                    battery_expected.append(expected_total)
 
             # Collect day sequences for joint (decay, k) calibration sweep.
             # Per-hour wasted is needed alongside raw_solar so the carryover
@@ -2293,17 +2679,32 @@ class DiagnosticsEngine:
         # Battery health
         battery_health = {}
         if battery_residuals:
-            mean_residual = sum(battery_residuals) / len(battery_residuals)
+            # Dispersion, sample-size gate and the relative-deviation
+            # filter all live in ``_assess_battery_bias`` (#1066) so the
+            # decision is one named, testable mapping rather than a
+            # chain of elifs inside a 2000-line method.
+            bias = _assess_battery_bias(battery_residuals, battery_expected)
+            assessment = bias["assessment"]
+
             battery_health = {
-                "mean_residual_kwh": round(mean_residual, 4),
-                "qualifying_post_sunset_hours": len(battery_residuals),
+                "mean_residual_kwh": bias["mean_residual_kwh"],
+                # Mean prediction over the same hours, and the resulting
+                # fractional miss.  Reported, not just used: a reader who
+                # disagrees with the threshold needs the number it was
+                # compared against.
+                "mean_expected_kwh": bias["mean_expected_kwh"],
+                "relative_deviation": bias["relative_deviation"],
+                "std_residual_kwh": bias["std_residual_kwh"],
+                "std_error_kwh": bias["std_error_kwh"],
+                "qualifying_post_sunset_hours": bias["n_hours"],
+                "min_hours_for_assessment": BATTERY_BIAS_MIN_HOURS,
+                "bias_threshold_kwh": BATTERY_RESIDUAL_BIAS_KWH,
+                "bias_threshold_relative": BATTERY_RESIDUAL_BIAS_RELATIVE,
                 "decay_rate": self.coordinator.solar_battery_decay,
-                # Negative residual = actual < expected = battery under-credits
-                # post-sunset = decays too fast. Positive = opposite.
-                "assessment": "too_slow" if mean_residual > 0.05 else ("too_fast" if mean_residual < -0.05 else "ok"),
+                "assessment": assessment,
             }
-            if battery_health["assessment"] != "ok":
-                global_flags.append(f"battery_decay_{battery_health['assessment']}")
+            if assessment in ("too_fast", "too_slow"):
+                global_flags.append(f"battery_decay_{assessment}")
 
         # Joint (decay, k) battery calibration with counterfactual residuals.
         #
@@ -2351,14 +2752,53 @@ class DiagnosticsEngine:
         # acceptable here because the post-sunset evening is far past the
         # morning when the bias was largest.
         DECAY_GRID = [round(0.50 + 0.05 * i, 2) for i in range(10)]   # 0.50..0.95
-        K_GRID = [round(0.1 * i, 1) for i in range(11)]               # 0.0..1.0
+        # Locked to the single value the system can actually run.
+        #
+        # ``battery_thermal_feedback_k`` was retired in 1.3.5: the UI was
+        # removed and ``coordinator.__init__`` strips the key from
+        # ``entry.data`` on every init, forcing 0.0.  Sweeping k anyway
+        # meant this argmin searched a space the system has decided not to
+        # occupy — and because the apply path wrote the whole ``best``
+        # pair, an install could be handed ``(decay=0.70, k=0.40)``, keep
+        # the decay (not stripped) and lose the k (stripped on the next
+        # restart).  The result was a decay fitted *conditional on k=0.40*
+        # running permanently at k=0.0: a combination the sweep evaluated
+        # and did not select.  Nothing guarantees
+        # ``argmin decay | k=0.4 == argmin decay | k=0.0``.
+        #
+        # The k dimension is not deleted, only pinned — the tuple shape,
+        # ``_replay_score``'s k argument and the ``"decay,k"`` surface keys
+        # all survive, so reviving the feature is a one-line change and the
+        # surface keys still document which k the fit is conditional on.
+        # The evidence base for revisiting the retirement lives in
+        # ``battery_feedback_sweep``, which still sweeps k as observability
+        # (it just no longer votes — see ``battery_feedback_verdict``).
+        K_GRID = [0.0]
         POST_SUNSET_REPLAY_HOURS = 6
         MIN_POST_SUNSET_HOURS_FOR_RECOMMENDATION = 5
 
         calibration: dict = {}
         if day_sequences:
             decay_live = self.coordinator.solar_battery_decay
-            k_live = self.coordinator.battery_thermal_feedback_k
+            # ``k_live`` feeds ``k_live > 0.0`` inside ``_replay_score``,
+            # the ``changed`` flag, and the apply gate, so a non-numeric
+            # value raises TypeError mid-sweep and a string makes
+            # ``changed`` permanently True against the float grid.  All
+            # four reads of this attribute in ``diagnose_solar`` go
+            # through ``_coerce_scalar`` so they cannot disagree.
+            #
+            # For *this* attribute the guard is consistency, not hardening
+            # against real input: ``coordinator.__init__`` strips
+            # ``CONF_BATTERY_THERMAL_FEEDBACK_K`` from ``entry.data`` on
+            # every init and assigns the module default, and the only
+            # other writer is the apply path below, which writes from
+            # ``K_GRID``.  ``solar_battery_decay`` is the read of this
+            # shape that *does* arrive from config; it is coerced at the
+            # coordinator boundary instead, which is the better place when
+            # the value has consumers outside this method.
+            k_live = _coerce_scalar(
+                self.coordinator.battery_thermal_feedback_k, 0.0
+            )
 
             # Build per-day post-sunset hour set: the N hours immediately
             # after the last hour with raw_solar > 0.01.  Days with no
@@ -2409,15 +2849,25 @@ class DiagnosticsEngine:
                 decay_alt: float,
                 k_alt: float,
                 window_by_day: dict[str, set[int]],
-            ) -> tuple[float, int]:
+            ) -> tuple[float, int, list[float]]:
                 """Counterfactual replay scored over ``window_by_day``.
 
-                Returns (rmse, n_hours_evaluated).  Window-agnostic — the
-                replay recurrence and counterfactual residual formula are
-                the same regardless of which hours feed into the SSE.
+                Returns (rmse, n_hours_evaluated, per_hour_residuals).
+                Window-agnostic — the replay recurrence and counterfactual
+                residual formula are the same regardless of which hours
+                feed into the SSE.
+
+                The residual list is returned rather than only its SSE so
+                the significance gate (#1066) can run a paired test
+                against another candidate's residuals.  Iteration order is
+                deterministic — ``day_sequences`` insertion order, then
+                ``hours_sorted`` — so two calls over the same window
+                produce index-aligned lists describing the same hours,
+                which is what makes the pairing exact.
                 """
                 sse = 0.0
                 n = 0
+                residuals: list[float] = []
                 for day_key, hours in day_sequences.items():
                     window = window_by_day.get(day_key)
                     if not window:
@@ -2458,8 +2908,9 @@ class DiagnosticsEngine:
                             residual_alt = (actual - expected) + (alt_release - live_release)
                             sse += residual_alt * residual_alt
                             n += 1
+                            residuals.append(residual_alt)
                 rmse = (sse / n) ** 0.5 if n > 0 else float("inf")
-                return rmse, n
+                return rmse, n, residuals
 
             # Post-sunset surface — the original tail-decay scoring.
             # Recommendation is driven by this surface (the live battery
@@ -2469,17 +2920,24 @@ class DiagnosticsEngine:
             best = (decay_live, k_live)
             best_rmse = float("inf")
             n_post_sunset = 0
+            best_residuals: list[float] = []
             for d_alt in DECAY_GRID:
                 for k_alt in K_GRID:
-                    rmse, n_post_sunset = _replay_score(
+                    rmse, n_post_sunset, resid = _replay_score(
                         d_alt, k_alt, post_sunset_set_by_day
                     )
                     if n_post_sunset < MIN_POST_SUNSET_HOURS_FOR_RECOMMENDATION:
                         continue
                     surface[f"{d_alt},{k_alt}"] = round(rmse, 4)
+                    # ``1e-6`` is retained deliberately.  It guards float
+                    # equality in *selection* — argmin should pick the
+                    # minimum, and that was never the bug.  Whether the
+                    # winning margin is worth reporting is a separate
+                    # question, answered by the significance gate below.
                     if rmse < best_rmse - 1e-6:
                         best_rmse = rmse
                         best = (d_alt, k_alt)
+                        best_residuals = resid
 
             # Morning surface — read-only diagnostic.  Same grid + same
             # counterfactual, but scored over the rising-sun window per
@@ -2492,7 +2950,7 @@ class DiagnosticsEngine:
             n_morning = 0
             for d_alt in DECAY_GRID:
                 for k_alt in K_GRID:
-                    rmse, n_morning = _replay_score(
+                    rmse, n_morning, _resid = _replay_score(
                         d_alt, k_alt, morning_set_by_day
                     )
                     if n_morning < MIN_POST_SUNSET_HOURS_FOR_RECOMMENDATION:
@@ -2508,10 +2966,10 @@ class DiagnosticsEngine:
             # this equals surface[f"{decay_live},{k_live}"]; computing it
             # explicitly handles the case where live values fall between
             # grid points (e.g. decay 0.82).
-            live_rmse, _ = _replay_score(
+            live_rmse, _, live_residuals = _replay_score(
                 decay_live, k_live, post_sunset_set_by_day
             )
-            morning_live_rmse, _ = _replay_score(
+            morning_live_rmse, _, _ = _replay_score(
                 decay_live, k_live, morning_set_by_day
             )
 
@@ -2535,6 +2993,62 @@ class DiagnosticsEngine:
                     and morning_best_rmse != float("inf")
                 )
                 else None
+            )
+
+            # --- Is the recommendation worth showing? (#1066) ---------
+            # Three independent reasons to withhold it, all computed
+            # here so the verdict below reads as a lookup rather than a
+            # second decision procedure.
+            changed = (best[0] != decay_live or best[1] != k_live)
+            # ``len(surface)`` is the number of candidates that actually
+            # qualified and competed in the argmin — not len(DECAY_GRID) ×
+            # len(K_GRID), since candidates below the hour floor are
+            # skipped and never had a chance to win.  Penalising for
+            # comparisons that did not happen would be as wrong as
+            # penalising for none.
+            significance = paired_loss_improvement(
+                live_residuals,
+                best_residuals,
+                n_candidates_considered=max(1, len(surface)),
+            )
+
+            # Did the sweep produce evidence at all?  Two ways it can run
+            # and conclude nothing, and neither is visible in the hour
+            # count (which is candidate-independent, so it stays truthy
+            # while the surface is empty):
+            #
+            #   1. No candidate cleared MIN_POST_SUNSET_HOURS_FOR_
+            #      RECOMMENDATION, so ``surface`` is empty and ``best``
+            #      is still the live seed.
+            #   2. The surface populated but fewer than
+            #      BATTERY_RECOMMENDATION_MIN_PAIRED_HOURS paired hours
+            #      exist, so the screen declined before measuring
+            #      anything.  ``below_noise_floor`` would imply a
+            #      measurement was made and came up short; it was not.
+            #
+            # Consumed by ``battery_decay_verdict``, which reports
+            # ``insufficient_data`` and lets the bias reading speak.
+            sweep_produced_evidence = bool(surface) and (
+                significance.get("declined_reason") != "too_few_paired_hours"
+            )
+
+            # A minimum at the edge of the swept grid means the sweep did
+            # not bracket it — the surface is flat, monotone, or the true
+            # optimum lies outside.  Reporting the edge value as "the
+            # empirical optimum" presents "the sweep found nothing" as
+            # "the sweep found 0.95".
+            decay_at_boundary = changed and best[0] in (
+                DECAY_GRID[0], DECAY_GRID[-1]
+            )
+
+            # Two windows disagreeing about the optimum is evidence that
+            # the recommendation is window-specific overfitting rather
+            # than a property of the building.  Previously computed,
+            # reported next to the recommendation, and not acted on.
+            windows_disagree = bool(
+                changed
+                and morning_best_rmse != float("inf")
+                and morning_best[0] != best[0]
             )
 
             calibration = {
@@ -2568,33 +3082,100 @@ class DiagnosticsEngine:
                 "morning_rmse_surface": morning_surface,
                 "morning_hours_evaluated": n_morning,
                 "tail_morning_disagreement_kwh": tail_morning_disagreement,
-                "method": "joint_decay_k_counterfactual_replay",
+                # Recommendation gating (#1066).  ``recommended_decay``
+                # above remains the raw argmin — these say whether it
+                # should be surfaced as advice.
+                "recommendation_significance": significance,
+                "sweep_produced_evidence": sweep_produced_evidence,
+                "qualifying_candidates": len(surface),
+                "optimum_at_sweep_boundary": decay_at_boundary,
+                "windows_disagree": windows_disagree,
+                "recommendation_withheld_reason": (
+                    None if not changed
+                    else "windows_disagree" if windows_disagree
+                    else "optimum_at_sweep_boundary" if decay_at_boundary
+                    else "below_noise_floor" if not significance["significant"]
+                    else None
+                ),
+                # No longer a joint sweep: k is pinned at the retired
+                # feature's fixed value, so this searches decay alone and
+                # the name says so.  ``k_swept`` echoes what was actually
+                # searched, since the ``"decay,k"`` surface keys otherwise
+                # suggest two free dimensions.
+                "method": "decay_counterfactual_replay_at_fixed_k",
+                "k_swept": list(K_GRID),
                 "loss": "rmse_post_sunset",
+                # Named a screen, not a significance test: the candidate
+                # is the argmin over the grid and is tested on the
+                # residuals that selected it, so the t statistic is not a
+                # p-value.  See const.BATTERY_RECOMMENDATION_MIN_T.
+                "recommendation_screen": (
+                    "paired_diff_of_squared_residuals; base_t="
+                    f"{BATTERY_RECOMMENDATION_MIN_T}"
+                    " + sqrt(2 ln m) selection penalty"
+                    " + lag1 serial-correlation SE inflation;"
+                    " NOT a calibrated p-value"
+                ),
             }
+            # Apply gate now respects the withholding chain (#1066 review).
+            # Previously a single call could emit
+            # ``recommendation_withheld_reason: "windows_disagree"`` and
+            # persist that same value to ``entry.data`` in the same pass —
+            # the payload saying "do not act" while acting.  The service
+            # flag remains explicit and user-driven; what changed is that
+            # it now applies the recommendation the diagnostic actually
+            # made, rather than the raw argmin the diagnostic declined to
+            # make.  ``apply_skipped_reason`` is surfaced below so a user
+            # who passed the flag and saw nothing change learns why.
+            apply_skipped_reason = None
+            if apply_battery_decay and changed and calibration.get(
+                "recommendation_withheld_reason"
+            ):
+                apply_skipped_reason = calibration[
+                    "recommendation_withheld_reason"
+                ]
+            calibration["apply_requested"] = bool(apply_battery_decay)
+            calibration["apply_skipped_reason"] = apply_skipped_reason
             if apply_battery_decay and (
                 best[0] != decay_live or best[1] != k_live
-            ) and best_rmse != float("inf"):
-                old_decay, old_k = decay_live, k_live
+            ) and best_rmse != float("inf") and apply_skipped_reason is None:
+                old_decay = decay_live
                 self.coordinator.solar_battery_decay = best[0]
-                self.coordinator.battery_thermal_feedback_k = best[1]
-                # Persist BOTH to entry.data
+                # Decay ONLY.  ``battery_thermal_feedback_k`` is retired
+                # (see ``K_GRID``) and must not be written here: the key
+                # is stripped from ``entry.data`` by
+                # ``coordinator.__init__`` on the next restart, so writing
+                # it produced a value that worked for hours or days and
+                # then silently reverted — while the decay written in the
+                # same call, which is NOT stripped, survived as a value
+                # fitted under a k the install no longer had.
+                #
+                # With ``K_GRID = [0.0]`` this is belt and braces:
+                # ``best[1]`` cannot be non-zero.  Kept explicit anyway so
+                # that widening the grid for research cannot silently
+                # restore the write.
                 new_data = {
                     **self.coordinator.entry.data,
                     "solar_battery_decay": best[0],
-                    "battery_thermal_feedback_k": best[1],
                 }
                 self.coordinator.hass.config_entries.async_update_entry(
                     self.coordinator.entry, data=new_data
                 )
                 calibration["applied"] = True
                 _LOGGER.info(
-                    "Joint battery calibration applied: decay %.2f → %.2f, k %.2f → %.2f",
-                    old_decay, best[0], old_k, best[1],
+                    "Battery decay calibration applied: %.2f → %.2f (k fixed at %.2f)",
+                    old_decay, best[0], k_live,
                 )
 
         # Carry-over reservoir feedback sweep (#896 follow-up).  Replays
         # the carryover-state EMA over the window for each k candidate
         # and reports per-cell residual delta vs the live (k=0) baseline.
+        #
+        # OBSERVABILITY ONLY.  ``battery_thermal_feedback_k`` is retired
+        # (see ``K_GRID`` above); this sweep still searches k because it is
+        # the evidence base for that retirement, but its verdict is
+        # ``research_optimum_k_*`` and does not raise ``any_action``.  It
+        # answers "would k have helped", never "set k to this".
         #
         # As of split-state implementation, this sweep models the LIVE
         # wiring: ``_solar_carryover_state`` is charged by ``k × wasted``
@@ -2636,12 +3217,43 @@ class DiagnosticsEngine:
                     trace.append(B)
                 trajectories[k_cand] = trace
 
-            baseline_trace = trajectories[0.0]
+            # Counterfactual anchor MUST be the live k, not k = 0 (#1066
+            # review).  ``residual_live`` below is ``actual - expected``
+            # where ``expected`` is the *logged* prediction — already net
+            # of whatever carryover release the live k produced.  Anchoring
+            # the delta at k = 0 therefore offsets every candidate by
+            # ``release_live - release_0``, so on an install running k > 0
+            # the candidate equal to the live setting is scored as a
+            # change and the sweep can "discover" the value already in
+            # use.  Anchoring at k_live makes ``residual_alt(k_live)``
+            # reduce to the logged residual exactly, which is the property
+            # the decay sweep's ``_replay_score`` already had.
+            #
+            # ``k_live`` may sit off the candidate grid (it is a free
+            # config value), so its trajectory is replayed here rather
+            # than looked up.  Bit-identical to the old behaviour whenever
+            # k_live == 0.0, which is the default and the case for every
+            # install that has not opted in.
+            k_live_sweep = _coerce_scalar(
+                self.coordinator.battery_thermal_feedback_k, 0.0
+            )
+            _live_trace: list[float] = []
+            _B = 0.0
+            for (impact_raw, wasted, _act, _exp, heating_active,
+                 _hb, _tb, _sb) in sweep_tuples:
+                feedback = (
+                    (k_live_sweep * wasted)
+                    if (k_live_sweep > 0.0 and heating_active) else 0.0
+                )
+                _B = _B * decay_for_sweep + (impact_raw + feedback) * (1 - decay_for_sweep)
+                _live_trace.append(_B)
+            baseline_trace = _live_trace
 
             # Per-cell residuals.  Cells dropped when they lack a temp
             # bucket (transition zone) — kept in global aggregate via the
             # ``global`` cell key so the user still sees an overall RMSE.
             per_k_results: dict[str, dict] = {}
+            residuals_by_k: dict[str, list[float]] = {}
             for k_cand in k_candidates:
                 k_trace = trajectories[k_cand]
                 cell_residuals: dict[tuple, list[float]] = {}
@@ -2689,12 +3301,51 @@ class DiagnosticsEngine:
                     },
                     "cells": cells,
                 }
+                # Kept out of per_k_results so the service payload does
+                # not grow by one float per hour per candidate.  Index
+                # order is ``sweep_tuples`` order for every candidate —
+                # ``global_residuals.append`` runs before the
+                # ``temp_bucket is None`` continue — so the lists are
+                # index-aligned across candidates and the pairing against
+                # the live-k baseline is exact (#1066).
+                residuals_by_k[str(k_cand)] = global_residuals
+
+            # Baseline residuals = the live k's own replay.  With
+            # ``baseline_trace`` anchored at k_live the release delta is
+            # identically zero for the live setting, so these reduce to the
+            # logged residuals — which is exactly the property that makes
+            # the anchor correct.  Built in ``sweep_tuples`` order so they
+            # are index-aligned with every ``residuals_by_k`` entry.
+            live_k_residuals: list[float] = [
+                actual - expected
+                for (_ir, _w, actual, expected, _ha, _hb, _tb, _sb) in sweep_tuples
+            ]
+            live_k_sse = sum(r * r for r in live_k_residuals)
+            live_k_rmse = (
+                (live_k_sse / len(live_k_residuals)) ** 0.5
+                if live_k_residuals else 0.0
+            )
 
             # Empirical optimum: lowest global RMSE.  Tie-break in favour
             # of smaller k (more conservative — closer to the disabled
             # default).  Reported as a recommendation, not auto-applied.
-            best_k = 0.0
-            best_global_rmse = per_k_results["0.0"]["global"]["rmse_kwh"]
+            # Seeded from the LIVE k, not from 0.0 (#1066 review).  On an
+            # install running k > 0 the old seed meant the sweep started
+            # from a value the install is not using, so "no candidate
+            # beats the baseline" could not be expressed and the argmin
+            # always reported a change.
+            best_k = k_live_sweep
+            # Rounded to match what the candidates are compared as.  The
+            # candidate RMSEs come out of ``per_k_results`` already
+            # rounded to 4 dp, so seeding with the raw value compares a
+            # full-precision baseline against quantised candidates: a
+            # candidate that ties the baseline exactly can still round
+            # DOWN by up to 5e-5 and clear the 1e-6 argmin margin, which
+            # is 50× the epsilon.  On a sweep where every candidate ties
+            # — an install with no wasted solar in the window, so k
+            # changes nothing — that reported a spurious change away from
+            # the live setting.  Compare like with like.
+            best_global_rmse = round(live_k_rmse, 4)
             for k_cand in k_candidates:
                 cand_rmse = per_k_results[str(k_cand)]["global"]["rmse_kwh"]
                 if cand_rmse < best_global_rmse - 1e-6:
@@ -2709,25 +3360,45 @@ class DiagnosticsEngine:
             # data — particularly relevant at 10-day windows where many
             # cells carry only 1-3 hours.
             #
-            # Sweep collapse (#896 follow-up).  When ``best_k == 0.0``
-            # every per_cell_at_optimum row would be identical to the
-            # baseline (delta_rmse = 0 everywhere), and every non-baseline
-            # ``sweep[k]["cells"]`` table is informational fluff with no
-            # actionable signal.  Emit only the baseline cells in
-            # ``sweep["0.0"]`` and a single ``per_k_global_rmse`` summary
-            # for the other candidates.  When ``best_k > 0`` the full
-            # detail is preserved on baseline + optimum k; intermediate k
-            # values still drop ``cells`` because they are not the
-            # recommended target.
-            if best_k == 0.0:
+            # Sweep collapse (#896 follow-up).  When the optimum IS the
+            # live setting every per_cell_at_optimum row would be
+            # identical to the baseline (delta_rmse = 0 everywhere), and
+            # every non-baseline ``sweep[k]["cells"]`` table is
+            # informational fluff with no actionable signal.  Emit only
+            # the baseline cells and a single ``per_k_global_rmse``
+            # summary for the other candidates.  Otherwise the full detail
+            # is preserved on baseline + optimum k; intermediate k values
+            # still drop ``cells`` because they are not the recommended
+            # target.
+            #
+            # Keyed on ``best_k == k_live_sweep``, not ``== 0.0``: with the
+            # baseline anchored at the live k, "no change recommended" is
+            # the live value, and on a k > 0 install the old test collapsed
+            # the wrong branch.  ``baseline_key`` follows for the same
+            # reason — the per-cell baseline column must be the anchor the
+            # headline numbers are quoted against, or the two disagree
+            # inside one payload.
+            #
+            # ``k_live_sweep`` may sit off the candidate grid (it is a free
+            # config value), in which case there is no ``per_k_results``
+            # row for it.  Both lookups below are guarded; an unguarded
+            # ``per_k_results[str(best_k)]`` here previously raised
+            # KeyError and killed the whole diagnose_solar service.
+            baseline_key = (
+                str(k_live_sweep) if str(k_live_sweep) in per_k_results else None
+            )
+            optimum_key = (
+                str(best_k) if str(best_k) in per_k_results else None
+            )
+            if best_k == k_live_sweep or optimum_key is None or baseline_key is None:
                 per_cell_at_optimum = None
                 for k_str, k_data in per_k_results.items():
-                    if k_str != "0.0":
+                    if k_str != baseline_key:
                         k_data.pop("cells", None)
             else:
                 per_cell_at_optimum = {}
-                baseline_cells = per_k_results["0.0"]["cells"]
-                optimum_cells = per_k_results[str(best_k)]["cells"]
+                baseline_cells = per_k_results[baseline_key]["cells"]
+                optimum_cells = per_k_results[optimum_key]["cells"]
                 all_cell_keys = set(baseline_cells) | set(optimum_cells)
                 for cell_key in sorted(all_cell_keys):
                     base_cell = baseline_cells.get(cell_key, {"n": 0, "rmse_kwh": 0.0})
@@ -2741,13 +3412,25 @@ class DiagnosticsEngine:
                         "thin_sample": base_cell["n"] < 5,
                     }
                 # Drop cells from intermediate k values; only baseline
-                # and optimum are actionable for the user.
+                # and optimum are actionable for the user.  Keyed on the
+                # same two variables the branch above reads, NOT on the
+                # ``"0.0"`` literal: with the baseline anchored at the
+                # live k, the literal stripped the row that
+                # ``per_cell_at_optimum``'s baseline column and
+                # ``global_rmse_at_baseline_kwh`` are both quoted from,
+                # while retaining a k=0 row that is neither baseline nor
+                # optimum.  Same payload, two disagreeing anchors — the
+                # exact condition ``baseline_key`` exists to prevent.
                 for k_str, k_data in per_k_results.items():
-                    if k_str != "0.0" and k_str != str(best_k):
+                    if k_str != baseline_key and k_str != optimum_key:
                         k_data.pop("cells", None)
 
             battery_feedback_sweep = {
-                "current_k": self.coordinator.battery_thermal_feedback_k,
+                # The coerced value, not the raw attribute.  One payload
+                # must not report three different answers for one setting
+                # — ``baseline_k`` and ``calibration.current_k`` are both
+                # coerced, and this field feeds ``summary`` directly.
+                "current_k": k_live_sweep,
                 "decay_used": decay_for_sweep,
                 "n_hours_in_window": len(sweep_tuples),
                 "n_hours_with_heating_active": sum(
@@ -2759,13 +3442,53 @@ class DiagnosticsEngine:
                 "k_candidates": k_candidates,
                 "sweep": per_k_results,
                 "empirical_optimum_k": best_k,
+                # Recommendation gating (#1066).  ``empirical_optimum_k``
+                # stays the raw argmin; these say whether it is advice.
+                #
+                # A monotone sweep whose minimum sits on the last
+                # candidate has not bracketed an optimum — it has run out
+                # of grid.  Observed on a real install: 11 candidates
+                # decreasing from 0.1959 to 0.1931, minimum at k=1.0, and
+                # the boundary value was reported as ``empirical_optimum_k``
+                # as though the sweep had located it.  Compared against
+                # ``k_live_sweep`` rather than 0.0 so an install already
+                # running k > 0 is not told its own value is a finding.
+                "optimum_at_sweep_boundary": bool(
+                    best_k != k_live_sweep
+                    and len(k_candidates) > 1
+                    and best_k == k_candidates[-1]
+                ),
+                # Baseline is the LIVE k, not the k=0 grid corner.
+                "recommendation_significance": paired_loss_improvement(
+                    live_k_residuals,
+                    residuals_by_k.get(str(best_k), live_k_residuals),
+                    n_candidates_considered=max(1, len(k_candidates)),
+                ),
+                "baseline_k": k_live_sweep,
+                # Named a screen, not a significance test: the candidate
+                # is the argmin over the grid and is tested on the
+                # residuals that selected it, so the t statistic is not a
+                # p-value.  See const.BATTERY_RECOMMENDATION_MIN_T.
+                "recommendation_screen": (
+                    "paired_diff_of_squared_residuals; base_t="
+                    f"{BATTERY_RECOMMENDATION_MIN_T}"
+                    " + sqrt(2 ln m) selection penalty"
+                    " + lag1 serial-correlation SE inflation;"
+                    " NOT a calibrated p-value"
+                ),
                 "global_rmse_at_optimum_kwh": round(best_global_rmse, 4),
-                "global_rmse_at_baseline_kwh": round(
-                    per_k_results["0.0"]["global"]["rmse_kwh"], 4
-                ),
-                "rmse_improvement_kwh": round(
-                    per_k_results["0.0"]["global"]["rmse_kwh"] - best_global_rmse, 4
-                ),
+                # Baseline is the live k's replay, so on a k = 0 install
+                # this is bit-identical to the old ``per_k_results["0.0"]``
+                # reading, and on a k > 0 install it is the value that was
+                # previously wrong (#1066 review).
+                "global_rmse_at_baseline_kwh": round(live_k_rmse, 4),
+                # ``+ 0.0`` normalises ``-0.0``: the baseline is rounded
+                # to 4 dp and the optimum is not, so a no-change sweep
+                # leaves a residual bounded by 5e-5 that can round to
+                # negative zero and serialise as ``-0.0`` in the service
+                # response.  Cosmetic, but "-0.0 improvement" reads as a
+                # regression.
+                "rmse_improvement_kwh": round(live_k_rmse - best_global_rmse, 4) + 0.0,
                 "per_cell_at_optimum": per_cell_at_optimum,
                 # Methodology — read this before interpreting numbers.
                 "method": "carryover_release_replay",
@@ -2777,8 +3500,12 @@ class DiagnosticsEngine:
                     "subtracts from heating-mode demand prediction. "
                     "Each k candidate's hypothetical RMSE is computed "
                     "by replaying the carryover EMA over the window and "
-                    "adding the release-delta vs k=0 baseline to the "
-                    "logged residual.  Coefficients are held at their "
+                    "adding the release-delta vs the LIVE k baseline "
+                    "(reported as baseline_k) to the logged residual — "
+                    "so the candidate equal to the live setting scores "
+                    "exactly the logged residual, and no change is "
+                    "reported when none is available.  Coefficients are "
+                    "held at their "
                     "currently-learned values (frozen-coefficient mode) "
                     "— real adoption of k > 0 will trigger ~2-6 % NLMS "
                     "coefficient drift over 2-3 weeks, which this "
@@ -2903,37 +3630,84 @@ class DiagnosticsEngine:
         if battery_feedback_sweep:
             opt_k = battery_feedback_sweep.get("empirical_optimum_k", 0.0)
             improvement = battery_feedback_sweep.get("rmse_improvement_kwh", 0.0)
-            if opt_k == 0.0:
-                bf_verdict = "no_improvement_available"
-            else:
-                bf_verdict = f"consider_k_{opt_k}"
+            bf_sig = battery_feedback_sweep.get("recommendation_significance") or {}
+            bf_boundary = battery_feedback_sweep.get(
+                "optimum_at_sweep_boundary", False
+            )
+            # ``improvement`` used to be bound here, reported, and never
+            # read by the verdict (#1066).  It now gates, via the paired
+            # significance test rather than its own magnitude.
+            bf_verdict = battery_feedback_verdict(
+                opt_k,
+                bf_boundary,
+                bf_sig.get("significant", False),
+                current_k=battery_feedback_sweep.get(
+                    "baseline_k", battery_feedback_sweep.get("current_k", 0.0)
+                ),
+            )
             battery_feedback_summary = {
                 "current_k": battery_feedback_sweep.get("current_k", 0.0),
                 "optimum_k": opt_k,
                 "rmse_improvement_kwh": improvement,
+                "t_statistic": bf_sig.get("t_statistic"),
+                "optimum_at_sweep_boundary": bf_boundary,
                 "verdict": bf_verdict,
             }
         else:
             battery_feedback_summary = {
-                "current_k": self.coordinator.battery_thermal_feedback_k,
+                # Coerced for the same reason the sweep's own
+                # ``current_k`` is: one attribute, one reported answer.
+                "current_k": _coerce_scalar(
+                    self.coordinator.battery_thermal_feedback_k, 0.0
+                ),
                 "verdict": "no_data",
             }
         # Battery decay verdict pivots on assessment from battery_health
         # and the calibration block; "ok" means no recommendation pending.
         if calibration:
-            decay_verdict = (
-                "ok"
-                if calibration.get("recommended_decay") == calibration.get("current_decay")
-                else f"consider_decay_{calibration.get('recommended_decay')}"
+            # ``recommended_decay != current_decay`` is necessary but not
+            # sufficient (#1066).  ``recommendation_withheld_reason``
+            # carries the three suppressing conditions in priority order,
+            # computed where the sweep ran; the verdict is a lookup.
+            decay_verdict = battery_decay_verdict(
+                calibration.get("current_decay"),
+                calibration.get("recommended_decay"),
+                calibration.get("recommendation_withheld_reason"),
+                sweep_produced_evidence=calibration.get(
+                    "sweep_produced_evidence", True
+                ),
+                bias_assessment=battery_health.get("assessment"),
             )
             battery_decay_summary = {
                 "current_decay": calibration.get("current_decay"),
                 "recommended_decay": calibration.get("recommended_decay"),
+                "t_statistic": (
+                    calibration.get("recommendation_significance", {})
+                    .get("t_statistic")
+                ),
+                # Both of these are load-bearing in the summary, not
+                # detail-block duplication.  ``recommended_decay`` above
+                # is the raw argmin and is populated even when the sweep
+                # declined to advise it — without the reason beside it a
+                # reader takes the number as endorsed and sets it by
+                # hand, which is exactly what the withholding chain
+                # exists to prevent.  ``bias_assessment`` is the second
+                # reading of the same residual; it raises ``any_action``
+                # on its own, so the summary must say what raised it.
+                "recommendation_withheld_reason": calibration.get(
+                    "recommendation_withheld_reason"
+                ),
+                "bias_assessment": battery_health.get("assessment"),
                 "verdict": decay_verdict,
             }
         elif battery_health:
+            # No calibration block at all, so the bias reading IS the
+            # verdict here.  ``bias_assessment`` is carried alongside it
+            # anyway, so the ``battery_bias_raises`` operand reads one
+            # key regardless of which branch built this dict.
             battery_decay_summary = {
                 "current_decay": battery_health.get("decay_rate"),
+                "bias_assessment": battery_health.get("assessment"),
                 "verdict": battery_health.get("assessment", "no_data"),
             }
         else:
@@ -2998,12 +3772,45 @@ class DiagnosticsEngine:
         #   indefinitely with no dismiss mechanism.  Accepted (the action
         #   is a single setting) rather than overlooked; a suppression
         #   path is the lever if the nag proves unwelcome.
+        # The post-sunset residual is read twice — as a decay
+        # recommendation and as a bias flag — and BOTH reach
+        # ``any_action``, each through its own operand (#1066).
+        #
+        # The ``battery_decay_*`` entries are filtered out of the generic
+        # ``bool(global_flags)`` term and re-enter as
+        # ``battery_bias_raises`` below.  That is ROUTING, not
+        # suppression: it puts the bias behind a named operand that says
+        # what it is, instead of inside an anonymous flag-list truth test.
+        # Do not "simplify" it back by dropping the operand.  An earlier
+        # revision did exactly that, justified as stopping one signal from
+        # raising the verdict "twice" — which a boolean OR cannot do, two
+        # true operands raise it exactly as much as one — and the effect
+        # was that a well-sampled bias vanished from the summary whenever
+        # the sweep merely ran.
+        #
+        # The bias is a separate operand rather than folded into
+        # ``battery_decay_summary["verdict"]`` because the verdict has to
+        # stay free to report ``windows_disagree`` and the other
+        # withholding reasons.  Those sit next to a populated
+        # ``recommended_decay``, and replacing them with the bias leaves
+        # a raw argmin in the payload looking endorsed.
+        non_battery_flags = [
+            f for f in global_flags if not f.startswith("battery_decay_")
+        ]
+        battery_bias_raises = battery_decay_summary.get("bias_assessment") in (
+            "too_fast", "too_slow",
+        )
         any_action = (
-            bool(global_flags)
+            bool(non_battery_flags)
             or bool(units_with_flags)
             or battery_feedback_summary["verdict"].startswith("consider_")
             or battery_decay_summary["verdict"].startswith("consider_")
+            # Two operands, one residual: the sweep's recommendation and
+            # the bias reading.  The second covers the case the first
+            # cannot — the sweep ran, found no better decay, and the
+            # residual is biased anyway.
             or battery_decay_summary["verdict"] in ("too_fast", "too_slow")
+            or battery_bias_raises
             or source_mix.get("verdict") == "enabled_but_unsupported"
             or readiness_4d.get("verdict") in ("ready_to_enable", "enabled_but_not_ready")
         )
@@ -3186,6 +3993,109 @@ class DiagnosticsEngine:
                 "real_sources": ["native", "erbs_from_ghi"],
             },
         }
+
+    def _compute_dni_dhi_outage(self) -> dict:
+        """Has the irradiance input gone away while 4D is live? (#1070)
+
+        An **alert**, not a routing decision, and deliberately not built
+        on :meth:`_compute_dni_dhi_source_mix`.  That gate is slow on
+        purpose — 30 days, 80 % dominance, 50 hours minimum — because
+        routing an install between pipelines is a considered choice.  The
+        question here is the opposite: did this provider stop publishing
+        irradiance in the last day or two?  A 30-day window would take
+        weeks to notice.  Two questions, two windows.
+
+        Walks ``_hourly_log`` backwards, counting **daylight** hours only
+        (``solar_factor > 0``) until the window is full.  The daylight
+        filter is load-bearing for the same reason it is in the source
+        mix: :func:`solar.derive_dni_dhi_source_label` never emits
+        ``"no_sun"``, so night hours carry a ``kasten_synthetic`` label on
+        any install with cloud data, and a wall-clock window would fire
+        every night on a healthy install.
+
+        Verdicts:
+            ``raise``  — real-source share below the raise bar; the
+                provider has effectively stopped supplying irradiance
+                while 4D is routed live.
+            ``clear``  — share at or above the clear bar; recovered.
+            ``hold``   — share between the two bars.  Sticky by design:
+                asymmetric thresholds are what stop an intermittent
+                provider from creating and deleting the repair on
+                alternating days.
+            ``not_applicable`` — 4D not routed live, or solar disabled.
+                Nothing to warn about; any existing issue is cleared.
+            ``insufficient_data`` — window not yet full.  Distinct from
+                ``clear``: no evidence is not evidence of health, and a
+                fresh install must not raise a repair on day one.
+
+        Strict read — walks ``hourly_log`` and writes nothing.  The
+        create/delete side-effect lives in ``repairs.py``.
+        """
+        flag_on = (
+            getattr(self.coordinator, "experimental_4d_primary", False) is True
+        )
+        solar_on = bool(getattr(self.coordinator, "solar_enabled", False))
+        if not flag_on or not solar_on:
+            # Gated on solar_enabled as well as the flag: with solar off
+            # the 4D path never runs, so a warning about its input
+            # quality is noise about a pipeline that is not executing.
+            return {
+                "verdict": "not_applicable",
+                "experimental_4d_primary_enabled": flag_on,
+                "solar_enabled": solar_on,
+                "daylight_hours_examined": 0,
+                "real_source_hours": 0,
+                "real_source_share": None,
+            }
+
+        real_hours = 0
+        examined = 0
+        for entry in reversed(self.coordinator._hourly_log):
+            if examined >= REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS:
+                break
+            try:
+                if float(entry.get("solar_factor") or 0.0) <= 0.0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            source = entry.get("dni_dhi_source")
+            if not source:
+                # Pre-#1058 entries carry no label.  Skipped rather than
+                # counted either way — an unlabelled hour is not evidence
+                # of an outage, and counting it as healthy would mask one.
+                continue
+            examined += 1
+            if source in ("native", "erbs_from_ghi"):
+                real_hours += 1
+
+        result = {
+            "experimental_4d_primary_enabled": flag_on,
+            "solar_enabled": solar_on,
+            "daylight_hours_examined": examined,
+            "real_source_hours": real_hours,
+            "window_hours": REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS,
+            "thresholds": {
+                "raise_below": REPAIR_DNI_DHI_OUTAGE_RAISE_BELOW,
+                "clear_at": REPAIR_DNI_DHI_OUTAGE_CLEAR_AT,
+                "min_hours": REPAIR_DNI_DHI_OUTAGE_MIN_HOURS,
+                "real_sources": ["native", "erbs_from_ghi"],
+            },
+        }
+
+        if examined < REPAIR_DNI_DHI_OUTAGE_MIN_HOURS:
+            result["verdict"] = "insufficient_data"
+            result["real_source_share"] = None
+            return result
+
+        share = real_hours / examined
+        result["real_source_share"] = round(share, 4)
+        if share < REPAIR_DNI_DHI_OUTAGE_RAISE_BELOW:
+            result["verdict"] = "raise"
+        elif share >= REPAIR_DNI_DHI_OUTAGE_CLEAR_AT:
+            result["verdict"] = "clear"
+        else:
+            result["verdict"] = "hold"
+        return result
 
     def _compute_4d_readiness(self, days_back: int, source_mix: dict | None = None) -> dict:
         """Both halves of the ``experimental_4d_primary`` gate (#1062).

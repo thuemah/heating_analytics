@@ -231,5 +231,22 @@
     "abort": {
       "already_configured": "Enheten er allerede konfigurert"
     }
+  },
+  "issues": {
+    "dni_dhi_outage": {
+      "title": "Solinnstrålingsdata er ikke lenger tilgjengelig",
+      "description": "4D-solmodellen er slått på for **{name}**, men værleverandøren din har sluttet å levere direkte og diffus innstråling. Bare {real_hours} av de siste {hours} dagslystimene hadde det.\n\nUten disse dataene utledes de to verdiene fra én enkelt skydekkeprosent, og på det grunnlaget er 4D-modellen mindre nøyaktig enn den enklere modellen den erstattet. Prediksjonene dine kjører fortsatt, men på den svakere modellen.\n\nVil du bytte tilbake til 3D-solmodellen? Ingenting går tapt — 4D-modellen fortsetter å lære i bakgrunnen, og du kan bytte tilbake når leverandøren din begynner å levere innstråling igjen.",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Bytt tilbake til 3D-solmodellen",
+            "description": "Dette slår av 4D-solmodellen og laster integrasjonen på nytt. Lærte data beholdes."
+          }
+        },
+        "abort": {
+          "entry_not_found": "Denne installasjonen ble ikke funnet, så ingenting ble endret. Den kan ha blitt fjernet etter at varselet dukket opp. Varselet kan trygt lukkes."
+        }
+      }
+    }
   }
 }

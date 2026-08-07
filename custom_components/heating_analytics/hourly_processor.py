@@ -1241,6 +1241,15 @@ class HourlyProcessor:
         # Accumulate orphaned savings into daily total
         self.coordinator._daily_orphaned_aux += self.coordinator._collector.orphaned_aux
 
+        # Repair-issue evaluation (#1070).  Placed after the log append
+        # above so the window includes the hour just closed — the whole
+        # point is to react within a day or two of a provider dropping
+        # irradiance, and skipping the freshest hour costs one hour of
+        # that budget.  Never raises; see ``repairs.py``.
+        from .repairs import async_check_dni_dhi_outage
+
+        async_check_dni_dhi_outage(self.coordinator.hass, self.coordinator)
+
         # Save Logic (force save on hourly boundary)
         await self.coordinator._async_save_data(force=True)
 

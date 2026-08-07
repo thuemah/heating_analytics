@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from custom_components.heating_analytics.const import (
+    ATTR_SOLAR_FACTOR,
     DOMAIN,
     MODE_HEATING,
     MODE_COOLING,
@@ -363,8 +364,21 @@ def test_4d_shadow_mode_stratified_coeffs():
     )
 
 
-def test_4d_shadow_dni_dhi_unavailable_zero_solar():
-    """No GHI, no native DNI/DHI, no cloud_coverage -> 0 solar, source 'unavailable'."""
+def test_4d_shadow_dni_dhi_unresolvable_routes_to_3d():
+    """No GHI, no native DNI/DHI, no cloud_coverage -> 3D fallback (#1071).
+
+    This test previously asserted ``solar_reduction_kwh == 0.0`` and
+    ``dni_dhi_source == "unavailable"``, pinning the behaviour #1071
+    changed: an unresolvable irradiance ladder used to be renamed to
+    ``"unavailable"``, close the solar gate, and predict zero solar,
+    while ``forecast.py`` answered the same situation by falling back to
+    the cloud-derived 3D model.  The 3D answer won — a cloud estimate
+    always exists, so zero solar was never the honest reading.
+
+    Note the learned 4D coefficient below: it is deliberately present and
+    deliberately unused.  The route is chosen by input availability, not
+    by whether the 4D model could have produced a number.
+    """
     coord = _build_coordinator()
     _bind_prediction(coord, base_kwh=2.0, aux_kwh=0.0)
     _bind_sun(coord, elev=45.0, az=180.0)
@@ -372,7 +386,6 @@ def test_4d_shadow_dni_dhi_unavailable_zero_solar():
     coord.balance_point = 15.0
     coord.auxiliary_heating_active = False
     coord.aux_affected_entities = []
-    # Even with a learned 4D coefficient, no irradiance signal -> 0.
     coord._solar_coefficients_4d_per_unit = {
         ENTITY_A: {
             "heating": {
@@ -386,8 +399,8 @@ def test_4d_shadow_dni_dhi_unavailable_zero_solar():
         is_aux_active=False,
         override_now=datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
     )
-    assert result["breakdown"]["solar_reduction_kwh"] == 0.0
-    assert result["dni_dhi_source"] == "unavailable"
+    assert result["pipeline"] == "3d_no_irradiance"
+    assert result["dni_dhi_source"] == "none"
 
 
 def test_4d_shadow_no_carryover_release():
@@ -600,6 +613,117 @@ def test_4d_shadow_override_correction_percent_overrides_live_slider():
     assert result_no_override["breakdown"]["solar_reduction_kwh"] < sr_override, (
         "without override, closed-slider coordinator should produce less solar"
     )
+
+
+# ---------------------------------------------------------------------
+# No-irradiance fallback (#1071)
+# ---------------------------------------------------------------------
+
+def _bind_solar_coeffs_4d(coord, *, s=0.4, e=0.2, w=0.2, diffuse=0.1):
+    """Give ENTITY_A a learned 4D heating coefficient set."""
+    coord._solar_coefficients_4d_per_unit = {
+        ENTITY_A: {
+            "heating": {"s": s, "e": e, "w": w, "diffuse": diffuse, "learned": True},
+            "cooling": {},
+        }
+    }
+
+
+def _unresolvable_irradiance_coordinator():
+    """Coordinator whose whole irradiance ladder resolves to ``"none"``.
+
+    No GHI sensor, no native DNI/DHI, and ``_get_cloud_coverage``
+    returning None.  The last of those cannot happen in production —
+    the real method has no None branch — so it is forced here to reach
+    the branch under test.
+    """
+    coord = _build_coordinator()
+    _bind_prediction(coord, base_kwh=2.0, aux_kwh=0.0)
+    _bind_sun(coord, elev=45.0, az=180.0)
+    _bind_weather(coord, dni=None, dhi=None, ghi=None, cloud=None)
+    _bind_solar_coeffs_4d(coord)
+    coord.balance_point = 15.0
+    coord.auxiliary_heating_active = False
+    coord.aux_affected_entities = []
+    # Live cloud-derived solar state, as the per-minute update tick
+    # populates it in production.  This is the estimate the fallback
+    # exists to preserve — without it the 3D path reads 0.0 and the
+    # test would pass for the wrong reason.
+    coord.data[ATTR_SOLAR_FACTOR] = 0.6
+    coord.solar_azimuth = 180.0
+    return coord
+
+
+def test_no_irradiance_falls_back_to_3d_not_zero_solar():
+    """``resolve_dni_dhi`` -> "none" must yield the 3D result, not zero solar.
+
+    The rule (#1071): "no irradiance resolvable" means the ladder found
+    nothing, NOT that no solar signal exists — the 3D path's cloud input
+    always produces an estimate.  Zeroing solar would assert darkness on
+    what may be a clear day.  Pins the live path against
+    ``forecast.py``'s answer, which excludes "none" from its 4D route.
+    """
+    coord = _unresolvable_irradiance_coordinator()
+    now = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    result = coord.statistics.calculate_total_power_4d(
+        temp=10.0, effective_wind=0.0, solar_impact=0.0,
+        is_aux_active=False, override_now=now,
+    )
+
+    # Markers make the fallback visible rather than silent.
+    assert result["pipeline"] == "3d_no_irradiance"
+    assert result["dni_dhi_source"] == "none"
+
+    # And it is byte-for-byte the 3D answer, not a zeroed 4D one.
+    expected = coord.statistics._calculate_total_power_3d(
+        10.0, 0.0, 0.0, False, override_now=now,
+    )
+    assert result["total_kwh"] == expected["total_kwh"]
+    assert result["breakdown"] == expected["breakdown"]
+
+    # The substantive claim: solar was NOT zeroed.  The 3D path derives
+    # it from the cloud-model solar vector, which exists regardless of
+    # whether the irradiance ladder resolved.
+    assert result["breakdown"]["solar_reduction_kwh"] > 0.0, (
+        "no-irradiance hour must keep the cloud-derived solar estimate"
+    )
+
+
+def test_unavailable_sentinel_means_only_not_attempted():
+    """``"unavailable"`` no longer doubles as "resolved to nothing" (#1071).
+
+    Solar disabled is the one state that reaches the initialiser, and it
+    still closes the gate.  A ladder that runs and finds nothing takes
+    the 3D fallback and keeps its own ``"none"`` label instead.
+    """
+    coord = _unresolvable_irradiance_coordinator()
+    coord.solar_enabled = False
+    now = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    result = coord.statistics.calculate_total_power_4d(
+        temp=10.0, effective_wind=0.0, solar_impact=0.0,
+        is_aux_active=False, override_now=now,
+    )
+
+    assert result["dni_dhi_source"] == "unavailable"
+    assert result["pipeline"] == "4d_shadow"
+    assert result["breakdown"]["solar_reduction_kwh"] == 0.0
+
+
+def test_resolvable_irradiance_still_runs_4d():
+    """The fallback must not swallow hours the ladder can resolve."""
+    coord = _unresolvable_irradiance_coordinator()
+    _bind_weather(coord, dni=600.0, dhi=100.0, ghi=None, cloud=None)
+    now = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    result = coord.statistics.calculate_total_power_4d(
+        temp=10.0, effective_wind=0.0, solar_impact=0.0,
+        is_aux_active=False, override_now=now,
+    )
+
+    assert result["pipeline"] == "4d_shadow"
+    assert result["dni_dhi_source"] == "native"
 
 
 if __name__ == "__main__":

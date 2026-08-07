@@ -231,5 +231,22 @@
     "abort": {
       "already_configured": "Device is already configured"
     }
+  },
+  "issues": {
+    "dni_dhi_outage": {
+      "title": "Solar irradiance data is no longer available",
+      "description": "The 4D solar model is switched on for **{name}**, but your weather provider has stopped supplying direct and diffuse irradiance. Only {real_hours} of the last {hours} daylight hours carried it.\n\nWithout that data those two values are derived from a single cloud-cover percentage, and on that input the 4D model is less accurate than the simpler one it replaced. Your predictions are still running, but on the weaker model.\n\nSwitch back to the 3D solar model? Nothing is lost by doing so — the 4D model keeps learning in the background, and you can switch back whenever your provider starts supplying irradiance again.",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Switch back to the 3D solar model",
+            "description": "This turns off the 4D solar model and reloads the integration. Learned data is kept."
+          }
+        },
+        "abort": {
+          "entry_not_found": "This installation could not be found, so nothing was changed. It may have been removed since the notice appeared. The notice can be safely dismissed."
+        }
+      }
+    }
   }
 }

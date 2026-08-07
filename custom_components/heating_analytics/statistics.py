@@ -1185,10 +1185,20 @@ class StatisticsManager:
 
         Returns:
             Same shape as :meth:`calculate_total_power`, plus:
-                ``pipeline``: always ``"4d_shadow"``.
+                ``pipeline``: ``"4d_shadow"``, except on the no-irradiance
+                    fallback below, where it is ``"3d_no_irradiance"`` and
+                    the body is a 3D result (#1071).
                 ``dni_dhi_source``: source label from ``resolve_dni_dhi``
                     (``"erbs_from_ghi"``, ``"native"``,
-                    ``"kasten_synthetic"``, ``"no_sun"``, ``"none"``).
+                    ``"kasten_synthetic"``, ``"no_sun"``), or
+                    ``"replay_override"`` when DNI/DHI was injected, or
+                    ``"unavailable"`` when resolution was never attempted
+                    (solar disabled), or ``"none"`` on the fallback.
+
+            ``"unavailable"`` carries exactly one meaning: resolution was
+            not attempted.  It used to double as "resolution succeeded and
+            found nothing" via a rename here; that state now returns the 3D
+            fallback instead and keeps its own ``"none"`` label (#1071).
         """
         temp_key = str(int(round(temp)))
         wind_bucket = self.coordinator._get_wind_bucket(effective_wind)
@@ -1222,6 +1232,9 @@ class StatisticsManager:
         dhi = 0.0
         sun_elev = 0.0
         sun_az = 0.0
+        # "resolution not attempted" only — reached when solar is disabled
+        # (neither branch below runs).  A ladder that runs and finds nothing
+        # returns the 3D fallback labelled "none"; it does not land here.
         dni_dhi_source = "unavailable"
 
         # Replay override path — used by the divergence diagnose block
@@ -1297,9 +1310,55 @@ class StatisticsManager:
                     dni_in, dhi_in, ghi_in, cloud_in, sun_elev, day_of_year
                 )
                 if src_label == "none":
-                    dni_dhi_source = "unavailable"
-                else:
-                    dni_dhi_source = src_label
+                    # THE RULE for "no irradiance resolvable" (#1071): fall
+                    # back to the cloud-derived 3D model, never to zero solar.
+                    #
+                    # "none" means the irradiance ladder found nothing — no
+                    # GHI sensor, no native DNI/DHI, no cloud coverage.  It
+                    # does NOT mean "no solar signal exists": the 3D path's
+                    # input is ``coordinator._get_cloud_coverage()``, which
+                    # has no None branch (50.0 with no weather entity, 50.0
+                    # with no state, CLOUD_COVERAGE_MAP from the condition
+                    # text, DEFAULT_CLOUD_COVERAGE otherwise).  A cloud-
+                    # derived estimate therefore always exists, and zeroing
+                    # solar would discard it — asserting darkness on what may
+                    # be a clear day.
+                    #
+                    # ``forecast.py`` reaches the same conclusion by excluding
+                    # "none" from its 4D route; this is that rule stated once,
+                    # at the decision point, so the two cannot drift apart.
+                    # Deliberately NOT unified with the third answer:
+                    # ``solar.reconstruct_hour_inputs`` maps "none" to
+                    # HOUR_INPUT_FAIL_NO_DNI_DHI and skips the hour, which is
+                    # correct for replay/diagnostics — an hour with no input
+                    # must not be counted as a 0-solar observation.  Three
+                    # contexts, two rules, both intentional.
+                    #
+                    # Reachability: effectively nil on this path (see above —
+                    # ``cloud_in`` is only None if that call raises).  Live
+                    # exposure is via ``resolve_dni_dhi_for_forecast``, whose
+                    # cloud input comes from a forecast-item dict that can
+                    # genuinely lack both ``cloud_coverage`` and a mappable
+                    # ``condition``.  Kept correct here regardless, so the
+                    # branch cannot be read as a deliberate zero-solar choice.
+                    fallback = self._calculate_total_power_3d(
+                        temp,
+                        effective_wind,
+                        solar_impact,
+                        is_aux_active,
+                        unit_modes=unit_modes,
+                        detailed=detailed,
+                        known_aux_impact_kwh=known_aux_impact_kwh,
+                        override_now=override_now,
+                    )
+                    # Stamp the markers the 3D return does not carry, so the
+                    # fallback is visible rather than silent.  A 4D-primary
+                    # install running 3D for a whole hour should be able to
+                    # see that it did.
+                    fallback["pipeline"] = "3d_no_irradiance"
+                    fallback["dni_dhi_source"] = "none"
+                    return fallback
+                dni_dhi_source = src_label
             else:
                 dni_dhi_source = "no_sun"
 
@@ -2848,7 +2907,35 @@ class StatisticsManager:
                     cooldown_suppressed = True
 
             if is_unusual and not cooldown_suppressed:
-                _LOGGER.warning(
+                # DEBUG, not WARNING — the log level follows who owns the
+                # decision, not how interesting the number is.
+                #
+                # WARNING means "the operator should look at the
+                # component".  A deviation measurement is user-domain
+                # data: whether a given deviation is worth acting on
+                # depends on season, occupancy and what this particular
+                # household considers actionable, and the component holds
+                # none of that.  It holds the mechanism — how far actual
+                # departed from expected — and publishes it on the
+                # deviation sensor (``unusual``, ``deviation_score``,
+                # ``deviation_threshold``, ``confidence``, ``contributors``),
+                # which is where a user automation can apply its own
+                # policy with the context we lack.
+                #
+                # The volume was the symptom that surfaced it: this runs
+                # once per coordinator update, so a score resting near its
+                # threshold re-logged every minute — 737 lines in 24 h on
+                # the reference install, 63 % of all WARNING/ERROR output,
+                # burying unrelated problems.  But the level would have
+                # been wrong at seven lines too.
+                #
+                # NOTE for anyone extending this: moving the line did NOT
+                # fix the oscillation.  ``_is_deviation_unusual`` is a bare
+                # ``score > threshold`` with no hysteresis, so ``unusual``
+                # flips in the sensor attribute exactly as it did in the
+                # log.  Automations should key on the score/threshold pair
+                # rather than the boolean until that is addressed.
+                _LOGGER.debug(
                     f"Unusual Deviation Detected for {name} ({entity_id}): "
                     f"Deviation={deviation:.2f} kWh, Expected={expected_so_far:.2f} kWh, "
                     f"Confidence={confidence} (Avg Obs: {avg_obs_count:.1f}), Score={dev_score:.2f} > {dev_threshold:.2f}"

@@ -508,7 +508,26 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             mpc_managed_sensor=self.mpc_managed_sensor,
         )
 
-        self.solar_battery_decay = entry.data.get("solar_battery_decay", SOLAR_BATTERY_DECAY)
+        # Coerced at the boundary, like ``solar_hotspot_attenuation_gamma``
+        # and ``solar_redistribution_tau_hours`` below.  This one genuinely
+        # arrives from ``entry.data`` — ``diagnose_solar``'s
+        # ``apply_battery_decay: true`` writes it there — so a JSON
+        # round-trip or a hand-edited entry can present it as a string,
+        # and it feeds bare arithmetic (``state * decay``) in the battery
+        # replays with no guard downstream.  ``forecast.py`` already
+        # defends both this and ``battery_thermal_feedback_k`` at its own
+        # read site; fixing it here covers every consumer instead.
+        #
+        # ``bool`` excluded deliberately: it subclasses ``int``, so
+        # ``True`` would become a decay of 1.0 — a battery that never
+        # discharges.
+        _decay_raw = entry.data.get("solar_battery_decay", SOLAR_BATTERY_DECAY)
+        self.solar_battery_decay = (
+            float(_decay_raw)
+            if isinstance(_decay_raw, (int, float))
+            and not isinstance(_decay_raw, bool)
+            else SOLAR_BATTERY_DECAY
+        )
         # Saturation-wasted thermal-feedback (#896).  The Advanced Options UI
         # was retired in the same release that documented this code path —
         # joint sweep evidence showed empirical optimum k = 0 across the
@@ -1924,6 +1943,21 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         Delegates to :class:`diagnostics.DiagnosticsEngine`.
         """
         return self._diagnostics._compute_4d_readiness(days_back)
+
+    def evaluate_dni_dhi_outage(self) -> dict:
+        """Has irradiance input gone away while 4D is routed live? (#1070)
+
+        Public entry point for the hour-boundary repair check.  Distinct
+        from :meth:`evaluate_4d_readiness`, which answers the slow
+        routing question over 30 days; this is the fast alert question
+        over a trailing window of daylight hours.
+
+        Cheap: walks ``_hourly_log`` backwards and stops once the window
+        is full — tens of entries, not the whole log.
+
+        Delegates to :class:`diagnostics.DiagnosticsEngine`.
+        """
+        return self._diagnostics._compute_dni_dhi_outage()
 
     def _get_float_state(self, entity_id: str) -> float | None:
         """Helper to get float state from an entity."""

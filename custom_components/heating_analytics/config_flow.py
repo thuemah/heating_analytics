@@ -17,6 +17,31 @@ Architecture notes for contributors
   ``wind_from_user`` is True (form values).  ``setdefault`` values are already
   in m/s and must not be double-converted.
 
+Field ordering on ``advanced`` / ``reconfigure_advanced``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Field order is dict insertion order in ``_schema_advanced``.  The axis that
+governs it is **expected interaction frequency** — how likely this field is
+the reason the user opened the page — **not** consequence.  A setting that is
+dangerous but set once at setup belongs low; a setting a user returns to after
+reading ``diagnose_solar`` belongs high.
+
+The ``--- Mundane fields at the bottom ---`` group means exactly that
+(``csv_auto_logging``, ``max_energy_delta``, ``hourly_log_retention_days``) —
+routine, not **expert-only**.  Do not demote a high-consequence setting into
+it: HA config flow has no collapsible sections, so "at the bottom" is the only
+"tucked away" that exists, and parking an expert setting next to log retention
+puts it directly in the path of a user scrolling down for something routine.
+"Findable but not offered" needs a separate expert step, which does not exist.
+
+Known deviation, not an example to copy: ``daily_learning_mode`` (Track B) and
+``track_c_enabled`` (Track C) sit near the top and do not follow this axis —
+both are high-consequence and set once at setup if ever.  Their placement
+predates the rule.
+
+``CONF_EXPERIMENTAL_4D_PRIMARY`` is first on a different basis entirely — it
+must render under the readiness verdict in the step description.  See
+``_schema_advanced``'s docstring; that position is pinned by a test.
+
 Translation notes
 ~~~~~~~~~~~~~~~~~
 Two files: ``translations/en.json`` and ``translations/nb.json``.
@@ -486,8 +511,9 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         initial setup wizard never shows it.
 
         Field order is dict insertion order and is load-bearing for that one
-        field; the rest of the page runs high-priority toggles first and the
-        ``--- Lower-priority fields at the bottom ---`` group last.
+        field.  For the rest of the page the ordering axis is expected
+        interaction frequency, not consequence — see "Field ordering" in the
+        module docstring before placing a new field.
         """
         g = lambda k, d=None: self._v(user_input, defaults, k, d)
 
@@ -608,7 +634,7 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # (CONF_EXPERIMENTAL_4D_PRIMARY was here; it is now inserted first so
         # it sits directly under the readiness verdict in the step
         # description — see the top of this method.)
-        # --- Lower-priority fields at the bottom ---
+        # --- Mundane fields at the bottom (routine, not expert-only) ---
         schema[vol.Optional("csv_auto_logging", default=g("csv_auto_logging", DEFAULT_CSV_AUTO_LOGGING))] = selector.BooleanSelector()
         schema[vol.Optional("max_energy_delta", default=g("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA))] = (
             selector.NumberSelector(

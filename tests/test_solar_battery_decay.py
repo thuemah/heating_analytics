@@ -220,7 +220,10 @@ class TestDiagnoseSolarCalibrationSweep:
         assert "recommended_k" in calibration
         assert "rmse_surface" in calibration
         assert "method" in calibration
-        assert calibration["method"] == "joint_decay_k_counterfactual_replay"
+        # Not "joint_" any more: k is pinned at the retired feature's
+        # fixed value, so the sweep searches decay alone.
+        assert calibration["method"] == "decay_counterfactual_replay_at_fixed_k"
+        assert calibration["k_swept"] == [0.0]
 
     def test_sweep_with_no_data_returns_empty(self):
         """Empty hourly log produces empty calibration."""
@@ -426,29 +429,110 @@ class TestJointDecayKSweepValidation:
         assert cal["post_sunset_hours_evaluated"] == 0
         assert cal["rmse_surface"] == {}
 
-    def test_sweep_includes_k_dimension(self):
-        """When wasted is non-zero on truth-data with k > 0, the sweep
-        should pick up the k contribution and recommend k > 0."""
-        true_decay, true_k = 0.80, 0.3
+    def test_the_sweep_never_searches_k(self):
+        """k is pinned, so a k>0 truth cannot be recovered — by design.
+
+        This test used to assert the opposite: fed a log generated at
+        ``true_k = 0.3`` it required the sweep to recover 0.3 on both
+        dimensions.  That is exactly the capability that had to go.
+        ``battery_thermal_feedback_k`` was retired in 1.3.5 and
+        ``coordinator.__init__`` strips it from ``entry.data`` on every
+        init, so a recovered k > 0 could not survive a restart — while the
+        decay recommended alongside it, which is NOT stripped, did.  An
+        install that applied the pair ended up running a decay fitted
+        conditional on a k it no longer had.
+
+        The sweep now searches only the slice the system can occupy.
+        """
         log = []
         for d in range(1, 8):
             log += self._generate_day(
-                f"2026-04-{d:02d}", true_decay=true_decay, true_k=true_k,
-                peak_wasted=0.2,  # non-zero wasted so k matters
+                f"2026-04-{d:02d}", true_decay=0.80, true_k=0.3,
+                peak_wasted=0.2,  # non-zero wasted, so k would matter
             )
-        coord = self._make_coord(log, decay=true_decay, k=true_k)
+        coord = self._make_coord(log, decay=0.80, k=0.3)
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         cal = result["global"]["battery_calibration"]
 
-        # Recovers the truth on both dimensions
-        assert cal["recommended_decay"] == pytest.approx(true_decay, abs=0.05)
-        assert cal["recommended_k"] == pytest.approx(true_k, abs=0.1)
-        assert cal["recommended_rmse_kwh"] < 1e-6
+        assert cal["k_swept"] == [0.0]
+        for key in cal["rmse_surface"]:
+            assert key.split(",")[1] == "0.0", (
+                f"surface cell {key} searched a k the system cannot run"
+            )
+
+    def test_recommended_k_is_never_above_zero(self):
+        """No fixture may produce a k recommendation, whatever the data.
+
+        The guard against this siding back: the apply path writes only
+        decay now, but a widened grid would silently make
+        ``recommended_k`` actionable again.
+        """
+        log = []
+        for d in range(1, 8):
+            log += self._generate_day(
+                f"2026-04-{d:02d}", true_decay=0.70, true_k=0.5,
+                peak_wasted=0.3,
+            )
+        coord = self._make_coord(log, decay=0.80, k=0.0)
+        result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
+        assert result["global"]["battery_calibration"]["recommended_k"] == 0.0
+
+    def _apply_and_capture(self, *, live_decay, true_decay, live_k=0.0):
+        """Run the sweep with ``apply_battery_decay: true`` and return
+        (calibration, data written to entry.data or None)."""
+        log = []
+        for d in range(1, 8):
+            log += self._generate_day(
+                f"2026-04-{d:02d}", true_decay=true_decay, true_k=0.0,
+                live_decay=live_decay, live_k=live_k, peak_wasted=0.2,
+            )
+        coord = self._make_coord(log, decay=live_decay, k=live_k)
+        coord.entry.data = {"some_other_key": 1}
+        result = DiagnosticsEngine(coord).diagnose_solar(
+            days_back=30, apply_battery_decay=True
+        )
+        update = coord.hass.config_entries.async_update_entry
+        written = update.call_args.kwargs["data"] if update.called else None
+        return result["global"]["battery_calibration"], written
+
+    def test_apply_never_writes_the_retired_k_key(self):
+        """The regression guard this whole change exists for.
+
+        ``apply_battery_decay: true`` used to persist BOTH members of the
+        joint argmin.  ``coordinator.__init__`` strips
+        ``battery_thermal_feedback_k`` from ``entry.data`` on every init
+        but does NOT strip ``solar_battery_decay`` — so the k evaporated
+        on the next restart while the decay, fitted conditional on that k,
+        stayed forever.  Writing the key at all is the defect; the fix is
+        not writing it.
+        """
+        cal, written = self._apply_and_capture(live_decay=0.50, true_decay=0.80)
+        if not cal.get("applied"):
+            pytest.skip("fixture produced no applicable recommendation")
+
+        assert written is not None
+        assert "battery_thermal_feedback_k" not in written, (
+            "the retired key must never be persisted — it is stripped on "
+            "the next init, leaving a decay fitted under a k that is gone"
+        )
+        assert "solar_battery_decay" in written
+        assert written["some_other_key"] == 1, "unrelated config preserved"
+
+    def test_apply_does_not_mutate_runtime_k(self):
+        """Runtime k must stay whatever the coordinator set it to."""
+        cal, _ = self._apply_and_capture(live_decay=0.50, true_decay=0.80)
+        if not cal.get("applied"):
+            pytest.skip("fixture produced no applicable recommendation")
+        # ``_make_coord`` is a MagicMock, so an assignment would show up as
+        # a plain float replacing the configured one.
+        assert cal["current_k"] == 0.0
 
     def test_rmse_surface_grid_size(self):
-        """Surface should cover all evaluable (decay, k) combinations:
-        10 decay × 11 k = 110 cells.  Cells with too few post-sunset hours
-        are dropped, but with a typical multi-day log all 110 should appear.
+        """Surface covers the 10 decay candidates at the single pinned k.
+
+        Was 10 decay x 11 k = 110 before k was pinned.  Cells with too few
+        post-sunset hours are dropped, but with a typical multi-day log
+        all 10 should appear.
         """
         log = []
         for d in range(1, 6):
@@ -458,7 +542,7 @@ class TestJointDecayKSweepValidation:
         coord = self._make_coord(log)
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         cal = result["global"]["battery_calibration"]
-        assert len(cal["rmse_surface"]) == 110
+        assert len(cal["rmse_surface"]) == 10
 
     def test_surface_keys_format(self):
         """Surface keys are 'decay,k' strings (consumable by JSON / json.dumps)."""
@@ -654,8 +738,8 @@ class TestMorningWindowDiagnostic:
         assert abs(cal["tail_morning_disagreement_kwh"]) < 0.01
 
     def test_morning_surface_full_grid_size(self):
-        """Morning surface covers same 110-cell grid as post-sunset
-        (when enough morning hours exist)."""
+        """Morning surface covers the same 10-cell grid as post-sunset
+        (when enough morning hours exist).  Was 110 before k was pinned."""
         log = []
         for d in range(1, 6):
             log += self._generate_day(
@@ -664,7 +748,7 @@ class TestMorningWindowDiagnostic:
         coord = self._make_coord(log)
         result = DiagnosticsEngine(coord).diagnose_solar(days_back=30)
         cal = result["global"]["battery_calibration"]
-        assert len(cal["morning_rmse_surface"]) == 110
+        assert len(cal["morning_rmse_surface"]) == 10
 
     def test_morning_block_handles_no_sunny_days(self):
         """All-overcast / all-dark fixture → morning evaluation falls

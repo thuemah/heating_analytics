@@ -890,10 +890,15 @@ diagnose_solar:
     apply_battery_decay:
       name: Apply Recommended Battery Decay
       description: >-
-        When enabled, automatically applies the recommended battery decay rate
-        from the calibration sweep. The value is persisted and takes effect
+        When enabled, applies the recommended battery decay rate from the
+        calibration sweep. The value is persisted and takes effect
         immediately. Use diagnose_solar without this flag first to review the
         recommendation.
+        Nothing is written when the sweep declined to make a recommendation —
+        for example when its two time windows disagree, when the best value
+        sits at the edge of the searched range, or when the improvement is
+        indistinguishable from noise. The reason is reported as
+        apply_skipped_reason.
       default: false
       selector:
         boolean:

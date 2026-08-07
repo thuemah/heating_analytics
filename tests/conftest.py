@@ -124,6 +124,35 @@ sys.modules["homeassistant.components.number"].NumberEntity = MockEntity
 sys.modules["homeassistant.components.switch"].SwitchEntity = MockEntity
 sys.modules["homeassistant.components.select"].SelectEntity = MockEntity
 
+# Repairs platform (#1070).  ``RepairsFlow`` must be a real class, not a
+# MagicMock — ``class X(MagicMock())`` raises TypeError.  Same reason
+# MockEntity above exists.  The flow-machinery methods the base class
+# would supply are stubbed as MagicMocks per instance so tests can assert
+# on what the fix flow called without standing up HA's data_entry_flow.
+sys.modules["homeassistant.components.repairs"] = MagicMock()
+
+class MockRepairsFlow:
+    def __init__(self, *args, **kwargs):
+        self.hass = MagicMock()
+        self.async_show_form = MagicMock(return_value={"type": "form"})
+        self.async_create_entry = MagicMock(return_value={"type": "create_entry"})
+        self.async_abort = MagicMock(
+            side_effect=lambda reason=None, **kw: {
+                "type": "abort", "reason": reason,
+            }
+        )
+
+sys.modules["homeassistant.components.repairs"].RepairsFlow = MockRepairsFlow
+
+# issue_registry is reached via ``from homeassistant.helpers import
+# issue_registry as ir``, which resolves off the MagicMock parent — but
+# register it explicitly so ``import homeassistant.helpers.issue_registry``
+# works too, and so tests can patch a stable object.
+sys.modules["homeassistant.helpers.issue_registry"] = MagicMock()
+sys.modules["homeassistant.helpers"].issue_registry = sys.modules[
+    "homeassistant.helpers.issue_registry"
+]
+
 # Mock util.dt with REAL timezone and parse_datetime
 mock_dt = MagicMock(name='mock_dt_real')
 mock_dt.UTC = timezone.utc # Use real UTC object
