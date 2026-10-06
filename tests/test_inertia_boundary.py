@@ -59,33 +59,37 @@ def mock_time():
         yield mock_dt
 
 def test_get_recent_log_temps_boundary(coordinator, mock_time):
-    """Test off-by-one error in _get_recent_log_temps."""
-    # We are at 15:00. Processing hour 14:00-15:00.
-    # We want history logs for 11:00, 12:00, 13:00 (3 logs).
-    # Combined with current 14:00, this gives 4h inertia.
+    """History is counted from the start of the hour being closed.
 
-    # Logs in history (timestamps are start of hour)
+    At the 15:00 boundary the closed hour started at 14:00; the log from
+    11:00 is 3 hours older and belongs to its history.  Tau (4) is a gap
+    threshold, not an age cutoff: an age cutoff measured from the boundary
+    time is what used to drop this log by the seconds past 15:00 (#1109).
+    """
     coordinator._hourly_log = [
-        {"timestamp": "2023-01-01T11:00:00+00:00", "temp": 11.0}, # T_4 (should be included)
-        {"timestamp": "2023-01-01T12:00:00+00:00", "temp": 12.0}, # T_3
-        {"timestamp": "2023-01-01T13:00:00+00:00", "temp": 13.0}, # T_2
+        {"timestamp": "2023-01-01T11:00:00+00:00", "temp": 11.0},
+        {"timestamp": "2023-01-01T12:00:00+00:00", "temp": 12.0},
+        {"timestamp": "2023-01-01T13:00:00+00:00", "temp": 13.0},
     ]
+    closed_hour_start = FIXED_NOW - timedelta(hours=1)  # 14:00
 
-    # Current time 15:00
-    current_time = FIXED_NOW # 15:00
+    temps = coordinator._get_recent_log_temps(closed_hour_start)
 
-    # Max gap 4 hours. Cutoff = 15:00 - 4h = 11:00.
-    # Logic should be: log_time >= cutoff.
-    # 11:00 >= 11:00 -> True.
-    # Current code: log_time > cutoff. -> False.
-
-    temps = coordinator._get_recent_log_temps(current_time, hours_back=3, max_gap_hours=4)
-
-    # If bug exists, 11:00 is excluded, so we get [12.0, 13.0] (2 items)
-    # If fixed, we get [11.0, 12.0, 13.0] (3 items)
-
-    assert len(temps) == 3, f"Expected 3 logs, got {len(temps)}: {temps}"
     assert temps == [11.0, 12.0, 13.0]
+
+
+def test_get_recent_log_temps_is_hour_aligned(coordinator, mock_time):
+    """A missing hour is a None in its place; history before a gap longer
+    than tau is dropped; the whole kernel is covered."""
+    coordinator._hourly_log = [
+        {"timestamp": "2023-01-01T05:00:00+00:00", "temp": 5.0},   # before a 5 h gap
+        {"timestamp": "2023-01-01T10:00:00+00:00", "temp": 10.0},
+        {"timestamp": "2023-01-01T12:00:00+00:00", "temp": 12.0},  # 11:00 missing
+        {"timestamp": "2023-01-01T13:00:00+00:00", "temp": 13.0},
+    ]
+    temps = coordinator._get_recent_log_temps(FIXED_NOW - timedelta(hours=1))
+    assert temps == [10.0, None, 12.0, 13.0]
+
 
 def test_close_hour_gap_per_unit(coordinator, mock_time):
     """Test that _close_hour_gap updates per-unit expectations."""

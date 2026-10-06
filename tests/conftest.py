@@ -213,7 +213,6 @@ def mock_coordinator(mock_entry):
     mock.energy_sensors = []
     mock.solar_battery_decay = 0.50
     mock.battery_thermal_feedback_k = 0.0
-    mock.inertia_weights = [0.2, 0.8]
     mock.learning_rate = 0.05
     mock.learning_enabled = True
     mock.wind_unit = "m/s"
@@ -254,6 +253,10 @@ def mock_coordinator(mock_entry):
     mock._daily_aux_breakdown = {}
     mock._lifetime_individual = {}
     mock._last_hour_processed = None
+    mock._last_hour_start = None
+    # Real inertia axis: tau 4, 20-hour kernel, real re-keying for replays.
+    from tests.helpers import bind_inertia_axis
+    bind_inertia_axis(mock)
     mock._accumulation_start_time = None
     mock._last_energy_values = {}
     mock._learned_u_coefficient = None
@@ -285,6 +288,8 @@ def mock_coordinator(mock_entry):
     mock._per_unit_min_base_thresholds = {}
     mock._unit_modes = {}
     mock._last_batch_fit_per_unit = {}
+    mock._heat_source_state = {"last_run": None, "units": {}}
+    mock.heat_source_user_types = {}
     mock._tobit_sufficient_stats = {}
     mock._experimental_tobit_live_learner = False
     mock._tobit_live_entities = set()

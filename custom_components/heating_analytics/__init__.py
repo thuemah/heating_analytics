@@ -13,7 +13,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import DOMAIN, HEAT_SOURCE_AUTO, HEAT_SOURCE_USER_TYPES
 from .coordinator import HeatingDataCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,6 +38,9 @@ SERVICE_EXIT_COOLDOWN = "exit_cooldown"
 SERVICE_GET_FORECAST = "get_forecast"
 SERVICE_CALIBRATE_INERTIA = "calibrate_inertia"
 SERVICE_CALIBRATE_WIND_THRESHOLDS = "calibrate_wind_thresholds"
+SERVICE_CALIBRATE_BALANCE_POINT = "calibrate_balance_point"
+SERVICE_CLASSIFY_HEAT_SOURCES = "classify_heat_sources"
+SERVICE_SET_HEAT_SOURCE_TYPE = "set_heat_source_type"
 SERVICE_CALIBRATE_UNIT_THRESHOLDS = "calibrate_unit_thresholds"
 SERVICE_DIAGNOSE_MODEL = "diagnose_model"
 SERVICE_DIAGNOSE_SOLAR = "diagnose_solar"
@@ -64,6 +67,20 @@ SERVICE_SCHEMA_CALIBRATE_INERTIA = vol.Schema({
 SERVICE_SCHEMA_CALIBRATE_WIND = vol.Schema({
     vol.Optional("entity_id"): cv.entity_id,
     vol.Optional("days", default=60): vol.All(vol.Coerce(int), vol.Range(min=1, max=180)),
+})
+
+SERVICE_SCHEMA_CALIBRATE_BALANCE_POINT = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+})
+
+SERVICE_SCHEMA_CLASSIFY_HEAT_SOURCES = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+})
+
+SERVICE_SCHEMA_SET_HEAT_SOURCE_TYPE = vol.Schema({
+    vol.Optional("entity_id"): cv.entity_id,
+    vol.Required("unit_entity_id"): cv.entity_id,
+    vol.Required("heat_source_type"): vol.In((HEAT_SOURCE_AUTO,) + HEAT_SOURCE_USER_TYPES),
 })
 
 SERVICE_SCHEMA_CALIBRATE_UNIT_THRESHOLDS = vol.Schema({
@@ -134,6 +151,7 @@ SERVICE_SCHEMA_RETRAIN = vol.Schema({
     vol.Optional("days_back"): vol.All(vol.Coerce(int), vol.Range(min=1, max=730)),
     vol.Optional("reset_first", default=False): cv.boolean,
     vol.Optional("experimental_cop_smear", default=False): cv.boolean,  # #793 hidden flag
+    vol.Optional("dry_run", default=False): cv.boolean,
 })
 
 SERVICE_SCHEMA_RETRAIN_UNIT = vol.Schema({
@@ -547,15 +565,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         days_back = call.data.get("days_back")
         reset_first = call.data.get("reset_first", False)
         experimental_cop_smear = call.data.get("experimental_cop_smear", False)
+        dry_run = call.data.get("dry_run", False)
 
         coord = _get_target_coordinator(hass, entity_id)
         _LOGGER.info(
             f"Service called: retrain_from_history (days_back={days_back}, reset_first={reset_first}, "
-            f"experimental_cop_smear={experimental_cop_smear}, coordinator={coord.entry.entry_id})"
+            f"experimental_cop_smear={experimental_cop_smear}, dry_run={dry_run}, "
+            f"coordinator={coord.entry.entry_id})"
         )
         return await coord.retrain_from_history(
             days_back=days_back, reset_first=reset_first,
             experimental_cop_smear=experimental_cop_smear,
+            dry_run=dry_run,
         )
 
     hass.services.async_register(
@@ -823,7 +844,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for eid_key, entity_block in primary_result.items():
             if not isinstance(entity_block, dict):
                 continue
-            if eid_key in ("dry_run", "n_skipped_cooling_unlearned", "suggested_gates"):
+            if eid_key in (
+                "dry_run",
+                "n_skipped_cooling_unlearned",
+                "n_skipped_learning_status",
+                "suggested_gates",
+            ):
                 continue
             for facade in ("s", "e", "w"):
                 f_block = entity_block.get(facade)
@@ -1350,6 +1376,67 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
 
+    # Register Calibrate Balance Point Service (#1045).  Suggestion only:
+    # the balance point is config-entry data and is changed in the
+    # reconfigure flow, never written by this service.
+    async def handle_calibrate_balance_point(call: ServiceCall) -> dict:
+        """Handle the calibrate balance point service call."""
+        from .balance_point import calibrate_balance_point, model_snapshot
+
+        target_coordinator = _get_target_coordinator(hass, call.data.get("entity_id"))
+        _LOGGER.debug(
+            "Handling calibrate_balance_point (coordinator: %s)",
+            target_coordinator.entry.entry_id,
+        )
+        # A year of daily fits over a (cp, shift, carry-over) grid takes
+        # a few seconds (several times more on small hardware): run it off the event loop,
+        # on copies taken here so the coordinator cannot mutate them mid-fit.
+        snapshot = model_snapshot(target_coordinator)
+        return await hass.async_add_executor_job(
+            calibrate_balance_point, target_coordinator, snapshot
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CALIBRATE_BALANCE_POINT,
+        handle_calibrate_balance_point,
+        schema=SERVICE_SCHEMA_CALIBRATE_BALANCE_POINT,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    # Heat-source type per unit (heat_source.py).  The classification also
+    # runs in the background after midnight, weekly; this runs it now.
+    async def handle_classify_heat_sources(call: ServiceCall) -> dict:
+        """Handle the classify heat sources service call."""
+        coord = _get_target_coordinator(hass, call.data.get("entity_id"))
+        return await coord.async_classify_heat_sources()
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CLASSIFY_HEAT_SOURCES,
+        handle_classify_heat_sources,
+        schema=SERVICE_SCHEMA_CLASSIFY_HEAT_SOURCES,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    async def handle_set_heat_source_type(call: ServiceCall) -> dict:
+        """Handle the set heat source type service call (``auto`` clears)."""
+        coord = _get_target_coordinator(hass, call.data.get("entity_id"))
+        try:
+            return await coord.async_set_heat_source_type(
+                call.data["unit_entity_id"], call.data["heat_source_type"],
+            )
+        except ValueError as err:
+            raise ServiceValidationError(str(err)) from err
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_HEAT_SOURCE_TYPE,
+        handle_set_heat_source_type,
+        schema=SERVICE_SCHEMA_SET_HEAT_SOURCE_TYPE,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
     # Register Calibrate Unit Thresholds Service
     async def handle_calibrate_unit_thresholds(call: ServiceCall) -> dict:
         """Handle the calibrate unit thresholds service call.
@@ -1579,6 +1666,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_GET_FORECAST)
             hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_INERTIA)
             hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_WIND_THRESHOLDS)
+            hass.services.async_remove(DOMAIN, SERVICE_CALIBRATE_BALANCE_POINT)
+            hass.services.async_remove(DOMAIN, SERVICE_CLASSIFY_HEAT_SOURCES)
+            hass.services.async_remove(DOMAIN, SERVICE_SET_HEAT_SOURCE_TYPE)
             hass.services.async_remove(DOMAIN, SERVICE_RESET_SOLAR_LEARNING)
             hass.services.async_remove(DOMAIN, SERVICE_RETRAIN_FROM_HISTORY)
             hass.services.async_remove(DOMAIN, SERVICE_RETRAIN_UNIT_FROM_HISTORY)

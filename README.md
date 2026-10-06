@@ -8,12 +8,12 @@
 
 **Turn your Home Assistant into a smart energy detective.**
 
-Your heating system consumes energy every day, but how do you know if it's working efficiently? This integration learns your home's unique thermal behavior and tells you exactly how much energy you *should* be using right now—based on current weather—versus what you're *actually* using.
+Your heating and cooling systems consume energy every day, but how do you know if they are working efficiently? This integration learns your home's unique thermal behavior and tells you exactly how much energy you *should* be using right now—based on current weather—versus what you're *actually* using.
 
 **Catch energy waste before it catches you:**
 
 - Detect open windows draining heat
-- Measure real savings from your fireplace
+- Measure real savings from your fireplace or space heaters
 - Spot inefficiencies in real-time
 - Get accurate daily forecasts based on weather
 
@@ -28,7 +28,7 @@ Think of it as a fitness tracker for your home's heating system.
 
 
 
-The integration continuously learns the relationship between outdoor conditions (temperature, wind, solar) and your heating consumption. Once trained, it predicts what you *should* use and compares it to reality—alerting you to unexpected deviations.
+The integration continuously learns the relationship between outdoor conditions (temperature, wind, sun) and your heating and cooling consumption. Once trained, it predicts what you *should* use and compares it to reality—alerting you to unexpected deviations.
 
 > **Architecture note:** Heating Analytics is a *feed-forward* engine — it produces diagnostics and predictions, but never writes setpoints or controls your heating directly. The outputs are designed to feed external logic (HA Automations, EMHASS, Node-RED) so you retain full control and the model's training data stays uncontaminated by its own decisions.
 
@@ -78,13 +78,18 @@ Once you have basic data flowing, enhance accuracy:
 - **Supported Units:** `m/s`, `km/h`, `mph`, `kn` (knots)
 
 **Solar Configuration:**
-- Enable solar correction to let the system account for "free heat" from sunlight
-- Window orientation is learned automatically — no manual azimuth or area input needed
-- Adjust `Solar Correction` (0–100) to reflect typical blind/screen usage
+- Solar gain is always modelled — window orientation is learned automatically, no manual azimuth or area input needed
+- Tell the integration which facades (south / east / west) have external screens, and which units they affect
+- Adjust `Solar Correction` (0–100) to reflect typical blind/screen usage, or automate it from your screens
 
 **Balance Point:**
 - Adjust the temperature where heating kicks in (default: 17°C)
+- Run `calibrate_balance_point` to check it against your own daily history (see [Calibrate Balance Point](#calibrate-balance-point))
 - Fine-tune learning rate if the model reacts too slowly/quickly
+
+**Calibration services:** once a few weeks of data are in, `calibrate_inertia` suggests the thermal inertia setting and `calibrate_wind_thresholds` the wind bucket boundaries for your house.
+
+**Heat-source type:** the integration works out each unit's heat-source type from its history. If you know it, set it in the advanced settings (see [Heat-Source Type per Unit](#heat-source-type-per-unit)).
 
 ---
 
@@ -98,8 +103,11 @@ If you have past energy/weather data, jump-start the learning process:
 - The model trains instantly on months/years of history
 
 **Multi-Zone Tracking:**
-- Configure individual heating units (living room, bedroom, etc.)
-- Track per-room efficiency and solar distribution
+- Configure individual heating units (living room, bedroom, heat pump, floor cables, etc.)
+- Track per-room efficiency, solar distribution and individual baselines
+
+**Heat Pump Controller (Track C):**
+- Connect `heatpump_mpc` so the model learns the building's heat loss from delivered heat instead of from a meter the controller shifts in time (see Track C below)
 
 **Dashboard & Visualizations:**
 - Ready-to-paste Plotly cards are available in the [`tools/`](https://github.com/thuemah/heating_analytics/blob/main/tools/) folder
@@ -125,7 +133,8 @@ If you have past energy/weather data, jump-start the learning process:
 
 | Attribute | Used for | Fallback if missing |
 |-----------|----------|---------------------|
-| `cloud_coverage` | Solar model — determines how much solar energy reaches windows | Maps from weather condition text (e.g. "sunny" → 10%, "cloudy" → 80%), then falls back to 50% if condition is unknown. This coarse estimate significantly reduces solar model accuracy. |
+| `cloud_coverage` | Solar model — determines how much solar energy reaches windows | Maps from weather condition text (e.g. "sunny" → 0%, "partlycloudy" → 50%, "cloudy" → 85%), then falls back to 50% if condition is unknown. This coarse estimate significantly reduces solar model accuracy. |
+| `direct_normal_irradiance` + `diffuse_radiation` | Direct and diffuse sunlight for the 4D solar model | The 4D model falls back to an estimate from `cloud_coverage`, where it is worse than the standard 3D model. A local irradiance (GHI) sensor, configured in the integration settings, takes precedence over both. |
 | `wind_gust_speed` | Wind gust compensation (higher accuracy wind penalty) | Ignored — only sustained wind speed is used |
 | `humidity` | Per-hour COP defrost penalty (Track C) | 50% default — defrost may under/over-trigger |
 | `forecast` | 7-day hourly energy forecast | No forecast sensors available |
@@ -168,7 +177,7 @@ It adds:
 - **Regime-Aware Prediction:**
     - **Cold Regime:** Uses thermodynamic scaling for accurate extrapolation in deep winter.
     - **Mild Regime:** Prioritizes neighbor averaging and wind fallbacks for stability in variable transition seasons.
-- **Thermal Inertia:** Accounts for 4-hour rolling average temperature (buildings don't react instantly)
+- **Thermal Inertia:** Learns and predicts on an *effective* temperature — recent outdoor temperatures weighted by how many hours ago they were read, with a configurable time constant (default 4 hours) — because buildings don't react instantly. Learning, forecasting and retraining all use the same effective temperature.
 - **Adaptive:** Updates hourly based on actual vs expected consumption
 
 ### Thermal Degree Days (TDD)
@@ -177,6 +186,14 @@ The integration uses **Thermal Degree Days (TDD)** instead of traditional Heatin
 - **Formula:** `abs(Balance Point - Outdoor Temp) / 24`
 - **Why?** TDD is a unified metric that handles both **Heating** (below Balance Point) and **Cooling** (above Balance Point) in mixed-mode systems.
 - **Benefit:** Provides a continuous efficiency metric (`kWh / TDD`) year-round, regardless of season.
+- **Fixed at the balance point it was logged under:** every day in the history records the balance point its degree days were summed at. After you change the balance point, comparisons with older days recalculate their degree days from the stored hourly temperatures instead of mixing the old and the new value.
+
+### Thermal Regime & Primary Driver
+
+Two attributes on **Energy Baseline Today** say what the building is doing and what drives it right now:
+
+- **`thermal_regime`:** `heating`, `cooling`, `mixed` or `idle`, from how today's energy splits between units in heating and in cooling mode. It is weighted by energy, not by the number of units — six idle radiators do not outvote one air conditioner doing all the work. Hot water and switched-off units are left out. The explanations use it to decide which way warm weather and sunshine push consumption; under `mixed` they make no directional claim.
+- **`primary_driver`:** the largest cost on top of a calm, clear day at the balance point — `Temp`, `Wind` or `Solar_Deficit` (a sky darker than clear) when heating; `Temp` or `Solar_Load` (sunshine adding cooling load) when cooling — or `None` when none of them is significant.
 
 ### Shadow Forecasting (Primary vs Secondary)
 
@@ -231,7 +248,7 @@ When you turn off a fireplace or space heater, the house retains heat for hours.
 To prevent this, the system enters a **Cooldown State** automatically when Auxiliary Heating turns off.
 - **Action:** Learning is strictly locked for all affected units.
 - **Duration:** 2 to 6 hours (dynamic).
-- **Exit Condition:** The system monitors real-time consumption. Once the affected units' usage returns to expected levels (convergence), the lock is released.
+- **Exit Condition:** The system monitors real-time consumption. Once the affected units use at least 92 % of their expected consumption again (convergence), the lock is released.
 - **Benefit:** Ensures your "Normal Heating Model" remains pure and unpolluted by residual heat from the fireplace.
 
 ### Air-to-Water Heat Pump Support (DHW Mode)
@@ -248,15 +265,39 @@ The repository includes ready-made blueprints that automate the mode transitions
 
 - **`blueprints/heat_pump_mode_sync.yaml`** — For heat pumps exposing an operation mode sensor (e.g. `"Heating"` / `"Domestic Hot Water"` / `"Defrost"`). Import this blueprint, select your mode sensor and mode helper, and all transitions are handled automatically. Defrost is transparent: the previous heating or DHW mode is preserved so defrost energy is attributed correctly rather than creating a spurious mode flip.
 
+  [![Import the heat_pump_mode_sync blueprint into your Home Assistant instance.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fthuemah%2Fheating_analytics%2Fblob%2Fmain%2Fblueprints%2Fheat_pump_mode_sync.yaml)
+
 - **`blueprints/climate_sync.yaml`** — For units exposed as standard HA climate entities (`heat` / `cool` / `off`). Optionally enable the guest mode prefix to track occupancy spikes separately from the main model.
 
-Import via: **Settings → Automations & Scenes → Blueprints → Import Blueprint**, and paste the raw GitHub URL.
+  [![Import the climate_sync blueprint into your Home Assistant instance.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fthuemah%2Fheating_analytics%2Fblob%2Fmain%2Fblueprints%2Fclimate_sync.yaml)
+
+The buttons open the blueprint import dialog in your own Home Assistant instance with the URL filled in. Without them: **Settings → Automations & Scenes → Blueprints → Import Blueprint**, and paste the blueprint's GitHub URL. See [`blueprints/README.md`](blueprints/README.md) for copying the files by hand.
+
+### Heat-Source Type per Unit
+
+Each unit carries a heat-source type. The integration works it out from the unit's own daily history, once a week after midnight, or on demand with `classify_heat_sources`:
+
+| Type | Evidence |
+|------|----------|
+| Reversible heat pump | The unit used real energy for heating on cold days **and** for cooling on warm days. A panel heater left in cooling mode does not count: mode time alone is no evidence. |
+| Efficiency rises with outdoor temperature | The shape of the unit's heating energy against the cold — an air-source heat pump. |
+| Constant efficiency | Direct electric heating *or* a ground-source heat pump. Energy data cannot tell those two apart. |
+| Unknown | The default. The unit keeps it until the evidence is clear, including without its coldest days: a heat pump that runs at full capacity on the coldest days can otherwise look like direct electric heating. |
+
+- **Stable:** a type is replaced only when another one is found on two runs in a row.
+- **Your setting wins:** set the device type yourself in the advanced settings — one list of energy sensors per type: direct electric, ground source, air-to-water, air-to-air — or with `set_heat_source_type` (`auto` goes back to the worked-out type). Both change the same setting.
+- **Heat pump controller:** the unit managed by `heatpump_mpc` is always an air-to-water heat pump.
+- **Where it shows:** as attributes on the unit's Mode entity, with a notification when a type is worked out for a unit you have not set yourself. Nothing uses it for predictions yet; `calibrate_balance_point` reports it per unit.
 
 ### Smart Solar Tracking & Recommendations (Kelvin Twist)
 
 The system employs a sophisticated 3-zone geometric model ("The Kelvin Twist") to distinguish between direct sunlight, glancing angles, and shadow.
 
 - **Precision Tracking:** Differentiates between what's *possible* (Potential) and what's *actual* (Absorbed), capped by the house's thermodynamic demand (Saturation Logic).
+- **Per-Direction Learning:** Each unit learns how much sun it gets through south-, east- and west-facing windows, separately for heating and cooling mode. Coefficients can only be zero or positive — a window can only let heat in.
+- **4D Solar Model (optional):** If your weather entity provides direct and diffuse irradiance, or you have a local irradiance (GHI) sensor, a fourth component for diffuse light can be switched on in the reconfigure settings. `diagnose_solar` reports whether your installation is ready for it (`four_d_readiness`). Without real irradiance data the standard 3D model is the better choice, and a repair notice appears if the data disappears while 4D is on.
+- **Censoring-Aware Learning:** When the sun covers nearly all of a unit's demand, consumption cannot fall any further, so the hour only shows that the sun helped *at least* that much. A Tobit estimator treats such hours as a lower bound instead of an exact value. It runs in the live learner (on by default, switchable with `set_experimental_tobit_live_learner`) and in `batch_fit_solar`.
+- **Obstruction Gates:** `fit_solar_obstruction` suggests sun elevations below which terrain or neighbours, or above which an overhang, block direct sun for a unit's facade. Nothing is written until you accept a suggestion with `apply_obstruction_gate`.
 - **Recommendation State:** Actionable advice exposed via attributes (e.g., `recommendation_state` on `sensor.heating_expected_energy_today`).
     - **`maximize_solar`:** Cold + Sunny. Advice: Open blinds/curtains to let free heat in.
     - **`mitigate_solar`:** Hot + Sunny. Advice: Close blinds/curtains to prevent overheating.
@@ -284,7 +325,7 @@ A helper entity (`number.heating_analytics_solar_correction`) allows you to info
     - **Budget:** The static plan created at midnight (based on the forecast at that time).
     - **Projection:** Where you are actually heading. Calculated as `Actual Usage So Far + Live Forecast for Remaining Day`.
     - **Why:** If the weather changes significantly during the day, the "Budget" becomes obsolete. The "Projection" adapts instantly, giving you a realistic end-of-day total to aim for.
-- **Heating Efficiency Sensor:** Real-time `kWh/TDD` metric that handles midnight crossovers seamlessly. Includes a sanity check (Error if COP > 10).
+- **Heating Efficiency Sensor:** Real-time `kWh/TDD` metric that handles midnight crossovers seamlessly.
 - **Potential Savings Sensor:** Shows daily savings from auxiliary heat. Includes `allocated` (unit-specific) and `unassigned` (global/orphaned) savings breakdown.
 - **Thermal State Sensor:** Exposes the thermally weighted temperature used for predictions.
 - **Confidence Grading:** Sensors expose confidence metrics (sample counts, standard deviation) so you know exactly how reliable a prediction is.
@@ -307,13 +348,13 @@ The system stores **Hourly Data Vectors** (Temp, Wind, Actual Load) for every da
 
 | Entity | Unit | Description |
 |--------|------|-------------|
-| Energy Today | kWh | Total heating energy consumed today |
-| Energy Baseline Today | kWh | Model expectation given actual weather. Rich attributes: thermal stress, drivers, solar/wind detail |
+| Energy Today | kWh | Total energy consumed today by the configured units |
+| Energy Baseline Today | kWh | Model expectation given actual weather. Rich attributes: thermal stress, `thermal_regime`, `primary_driver`, solar/wind detail |
 | Efficiency | kWh/TDD | Rolling efficiency with historical averages |
 | Weather Plan Today | kWh | Full-day weather-based energy plan (frozen at midnight) |
 | Energy Estimate Today | kWh | Best estimate: actuals so far + forecast remainder. Includes confidence level |
 | Forecast Details | — | Diagnostic: which forecast source is performing better |
-| Deviation Today | % | Actual vs expected deviation with contributor breakdown |
+| Deviation Today | % | Actual vs expected deviation with contributor breakdown, and today's heating / cooling split (`accumulated_heating_kwh`, `accumulated_cooling_kwh`) |
 | Effective Wind | m/s | Current effective wind with gust factor applied |
 | Correlation Data | — | Diagnostic: temperature-vs-energy curves for graphing |
 | Last Hour Actual | kWh | Diagnostic: last completed hour's actual consumption |
@@ -321,7 +362,7 @@ The system stores **Hourly Data Vectors** (Temp, Wind, Actual Load) for every da
 | Last Hour Deviation | kWh | Diagnostic: last hour deviation with model update details |
 | AUX Savings Today | kWh | Estimated energy saved by auxiliary heat (e.g. wood stove) |
 | Model Comparison Day/Week/Month | kWh | Current vs same period last year (3 sensors) |
-| Week Ahead Forecast | kWh | 7-day energy forecast with daily breakdown |
+| Week Ahead Forecast | kWh | 7-day energy forecast with daily breakdown, and a range from how far past 7-day plans missed once enough weeks have been scored |
 | Period Comparison | — | Diagnostic: result of compare_periods service call |
 | Thermal State | °C | Inertia-weighted effective outdoor temperature |
 | {Unit} Daily | kWh | Per-unit daily consumption (one per energy sensor) |
@@ -341,7 +382,7 @@ The system stores **Hourly Data Vectors** (Temp, Wind, Actual Load) for every da
 | Solar Correction | Number | 100% | How much solar reaches the building (0–100%) |
 | Learning Enabled | Switch | On | Master on/off for model learning |
 | Auxiliary Heating Active | Switch | Off | Signals unmetered heat source is active |
-| {Unit} Mode | Select | Heating | Per-unit mode (heating/cooling/off/dhw/guest). Created for each energy sensor. |
+| {Unit} Mode | Select | Heating | Per-unit mode (`heating`, `cooling`, `off`, `dhw`, `guest_heating`, `guest_cooling`). Created for each energy sensor. Shows the unit's heat-source type as attributes. |
 
 ---
 
@@ -387,7 +428,9 @@ Rather than a single monolithic dashboard, the [`tools/`](https://github.com/thu
 | **Wind Gust Factor** | 0.6 | Weight given to wind gusts (60%) |
 | **Wind Threshold** | 8.0 m/s | Threshold for 'High Wind' conditions. Too low pushes many hours into the high_wind bucket with insufficient samples. |
 | **Extreme Wind Threshold** | 10.8 m/s | Threshold for 'Extreme Wind' conditions. |
-| **Thermal Inertia** | 4 hours | Hours of outdoor temperature history the model considers (1–24h slider). Low for lightweight structures, high for heavy concrete/stone. |
+| **Thermal Inertia** | 4 hours | Time constant of the effective temperature (1–24 h slider). Low for lightweight structures, high for heavy concrete/stone. See [Thermal Inertia](#thermal-inertia) below. |
+| **Hourly Log Retention** | 90 days | How long the detailed hourly log is kept (90 / 180 / 365 days). Retraining and most diagnostics work from this log. |
+| **External Screens** | South, east and west | Which facades have external screens that the Solar Correction slider moves. |
 
 ### Thermal Mass Correction
 
@@ -418,13 +461,15 @@ When enabled (requires Daily Learning Mode + Indoor Temperature Sensor), the sys
 
 This setting is UI-only and is not stored in the integration's configuration. It is derived automatically from the presence of a configured indoor temperature sensor on subsequent reconfiguration.
 
-### Thermal Inertia Profiles
+### Thermal Inertia
 
-You can configure how quickly your house reacts to outside temperature changes.
+You can configure how quickly your house reacts to outside temperature changes. The model does not learn against the outdoor temperature right now, but against an *effective* temperature: each recent hour's outdoor temperature weighted by `e^(−t/τ)`, where `t` is how many hours ago it was and `τ` is the Thermal Inertia setting. The newest hour counts most, and the weights reach back `5 × τ` hours (at most a week).
 
-- **Normal (Default):** 4-hour window (20% current, 80% history). Best for standard insulated homes.
-- **Fast:** 2-hour window (50% current, 50% history). Best for poorly insulated homes or low thermal mass (e.g., wooden cabin).
-- **Slow:** 12-hour window (Bell curve). Best for high thermal mass buildings (e.g., concrete/stone, passive houses) where today's heating depends heavily on yesterday's weather.
+- **1–2 hours:** poorly insulated homes or low thermal mass (e.g., wooden cabin).
+- **4 hours (default):** standard insulated homes.
+- **12 hours or more:** high thermal mass buildings (e.g., concrete/stone, passive houses) where today's heating depends heavily on yesterday's weather.
+
+`calibrate_inertia` finds the value that explains your consumption best. A gap in the history longer than the setting (Home Assistant down for a while) starts the history afresh.
 
 ### Heating Strategy: Which Units to Track?
 
@@ -441,11 +486,11 @@ If you have a hidden consumer (like a bathroom floor heater) that isn't tracked,
 
 ### Solar Settings
 
-Solar correction is always active. The system exposes a **Solar Correction** number entity (0–100%, default 100%) that represents how much solar gain currently reaches the building (100% = screens fully open, 0% = fully closed). Screen attenuation is applied **per direction** based on three configuration booleans — *External screens on south / east / west facade?* — answered during setup (defaults: all three True). A screened facade ramps from ~8% transmittance (screen fabric × triple glass) at slider 0 % up to 100 % at slider 100 %; an unscreened facade stays at 100 % regardless of the slider. This preserves the model's estimate of unscreened-window gain when only some facades have screens. Installations without explicit per-direction configuration fall back to a composite floor of 30 %, representing the typical Nordic mix of partly-screened buildings (unmonitored north/utility windows, diffuse radiation, conductive gain through the opaque envelope).
+Solar correction is always active. The system exposes a **Solar Correction** number entity (0–100%, default 100%) that represents how much solar gain currently reaches the building (100% = screens fully open, 0% = fully closed). Screen attenuation is applied **per direction** based on three configuration booleans — *External screens on south / east / west facade?* — answered during setup (defaults: all three True). A screened facade ramps from 30 % transmittance at slider 0 % up to 100 % at slider 100 %; an unscreened facade stays at 100 % regardless of the slider. The 30 % is not the screen fabric alone (about 8 %): most "screened" facades also have doors and smaller windows without screens. This preserves the model's estimate of unscreened-window gain when only some facades have screens. Installations without explicit per-direction configuration fall back to a composite floor of 30 %, representing the typical Nordic mix of partly-screened buildings (unmonitored north/utility windows, diffuse radiation, conductive gain through the opaque envelope).
 
-Solar coefficients are learned automatically per unit using a 3D vector model (south, east, and west components). Each unit learns how much energy it saves (heating) or consumes additionally (cooling) per unit of raw solar irradiance. The coefficients encode window physics (area, orientation, thermal coupling). For unscreened facades the coefficient converges to pure window physics; for screened facades it absorbs that direction's average transmittance — both cases handled transparently by the same prediction path. Learning uses Normalized LMS (NLMS), which adapts the step size to the solar signal strength: high-solar units and low-solar units converge at the same rate, preventing oscillation in sun-exposed rooms.
+Solar coefficients are learned automatically per unit using a 3D vector model (south, east, and west components), with separate coefficients for heating and cooling mode. Each unit learns how much energy it saves (heating) or consumes additionally (cooling) per unit of raw solar irradiance. The **Screen-affected Units** setting limits the screen effect to the units behind screened windows. The coefficients encode window physics (area, orientation, thermal coupling). For unscreened facades the coefficient converges to pure window physics; for screened facades it absorbs that direction's average transmittance — both cases handled transparently by the same prediction path. Learning uses Normalized LMS (NLMS), which adapts the step size to the solar signal strength: high-solar units and low-solar units converge at the same rate, preventing oscillation in sun-exposed rooms.
 
-A **Solar Thermal Battery** smooths solar impact across hours using exponential decay (default 0.80, half-life ~3.8 hours). This models heat stored in building mass (concrete, floor slabs) that releases gradually after peak sun. The decay rate can be calibrated per installation via the `diagnose_solar` service.
+A **Solar Thermal Battery** smooths solar impact across hours using exponential decay (default 0.50, half-life about 1 hour). This models heat stored in building mass (concrete, floor slabs) that releases gradually after peak sun. The decay rate can be calibrated per installation via the `diagnose_solar` service.
 
 ### Auxiliary Settings
 
@@ -463,7 +508,7 @@ A **Solar Thermal Battery** smooths solar impact across hours using exponential 
 - **Drafty house?** → Increase Wind Gust Factor above the default 0.6 (e.g. 0.8)
 - **Model too slow to adapt?** → Increase Learning Rate to 0.02 (2%)
 - **Made changes to insulation/heating?** → Temporarily increase Learning Rate to 0.03-0.04 (3-4%) for a few days at stable temperatures to speed up re-learning
-- **Big south-facing windows?** → Enable solar with accurate area for best results
+- **External screens on some facades only?** → Set the screen facades and the screen-affected units in the settings, so closing the screens does not lower the other windows' solar estimate
 
 ### Heat Pump Best Practices ⚠️
 
@@ -586,7 +631,8 @@ Use this when a sensor entity ID changes — for example, after a hardware repla
 - Unit operating modes
 - Observation counts and hourly delta/expected vectors
 - Daily and lifetime individual statistics
-- Full hourly log history
+- Full hourly log history, and the unit's share of the daily history
+- The unit's heat-source type, whether worked out or set by you
 
 **What gets reset:**
 - The energy baseline for the replaced sensor. The new sensor will establish its own baseline on the next update cycle, preventing consumption spikes caused by differing cumulative totals between the old and new meter.
@@ -610,6 +656,8 @@ Create a complete backup of your learning model, history, and configuration to a
 
 **Parameters:**
 - `file_path`: Absolute path for backup file (e.g., `/config/heating_backup.json`)
+
+The file must be inside the Home Assistant config directory, or in a directory listed under `allowlist_external_dirs`. The config directory's `.storage` folder is not allowed. The same rule applies to `restore_data`, `export_to_csv` and `import_from_csv`.
 
 **What's Included:**
 - Complete learning model (all correlation data)
@@ -656,7 +704,8 @@ Reset the entire learning model to start fresh.
 - All correlation data (global and per-unit)
 - Learning buffers
 - Observation counts
-- Solar coefficients
+- Solar and auxiliary coefficients
+- The daily learning U-coefficient
 
 **What's Preserved:**
 - Daily history
@@ -679,6 +728,7 @@ Reset the learned model for a specific heating unit only.
 
 **What Gets Reset:**
 - Correlation data for this unit only
+- Auxiliary and solar coefficients for this unit
 - Observation counts for this unit
 
 **What's Preserved:**
@@ -699,7 +749,7 @@ data:
 
 **Why Use This Instead of Full Reset?**
 
-Unlike `reset_learning_data`, this service preserves the learning buffer. The buffer contains the last 10 samples collected for each temperature/wind condition. When the model resets, these samples are immediately used to "jump-start" learning, giving you accurate predictions within hours instead of days.
+Unlike `reset_learning_data`, this service preserves the learning buffer. The samples in it are applied on the next cold start to "jump-start" learning, giving you usable predictions sooner. To rebuild the unit from the hourly log instead, use `retrain_unit_from_history` with `reset_first` (below).
 
 ---
 
@@ -707,19 +757,23 @@ Unlike `reset_learning_data`, this service preserves the learning buffer. The bu
 
 **Service:** `heating_analytics.retrain_from_history`
 
-Retrains the model using the existing hourly log — no CSV needed. Replays logged hours through the same learning path used during live operation.
+Retrains the model using the existing hourly log — no CSV needed. Replays logged hours through the same learning rules used during live operation, with your current settings (balance point, thermal inertia, wind thresholds, units and modes). A retrain is never required: the model adapts to new settings on its own as new hours come in. A retrain applies them to the stored history at once.
 
 ```yaml
 service: heating_analytics.retrain_from_history
 data:
   days_back: 30
-  reset_first: true
+  dry_run: true
 ```
 
 **Parameters:**
 - `entity_id` (optional): Target instance
 - `days_back` (optional, 1–730): Limit to most recent N days. Empty = all available
-- `reset_first` (default false): Clear all learned data before retraining
+- `reset_first` (default false): Clear all learned data before retraining. The rebuild then comes from the hourly log alone, which is kept for the configured retention period. Temperatures the log does not cover, often the coldest winter days, lose their learned values and cannot be rebuilt.
+- `dry_run` (default false): Run the same retrain on a copy of the model and write nothing. The response lists the temperature buckets that would be added, removed and changed (overall, per 5 °C band and per unit), the solar and auxiliary coefficients before and after, and the predictions of the current and the retrained model over the last 30 days, per day and per temperature band. Those are set against the consumption the model learns from; energy used in guest, off and hot-water mode is shown separately, because the model does not predict it. Use it before any retrain, with or without `reset_first`.
+- `experimental_cop_smear` (default false): For daily learning (Track B) with `heatpump_mpc` COP parameters available, spread each day over its hours weighted by the heat pump's per-hour efficiency instead of evenly. No effect on hourly learning or Track C.
+
+**`retrain_unit_from_history`** does the same for one unit's own model (`unit_entity_id`), with `days_back`, `reset_first` and `dry_run`. It leaves the unit's solar and auxiliary coefficients as they are.
 
 ---
 
@@ -728,7 +782,7 @@ data:
 | Service | Description |
 |---------|-------------|
 | `reset_forecast_accuracy` | Clears forecast accuracy tracking history. Preserves energy logs. |
-| `reset_solar_learning` | Resets solar coefficients for one unit (`unit_entity_id`) or all units in an instance. |
+| `reset_solar_learning` | Resets solar coefficients for one unit (`unit_entity_id`) or all units in an instance. With `replay_from_history`, refits them from the hourly log straight away. |
 | `exit_cooldown` | Force-exits the auxiliary cooldown period, resuming normal learning immediately. |
 | `compare_periods` | Compares two historical periods. Returns delta analysis as a response. |
 
@@ -738,31 +792,54 @@ data:
 
 **Service:** `heating_analytics.get_forecast`
 
-Retrieve the detailed hourly heating plan (prediction) for today.
+Retrieve the detailed hourly plan (prediction) from the current hour onwards.
 
 **Parameters:**
-- `type`: `hourly` (Only supported type currently)
+- `days` (1–14, default 1): How many days ahead
+- `isolate_sensor` (optional): An energy sensor. Each hour then returns that unit's share only, `max(0, whole house − Σ other units)` — the demand a heat pump controller's own unit must cover
+- `human_readable` (default false): A condensed summary for people instead of the full payload: a day-level summary, the largest contributors per hour with friendly names, the solar split and the weather source per hour
 
 **Returns:**
 A dictionary containing the forecast plan:
 - `forecast`: List of hourly objects with:
     - `datetime`: ISO timestamp
-    - `predicted_kwh`: Expected energy usage
-    - `temperature`: Outdoor temperature
+    - `kwh`: Expected energy usage
+    - `temp` / `inertia_temp`: Outdoor and effective temperature
     - `wind_speed`: Wind speed
+    - `solar_kwh`, `solar_offset_kwh`, `solar_load_kwh`: Solar effect, split into heating reduction and cooling addition
     - `aux_impact_kwh`: Estimated savings from auxiliary heating (if active)
+    - `unit_breakdown`: Expected energy per unit
+    - `source`: Which weather source the hour used
 
 **Example:**
 ```yaml
-service: heating_analytics.get_forecast
+action: heating_analytics.get_forecast
 data:
-  type: hourly
+  days: 2
 response_variable: heating_plan
 ```
 
 **Use Case:**
 - Automations that need to know *exactly* how much energy the house will use in the next few hours.
-- Custom dashboards that need raw prediction data.
+- Heat pump controllers (`isolate_sensor`) and custom dashboards that need raw prediction data.
+
+---
+
+### Calibrate Balance Point
+
+**Service:** `heating_analytics.calibrate_balance_point`
+
+Checks your configured balance point against the last year of daily history. It fits each day's heating energy against how cold the day was: a flat floor above the balance point and a rising arm below it. It works from whole days, so it can run at any time of year. Only energy used by units in heating mode counts, and days with auxiliary heat, guest mode, many windy hours or missing hours are left out.
+
+- **Sunshine** — the day's own and heat still stored from the day before — lowers the day's balance point. It is fitted, so the result is the balance point of a day without sun.
+- **Heat pumps** get more heat out of each kWh the milder it is outside, which bends the arm. That is fitted too; the report shows the balance point for each assumed heat pump curve, and each unit's heat-source type.
+- **A new value is suggested only when** fits on alternating weeks agree, the result does not depend on the assumed heat pump curve, no part of the sun or heat pump model sits at its limit, the model fits most days, your current value lies outside the fit's uncertainty, and the change is at least 1 °C.
+
+```yaml
+action: heating_analytics.calibrate_balance_point
+```
+
+**Suggestion only** — nothing is written. To act on a suggestion, change the balance point in the integration's reconfigure settings. The report also tells you how many recent hours the change would reclassify.
 
 ---
 
@@ -800,7 +877,7 @@ Tests historical data to find the ideal thermal inertia time constant (tau, 1–
 action: heating_analytics.calibrate_inertia
 ```
 
-**Returns:** Recommended tau, MAE comparison across tau values, and a Gaussian sweep for reference.
+**Returns:** Recommended tau (set the Thermal Inertia slider to it), the fit for each tau value, and a Gaussian sweep for reference. `live_axis_comparison` shows how well the effective temperature learning used up to 1.3.15 and the current one explain your consumption, per outdoor-temperature band.
 
 ---
 
@@ -845,6 +922,7 @@ data:
 - **Screen correction impact:** Compares prediction error at different screen positions (closed vs open) to detect screen-induced coefficient drift.
 - **Temporal bias:** Morning vs afternoon mean prediction delta — reveals timing errors in the cloud model or battery decay.
 - **Hour-of-day residual curve:** Per-hour mean error from 6:00 to 18:00.
+- **4D readiness (`four_d_readiness`) and irradiance source (`dni_dhi_source_mix`):** Whether your weather data supplies real direct and diffuse sunlight, and whether the 4D model has learned enough to be switched on.
 
 **Battery calibration:** To automatically apply the recommended decay rate:
 
@@ -854,6 +932,40 @@ data:
   days: 30
   apply_battery_decay: true
 ```
+
+---
+
+### Heat-Source Type Services
+
+| Service | Description |
+|---------|-------------|
+| `classify_heat_sources` | Works out each unit's heat-source type now instead of waiting for the weekly run, and returns the evidence per unit. |
+| `set_heat_source_type` | Sets a unit's type (`unit_entity_id`, `heat_source_type`), overriding the worked-out one. `auto` goes back to the worked-out type. Changes the same setting as the lists in the advanced settings. |
+
+See [Heat-Source Type per Unit](#heat-source-type-per-unit).
+
+---
+
+### Solar Model Services
+
+For cases the live learners cannot settle on their own. The fitting services take a `unit_entity_id` to limit them to one unit and a `dry_run` to preview the result.
+
+| Service | Description |
+|---------|-------------|
+| `batch_fit_solar` | Fits each unit's solar coefficients over the last `days_back` days (default 30) in one go, for heating and cooling separately. Useful when the sun peaks on mild afternoons with little demand to measure against. When the unit already has a learned coefficient, the result is blended with it. |
+| `batch_fit_solar_4d` | The same for the optional 4D model's coefficients. |
+| `apply_implied_coefficient` | Writes the coefficient `diagnose_solar` implies from your data, direction by direction, skipping directions that are not stable across time windows (`force` overrides). Meant for units no learner can fit, such as a unit run by a heat pump controller. |
+| `fit_solar_obstruction` | Suggests sun elevations below which (terrain, neighbours) or above which (an overhang) direct sun is blocked, per unit and facade. Suggestions only, and only when they hold in at least two of the 30-, 60- and 90-day windows. |
+| `apply_obstruction_gate` | Accepts one suggestion (`unit_entity_id`, `facade`, `side`, `value`), or clears it with `clear`. Below 2–20° for terrain, above 20–60° for an overhang. |
+| `calibrate_unit_thresholds` | Recalculates each unit's noise floor for solar learning from its dark hours. Runs by itself at every startup. |
+
+#### Tobit Live Learner
+
+| Service | Description |
+|---------|-------------|
+| `set_experimental_tobit_live_learner` | Turns the censoring-aware live learner on or off (`enabled`; turning it on needs `confirm: true`). On by default. |
+| `set_tobit_live_entities` | Limits it to the listed units; an empty list lets it decide per unit. |
+| `reset_tobit_live_state` | Clears its running statistics, for one unit or all. The coefficients themselves are not touched. |
 
 ---
 
@@ -953,6 +1065,9 @@ data:
 - Check that weather entity provides cloud coverage
 - Consider using Open-Meteo for more accurate solar data
 
+**"A repair notice says the irradiance data has stopped"**
+- Your weather provider stopped supplying direct and diffuse sunlight while the 4D solar model is on. The model now runs on an estimate from cloud coverage, where the standard 3D model is better. Switch the 4D model off in the reconfigure settings, or fix the weather source. The notice clears by itself when the data comes back.
+
 **"Model learning too slowly"**
 - Increase Learning Rate (e.g., from 0.01 to 0.02)
 - Import historical data to jump-start
@@ -968,12 +1083,12 @@ data:
 
 **Hourly Logging:**
 - Keeps detailed log with configurable retention (90 / 180 / 365 days, default 90)
-- Includes: temperature, wind, humidity, expected vs actual energy
+- Includes: temperature, wind, humidity, expected vs actual energy, per-unit energy and modes, and which units' meters reported
 - Available attributes on `sensor.heating_analytics_last_hour_deviation`:
   - `model_updated_temp_category`: Temperature bucket used for learning
   - `model_value_before/after`: Model prediction before/after update
   - `model_delta`: Change in model value
-  - `inertia_temperature`: 4-hour rolling average temperature
+  - `inertia_temperature`: The effective temperature the hour was learned under
 
 **Daily Logging:**
 - Stores aggregated daily stats indefinitely

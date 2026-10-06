@@ -26,6 +26,7 @@ from custom_components.heating_analytics.learning import LearningManager
 from custom_components.heating_analytics.observation import build_strategies
 from custom_components.heating_analytics.solar import SolarCalculator
 from custom_components.heating_analytics.retrain import RetrainEngine
+from tests.helpers import bind_inertia_axis
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +127,11 @@ class TestLiveMidnightSyncOutage:
         """Track C succeeds → normal path, no outage counted."""
         base_coord.track_c_enabled = True
         base_coord.mpc_managed_sensor = "sensor.vp_stue"
-        # Pretend Track C returns (kwh, distribution, source).
+        # Pretend Track C returns (kwh, distribution, source, smear).
         dist = [{"synthetic_kwh_el": 0.5} for _ in range(24)]
-        base_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(return_value=(12.0, dist, "live"))
+        base_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(
+            return_value=(12.0, dist, "live", {"balance_point": 15.0, "cop_params": None})
+        )
         base_coord._daily_processor.apply_strategies_to_global_model = MagicMock(return_value=3)
         base_coord._hourly_log = _full_day_logs("2026-04-20")
         base_coord._accumulated_energy_today = 12.0
@@ -191,6 +194,7 @@ def _retrain_coord(hourly_log, *, track_c_enabled: bool, daily_history: dict | N
         track_c_enabled=track_c_enabled,
         mpc_managed_sensor="sensor.vp_stue" if track_c_enabled else None,
     )
+    bind_inertia_axis(coord)
     return coord
 
 

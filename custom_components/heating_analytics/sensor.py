@@ -84,6 +84,7 @@ from .const import (
 
     # Forecast Attributes
     ATTR_FORECAST_DETAILS,
+    KEY_FORECAST_ACCURACY_INTERNAL,
     ATTR_DAILY_FORECAST,
     ATTR_WEEKLY_SUMMARY,
     ATTR_AVG_TEMP_FORECAST,
@@ -684,14 +685,21 @@ class HeatingForecastDetailsSensor(HeatingAnalyticsBaseSensor):
     def native_value(self) -> str:
         """Return a summary of which forecast source is performing better."""
         details = self.coordinator.data.get(ATTR_FORECAST_DETAILS, {})
-        accuracy = details.get("accuracy_by_source", {})
+
+        # The user-facing attribute carries only the "daily" half of each source's
+        # stats, and "daily" has no sample count at all. Both numbers this state
+        # string needs live on the internal sibling key instead — see the comment
+        # on the ATTR_FORECAST_DETAILS assembly in coordinator.py.
+        accuracy = self.coordinator.data.get(KEY_FORECAST_ACCURACY_INTERNAL, {})
         primary = accuracy.get("primary", {})
         secondary = accuracy.get("secondary", {})
 
+        # One history entry per day, so this is a day count despite living under
+        # the "hourly" (hourly-derived) stats upstream.
         p_samples = primary.get("samples", 0)
         s_samples = secondary.get("samples", 0)
 
-        if not secondary or not self.coordinator.data.get(ATTR_FORECAST_DETAILS, {}).get("blend_config", {}).get("secondary_entity_id"):
+        if not secondary or not details.get("blend_config", {}).get("secondary_entity_id"):
             return "Primary source only"
 
         if p_samples < CONFIDENCE_MIN_SAMPLES and s_samples < CONFIDENCE_MIN_SAMPLES:
@@ -703,8 +711,11 @@ class HeatingForecastDetailsSensor(HeatingAnalyticsBaseSensor):
         if p_samples < CONFIDENCE_MIN_SAMPLES:
             return f"Secondary source is active ({s_samples} days logged)"
 
-        p_error = primary.get("hourly", {}).get("p50_abs_error", 999)
-        s_error = secondary.get("hourly", {}).get("p50_abs_error", 999)
+        p_error = primary.get("p50_abs_error")
+        s_error = secondary.get("p50_abs_error")
+
+        if p_error is None or s_error is None:
+            return "Gathering accuracy data"
 
         if p_error < s_error * FORECAST_COMPARISON_FACTOR:
             return f"Primary is performing better ({p_error:.1f} vs {s_error:.1f} kWh error)"
@@ -1758,6 +1769,9 @@ class HeatingThermalStateSensor(HeatingAnalyticsBaseSensor):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_icon = "mdi:thermometer-chevron-up"
+    # One value per hour of the inertia kernel (up to 5 × tau), rewritten
+    # every update: shown on the entity, kept out of the recorder.
+    _unrecorded_attributes = frozenset({"inertia_history", "weights"})
 
     @property
     def native_value(self) -> float | None:

@@ -90,6 +90,10 @@ retrain_from_history:
         If true, clears all existing learned correlation data and the U-coefficient before
         retraining. Use this for a full cold-start rebuild from history.
         If false (default), retraining refines the existing model via EMA.
+        The rebuild uses only the hourly log, which is kept for the configured
+        retention period. Temperatures the log does not cover, often the coldest
+        winter days, lose their learned values and cannot be rebuilt. Preview it
+        with dry_run first.
       default: false
       selector:
         boolean:
@@ -101,6 +105,24 @@ retrain_from_history:
         q/24. Produces up to 24 temperature buckets per day instead of one.
         Requires heatpump_mpc integration with get_cop_params service.
         No effect on Track A or Track C.
+      default: false
+      selector:
+        boolean:
+    dry_run:
+      name: Dry Run (preview only)
+      description: >-
+        If true, runs exactly the same retrain on a copy of the model and writes
+        nothing: the model, the stored data and the history are left as they are,
+        and nothing is saved. The response adds what the retrain would change:
+        base buckets added, removed and changed (overall, per 5 °C band and wind
+        bucket, and per unit), aux coefficients, solar coefficients before and
+        after, the U-coefficient, and the effect on predictions over the last 30
+        days (modelled kWh before and after, per day and per temperature band,
+        and the fit on the hours the retrain learns from). Predictions are set
+        against the consumption the model learns from: energy used in guest,
+        off and hot-water mode is taken off and shown separately, since the
+        model does not predict it. Combine with reset_first to preview a full
+        rebuild.
       default: false
       selector:
         boolean:
@@ -765,6 +787,94 @@ calibrate_wind_thresholds:
           max: 180
           mode: box
 
+calibrate_balance_point:
+  name: Calibrate Balance Point
+  description: >-
+    Fits the balance point from the last year of daily history instead of
+    relying on the configured value alone. Fits each day's heating energy
+    against its degree-hours as a change-point model (a flat floor above the
+    balance point, a rising arm below it). Sunshine - today's and heat stored
+    from yesterday's - lowers the day's balance point, and a heat pump's
+    efficiency rising with outdoor temperature bends the arm; both are
+    fitted, so the result is the balance point of a day without sun. Days
+    with auxiliary heat, guest mode, many windy hours, missing hours or no
+    per-unit energy breakdown (imported history) are left out. Suggests a new value only when
+    fits on alternating weeks agree, the result does not depend on the
+    assumed heat pump curve, no part of the sun or heat pump model is at
+    its limit, the model fits most days, the configured value lies outside the fit's
+    uncertainty interval and the change is at least 1 °C. The report shows
+    the balance point for each assumed curve. Suggestion
+    only - nothing is written. To apply, change the balance point in the
+    integration's reconfigure flow. retrain_from_history can then bring what
+    the model has already learned in line with it at once.
+  fields:
+    entity_id:
+      name: Entity
+      description: The Heating Analytics sensor to target (optional, defaults to primary instance).
+      selector:
+        entity:
+          integration: heating_analytics
+
+classify_heat_sources:
+  name: Classify Heat Sources
+  description: >-
+    Works out from each unit's own history what kind of heat source it is,
+    and stores the result. This also runs by itself after midnight once a
+    week. A unit that has used real energy both for heating on cold days and
+    for cooling on warm days is a reversible heat pump. Otherwise the shape of
+    its heating energy against the cold decides: efficiency that rises with
+    the outdoor temperature (an air-source heat pump) or efficiency that does
+    not change (direct electric heating, or a ground-source heat pump - the
+    energy data cannot tell those two apart). A unit gets a type only when
+    the evidence is clear, including without its coldest days; otherwise it
+    stays unknown. A type is replaced only when the other type is found twice
+    in a row. The response shows each unit's evidence. A type you set, in the
+    integration's configuration or with set_heat_source_type, always wins.
+  fields:
+    entity_id:
+      name: Entity
+      description: The Heating Analytics sensor to target (optional, defaults to primary instance).
+      selector:
+        entity:
+          integration: heating_analytics
+
+set_heat_source_type:
+  name: Set Heat Source Type
+  description: >-
+    Sets what kind of heat source a unit is, overriding the type worked out
+    from its history. Choose auto to go back to the worked-out type. The same
+    setting is in the integration's configuration (the four heat-source
+    lists); this action changes it there too. The type is shown on the unit's
+    Mode entity.
+  fields:
+    entity_id:
+      name: Instance
+      description: A Heating Analytics sensor belonging to the instance you want to target. Leave empty for the first available instance.
+      selector:
+        entity:
+          integration: heating_analytics
+    unit_entity_id:
+      name: Unit Sensor
+      description: The unit's energy sensor. Must be one of the integration's configured energy sensors.
+      required: true
+      selector:
+        entity:
+          domain: sensor
+    heat_source_type:
+      name: Heat Source Type
+      description: >-
+        The device. auto clears your type and goes back to the one worked out
+        from the unit's history.
+      required: true
+      selector:
+        select:
+          options:
+            - auto
+            - direct_electric
+            - ground_source
+            - air_to_water
+            - air_to_air
+
 calibrate_unit_thresholds:
   name: Calibrate Per-Unit Min-Base Thresholds
   description: >-
@@ -796,7 +906,7 @@ calibrate_unit_thresholds:
 
 calibrate_inertia:
   name: Calibrate Thermal Inertia
-  description: "Tests historical data to find the ideal thermal inertia (tau, 1-24h) for your house. Primary result uses a causal exponential decay kernel (matching the coordinator's RC-circuit model) — set your config-flow slider to recommended_tau. Gaussian sweep is included as a comparison. Returns results as a response."
+  description: "Tests historical data to find the ideal thermal inertia (tau, 1-24h) for your house. Primary result uses a causal exponential decay kernel (matching the coordinator's RC-circuit model) — set your config-flow slider to recommended_tau. Gaussian sweep is included as a comparison. live_axis_comparison shows, at your configured tau, how well the inertia temperature used by learning up to 1.3.15 (only the newest tau - 1 hours) and the current one (the whole kernel) explain your consumption, and how many hours change temperature bucket. Returns results as a response."
   fields:
     entity_id:
       name: Entity

@@ -12,6 +12,14 @@ from .helpers import (
     generate_gaussian_kernel,
     generate_exponential_kernel,
     calculate_asymmetric_inertia,
+    hour_had_any_aux,
+    daily_tdd_at_balance_point,
+    finite_float,
+    hour_start_utc,
+    local_day_hours,
+    log_entry_instant,
+    vector_slot_hours,
+    weighted_inertia,
 )
 from .explanation import WeatherImpactAnalyzer, ExplanationFormatter
 from .learning import _solar_coeff_regime
@@ -343,6 +351,7 @@ class StatisticsManager:
         known_aux_impact_kwh: float | None = None,
         carryover_state_override: float | None = None,
         override_now: datetime | None = None,
+        disable_interventions: bool = False,
     ) -> dict:
         """Calculate total power and breakdown using Hybrid "Global Stabilizer" logic.
 
@@ -364,6 +373,12 @@ class StatisticsManager:
                       If False, unit_breakdown will be empty to save performance.
             known_aux_impact_kwh: Optional known auxiliary impact (kWh). If provided, it overrides
                                   the model-predicted aux reduction and forces distribution logic.
+            disable_interventions: Force the hotspot attenuation (#950) and the
+                                   tail-aware redistribution (#948) off regardless of
+                                   configuration.  Used by the 4D no-irradiance fallback,
+                                   which must compute under the same model as the 4D
+                                   hours around it.  The carryover release (#896) is
+                                   disabled separately via ``carryover_state_override=0.0``.
 
         Returns:
              dict: {
@@ -447,7 +462,9 @@ class StatisticsManager:
             override_now if override_now is not None
             else (None if _is_forecast_path else dt_util.now())
         )
-        _interventions_disabled = _is_forecast_path and override_now is None
+        _interventions_disabled = disable_interventions or (
+            _is_forecast_path and override_now is None
+        )
 
         # Hoisted sun-elevation for the target hour.  Both #948 and #950
         # gate on this value so we compute it once per call.  When
@@ -524,20 +541,22 @@ class StatisticsManager:
             # H-k is eligible iff solar_factor > 0.05 AND past midpoint
             # sun_elev < 30°.  Missing entries (gaps in log) yield None —
             # past contribution skipped.
-            _h_now = _target_now.replace(minute=0, second=0, microsecond=0)
+            # Keyed and stepped on UTC instants: a "YYYY-MM-DDTHH" prefix
+            # is shared by both passes through the repeated DST fall-back
+            # hour, and stepping a local datetime by timedelta is wall-clock
+            # arithmetic that lands on the wrong hour across a DST change.
+            _h_now = hour_start_utc(_target_now)
             _log = getattr(self.coordinator, "_hourly_log", None) or []
-            # Build an index from "YYYY-MM-DDTHH" prefix → entry for O(K)
-            # lookup; bounded to last ~K+8 entries to keep it cheap.
+            # Index the last ~K+8 entries by start instant for O(K) lookup.
             _log_tail = _log[-(_redist_K + 8):] if len(_log) > (_redist_K + 8) else _log
-            _by_hour: dict[str, dict] = {}
+            _by_hour: dict[datetime, dict] = {}
             for _e in _log_tail:
-                _ts = _e.get("timestamp")
-                if isinstance(_ts, str) and len(_ts) >= 13:
-                    _by_hour[_ts[:13]] = _e
+                _inst = log_entry_instant(_e)
+                if _inst is not None:
+                    _by_hour[_inst] = _e
             for _k in range(1, _redist_K + 1):
                 _h_past = _h_now - timedelta(hours=_k)
-                _key = _h_past.isoformat()[:13]
-                _e = _by_hour.get(_key)
+                _e = _by_hour.get(_h_past)
                 if _e is None:
                     _redist_past_meta.append(None)
                     continue
@@ -1127,7 +1146,11 @@ class StatisticsManager:
           NOT applied.  These are 3D-pipeline interventions; the 4D
           variant is the bare physics, by design — they would have to be
           re-derived for the 4D coefficient space before they could fire
-          here.  ``breakdown.carryover_release_kwh`` is fixed at 0.
+          here.  ``breakdown.carryover_release_kwh`` is fixed at 0.  The
+          same holds on the no-irradiance fallback hour
+          (``pipeline: "3d_no_irradiance"``): it runs the 3D solar input
+          with all three interventions forced off, so it is computed
+          under the same model as the 4D hours around it.
         * Base + aux paths are identical to 3D.  4D is a solar-only
           pipeline change; there is no separate "4D base" model.
 
@@ -1341,6 +1364,19 @@ class StatisticsManager:
                     # genuinely lack both ``cloud_coverage`` and a mappable
                     # ``condition``.  Kept correct here regardless, so the
                     # branch cannot be read as a deliberate zero-solar choice.
+                    #
+                    # The fallback is the 3D model **restricted to what 4D
+                    # would have done** (#1073), not the full 3D model.  The
+                    # three 3D-only interventions — hotspot attenuation
+                    # (#950), tail-aware redistribution (#948) and carryover
+                    # release (#896) — are listed in this method's docstring
+                    # as deliberately absent from the 4D path, and the hours
+                    # either side of a fallback hour are computed without
+                    # them.  Enabling them for one hour would put that hour
+                    # under a different model from its neighbours for a
+                    # reason that has nothing to do with the building.  Only
+                    # the solar *input* changes (cloud-derived 3D instead of
+                    # DNI/DHI); the intervention set does not.
                     fallback = self._calculate_total_power_3d(
                         temp,
                         effective_wind,
@@ -1350,6 +1386,8 @@ class StatisticsManager:
                         detailed=detailed,
                         known_aux_impact_kwh=known_aux_impact_kwh,
                         override_now=override_now,
+                        carryover_state_override=0.0,
+                        disable_interventions=True,
                     )
                     # Stamp the markers the 3D return does not carry, so the
                     # fallback is visible rather than silent.  A 4D-primary
@@ -1690,9 +1728,9 @@ class StatisticsManager:
            nearest windier-adjacent bucket) before ``normal`` — mirroring the
            mild-regime wind fallback in ``_get_prediction_from_model``.
            Resolving a storm hour to the calmest bucket systematically
-           under-predicts wind loss on the coldest nights.  (This whole
-           ``extreme_wind`` concept is removed in 1.4.0 — #1022; the guard
-           below is the interim fix for the 1.3.x cold-regime path.)
+           under-predicts wind loss on the coldest nights.  (Introduced as
+           an interim fix while #1022 planned to remove ``extreme_wind``;
+           that removal was reversed, so this is now the permanent rule.)
         3. Normal (Most robust baseline)
         4. High Wind (If normal missing)
         5. Extreme Wind (Last resort)
@@ -2159,7 +2197,7 @@ class StatisticsManager:
         if yesterday_key in self.coordinator.model.daily_history:
              entry = self.coordinator.model.daily_history[yesterday_key]
              if entry is not None:
-                 tdd_yest = entry.get("tdd", 0.0)
+                 tdd_yest = round(daily_tdd_at_balance_point(entry, self.coordinator.balance_point), 1)
                  kwh_yest = entry.get("kwh", 0.0)
              else:
                  tdd_yest = 0.0
@@ -2232,7 +2270,7 @@ class StatisticsManager:
         for k in keys:
             entry = history.get(k)
             if entry is not None:
-                sum_tdd += entry.get("tdd", 0.0)
+                sum_tdd += daily_tdd_at_balance_point(entry, self.coordinator.balance_point)
                 sum_kwh += entry.get("kwh", 0.0)
                 count += 1
 
@@ -2480,6 +2518,11 @@ class StatisticsManager:
                     if has_valid_vectors:
                         # Get correct key for load
                         vec_load = vectors.get("actual_kwh", vectors.get("load"))
+                        # Clock hours per slot: 2 where the repeated DST
+                        # fall-back hour was folded in, matching the 25
+                        # entries the hourly-log path sees for that day.
+                        slot_hours = vector_slot_hours(vectors)
+                        bp_now = self.coordinator.balance_point
 
                         # Reconstruct hourly points from vectors
                         for h in range(24):
@@ -2490,22 +2533,60 @@ class StatisticsManager:
                                     "temp": v_temp,
                                     "wind": vectors["wind"][h] if vectors.get("wind") else entry.get("wind", 0.0),
                                     "load": v_load if v_load is not None else 0.0,
-                                    "tdd": vectors["tdd"][h] if vectors.get("tdd") else None,
+                                    # Not the stored tdd: it is fixed at the
+                                    # BP of the day it was logged, and for an
+                                    # hour it holds no more than v_temp does.
+                                    # Recomputed at the current BP.
+                                    "tdd": abs(bp_now - v_temp) * slot_hours[h] / 24.0,
                                     "solar_factor": vectors["solar_rad"][h] if vectors.get("solar_rad") else entry.get("solar_factor"),
                                     "timestamp": None,
-                                    "multiplier": 1.0, # Hourly weight
+                                    "multiplier": float(slot_hours[h]),  # Clock hours in the slot
                                     "unit_modes": None # Vectors don't store unit modes yet, inferred later
                                 })
                     else:
-                        # Fallback to Daily Averages
+                        # Fallback to Daily Averages.  T_eff is rebuilt from the
+                        # stored tdd at the BP that tdd was summed at — rebuilt
+                        # at another BP it moves the whole day by the change —
+                        # and not at all when the day records no single BP.
+                        bp_now = self.coordinator.balance_point
+                        stored_tdd = entry.get("tdd")
+                        if "balance_point" in entry:
+                            recon_bp = finite_float(entry.get("balance_point"))
+                        else:
+                            recon_bp = bp_now  # predates the v10 stamp
+                        # The stored tdd sums the logged hours; T_eff is the
+                        # mean distance from the BP per hour, so the sum is
+                        # scaled to 24 of them — up on a partial day, down on
+                        # a 25-hour fall-back day.
+                        vec_temps = vectors.get("temp") if isinstance(vectors, dict) else None
+                        slot_hours = vector_slot_hours(vectors)
+                        n_logged = (
+                            sum(
+                                slot_hours[i]
+                                for i, t in enumerate(vec_temps[:24])
+                                if finite_float(t) is not None
+                            )
+                            if isinstance(vec_temps, list) else 0
+                        )
+                        recon = (
+                            (
+                                float(stored_tdd) * (24.0 / n_logged if n_logged > 0 else 1.0),
+                                recon_bp,
+                            )
+                            if recon_bp is not None and finite_float(stored_tdd) is not None
+                            else None
+                        )
                         day_data_points.append({
                             "temp": entry.get("temp", 0.0),
-                            "tdd": entry.get("tdd"), # Capture TDD for reconstruction
+                            "recon": recon,
+                            "tdd": daily_tdd_at_balance_point(entry, bp_now),
                             "wind": entry.get("wind", 0.0),
                             "load": entry.get("kwh", 0.0), # Daily average doesn't have intra-day shape
                             "solar_factor": entry.get("solar_factor"),
                             "timestamp": None,
-                            "multiplier": 24.0 # Daily history has 24h weight
+                            # The day's clock hours: 23 or 25 on a DST day.
+                            "multiplier": float(local_day_hours(current)),
+                            "daily": True,
                         })
 
             # --- Process Day ---
@@ -2524,39 +2605,30 @@ class StatisticsManager:
                     s_factor = point["solar_factor"]
                     multiplier = point["multiplier"]
 
-                    # Thermodynamic Reconstruction (Jensen's Inequality Fix)
-                    # This logic is now applied to BOTH hourly logs and daily history
-                    # to ensure consistent calculations.
+                    # Thermodynamic Reconstruction (Jensen's Inequality Fix):
+                    # a daily-average point's effective temperature, from the
+                    # stored tdd at the BP it was summed at.  Hourly points need
+                    # none — an hour's tdd adds nothing to its temperature.
                     calc_temp = temp
-                    tdd_contribution = 0.0
-
-                    if point.get("tdd") is not None:
-                        tdd_contribution = float(point["tdd"])
-                        tdd_val = tdd_contribution
-                        # If it's an hourly log, scale the TDD value up to represent the hour's delta
-                        if multiplier == 1.0:
-                            tdd_val = tdd_val * 24.0
-
-                        if tdd_val > 0.1:  # Threshold to avoid noise
-                            # Recover effective temperature from TDD
-                            if temp >= self.coordinator.balance_point:
-                                calc_temp = self.coordinator.balance_point + tdd_val
+                    recon = point.get("recon")
+                    if recon is not None:
+                        recon_tdd, recon_bp = recon
+                        if recon_tdd > 0.1:  # Threshold to avoid noise
+                            if temp >= recon_bp:
+                                calc_temp = recon_bp + recon_tdd
                             else:
-                                calc_temp = self.coordinator.balance_point - tdd_val
-                    else:
-                        # Fallback if TDD missing: Calculate from temp (Approximate)
-                        # If Hourly (1.0): abs(BP - temp) / 24.0
-                        # If Daily (24.0): abs(BP - temp)
-                        delta = abs(self.coordinator.balance_point - temp)
-                        if multiplier == 1.0:
-                            tdd_contribution = delta / 24.0
-                        else:
-                            tdd_contribution = delta
+                                calc_temp = recon_bp - recon_tdd
+
+                    # Degree-days at the current BP.  Vector and daily points
+                    # carry theirs; an hourly-log point is one hour.
+                    tdd_contribution = point.get("tdd")
+                    if tdd_contribution is None:
+                        tdd_contribution = abs(self.coordinator.balance_point - temp) / 24.0
 
                     total_tdd += tdd_contribution
 
                     if self.coordinator.solar_enabled:
-                        if multiplier > 1.0 and s_factor is None:  # Only for daily history
+                        if point.get("daily") and s_factor is None:  # Only for daily history
                             s_factor = self.coordinator.solar.estimate_daily_avg_solar_factor(
                                 current
                             )
@@ -2593,7 +2665,9 @@ class StatisticsManager:
                         detailed=False,
                     )
 
-                    # Multiply by multiplier (24 for daily history, 1 for hourly)
+                    # Multiply by multiplier: clock hours of the point (the
+                    # day's length for daily history, a slot's for vectors,
+                    # 1 for hourly logs)
                     day_total_kwh = res["total_kwh"] * multiplier
                     day_total_solar = (
                         res["breakdown"]["solar_reduction_kwh"] * multiplier
@@ -2614,10 +2688,12 @@ class StatisticsManager:
                     day_wind_weighted_sum += wind * load
                     day_load_sum += load
 
-                    # Simple Accumulation (Fallback)
-                    day_temp_simple_sum += calc_temp
-                    day_wind_simple_sum += wind
-                    day_sample_count += 1
+                    # Simple Accumulation (Fallback), per clock hour.  A day
+                    # is either hourly points or one daily point, so the
+                    # daily point's weight cancels.
+                    day_temp_simple_sum += calc_temp * multiplier
+                    day_wind_simple_sum += wind * multiplier
+                    day_sample_count += multiplier
 
                 # Accumulate Daily Stats for Global Average
                 if day_sample_count > 0:
@@ -3500,16 +3576,31 @@ class StatisticsManager:
             "learning_status_exclusion": 0
         }
 
-        # Sort logs chronologically (oldest first)
-        sorted_logs = sorted(self.coordinator.model.hourly_log, key=lambda x: x["timestamp"])
-
-        for log in sorted_logs:
+        # Chronological by instant, and hour-aligned: ``raw_temps[i]`` is the
+        # i-th clock hour since the first, ``None`` where the log has no
+        # entry.  A kernel window over it then weights every reading by its
+        # true age, as live learning does (helpers.weighted_inertia), rather
+        # than letting a missing hour shift older readings onto newer
+        # weights.  Sorting on the timestamp text misorders the repeated
+        # DST fall-back hour.
+        timed_logs = []
+        for log in self.coordinator.model.hourly_log:
             if log["timestamp"] < start_iso:
                 continue
+            instant = log_entry_instant(log)
+            if instant is not None:
+                timed_logs.append((instant, log))
+        timed_logs.sort(key=lambda item: item[0])
+        first_instant = timed_logs[0][0] if timed_logs else None
 
+        for instant, log in timed_logs:
             total_hours_evaluated += 1
-            raw_temps.append(log["temp"])
-            raw_kwh.append(log.get("actual_kwh", 0.0))
+            slot = int(round((instant - first_instant).total_seconds() / 3600.0))
+            while len(raw_temps) <= slot:
+                raw_temps.append(None)
+                raw_kwh.append(None)
+            raw_temps[slot] = log["temp"]
+            raw_kwh[slot] = log.get("actual_kwh", 0.0)
 
             # Filtration Criteria ("Pure" hours only)
             actual_kwh = log.get("actual_kwh", 0.0)
@@ -3522,8 +3613,9 @@ class StatisticsManager:
                 discarded_reasons["solar_interference"] += 1
                 continue
 
-            aux_active = log.get("auxiliary_active", False)
-            if aux_active:
+            # Any aux, not just aux-dominant: ``auxiliary_active`` is the
+            # ≥ 80 % learning flag and would admit partial-aux hours.
+            if hour_had_any_aux(log):
                 discarded_reasons["auxiliary_active"] += 1
                 continue
 
@@ -3535,7 +3627,7 @@ class StatisticsManager:
 
             # Store the index in raw_temps so we can calculate the window later
             pure_logs.append({
-                "index": len(raw_temps) - 1,
+                "index": slot,
                 "timestamp": log["timestamp"],
                 "actual_kwh": actual_kwh,
                 "temp": log["temp"],
@@ -3547,10 +3639,13 @@ class StatisticsManager:
             for log in pure_logs:
                 idx = log["index"]
 
-                # Get surrounding hours, handling boundaries
-                prev_kwh = raw_kwh[idx - 1] if idx > 0 else raw_kwh[idx]
+                # Get surrounding hours, handling boundaries (and hours
+                # missing from the log)
                 curr_kwh = raw_kwh[idx]
-                next_kwh = raw_kwh[idx + 1] if idx < len(raw_kwh) - 1 else raw_kwh[idx]
+                prev_kwh = raw_kwh[idx - 1] if idx > 0 else None
+                next_kwh = raw_kwh[idx + 1] if idx < len(raw_kwh) - 1 else None
+                prev_kwh = curr_kwh if prev_kwh is None else prev_kwh
+                next_kwh = curr_kwh if next_kwh is None else next_kwh
 
                 # Smoothed Y(t) = (Y(t-1) + Y(t) + Y(t+1)) / 3
                 log["actual_kwh"] = (prev_kwh + curr_kwh + next_kwh) / 3.0
@@ -3573,14 +3668,19 @@ class StatisticsManager:
         correlation_data = self.coordinator.model.correlation_data
         bp = self.coordinator.balance_point
 
-        def _eval_kernel_on_logs(kernel: tuple, kernel_window: int, logs: list) -> tuple:
-            """Evaluate a kernel on a list of logs; return (r2, rmse, n_points)."""
-            x_vals = []
-            y_vals = []
+        def _fit_axis(logs: list, eff_of) -> dict | None:
+            """TDD linear regression of wind-neutral kWh on an inertia axis.
+
+            ``eff_of(log)`` gives the log's effective temperature (or None to
+            skip it).  Returns ``{"r2", "rmse", "n", "residuals"}`` with the
+            unrounded fit and ``(log, eff_temp, residual)`` per point, or
+            ``{"n": n}`` alone when there are too few points or no variance.
+            """
+            points = []
             for log in logs:
-                idx = log["index"]
-                window = raw_temps[idx - kernel_window + 1 : idx + 1]
-                eff_temp = sum(t * w for t, w in zip(window, kernel))
+                eff_temp = eff_of(log)
+                if eff_temp is None:
+                    continue
 
                 wind_premium = 0.0
                 wind_bucket = log.get("wind_bucket", "normal")
@@ -3593,25 +3693,47 @@ class StatisticsManager:
 
                 wind_neutral_kwh = max(0.0, log["actual_kwh"] - wind_premium)
                 tdd = max(0.0, bp - eff_temp) / 24.0
-                x_vals.append(tdd)
-                y_vals.append(wind_neutral_kwh)
+                points.append((log, eff_temp, tdd, wind_neutral_kwh))
 
-            n = len(x_vals)
+            n = len(points)
             if n < 10:
-                return None, None, n
+                return {"n": n}
+            x_vals = [p[2] for p in points]
+            y_vals = [p[3] for p in points]
             mean_x = sum(x_vals) / n
             mean_y = sum(y_vals) / n
             den = sum((x - mean_x) ** 2 for x in x_vals)
             if den == 0:
-                return None, None, n
+                return {"n": n}
             slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_vals, y_vals)) / den
             intercept = mean_y - slope * mean_x
-            y_pred = [slope * x + intercept for x in x_vals]
-            ss_res = sum((y - p) ** 2 for y, p in zip(y_vals, y_pred))
+            residuals = [
+                (log, eff, y - (slope * x + intercept))
+                for (log, eff, x, y) in points
+            ]
+            ss_res = sum(r * r for _, _, r in residuals)
             ss_tot = sum((y - mean_y) ** 2 for y in y_vals)
             r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-            rmse = math.sqrt(ss_res / n)
-            return round(r2, 4), round(rmse, 4), n
+            return {"r2": r2, "rmse": math.sqrt(ss_res / n), "n": n, "residuals": residuals}
+
+        def _eval_kernel_on_logs(
+            kernel: tuple, kernel_window: int, logs: list, tau: float | None = None,
+        ) -> tuple:
+            """Evaluate a kernel on a list of logs; return (r2, rmse, n_points).
+
+            The effective temperature is ``helpers.weighted_inertia`` over the
+            hour-aligned window — the exact live computation for an
+            exponential kernel with its ``tau`` (gap cut included).
+            """
+            def _eff(log):
+                idx = log["index"]
+                window = raw_temps[max(0, idx - kernel_window + 1) : idx + 1]
+                return weighted_inertia(window, kernel, tau)
+
+            fit = _fit_axis(logs, _eff)
+            if "r2" not in fit:
+                return None, None, fit["n"]
+            return round(fit["r2"], 4), round(fit["rmse"], 4), fit["n"]
 
         # 3. Primary: Exponential sweep tau=1..24 with window=min(5*tau, 168)
         # Each tau uses its own eligible subset (matching coordinator behavior).
@@ -3620,7 +3742,7 @@ class StatisticsManager:
             exp_window = min(int(tau * 5), 168)
             kernel = generate_exponential_kernel(tau, exp_window)
             eligible = [log for log in pure_logs if log["index"] >= exp_window - 1]
-            r2, rmse, n = _eval_kernel_on_logs(kernel, exp_window, eligible)
+            r2, rmse, n = _eval_kernel_on_logs(kernel, exp_window, eligible, tau)
             if r2 is not None:
                 exp_primary[tau] = {"tau": tau, "r2": r2, "rmse": rmse, "points": n}
 
@@ -3666,7 +3788,7 @@ class StatisticsManager:
                     exp_window = min(int(tau * 5), 168)
                     kernel = generate_exponential_kernel(tau, exp_window)
                     eligible = [log for log in week_logs if log["index"] >= exp_window - 1]
-                    r2, _, _ = _eval_kernel_on_logs(kernel, exp_window, eligible)
+                    r2, _, _ = _eval_kernel_on_logs(kernel, exp_window, eligible, tau)
                     if r2 is not None and r2 > max_week_r2:
                         max_week_r2 = r2
                         week_best_tau = tau
@@ -3710,7 +3832,9 @@ class StatisticsManager:
 
                 # Use up to 8 hours of history for trend detection + weighting
                 window_start = max(0, idx - 7)
-                window = raw_temps[window_start : idx + 1]
+                window = [t for t in raw_temps[window_start : idx + 1] if t is not None]
+                if len(window) < 2:
+                    continue
 
                 eff_temp, regime = calculate_asymmetric_inertia(window)
                 regime_counts[regime] += 1
@@ -3815,7 +3939,7 @@ class StatisticsManager:
                     exp_window = min(int(tau * 5), 168)
                     kernel = generate_exponential_kernel(tau, exp_window)
                     eligible = [log for log in bin_logs if log["index"] >= exp_window - 1]
-                    r2, rmse, _ = _eval_kernel_on_logs(kernel, exp_window, eligible)
+                    r2, rmse, _ = _eval_kernel_on_logs(kernel, exp_window, eligible, tau)
                     if r2 is not None and r2 > bin_best_r2:
                         bin_best_r2 = r2
                         bin_best_tau = tau
@@ -3842,7 +3966,7 @@ class StatisticsManager:
                 ext_window = min(int(tau * 5), 168)
                 kernel = generate_exponential_kernel(tau, ext_window)
                 eligible = [log for log in pure_logs if log["index"] >= ext_window - 1]
-                r2, rmse, n = _eval_kernel_on_logs(kernel, ext_window, eligible)
+                r2, rmse, n = _eval_kernel_on_logs(kernel, ext_window, eligible, tau)
                 if r2 is not None:
                     ext_results.append({"tau": tau, "r2": r2, "rmse": rmse, "points": n})
                 else:
@@ -3857,7 +3981,94 @@ class StatisticsManager:
                 "note": "Extended sweep tau=1..72h, window=min(5*tau, 168). Explore tau values beyond the 24h config-flow range.",
             }
 
+        result["live_axis_comparison"] = self._compare_live_inertia_axes(
+            pure_logs, raw_temps, _fit_axis,
+        )
+
         return result
+
+    def _compare_live_inertia_axes(self, pure_logs: list, raw_temps: list, fit_axis) -> dict:
+        """Previous vs current live inertia axis at the configured tau.
+
+        Until this version live learning used only the newest ``tau − 1``
+        hours of the kernel (an age cutoff measured from the hour boundary);
+        it now uses the whole kernel with a gap cut, as the forecast and
+        this calibration always assumed.  Both axes are fitted with the same
+        TDD regression on the same pure hours, so the numbers say which one
+        explains this installation's consumption better, and by how much in
+        each outdoor-temperature band.  The share of hours whose bucket
+        changes is the reach of the switch.  Diagnostic only.
+        """
+        tau = float(self.coordinator.inertia_tau)
+        kernel = list(self.coordinator.inertia_weights)
+        window = len(kernel)
+        previous_span = max(1, int(tau) - 1)  # hours the old cutoff kept
+
+        eligible = [log for log in pure_logs if log["index"] >= window - 1]
+
+        def _window(log):
+            idx = log["index"]
+            return raw_temps[max(0, idx - window + 1) : idx + 1]
+
+        def _previous(log):
+            return weighted_inertia(_window(log)[-previous_span:], kernel)
+
+        def _current(log):
+            return weighted_inertia(_window(log), kernel, tau)
+
+        prev_fit = fit_axis(eligible, _previous)
+        curr_fit = fit_axis(eligible, _current)
+        out = {
+            "tau": tau,
+            "kernel_hours": window,
+            "previous_axis_hours": previous_span,
+            "points": curr_fit.get("n", 0),
+        }
+        if "r2" not in prev_fit or "r2" not in curr_fit:
+            out["skipped"] = "Too few pure hours with a full kernel of history"
+            return out
+
+        shifts = []
+        changed = 0
+        for log in eligible:
+            a, b = _previous(log), _current(log)
+            if a is None or b is None:
+                continue
+            shifts.append(b - a)
+            if int(round(a)) != int(round(b)):
+                changed += 1
+
+        def _bands(fit):
+            bands: dict[str, list[float]] = {}
+            for log, _eff, resid in fit["residuals"]:
+                low = math.floor(log["temp"] / 5.0) * 5
+                bands.setdefault(f"{low}..{low + 5}", []).append(resid)
+            return bands
+
+        prev_bands, curr_bands = _bands(prev_fit), _bands(curr_fit)
+        by_band = []
+        for band in sorted(set(prev_bands) | set(curr_bands), key=lambda b: float(b.split("..")[0])):
+            p, c = prev_bands.get(band, []), curr_bands.get(band, [])
+            by_band.append({
+                "outdoor_temp_c": band,
+                "points": len(c),
+                "rmse_previous": round(math.sqrt(sum(r * r for r in p) / len(p)), 4) if p else None,
+                "rmse_current": round(math.sqrt(sum(r * r for r in c) / len(c)), 4) if c else None,
+                "bias_previous": round(sum(p) / len(p), 4) if p else None,
+                "bias_current": round(sum(c) / len(c), 4) if c else None,
+            })
+
+        out.update({
+            "previous_axis": {"r2": round(prev_fit["r2"], 4), "rmse": round(prev_fit["rmse"], 4)},
+            "current_axis": {"r2": round(curr_fit["r2"], 4), "rmse": round(curr_fit["rmse"], 4)},
+            "r2_change": round(curr_fit["r2"] - prev_fit["r2"], 4),
+            "rmse_change": round(curr_fit["rmse"] - prev_fit["rmse"], 4),
+            "temp_key_changed_share": round(changed / len(shifts), 3) if shifts else None,
+            "mean_abs_shift_c": round(sum(abs(d) for d in shifts) / len(shifts), 2) if shifts else None,
+            "max_abs_shift_c": round(max(abs(d) for d in shifts), 2) if shifts else None,
+            "by_outdoor_temp": by_band,
+        })
+        return out
 
     def calibrate_wind_thresholds(self, days: int = 60) -> dict:
         """Find the optimal wind thresholds (high_wind, extreme_wind) to minimize model error.
@@ -3880,12 +4091,13 @@ class StatisticsManager:
             "missing_wind_or_temp": 0,
         }
 
-        sorted_logs = sorted(self.coordinator.model.hourly_log, key=lambda x: x["timestamp"])
+        # Keyed on the inertia axis the model learns on now: the grid search
+        # compares against the current buckets.
+        window_logs = self.coordinator._entries_on_current_axis(
+            [log for log in self.coordinator.model.hourly_log if log["timestamp"] >= start_iso]
+        )
 
-        for log in sorted_logs:
-            if log["timestamp"] < start_iso:
-                continue
-
+        for log in window_logs:
             total_hours_evaluated += 1
 
             actual_kwh = log.get("actual_kwh", 0.0)
@@ -3898,8 +4110,9 @@ class StatisticsManager:
                 discarded["solar_interference"] += 1
                 continue
 
-            aux_active = log.get("auxiliary_active", False)
-            if aux_active:
+            # Any aux, not just aux-dominant: ``auxiliary_active`` is the
+            # ≥ 80 % learning flag and would admit partial-aux hours.
+            if hour_had_any_aux(log):
                 discarded["auxiliary_active"] += 1
                 continue
 

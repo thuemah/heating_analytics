@@ -13,20 +13,32 @@ testable without standing up a config entry or an issue registry.
 """
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
+from homeassistant.util import dt as dt_util
 
 from custom_components.heating_analytics.const import (
+    REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS,
     REPAIR_DNI_DHI_OUTAGE_MIN_HOURS,
     REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS,
 )
 from custom_components.heating_analytics.diagnostics import DiagnosticsEngine
 
 
-def _entry(source: str | None, *, solar_factor: float = 0.5) -> dict:
-    """One hourly_log entry with the two fields the window reads."""
-    e = {"timestamp": "2026-07-27T12:00:00", "solar_factor": solar_factor}
+def _entry(
+    source: str | None, *, solar_factor: float = 0.5, days_ago: int = 0
+) -> dict:
+    """One hourly_log entry with the fields the window reads.
+
+    Timestamped relative to now: the walk stops at entries older than
+    ``REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS``, so a fixed date would age out.
+    """
+    ts = (dt_util.now() - timedelta(days=days_ago)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
+    e = {"timestamp": ts.isoformat(), "solar_factor": solar_factor}
     if source is not None:
         e["dni_dhi_source"] = source
     return e
@@ -85,6 +97,67 @@ def test_hysteresis_band_holds_rather_than_flapping():
 def test_single_stray_real_hour_still_raises():
     """The raise bar is slack for a stray hour, not a statistical claim."""
     log = _window("kasten_synthetic", 23) + _window("native", 1)
+    result = _engine(log)._compute_dni_dhi_outage()
+    assert result["verdict"] == "raise"
+
+
+# ---------------------------------------------------------------------
+# Age bound on the walk
+# ---------------------------------------------------------------------
+
+def test_walk_stops_at_the_age_bound():
+    """Evidence older than the age bound is never consulted.
+
+    A full window of kasten_synthetic just past the bound must not raise:
+    a repair on fortnight-old evidence says nothing about the provider
+    today.  With nothing recent the verdict is insufficient_data.
+    """
+    log = [
+        _entry("kasten_synthetic", days_ago=REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS + 1)
+        for _ in range(REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS)
+    ]
+    result = _engine(log)._compute_dni_dhi_outage()
+    assert result["verdict"] == "insufficient_data"
+    assert result["daylight_hours_examined"] == 0
+    assert result["max_age_days"] == REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS
+
+
+def test_unlabelled_legacy_log_is_not_walked_end_to_end():
+    """A long pre-``dni_dhi_source`` log must not be walked in full.
+
+    Unlabelled entries consume no window budget, so before the age bound
+    the whole log was walked on every hour boundary.  Entries that are
+    old *and* would otherwise change the verdict sit behind the unlabelled
+    run: reaching them would mean the bound was ignored.
+    """
+    stale_evidence = [
+        _entry("kasten_synthetic", days_ago=REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS + 30)
+        for _ in range(REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS)
+    ]
+    legacy = [
+        _entry(None, days_ago=d)
+        for d in range(REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS + 29, -1, -1)
+        for _ in range(24)
+    ]
+    result = _engine(stale_evidence + legacy)._compute_dni_dhi_outage()
+    assert result["verdict"] == "insufficient_data"
+    assert result["daylight_hours_examined"] == 0
+
+
+def test_window_inside_the_bound_still_counts():
+    """Entries a few days old (a December window at 60 °N) still count."""
+    log = [_entry("kasten_synthetic", days_ago=4) for _ in range(12)] + [
+        _entry("kasten_synthetic", days_ago=1) for _ in range(12)
+    ]
+    result = _engine(log)._compute_dni_dhi_outage()
+    assert result["verdict"] == "raise"
+
+
+def test_missing_timestamp_does_not_end_the_walk():
+    """An entry without a timestamp is skipped by the age check, not a stop."""
+    log = _window("kasten_synthetic")
+    for e in log:
+        e.pop("timestamp")
     result = _engine(log)._compute_dni_dhi_outage()
     assert result["verdict"] == "raise"
 

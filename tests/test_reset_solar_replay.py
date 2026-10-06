@@ -26,6 +26,7 @@ from custom_components.heating_analytics.learning import LearningManager
 from custom_components.heating_analytics.solar import SolarCalculator
 from custom_components.heating_analytics.observation import build_strategies
 from custom_components.heating_analytics.const import MODE_HEATING
+from tests.helpers import bind_inertia_axis
 
 
 def _reset_coord(hourly_log, *, energy_sensors=("sensor.heater1",)):
@@ -72,6 +73,7 @@ def _reset_coord(hourly_log, *, energy_sensors=("sensor.heater1",)):
         track_c_enabled=False,
         mpc_managed_sensor=None,
     )
+    bind_inertia_axis(coord)
     return coord
 
 

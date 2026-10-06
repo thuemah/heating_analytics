@@ -222,12 +222,17 @@ def test_inertia_legacy_missing_timestamp(coordinator, mock_time):
     assert inertia == 10.0
 
 def test_inertia_partial_filtering(coordinator, mock_time):
-    """Test 'Filter FIRST' logic: 2 old logs, 2 valid logs. Should take the 2 valid ones."""
+    """History before a gap longer than tau is a discontinuity and dropped.
+
+    Tau is a gap threshold, not an age cutoff (#1109): the logs before the
+    gap would be inside the 5·tau kernel, but a 5-hour hole (> tau = 4)
+    separates them from the rest.
+    """
     now = FIXED_NOW
 
     coordinator._hourly_log = [
-        {"timestamp": (now - timedelta(hours=6)).isoformat(), "temp": 20.0}, # Old
-        {"timestamp": (now - timedelta(hours=5)).isoformat(), "temp": 20.0}, # Old
+        {"timestamp": (now - timedelta(hours=8)).isoformat(), "temp": 20.0}, # Before the gap
+        {"timestamp": (now - timedelta(hours=7)).isoformat(), "temp": 20.0}, # Before the gap
         {"timestamp": (now - timedelta(hours=2)).isoformat(), "temp": 12.0}, # Valid H-2
         {"timestamp": (now - timedelta(hours=1)).isoformat(), "temp": 11.0}, # Valid H-1
     ]
@@ -237,11 +242,33 @@ def test_inertia_partial_filtering(coordinator, mock_time):
 
     inertia = coordinator._calculate_inertia_temp()
 
-    # Old logs (>4h) should be filtered out first.
-    # Remaining valid logs: [12.0, 11.0]
-    # Current: 10.0
-    # Weighted Average as above (partial history)
+    # Remaining: [12.0, 11.0] + current 10.0
     assert 10.0 <= inertia <= 12.0
+    w = coordinator.inertia_weights
+    expected = (10.0 * w[-1] + 11.0 * w[-2] + 12.0 * w[-3]) / (w[-1] + w[-2] + w[-3])
+    assert inertia == pytest.approx(expected)
+
+
+def test_inertia_gap_up_to_tau_keeps_older_history(coordinator, mock_time):
+    """A hole of at most tau hours drops the missing hours, not the history
+    behind them, and older readings keep the weight of their true age."""
+    now = FIXED_NOW
+
+    coordinator._hourly_log = [
+        {"timestamp": (now - timedelta(hours=6)).isoformat(), "temp": 20.0},
+        {"timestamp": (now - timedelta(hours=5)).isoformat(), "temp": 20.0},
+        {"timestamp": (now - timedelta(hours=2)).isoformat(), "temp": 12.0},
+        {"timestamp": (now - timedelta(hours=1)).isoformat(), "temp": 11.0},
+    ]
+    coordinator._get_float_state = MagicMock(return_value=10.0)
+
+    inertia = coordinator._calculate_inertia_temp()
+
+    w = coordinator.inertia_weights
+    n = len(w)
+    ages = {0: 10.0, 1: 11.0, 2: 12.0, 5: 20.0, 6: 20.0}
+    expected = sum(w[n - 1 - a] * t for a, t in ages.items()) / sum(w[n - 1 - a] for a in ages)
+    assert inertia == pytest.approx(expected)
 
 def test_inertia_graceful_degradation_logging(coordinator, mock_time):
     """Test that NO warnings are logged during normal startup (insufficient history)."""

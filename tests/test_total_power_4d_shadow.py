@@ -690,6 +690,44 @@ def test_no_irradiance_falls_back_to_3d_not_zero_solar():
     )
 
 
+def test_no_irradiance_fallback_runs_without_3d_only_interventions():
+    """The fallback is 3D restricted to what 4D would have done (#1073).
+
+    ``calculate_total_power_4d`` documents the carryover release (#896),
+    hotspot attenuation (#950) and tail-aware redistribution (#948) as
+    absent from the 4D path.  A fallback hour must not silently gain them,
+    or it is computed under a different model from the 4D hours around
+    it.  Carryover is the one this fixture can drive directly: with live
+    carryover state the unrestricted 3D primitive releases it, the
+    fallback does not.
+    """
+    coord = _unresolvable_irradiance_coordinator()
+    coord._solar_carryover_state = 5.0
+    coord.solar_battery_decay = 0.80
+    now = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    unrestricted = coord.statistics._calculate_total_power_3d(
+        10.0, 0.0, 0.0, False, override_now=now,
+    )
+    assert unrestricted["breakdown"]["carryover_release_kwh"] > 0.0, (
+        "fixture must exercise the carryover path for the test to mean anything"
+    )
+
+    result = coord.statistics.calculate_total_power_4d(
+        temp=10.0, effective_wind=0.0, solar_impact=0.0,
+        is_aux_active=False, override_now=now,
+    )
+    assert result["pipeline"] == "3d_no_irradiance"
+    assert result["breakdown"]["carryover_release_kwh"] == 0.0
+
+    restricted = coord.statistics._calculate_total_power_3d(
+        10.0, 0.0, 0.0, False, override_now=now,
+        carryover_state_override=0.0, disable_interventions=True,
+    )
+    assert result["total_kwh"] == restricted["total_kwh"]
+    assert result["breakdown"] == restricted["breakdown"]
+
+
 def test_unavailable_sentinel_means_only_not_attempted():
     """``"unavailable"`` no longer doubles as "resolved to nothing" (#1071).
 

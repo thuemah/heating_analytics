@@ -4,7 +4,26 @@ This directory contains Home Assistant automation blueprints for common Heating 
 
 ## Installation
 
-Blueprints must be copied to your Home Assistant configuration directory:
+### One-click import (recommended)
+
+Each button opens the blueprint import dialog in your own Home Assistant
+instance with the blueprint's URL filled in — no file access needed.
+
+| Blueprint | Import |
+|-----------|--------|
+| Climate State Sync (`climate_sync.yaml`) | [![Import the climate_sync blueprint into your Home Assistant instance.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fthuemah%2Fheating_analytics%2Fblob%2Fmain%2Fblueprints%2Fclimate_sync.yaml) |
+| Heat Pump Mode Sync (`heat_pump_mode_sync.yaml`) | [![Import the heat_pump_mode_sync blueprint into your Home Assistant instance.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fthuemah%2Fheating_analytics%2Fblob%2Fmain%2Fblueprints%2Fheat_pump_mode_sync.yaml) |
+
+An imported blueprint remembers where it came from, so Home Assistant can
+re-import it when a new version is published (⋮ menu on the blueprint →
+**Re-import blueprint**).
+
+The same works by hand: **Settings → Automations & Scenes → Blueprints →
+Import Blueprint**, then paste the blueprint's GitHub URL.
+
+### Manual copy
+
+If you prefer, copy the files into your Home Assistant configuration directory:
 
 ```bash
 # From your Home Assistant config directory:
@@ -12,8 +31,8 @@ mkdir -p blueprints/automation/heating_analytics
 cp <path-to-repo>/blueprints/*.yaml blueprints/automation/heating_analytics/
 ```
 
-Or manually:
-1. Copy `climate_sync.yaml` to `<config>/blueprints/automation/heating_analytics/`
+Or one at a time:
+1. Copy `climate_sync.yaml` (or `heat_pump_mode_sync.yaml`) to `<config>/blueprints/automation/heating_analytics/`
 2. Restart Home Assistant or reload automations
 3. The blueprint will appear in the automation editor under "Blueprints"
 
@@ -81,6 +100,16 @@ notes if you're coming from v1.
 - ✅ Active states like `auto` and `heat_cool` correctly route to heating
 - ✅ Inert states (`dry`, `fan_only`) leave the mode helper alone
 
+### Heat Pump Mode Sync
+
+**File:** `heat_pump_mode_sync.yaml`
+
+Maps a heat pump's operation-mode sensor (e.g. `Heating` / `Domestic Hot
+Water` / `Defrost`) to a Heating Analytics mode select helper.  Defrost is
+transparent: the previous heating or DHW mode is kept, so defrost energy is
+attributed to the mode it belongs to.  The blueprint's own description lists
+its inputs.
+
 ## Custom Logic
 
 For advanced use cases (e.g., temperature-based state selection, custom conditions),
@@ -89,7 +118,8 @@ you may still need to create manual automations. The blueprint covers ~90% of st
 ## Troubleshooting
 
 **Blueprint not appearing in UI:**
-- Ensure the file is in `blueprints/automation/heating_analytics/`
+- After a one-click import, check **Settings → Automations & Scenes → Blueprints**
+- After a manual copy, ensure the file is in `blueprints/automation/heating_analytics/`
 - Restart Home Assistant or reload automations from Developer Tools
 
 **States not syncing:**

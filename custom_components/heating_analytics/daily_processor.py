@@ -7,6 +7,7 @@ to this engine so the external API is unchanged.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from .const import (
     ATTR_TDD,
@@ -14,10 +15,178 @@ from .const import (
     MODES_EXCLUDED_FROM_GLOBAL_LEARNING,
     MODE_HEATING,
 )
-from .learning import regime_energy_split
+from .helpers import (
+    REGIME_SPLIT_KEYS,
+    aux_affected_entities_of,
+    first_reported_instants,
+    hour_slots,
+    hour_start_utc,
+    recorded_balance_points,
+)
+from .learning import unit_regime_energy
 from .thermodynamics import ThermodynamicEngine
 
 _LOGGER = logging.getLogger(__name__)
+
+
+_COP_PARAM_KEYS = (
+    "eta_carnot", "lwt", "f_defrost", "defrost_temp_threshold", "defrost_rh_threshold",
+)
+
+
+def _real_float(value) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def track_c_smear_record(coordinator, cop_params) -> dict:
+    """What a Track C day was smeared at, stored as ``track_c_smear`` (#1111).
+
+    The balance point, inertia tau, wind thresholds and solar battery decay
+    behind the day's weights, and the MPC COP parameters behind its per-hour
+    conversion.  With the parameters on the day, a retrain re-spreads it with
+    the exact COP instead of the one recovered from the stored hours.
+    Additive key on the ``daily_history`` day.
+    """
+    params = None
+    if isinstance(cop_params, dict) and "eta_carnot" in cop_params:
+        params = {
+            key: float(cop_params[key]) for key in _COP_PARAM_KEYS
+            if _real_float(cop_params.get(key)) is not None
+        }
+    return {
+        "balance_point": _real_float(getattr(coordinator, "balance_point", None)),
+        "inertia_tau": _real_float(getattr(coordinator, "inertia_tau", None)),
+        "wind_threshold": _real_float(getattr(coordinator, "wind_threshold", None)),
+        "extreme_wind_threshold": _real_float(
+            getattr(coordinator, "extreme_wind_threshold", None)
+        ),
+        "solar_battery_decay": _real_float(getattr(coordinator, "solar_battery_decay", None)),
+        "cop_params": params,
+    }
+
+
+def resmear_track_c_day(coordinator, day_logs: list[dict], day_record: dict) -> tuple[list | None, dict]:
+    """The Track C distribution a retrain applies for one day (#1111).
+
+    The stored ``track_c_distribution`` was smeared at the settings in force
+    that midnight — balance point, inertia axis, wind thresholds, solar
+    battery decay — and learning replayed under other settings must not
+    reapply that shape.  This re-spreads the day's stored totals with weights
+    from ``day_logs`` (the whole day, on the current inertia axis) at the
+    coordinator's current settings, through the same smearing code as the
+    midnight sync; see ``ThermodynamicEngine.resmear_distribution`` for the
+    per-hour COP.  The stored distribution is not modified: it stays the
+    record of what that midnight learned.
+
+    Returns ``(distribution, info)``.  ``info["status"]`` is ``exact_cop`` /
+    ``recovered_cop`` for a re-spread day, ``stored`` when the coordinator's
+    settings are not readable (the stored distribution is returned
+    unchanged), or ``no_distribution``.  ``info["moved_share"]`` is the share
+    of the day's electrical energy that moved between hours.
+    """
+    from .thermodynamics import ThermodynamicEngine
+
+    stored = day_record.get("track_c_distribution") if isinstance(day_record, dict) else None
+    if not stored:
+        return None, {"status": "no_distribution"}
+
+    settings = (
+        _real_float(getattr(coordinator, "balance_point", None)),
+        _real_float(getattr(coordinator, "wind_threshold", None)),
+        _real_float(getattr(coordinator, "extreme_wind_threshold", None)),
+        _real_float(getattr(coordinator, "solar_battery_decay", None)),
+    )
+    if any(value is None for value in settings) or not isinstance(day_logs, list):
+        return stored, {"status": "stored"}
+
+    smear = day_record.get("track_c_smear")
+    cop_params = smear.get("cop_params") if isinstance(smear, dict) else None
+    weather = DailyProcessor(coordinator).track_c_weather(
+        [d.get("datetime") for d in stored], day_logs,
+    )
+    engine = ThermodynamicEngine(balance_point=settings[0])
+    distribution, method = engine.resmear_distribution(stored, weather, cop_params)
+
+    old_total = sum(float(d.get("synthetic_kwh_el", 0.0) or 0.0) for d in stored)
+    moved = sum(
+        abs(float(new["synthetic_kwh_el"]) - float(old.get("synthetic_kwh_el", 0.0) or 0.0))
+        for new, old in zip(distribution, stored)
+    )
+    moved_share = moved / (2.0 * old_total) if old_total > 0 else 0.0
+    return distribution, {"status": method, "moved_share": moved_share}
+
+
+def per_unit_replay_context(coordinator) -> dict:
+    """Coordinator state ``LearningManager.replay_per_unit_models`` reads.
+
+    What the replay needs to learn each logged hour the way live per-unit
+    learning did: the sensors live learns hourly (and counts in the SNR
+    weight), the wind thresholds, the balance point and the robust
+    model lookup behind the expected unit base, the solar state behind the
+    headroom multiplier, the per-unit min-base overrides behind the SNR
+    unit count, the aux scope, and each unit's first report in the whole
+    hourly log (the anchor of ``helpers.unit_hour_reported_kwh``'s legacy
+    rule).
+
+    Attributes that are not real values (test stubs, MagicMock
+    coordinators) fall back to the conservative reading: no solar headroom,
+    exact-bucket lookup, every entity aux-affected.
+    """
+    from .const import DEFAULT_BALANCE_POINT
+    from .observation import hourly_learning_sensors
+    from .solar import SolarCalculator
+    from .statistics import StatisticsManager
+
+    def _real_number(value, default):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return default
+
+    statistics = getattr(coordinator, "statistics", None)
+    solar = getattr(coordinator, "solar", None)
+    screen_config = getattr(coordinator, "screen_config", None)
+    screen_affected = getattr(coordinator, "_screen_affected_set", None)
+    unit_min_base = getattr(coordinator, "_per_unit_min_base_thresholds", None)
+    hourly_log = getattr(coordinator, "_hourly_log", None)
+    solar_enabled = getattr(coordinator, "solar_enabled", False)
+    energy_sensors = getattr(coordinator, "energy_sensors", None)
+    strategies = getattr(coordinator, "_unit_strategies", None)
+    daily_learning_mode = getattr(coordinator, "daily_learning_mode", None)
+    hourly_sensors = (
+        hourly_learning_sensors(energy_sensors, strategies, daily_learning_mode)
+        if isinstance(energy_sensors, list)
+        and isinstance(strategies, dict)
+        and isinstance(daily_learning_mode, bool)
+        else None
+    )
+    return {
+        "hourly_sensors": hourly_sensors,
+        "wind_threshold": _real_number(getattr(coordinator, "wind_threshold", None), None),
+        "extreme_wind_threshold": _real_number(
+            getattr(coordinator, "extreme_wind_threshold", None), None
+        ),
+        "balance_point": _real_number(
+            getattr(coordinator, "balance_point", None), DEFAULT_BALANCE_POINT
+        ),
+        "get_prediction_from_model": (
+            statistics._get_prediction_from_model
+            if isinstance(statistics, StatisticsManager)
+            else None
+        ),
+        "solar_calculator": solar if isinstance(solar, SolarCalculator) else None,
+        "solar_enabled": isinstance(solar_enabled, (bool, int)) and bool(solar_enabled),
+        "screen_config": screen_config if isinstance(screen_config, tuple) else None,
+        "screen_affected_entities": (
+            screen_affected if isinstance(screen_affected, (set, frozenset)) else None
+        ),
+        "unit_min_base": unit_min_base if isinstance(unit_min_base, dict) and unit_min_base else None,
+        "aux_affected_entities": aux_affected_entities_of(coordinator),
+        "first_reported": first_reported_instants(
+            hourly_log if isinstance(hourly_log, list) else []
+        ),
+    }
 
 
 class DailyProcessor:
@@ -125,6 +294,14 @@ class DailyProcessor:
         # "idle" classification — see coordinator.thermal_regime_for_day.
         regime_heating_kwh = 0.0
         regime_cooling_kwh = 0.0
+        # The same split per unit (the heat-source classifier's input).
+        unit_heating_kwh: dict[str, float] = {}
+        unit_cooling_kwh: dict[str, float] = {}
+        # The split is only written when every hour carries a per-unit
+        # breakdown.  Hourly rows imported from CSV have none, and summing
+        # them would record 0 / 0 on a day with real consumption — an
+        # "idle" day instead of a day without evidence.
+        regime_split_known = all("unit_breakdown" in e for e in day_logs)
 
         for e in day_logs:
             for uid, val in e.get("unit_breakdown", {}).items():
@@ -132,12 +309,17 @@ class DailyProcessor:
             for uid, val in e.get("unit_expected_breakdown", {}).items():
                 unit_expected[uid] = unit_expected.get(uid, 0.0) + val
 
-            hour_heating, hour_cooling = regime_energy_split(
+            hour_units = unit_regime_energy(
                 e.get("unit_modes", {}) or {},
                 e.get("unit_breakdown", {}) or {},
             )
-            regime_heating_kwh += hour_heating
-            regime_cooling_kwh += hour_cooling
+            for uid, (heating, cooling) in hour_units.items():
+                regime_heating_kwh += heating
+                regime_cooling_kwh += cooling
+                if heating > 0.0:
+                    unit_heating_kwh[uid] = unit_heating_kwh.get(uid, 0.0) + heating
+                if cooling > 0.0:
+                    unit_cooling_kwh[uid] = unit_cooling_kwh.get(uid, 0.0) + cooling
 
         # Averages
         avg_temp = sum(e["temp"] for e in day_logs) / len(day_logs)
@@ -146,6 +328,11 @@ class DailyProcessor:
 
         # TDD (Sum of hourly TDD)
         total_tdd = sum(e.get("tdd", 0.0) for e in day_logs)
+        # The BP that sum is expressed at, so readers can tell whether the
+        # stored tdd still applies: None when the hours disagree (the sum
+        # applies at no single BP).  When no hour records one the key is
+        # left out, so backfill keeps whatever the v10 migration stamped.
+        tdd_bps = recorded_balance_points(day_logs)
 
         # Hourly Vectors (Kelvin Protocol: Data Aggregation)
         hourly_vectors = {
@@ -153,6 +340,13 @@ class DailyProcessor:
             "wind": [None] * 24,
             "tdd": [None] * 24,
             "actual_kwh": [None] * 24,
+            # Log entries (clock hours) folded into each local-hour slot:
+            # 2 in the repeated DST fall-back hour, where temp/wind are the
+            # mean and energy/tdd the sum of both.  Readers that rebuild the
+            # day from the vectors weight each slot by it
+            # (helpers.vector_slot_hours); days stored before it existed
+            # count one hour per filled slot.
+            "hours": [None] * 24,
         }
         if self.coordinator.solar_enabled:
             hourly_vectors["solar_rad"] = [None] * 24
@@ -167,10 +361,11 @@ class DailyProcessor:
 
         # Hour Collision Fix: Aggregate instead of overwrite
         # Iterate over hour slots (0-23) and aggregate all entries for that hour.
-        # This handles cases where multiple logs exist for the same hour (e.g. restart).
         # DST Handling:
         # - Spring Forward (23h): One hour slot will remain None (handled downstream).
-        # - Fall Back (25h): Two sets of logs map to same hour index. They are aggregated here.
+        # - Fall Back (25h): the repeated hour is logged as an entry of its
+        #   own, so slot 2 holds two entries.  They are aggregated here and
+        #   the slot's ``hours`` records that it covers two clock hours.
         for hour in range(24):
             hour_entries = [e for e in day_logs if e.get("hour") == hour]
             if not hour_entries:
@@ -187,6 +382,7 @@ class DailyProcessor:
             sum_load = sum(e.get("actual_kwh", 0.0) for e in hour_entries)
             sum_tdd = sum(e.get("tdd", 0.0) for e in hour_entries)
 
+            hourly_vectors["hours"][hour] = count
             hourly_vectors["temp"][hour] = hourly_avg_temp
             hourly_vectors["wind"][hour] = hourly_avg_wind
             hourly_vectors["tdd"][hour] = sum_tdd # Sum of TDD contributions
@@ -239,13 +435,26 @@ class DailyProcessor:
             "solar_impact_4d_kwh": solar_impact_4d_kwh_total,
             "thermodynamic_gross_kwh": round(thermodynamic_gross_kwh, 2),
             "tdd": round(total_tdd, 1),
+            **(
+                {"balance_point": next(iter(tdd_bps)) if len(tdd_bps) == 1 else None}
+                if tdd_bps
+                else {}
+            ),
             "temp": round(avg_temp, 1),
             "wind": round(avg_wind, 1),
             "solar_factor": round(avg_solar, 3),
             "unit_breakdown": {k: round(v, 3) for k, v in unit_breakdown.items()},
             "unit_expected_breakdown": {k: round(v, 3) for k, v in unit_expected.items()},
-            "regime_heating_kwh": round(regime_heating_kwh, 3),
-            "regime_cooling_kwh": round(regime_cooling_kwh, 3),
+            **(
+                {
+                    "regime_heating_kwh": round(regime_heating_kwh, 3),
+                    "regime_cooling_kwh": round(regime_cooling_kwh, 3),
+                    "unit_heating_kwh": {k: round(v, 3) for k, v in unit_heating_kwh.items()},
+                    "unit_cooling_kwh": {k: round(v, 3) for k, v in unit_cooling_kwh.items()},
+                }
+                if regime_split_known
+                else {}
+            ),
             "primary_entity": primary,
             "secondary_entity": secondary,
             "crossover_day": crossover,
@@ -303,6 +512,12 @@ class DailyProcessor:
                 # Logs are complete (or match history). Enrich daily history.
                 # We overwrite to ensure consistency (Sum of Parts == Whole)
                 self.coordinator._daily_history[date_key].update(agg)
+                if "regime_heating_kwh" not in agg:
+                    # The logs cannot support a split (imported rows without
+                    # a per-unit breakdown); drop one stored earlier rather
+                    # than leave it describing different data.
+                    for key in REGIME_SPLIT_KEYS:
+                        curr.pop(key, None)
                 updated_count += 1
 
         if updated_count > 0:
@@ -414,16 +629,19 @@ class DailyProcessor:
 
     async def run_track_c_midnight_sync(
         self, day_logs: list[dict], date_key: str
-    ) -> tuple[float, list, str] | None:
+    ) -> tuple[float, list, str, dict] | None:
         """Fetch MPC thermal data and run the ThermodynamicEngine Midnight Sync.
 
-        Returns (total_synthetic_el, distribution, source) where:
+        Returns (total_synthetic_el, distribution, source, smear) where:
           - total_synthetic_el: sum of synthetic_kwh_el across all 24 hours —
             the weather-smeared electrical equivalent used as q_adjusted in learning.
           - distribution: the full list of HourlyDistribution dicts for storage
             (enables future per-hour visualisation without recomputing).
           - source: "live" or "snapshot_<HHMM>" — identifies the data origin
             for daily_history tagging and diagnostics.
+          - smear: the settings the day was smeared at and the MPC COP
+            parameters (``track_c_smear_record``), stored beside the
+            distribution so a retrain can re-spread it exactly.
         Returns None if the sync cannot proceed (live call failed AND no
         matching snapshot available).  Triggers Option B skip at the caller.
         """
@@ -487,80 +705,9 @@ class DailyProcessor:
 
         mpc_records = filtered_records
 
-        # Build WeatherData from the day's hourly log entries (already available).
-        # delta_t  = balance_point - inertia_temp  (inertia-weighted temp mirrors Track A model;
-        #            falls back to raw temp if inertia_temp not logged)
-        # wind_factor = 3-bucket multiplier matching Track A wind buckets (1.0/1.3/1.6)
-        # solar_factor = 1.0 - solar (inverted; 0=no sun → full loss weight)
-        #                — with solar thermal battery decay applied so afternoon solar
-        #                  gain residual carries into evening hours (mirrors solar_battery_decay)
-        weather_data = []
-        log_by_hour = {e.get("hour", -1): e for e in day_logs}
-
-        # Solar battery pre-pass: accumulate decay across hours so that afternoon
-        # solar gain reduces evening loss weights, matching Track A's solar battery model.
-        solar_battery = 0.0
-        solar_residual_by_hour: dict[int, float] = {}
-        for h in range(24):
-            log_h = log_by_hour.get(h, {})
-            raw_solar_h = log_h.get("solar_factor")
-            raw_solar_h = raw_solar_h if raw_solar_h is not None else 0.0
-            solar_battery = solar_battery * self.coordinator.solar_battery_decay + raw_solar_h * (1 - self.coordinator.solar_battery_decay)
-            solar_residual_by_hour[h] = min(1.0, solar_battery)
-
-        for record in mpc_records:
-            try:
-                record_dt = _dt.parse_datetime(record["datetime"])
-                hour = record_dt.hour if record_dt else -1
-            except (KeyError, TypeError, ValueError):
-                hour = -1
-
-            log_entry = log_by_hour.get(hour, {})
-            # Fix 1: use inertia_temp (thermal-mass-weighted) rather than instantaneous
-            # outdoor temp — consistent with how Track A models heat demand.
-            # Use explicit None-check: dict.get(key, default) silently returns None
-            # when the key exists with a None value (e.g. early startup entries).
-            inertia_t = log_entry.get("inertia_temp")
-            raw_t = log_entry.get("temp")
-            outdoor_temp = (
-                inertia_t if inertia_t is not None
-                else raw_t if raw_t is not None
-                else self.coordinator.balance_point
-            )
-            eff_wind = log_entry.get("effective_wind")
-            effective_wind: float = eff_wind if eff_wind is not None else 0.0
-
-            # Fix 2: 3-bucket wind multiplier — mirrors Track A's discrete wind buckets
-            # (normal / high / extreme) rather than an unbounded linear scale.
-            if effective_wind >= self.coordinator.extreme_wind_threshold:
-                wind_factor = 1.6
-            elif effective_wind >= self.coordinator.wind_threshold:
-                wind_factor = 1.3
-            else:
-                wind_factor = 1.0
-
-            # Fix 3: solar factor with battery decay residual — evening hours after a
-            # sunny afternoon still carry a non-zero solar offset, preventing the smearing
-            # from over-weighting post-sunset hours (same as Track A's solar battery).
-            solar_with_decay = solar_residual_by_hour.get(hour if hour >= 0 else 0, 0.0)
-            solar_factor = max(0.0, 1.0 - solar_with_decay)
-
-            # Raw outdoor temp and humidity for per-hour COP calculation.
-            # Use raw_t (not inertia) for COP — COP depends on instantaneous
-            # air temperature at the evaporator, not thermally weighted.
-            raw_outdoor = raw_t if raw_t is not None else self.coordinator.balance_point
-            rh = log_entry.get("humidity")
-            rh = rh if rh is not None else 50.0
-
-            weather_data.append({
-                "datetime": record["datetime"],
-                "delta_t": abs(self.coordinator.balance_point - outdoor_temp),
-                "is_cooling": outdoor_temp > self.coordinator.balance_point,
-                "wind_factor": wind_factor,
-                "solar_factor": solar_factor,
-                "outdoor_temp": raw_outdoor,
-                "humidity": rh,
-            })
+        weather_data = self.track_c_weather(
+            [record["datetime"] for record in mpc_records], day_logs,
+        )
 
         engine = ThermodynamicEngine(balance_point=self.coordinator.balance_point)
         try:
@@ -582,7 +729,121 @@ class DailyProcessor:
         if source.startswith("snapshot_"):
             self.coordinator._track_c_snapshot = None
 
-        return total_synthetic_el, distribution, source
+        return (
+            total_synthetic_el,
+            distribution,
+            source,
+            track_c_smear_record(self.coordinator, cop_params),
+        )
+
+    def track_c_weather(self, datetimes: list[str], day_logs: list[dict]) -> list[dict]:
+        """One WeatherData row per Track C hour, from the day's hourly log.
+
+        The inputs of the smearing weights, at the coordinator's current
+        balance point, wind thresholds and solar battery decay.  Used by the
+        midnight sync and by the retrain re-smear (``resmear_track_c_day``),
+        which passes entries on the current inertia axis.
+
+        - delta_t = |balance_point − inertia_temp| (inertia-weighted temp
+          mirrors Track A's model; falls back to raw temp if inertia_temp is
+          not logged).
+        - wind_factor = 3-bucket multiplier matching Track A wind buckets
+          (1.0 / 1.3 / 1.6).
+        - solar_factor = 1.0 − solar residual (inverted; 0 = no sun → full
+          loss weight), with the solar battery decay applied so afternoon
+          solar gain carries into evening hours.
+        """
+        from homeassistant.util import dt as _dt
+
+        # Records join the log on the hour's UTC start instant, not the local
+        # hour number: on the DST fall-back day both passes through hour 2
+        # have a record and a log entry of their own.
+        slots = hour_slots(day_logs)
+        log_by_key = dict(slots)
+
+        # Solar battery pre-pass: accumulate decay across hours so that afternoon
+        # solar gain reduces evening loss weights, matching Track A's solar battery model.
+        solar_residual_by_key = self._solar_residuals(slots)
+
+        balance_point = self.coordinator.balance_point
+        weather_data = []
+        for dt_str in datetimes:
+            try:
+                record_dt = _dt.parse_datetime(dt_str)
+                key = hour_start_utc(record_dt) if record_dt else None
+            except (KeyError, TypeError, ValueError):
+                key = None
+
+            log_entry = log_by_key.get(key, {})
+            # Fix 1: use inertia_temp (thermal-mass-weighted) rather than instantaneous
+            # outdoor temp — consistent with how Track A models heat demand.
+            # Use explicit None-check: dict.get(key, default) silently returns None
+            # when the key exists with a None value (e.g. early startup entries).
+            inertia_t = log_entry.get("inertia_temp")
+            raw_t = log_entry.get("temp")
+            outdoor_temp = (
+                inertia_t if inertia_t is not None
+                else raw_t if raw_t is not None
+                else balance_point
+            )
+            eff_wind = log_entry.get("effective_wind")
+            effective_wind: float = eff_wind if eff_wind is not None else 0.0
+
+            # Fix 2: 3-bucket wind multiplier — mirrors Track A's discrete wind buckets
+            # (normal / high / extreme) rather than an unbounded linear scale.
+            if effective_wind >= self.coordinator.extreme_wind_threshold:
+                wind_factor = 1.6
+            elif effective_wind >= self.coordinator.wind_threshold:
+                wind_factor = 1.3
+            else:
+                wind_factor = 1.0
+
+            # Fix 3: solar factor with battery decay residual — evening hours after a
+            # sunny afternoon still carry a non-zero solar offset, preventing the smearing
+            # from over-weighting post-sunset hours (same as Track A's solar battery).
+            solar_with_decay = solar_residual_by_key.get(key, 0.0)
+            solar_factor = max(0.0, 1.0 - solar_with_decay)
+
+            # Raw outdoor temp and humidity for per-hour COP calculation.
+            # Use raw_t (not inertia) for COP — COP depends on instantaneous
+            # air temperature at the evaporator, not thermally weighted.
+            raw_outdoor = raw_t if raw_t is not None else balance_point
+            rh = log_entry.get("humidity")
+            rh = rh if rh is not None else 50.0
+
+            weather_data.append({
+                "datetime": dt_str,
+                "delta_t": abs(balance_point - outdoor_temp),
+                "is_cooling": outdoor_temp > balance_point,
+                "wind_factor": wind_factor,
+                "solar_factor": solar_factor,
+                "outdoor_temp": raw_outdoor,
+                "humidity": rh,
+            })
+        return weather_data
+
+    def _solar_residuals(self, slots: list[tuple[object, dict]]) -> dict:
+        """Solar battery residual per slot, keyed like ``helpers.hour_slots``.
+
+        EMA of ``solar_factor`` across the day in time order.  An hour
+        missing from the log is a step with no sun: the battery decays once
+        for it, as it did when this walked a fixed 0–23 hour range.
+        """
+        decay = self.coordinator.solar_battery_decay
+        battery = 0.0
+        previous = None
+        residuals: dict = {}
+        for key, entry in slots:
+            if isinstance(key, datetime) and isinstance(previous, datetime):
+                missing = round((key - previous).total_seconds() / 3600.0) - 1
+                if missing > 0:
+                    battery *= decay ** missing
+            raw_solar = entry.get("solar_factor")
+            raw_solar = raw_solar if raw_solar is not None else 0.0
+            battery = battery * decay + raw_solar * (1 - decay)
+            residuals[key] = min(1.0, battery)
+            previous = key
+        return residuals
 
     def apply_strategies_to_global_model(
         self,
@@ -603,15 +864,22 @@ class DailyProcessor:
             parse_datetime_fn=_dt.parse_datetime,
         )
 
-    def replay_per_unit_models(self, day_entries: list[dict]) -> None:
-        """Delegate to LearningManager — see learning.py for implementation."""
-        self.coordinator.learning.replay_per_unit_models(
+    def replay_per_unit_models(
+        self, day_entries: list[dict], *, replay_aux: bool = True,
+    ) -> dict | None:
+        """Delegate to LearningManager — see learning.py for implementation.
+
+        Used by ``retrain_from_history``, which rebuilds the per-unit aux
+        coefficients too (``replay_aux``): its ``reset_first`` clears them
+        and nothing else relearns them from history.
+        """
+        return self.coordinator.learning.replay_per_unit_models(
             day_entries=day_entries,
             strategies=self.coordinator._unit_strategies,
             model=self.coordinator.get_model_state(),
             learning_rate=self.coordinator.learning_rate,
-            wind_threshold=self.coordinator.wind_threshold,
-            extreme_wind_threshold=self.coordinator.extreme_wind_threshold,
+            replay_aux=replay_aux,
+            **per_unit_replay_context(self.coordinator),
         )
 
     async def try_track_b_cop_smearing(
@@ -626,6 +894,38 @@ class DailyProcessor:
         available, distributes q_adjusted across 24 hours using per-hour
         COP weights instead of flat q/24.  Returns bucket update count,
         or None if smearing was not possible (flag off, no COP params).
+        """
+        cop_params = await self.fetch_track_b_cop_params()
+        if cop_params is None:
+            return None
+        distribution = self.track_b_cop_distribution(
+            day_logs, q_adjusted, date_key, cop_params,
+        )
+        if distribution is None:
+            return None
+
+        # Store distribution for strategy dispatch (same as Track C).
+        bucket_updates = self.apply_strategies_to_global_model(
+            day_logs, distribution,
+        )
+
+        # Persist distribution for retrain replay.
+        self.coordinator._daily_history[date_key]["track_b_cop_distribution"] = distribution
+
+        _LOGGER.info(
+            f"Track B COP-smeared (#793): q_adjusted={q_adjusted:.2f} kWh "
+            f"distributed across 24 hours using per-hour COP."
+        )
+        return bucket_updates
+
+    async def fetch_track_b_cop_params(self, *, cache: bool = True) -> dict | None:
+        """The MPC COP params Track B COP smearing uses, or ``None``.
+
+        ``None`` while ENABLE_TRACK_B_COP_SMEARING is off (without awaiting
+        anything) and when the params are neither cached nor fetchable.
+        ``cache=False`` leaves ``_last_cop_params`` alone (a retrain dry
+        run).  Split from :meth:`track_b_cop_distribution` so a retrain can
+        fetch before its synchronous replay.
         """
         from .const import ENABLE_TRACK_B_COP_SMEARING
         if not ENABLE_TRACK_B_COP_SMEARING:
@@ -645,32 +945,42 @@ class DailyProcessor:
                 )
                 if isinstance(cop_response, dict) and "eta_carnot" in cop_response:
                     cop_params = cop_response
-                    self.coordinator._last_cop_params = cop_params
+                    if cache:
+                        self.coordinator._last_cop_params = cop_params
             except (TypeError, KeyError, AttributeError, HomeAssistantError) as err:
                 # HomeAssistantError covers ServiceNotFound when the MPC
                 # integration is uninstalled or not yet loaded (#878).
                 _LOGGER.debug(f"Track B COP smearing: could not fetch COP params ({err})")
+        return cop_params
 
-        if cop_params is None:
-            return None
+    def track_b_cop_distribution(
+        self,
+        day_logs: list[dict],
+        q_adjusted: float,
+        date_key: str,
+        cop_params: dict,
+    ) -> list[dict] | None:
+        """``q_adjusted`` spread over the day's hours with per-hour COP.
 
+        Pure: writes nothing.  ``None`` when the smearing fails.
+        """
         from homeassistant.util import dt as _dt
         from .thermodynamics import ThermodynamicEngine
 
-        # Build weather data from hourly log (same logic as Track C).
-        log_by_hour = {e.get("hour", -1): e for e in day_logs}
-        solar_battery = 0.0
-        solar_residual_by_hour: dict[int, float] = {}
-        for h in range(24):
-            log_h = log_by_hour.get(h, {})
-            raw_solar_h = log_h.get("solar_factor") or 0.0
-            solar_battery = solar_battery * self.coordinator.solar_battery_decay + raw_solar_h * (1 - self.coordinator.solar_battery_decay)
-            solar_residual_by_hour[h] = min(1.0, solar_battery)
+        # Build weather data from hourly log (same logic as Track C): one row
+        # per logged hour, in time order.  An hour missing from the log used
+        # to get a row at the balance point, which carries no weight; the
+        # repeated DST fall-back hour now gets a row of its own instead of
+        # overwriting the first.
+        slots = hour_slots(day_logs)
+        solar_residual_by_key = self._solar_residuals(slots)
+        # The placeholders below only fix the ratio between hours; spreading
+        # q over the rows actually present keeps their sum at q_adjusted.
+        per_row_kwh = q_adjusted / max(1, len(slots))
 
         weather_data = []
         synthetic_mpc_data = []
-        for h in range(24):
-            log_h = log_by_hour.get(h, {})
+        for key, log_h in slots:
             inertia_t = log_h.get("inertia_temp")
             raw_t = log_h.get("temp")
             outdoor = inertia_t if inertia_t is not None else (raw_t if raw_t is not None else self.coordinator.balance_point)
@@ -683,14 +993,14 @@ class DailyProcessor:
             else:
                 wind_factor = 1.0
 
-            solar_with_decay = solar_residual_by_hour.get(h, 0.0)
+            solar_with_decay = solar_residual_by_key.get(key, 0.0)
             solar_factor = max(0.0, 1.0 - solar_with_decay)
 
             raw_outdoor = raw_t if raw_t is not None else self.coordinator.balance_point
             rh = log_h.get("humidity")
             rh = rh if rh is not None else 50.0
 
-            ts = log_h.get("timestamp", f"{date_key}T{h:02d}:00:00")
+            ts = log_h.get("timestamp", f"{date_key}T{log_h.get('hour', 0):02d}:00:00")
             weather_data.append({
                 "datetime": ts,
                 "delta_t": abs(self.coordinator.balance_point - outdoor),
@@ -705,8 +1015,8 @@ class DailyProcessor:
             # total_kwh_el matters (the thermal values cancel out).
             synthetic_mpc_data.append({
                 "datetime": ts,
-                "kwh_th_sh": q_adjusted / 24.0,  # Placeholder — ratio matters, not absolute
-                "kwh_el_sh": q_adjusted / 24.0,   # COP=1 placeholder, overridden by per-hour COP
+                "kwh_th_sh": per_row_kwh,  # Placeholder — ratio matters, not absolute
+                "kwh_el_sh": per_row_kwh,  # COP=1 placeholder, overridden by per-hour COP
                 "mode": "sh",
             })
 
@@ -718,20 +1028,7 @@ class DailyProcessor:
         except (TypeError, KeyError, ValueError) as err:
             _LOGGER.warning(f"Track B COP smearing failed ({err}), falling back to flat.")
             return None
-
-        # Store distribution for strategy dispatch (same as Track C).
-        bucket_updates = self.apply_strategies_to_global_model(
-            day_logs, distribution,
-        )
-
-        # Persist distribution for retrain replay.
-        self.coordinator._daily_history[date_key]["track_b_cop_distribution"] = distribution
-
-        _LOGGER.info(
-            f"Track B COP-smeared (#793): q_adjusted={q_adjusted:.2f} kWh "
-            f"distributed across 24 hours using per-hour COP."
-        )
-        return bucket_updates
+        return distribution
 
     @staticmethod
     def compute_excluded_mode_energy(day_logs: list[dict]) -> float:
@@ -787,6 +1084,7 @@ class DailyProcessor:
             daily_stats = {
                 "kwh": round(kwh, 2),
                 "tdd": round(tdd, 1),
+                "balance_point": self.coordinator.balance_point,
                 "temp": round(avg_temp, 1),
                 "wind": 0.0,
                 "solar_factor": 0.0,
@@ -848,7 +1146,7 @@ class DailyProcessor:
             # Track C: replace electrical baseline with thermodynamic synthetic baseline.
             track_c_result = await self.run_track_c_midnight_sync(day_logs, key)
             if track_c_result is not None:
-                track_c_kwh, track_c_distribution, track_c_source = track_c_result
+                track_c_kwh, track_c_distribution, track_c_source, track_c_smear = track_c_result
 
                 # Compute q_adjusted from strategy contributions for U-coefficient.
                 # Only include non-MPC sensors that are in a learning-eligible mode (#789).
@@ -868,6 +1166,9 @@ class DailyProcessor:
                 self.coordinator._daily_history[key]["track_c_kwh_mpc_only"] = round(track_c_kwh, 3)
                 self.coordinator._daily_history[key]["track_c_kwh_non_mpc"] = round(non_mpc_daily_kwh, 3)
                 self.coordinator._daily_history[key]["track_c_distribution"] = track_c_distribution
+                # What the day was smeared at, and the MPC COP parameters, so a
+                # retrain under other settings can re-spread it (#1111).
+                self.coordinator._daily_history[key]["track_c_smear"] = track_c_smear
                 # S1 (#855 follow-up): explicit track identity per day.  "C_live"
                 # or "C_<snapshot_HHMM>".  Lets diagnose_model, retrain and
                 # future BP-aware consumers see the attribution source without

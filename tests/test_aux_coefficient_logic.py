@@ -8,6 +8,7 @@ from custom_components.heating_analytics.learning import LearningManager
 from custom_components.heating_analytics.solar import SolarCalculator
 from custom_components.heating_analytics.observation import build_strategies
 from custom_components.heating_analytics.retrain import RetrainEngine
+from tests.helpers import bind_inertia_axis
 
 @pytest.mark.asyncio
 async def test_aux_coefficient_persistence(hass):
@@ -398,6 +399,7 @@ def _track_a_aux_coord(hourly_log):
             coord, entries
         )
     )
+    bind_inertia_axis(coord)
     return coord
 
 

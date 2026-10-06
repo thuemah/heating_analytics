@@ -92,6 +92,8 @@ async def test_csv_import_tdd_population(mock_coordinator):
 
     expected_tdd = (17.0 - 7.0) / 24.0 # 0.41666...
     assert abs(first_entry["tdd"] - expected_tdd) < 0.001, f"TDD value incorrect. Expected {expected_tdd}, got {first_entry.get('tdd')}"
+    # The BP the tdd was computed at travels with it.
+    assert first_entry["bp_at_log_time"] == 17.0
 
     # Check if daily aggregation was called
     mock_coordinator._aggregate_daily_logs.assert_called()

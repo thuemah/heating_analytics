@@ -59,7 +59,8 @@ def detect_solar_shutdown_entities(
         potential_vector: (S, E, W) pre-screen solar vector.
         energy_sensors: Candidate entity IDs.
         unit_modes: {entity_id: MODE_*}; only MODE_HEATING is considered.
-        unit_actual_kwh: {entity_id: metered kWh this hour}.
+        unit_actual_kwh: {entity_id: metered kWh this hour} — the meter
+            map: a unit absent from it did not report and is never flagged.
         unit_expected_base_kwh: {entity_id: base-expected kWh this hour}.
         unit_min_base: Optional per-unit base thresholds (#871).  When
             provided, overrides SOLAR_SHUTDOWN_MIN_BASE per entity;
@@ -103,7 +104,14 @@ def detect_solar_shutdown_entities(
             continue
         if unit_modes.get(entity_id, MODE_HEATING) != MODE_HEATING:
             continue
-        actual = unit_actual_kwh.get(entity_id, 0.0)
+        # A sensor that did not report this hour is no signal, not a
+        # shutdown.  Read as 0 kWh it cleared the parasitic floor below on
+        # every sunny hour with a learned base, scaling the hour's SNR
+        # weight down and logging the unit as shut down for the replays,
+        # which then lifted its coefficient through the inequality path.
+        if entity_id not in unit_actual_kwh:
+            continue
+        actual = unit_actual_kwh[entity_id]
         base = unit_expected_base_kwh.get(entity_id, 0.0)
         override_val = overrides.get(entity_id)
         if isinstance(override_val, (int, float)) and override_val > 0.0:
@@ -123,10 +131,10 @@ def detect_solar_shutdown_entities(
         # ``actual_impact ≈ 0.07 kWh`` ("86 % of base disappeared"),
         # inflating the solar coefficient on what was physically a
         # fully-off compressor.  See post-stage-3 audit (#904) for the
-        # field data.  ``base > 0`` is required so that an offline
-        # sensor (no data, base reads zero) is NOT mistaken for a
-        # shutdown — that case should remain "no signal", not
-        # "shutdown".
+        # field data.  ``base > 0`` is required so that a unit with no
+        # expected demand is not read as shut down.  (An offline sensor
+        # is excluded above: its base comes from the model, not the
+        # sensor, so it does not read zero.)
         if base > 0.0 and actual < SOLAR_SHUTDOWN_ACTUAL_FLOOR:
             flagged.append(entity_id)
             continue
@@ -437,7 +445,10 @@ class LearningStrategy(Protocol):
         """Return kWh contribution for this unit at the given hour.
 
         Args:
-            hour: Hour of day (0–23).
+            hour: Key of the hour — in production the entry's start as a
+                  UTC instant (``helpers.hour_slots``), so the repeated DST
+                  fall-back hour is a hour of its own.  Only used to look
+                  the hour up in a distribution keyed the same way.
             weight: Normalised thermodynamic loss weight for this hour
                     (from ThermodynamicEngine).  Always provided, but
                     DirectMeter ignores it.
@@ -510,15 +521,16 @@ class WeightedSmear:
         self.sensor_id = sensor_id
         self.use_synthetic = use_synthetic
         # Set at midnight by coordinator before the learning loop.
-        self._distribution: dict[int, dict] | None = None
+        self._distribution: dict | None = None
         self._daily_total: float = 0.0
 
-    def set_distribution(self, distribution_by_hour: dict[int, dict] | None) -> None:
-        """Provide the hour-indexed Track C distribution, or None to clear.
+    def set_distribution(self, distribution_by_hour: dict | None) -> None:
+        """Provide the hour-keyed Track C distribution, or None to clear.
 
         Args:
-            distribution_by_hour: Maps hour (0–23) → HourlyDistribution dict
-                with at least ``synthetic_kwh_el`` key, or None to reset.
+            distribution_by_hour: Maps an hour key (the key
+                ``get_hourly_contribution`` is called with) → HourlyDistribution
+                dict with at least ``synthetic_kwh_el`` key, or None to reset.
         """
         self._distribution = distribution_by_hour
 
@@ -578,6 +590,31 @@ def build_strategies(
         else:
             strategies[sensor_id] = DirectMeter(sensor_id)
     return strategies
+
+
+def hourly_learning_sensors(
+    energy_sensors: list[str],
+    strategies: dict[str, LearningStrategy],
+    daily_learning_mode: bool,
+) -> list[str]:
+    """The energy sensors hourly per-unit learning runs for.
+
+    Under daily learning (Track B / C) only the DirectMeter sensors: a
+    WeightedSmear sensor's meter data is MPC-tainted and the strategies own
+    its writes at midnight (#776).  Otherwise every energy sensor.
+
+    This is also the unit set the hour's per-unit SNR weight counts
+    (``count_active_learnable_units``).  One function for live learning
+    (``hourly_processor``) and the retrain replay
+    (``LearningManager.replay_per_unit_models``), so the two cannot
+    disagree about which units learn or which count.
+    """
+    if daily_learning_mode:
+        return [
+            sid for sid, strategy in strategies.items()
+            if isinstance(strategy, DirectMeter)
+        ]
+    return list(energy_sensors)
 
 
 class ObservationCollector:

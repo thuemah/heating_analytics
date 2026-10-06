@@ -35,6 +35,7 @@ from custom_components.heating_analytics.const import (
     SOLAR_LEARNING_MIN_BASE,
 )
 from custom_components.heating_analytics.retrain import RetrainEngine
+from tests.helpers import bind_inertia_axis
 
 
 # -----------------------------------------------------------------------------
@@ -129,6 +130,7 @@ def _track_a_coord(hourly_log, energy_sensors=("sensor.heater",)):
             coord, entries
         )
     )
+    bind_inertia_axis(coord)
     return coord
 
 
@@ -308,6 +310,7 @@ def _daily_coord(hourly_log):
     coord._compute_excluded_mode_energy = MagicMock(return_value=0.0)
     coord._try_track_b_cop_smearing = AsyncMock(return_value=None)
     coord._apply_strategies_to_global_model = MagicMock()
+    bind_inertia_axis(coord)
     return coord
 
 

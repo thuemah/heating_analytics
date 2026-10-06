@@ -344,3 +344,31 @@ async def test_manual_exit_cooldown(coordinator):
 
     # Verify UI update triggered
     coordinator.async_set_updated_data.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_cooldown_hour_logs_affected_unit_snapshot(coordinator):
+    """The log records which units the cooldown froze (#1087 review).
+
+    ``learning_status`` cannot carry this under daily learning, and the
+    aux scope may be reconfigured later, so offline fits read the snapshot.
+    """
+    start_time = datetime(2023, 1, 1, 12, 0, 0)
+    coordinator._aux_cooldown_active = True
+    coordinator._aux_cooldown_start_time = start_time
+    coordinator.auxiliary_heating_active = False
+
+    await coordinator._process_hourly_data(start_time + timedelta(hours=1))
+
+    entry = coordinator._hourly_log[-1]
+    assert entry["aux_cooldown_entities"] == ["sensor.heater"]
+
+
+@pytest.mark.asyncio
+async def test_non_cooldown_hour_has_no_cooldown_snapshot(coordinator):
+    coordinator._aux_cooldown_active = False
+    coordinator.auxiliary_heating_active = False
+
+    await coordinator._process_hourly_data(datetime(2023, 1, 1, 13, 0, 0))
+
+    assert "aux_cooldown_entities" not in coordinator._hourly_log[-1]

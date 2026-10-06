@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from homeassistant.exceptions import HomeAssistantError
@@ -29,8 +29,18 @@ from .const import (
     ATTR_MIDNIGHT_FORECAST,
     ATTR_MIDNIGHT_UNIT_ESTIMATES,
     ATTR_MIDNIGHT_UNIT_MODES,
+    DEFAULT_BALANCE_POINT,
     DEFAULT_DAILY_LEARNING_RATE,
     SOLAR_BATTERY_DECAY,
+)
+from .helpers import (
+    coerce_config_float,
+    finite_float,
+    hour_start_utc,
+    infer_tdd_balance_point,
+    log_entry_instant,
+    recorded_balance_points,
+    vector_slot_hours,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -442,6 +452,95 @@ def _migrate_v8_to_v9(data: dict) -> dict:
     return data
 
 
+def _migrate_v9_to_v10(data: dict, balance_point: float | None = None) -> dict:
+    """v9 -> v10: record the balance point each day's stored ``tdd`` is at.
+
+    ``daily_history[day]["tdd"]`` is summed from hourly ``|BP − T| / 24`` at
+    the BP in force when each hour was logged, and readers must not combine
+    it with a different BP.  Every day lacking ``balance_point`` is stamped
+    from the best evidence available, in order:
+
+    1. the day's hours still in ``hourly_log``: the BP they record, or None
+       when they record more than one;
+    2. the day's own hourly vectors, which pin the BP down to rounding
+       (``helpers.infer_tdd_balance_point``) — None when no single BP
+       explains them;
+    3. for a day without usable vectors: the BP of the oldest hour in the
+       log that records one (the BP at the start of the retention window),
+       else ``balance_point`` (the current one).
+
+    Only step 3 guesses, and it matters only on the daily-average path of
+    days without vectors.  Days already carrying the key are left alone, so
+    the step is idempotent.
+    """
+    data = dict(data)
+    history = data.get("daily_history")
+    if not isinstance(history, dict):
+        return data
+    fallback = finite_float(balance_point)
+    if fallback is None:
+        fallback = DEFAULT_BALANCE_POINT
+
+    log_by_day: dict[str, list] = {}
+    oldest: tuple[str, float] | None = None
+    log = data.get("hourly_log")
+    for e in log if isinstance(log, list) else []:
+        if not isinstance(e, dict) or not isinstance(e.get("timestamp"), str):
+            continue
+        ts = e["timestamp"]
+        log_by_day.setdefault(ts[:10], []).append(e)
+        bp = finite_float(e.get("bp_at_log_time"))
+        if bp is not None and (oldest is None or ts < oldest[0]):
+            oldest = (ts, bp)
+    legacy_bp = oldest[1] if oldest is not None else fallback
+
+    migrated = {}
+    for day, entry in history.items():
+        if isinstance(entry, dict) and "balance_point" not in entry:
+            entry = dict(entry)
+            logged = recorded_balance_points(log_by_day.get(day, []))
+            if logged:
+                entry["balance_point"] = next(iter(logged)) if len(logged) == 1 else None
+            else:
+                decided, inferred = infer_tdd_balance_point(entry)
+                entry["balance_point"] = inferred if decided else legacy_bp
+        migrated[day] = entry
+    data["daily_history"] = migrated
+    return data
+
+
+def _parse_hour_start(value) -> datetime | None:
+    """``last_hour_start`` from storage as an aware UTC instant, or ``None``.
+
+    Absent (state saved before the key existed) or unreadable yields
+    ``None``, and the coordinator then falls back to the hour number.
+    """
+    if not isinstance(value, str):
+        return None
+    parsed = dt_util.parse_datetime(value)
+    if not isinstance(parsed, datetime) or parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _heat_source_state_from(raw) -> dict:
+    """The stored heat-source state, or the empty one.
+
+    ``{"last_run": iso | None, "units": {entity_id: {...}}}`` — see
+    ``heat_source.apply_evidence``.  Anything else loads as empty.
+    """
+    if not isinstance(raw, dict):
+        return {"last_run": None, "units": {}}
+    last_run = raw.get("last_run")
+    units = raw.get("units")
+    return {
+        "last_run": last_run if isinstance(last_run, str) else None,
+        "units": {
+            eid: dict(unit) for eid, unit in units.items() if isinstance(unit, dict)
+        } if isinstance(units, dict) else {},
+    }
+
+
 class StorageManager:
     """Manages data persistence (JSON, CSV)."""
 
@@ -572,6 +671,15 @@ class StorageManager:
             )
             old_data = _migrate_v8_to_v9(old_data)
 
+        if old_major_version < 10:
+            _LOGGER.info(
+                "Heating Analytics: migrating storage v%d -> v10 (balance point recorded on each daily_history day)",
+                old_major_version,
+            )
+            old_data = _migrate_v9_to_v10(
+                old_data, getattr(self.coordinator, "balance_point", None),
+            )
+
         return old_data
 
     def _cleanup_removed_sensors(self, target_dict: dict, log_context: str | None = None) -> None:
@@ -694,6 +802,14 @@ class StorageManager:
                 self._cleanup_removed_sensors(self.coordinator._last_batch_fit_per_unit)
             else:
                 self.coordinator._last_batch_fit_per_unit = {}
+
+            # Heat-source state per unit (heat_source.py) — additive optional
+            # key (no STORAGE_VERSION bump): absent on older stores and
+            # backups, where the empty state is what a migration would seed.
+            self.coordinator._heat_source_state = _heat_source_state_from(
+                data.get("heat_source")
+            )
+            self._cleanup_removed_sensors(self.coordinator._heat_source_state["units"])
 
             # Load Tobit live-learner state (#904 stage 3, storage v5).
             # Three fields survive a v4 → v5 migration with documented
@@ -987,14 +1103,18 @@ class StorageManager:
 
             # Load hourly persistence (with hour validation)
             current_time = dt_util.now()
-            current_hour = current_time.replace(minute=0, second=0, microsecond=0)
+            # Hour starts compared as UTC instants: during the repeated DST
+            # fall-back hour, local datetimes sharing a tzinfo compare equal
+            # across both passes (fold is ignored), which would restore the
+            # first pass's accumulators into the second.
+            current_hour = hour_start_utc(current_time)
             stale_energy_baselines = False
 
             acc_start_iso = data.get("accumulation_start_time")
             if acc_start_iso:
                 acc_start_time = dt_util.parse_datetime(acc_start_iso)
                 # Only restore if still same hour
-                if acc_start_time and acc_start_time.replace(minute=0, second=0, microsecond=0) == current_hour:
+                if acc_start_time and hour_start_utc(acc_start_time) == current_hour:
                     self.coordinator._accumulation_start_time = acc_start_time
                     self.coordinator._collector.energy_hour = data.get("accumulated_energy_hour", 0.0)
                     self.coordinator._collector.expected_energy_hour = data.get("accumulated_expected_energy_hour", 0.0)
@@ -1023,12 +1143,15 @@ class StorageManager:
             saved_last_hour = data.get("last_hour_processed")
             if saved_last_hour is not None:
                 self.coordinator._last_hour_processed = int(saved_last_hour)
+            self.coordinator._last_hour_start = _parse_hour_start(
+                data.get("last_hour_start")
+            )
 
             # Load hourly aggregates (with hour validation)
             aggregates = data.get("hourly_aggregates", {})
             if aggregates and aggregates.get("hour_start"):
                 saved_hour = dt_util.parse_datetime(aggregates["hour_start"])
-                if saved_hour and saved_hour.replace(minute=0, second=0, microsecond=0) == current_hour:
+                if saved_hour and hour_start_utc(saved_hour) == current_hour:
                     # Same hour - restore aggregates
                     self.coordinator._collector.start_time = saved_hour
                     self.coordinator._collector.wind_sum = aggregates.get("wind_sum", 0.0)
@@ -1156,7 +1279,13 @@ class StorageManager:
                     self.coordinator._aux_cooldown_start_time = None
 
             if "learning_rate" in data:
-                self.coordinator.learning_rate = data["learning_rate"]
+                # Same boundary as coordinator.__init__: a malformed stored
+                # value keeps the already-coerced config value.
+                self.coordinator.learning_rate = coerce_config_float(
+                    data["learning_rate"],
+                    self.coordinator.learning_rate,
+                    "learning_rate (stored)",
+                )
 
             forecast_history_loaded = False
             if "forecast_history" in data:
@@ -1351,6 +1480,12 @@ class StorageManager:
                     "hourly_expected_per_unit": self.coordinator._hourly_expected_per_unit,
                     "last_minute_processed": self.coordinator._collector.last_minute_processed,
                     "last_hour_processed": self.coordinator._last_hour_processed,
+                    # UTC start of the hour being accumulated; the hour
+                    # number above cannot tell a repeated DST hour apart.
+                    "last_hour_start": (
+                        self.coordinator._last_hour_start.isoformat()
+                        if self.coordinator._last_hour_start else None
+                    ),
                     # Persist critical state for robust gap filling (resolves race condition)
                     "current_model_rate": self.coordinator.data.get("current_model_rate", 0.0),
                     "current_unit_breakdown": self.coordinator.data.get("current_unit_breakdown", {}),
@@ -1419,6 +1554,7 @@ class StorageManager:
                     "unit_modes": self.coordinator._unit_modes,
                     "solar_optimizer_data": self.coordinator.solar_optimizer.get_data(),
                     "last_batch_fit_per_unit": self.coordinator._last_batch_fit_per_unit,
+                    "heat_source": self.coordinator._heat_source_state,
                     # Tobit live-learner state (#904 stage 3, storage v5).
                     # When the master flag is False these fields persist
                     # untouched — flag-off installs save the migrated v5
@@ -1519,6 +1655,7 @@ class StorageManager:
             "_critical_elev_per_facade_per_unit": self.coordinator._critical_elev_per_facade_per_unit,
             "per_unit_min_base_thresholds": self.coordinator._per_unit_min_base_thresholds,
             "last_batch_fit_per_unit": self.coordinator._last_batch_fit_per_unit,
+            "heat_source": self.coordinator._heat_source_state,
             "solar_battery_state": self.coordinator._solar_battery_state,
             "solar_carryover_state": self.coordinator._solar_carryover_state,
             "potential_battery_s": self.coordinator._potential_battery_s,
@@ -1587,6 +1724,9 @@ class StorageManager:
             data = _migrate_v6_to_v7(data)  # #991: per-facade obstruction state
             data = _migrate_v7_to_v8(data)  # #1009: per-entity obstruction state
             data = _migrate_v8_to_v9(data)  # v9: solar-window low+high gate
+            data = _migrate_v9_to_v10(  # v10: BP of each day's stored tdd
+                data, getattr(self.coordinator, "balance_point", None),
+            )
 
             # Apply Data
             self.coordinator._correlation_data.clear()
@@ -1615,6 +1755,9 @@ class StorageManager:
             saved_last_hour = data.get("last_hour_processed")
             if saved_last_hour is not None:
                 self.coordinator._last_hour_processed = int(saved_last_hour)
+            self.coordinator._last_hour_start = _parse_hour_start(
+                data.get("last_hour_start")
+            )
 
             acc_start_str = data.get("accumulation_start_time")
             if acc_start_str:
@@ -1662,7 +1805,13 @@ class StorageManager:
                     self.coordinator._aux_cooldown_start_time = None
 
             if "learning_rate" in data:
-                self.coordinator.learning_rate = data["learning_rate"]
+                # Same boundary as coordinator.__init__: a malformed stored
+                # value keeps the already-coerced config value.
+                self.coordinator.learning_rate = coerce_config_float(
+                    data["learning_rate"],
+                    self.coordinator.learning_rate,
+                    "learning_rate (stored)",
+                )
             if "solar_correction_percent" in data:
                 self.coordinator.solar_correction_percent = data["solar_correction_percent"]
 
@@ -1687,6 +1836,9 @@ class StorageManager:
                 eid: v for eid, v in raw_last_batch_fit.items()
                 if isinstance(v, dict)
             } if isinstance(raw_last_batch_fit, dict) else {}
+            self.coordinator._heat_source_state = _heat_source_state_from(
+                data.get("heat_source")
+            )
             raw_buffer_solar = data.get("learning_buffer_solar_per_unit", {})
             self.coordinator._learning_buffer_solar_per_unit = {}
             for eid, buf in raw_buffer_solar.items():
@@ -2229,6 +2381,7 @@ class StorageManager:
                         if temp is not None:
                             entry["temp"] = temp
                             entry["tdd"] = round(abs(self.coordinator.balance_point - temp) / 24.0, 3)
+                            entry["bp_at_log_time"] = self.coordinator.balance_point
                         if wind_speed_present:
                             entry["effective_wind"] = effective_wind
                             entry["wind_bucket"] = wind_bucket
@@ -2260,6 +2413,7 @@ class StorageManager:
                             "hour": ts.hour,
                             "temp": temp,
                             "tdd": round(abs(self.coordinator.balance_point - temp) / 24.0, 3),
+                            "bp_at_log_time": self.coordinator.balance_point,
                             "effective_wind": effective_wind,
                             "wind_bucket": wind_bucket,
                             "actual_kwh": kwh,
@@ -2402,7 +2556,7 @@ class StorageManager:
                         # land on the existing entry, so a pure DNI/DHI
                         # enrichment pass leaves temp / wind / cloud
                         # values from live observations untouched.
-                        for field in ('temp', 'tdd', 'effective_wind',
+                        for field in ('temp', 'tdd', 'bp_at_log_time', 'effective_wind',
                                        'wind_bucket', 'solar_factor',
                                        'dni', 'dhi'):
                             if field in weather_data:
@@ -2449,42 +2603,100 @@ class StorageManager:
                                 history_entry["hourly_vectors"] = vectors
 
                             updated_day = False
+                            tdd_patched_hours: set[int] = set()
 
+                            # Rows of one local hour are folded into its
+                            # slot as aggregate_logs folds log entries: the
+                            # mean of temp / wind / sun, the sum of tdd.  On
+                            # the DST fall-back day slot 2 has two rows.
+                            rows_by_hour: dict[int, list[dict]] = {}
                             for entry in daily_entries:
                                 hour = entry["hour"]
                                 if 0 <= hour <= 23:
-                                    # Field-conditional vector update —
-                                    # entries from a partial-field
-                                    # enrichment pass may not carry every
-                                    # weather field.
-                                    if "temp" in entry:
-                                        vectors["temp"][hour] = entry["temp"]
-                                    if "effective_wind" in entry:
-                                        vectors["wind"][hour] = entry["effective_wind"]
-                                    if "tdd" in entry:
-                                        vectors["tdd"][hour] = entry["tdd"]
-                                    if (self.coordinator.solar_enabled
-                                            and "solar_rad" in vectors
-                                            and "solar_factor" in entry):
-                                        vectors["solar_rad"][hour] = entry["solar_factor"]
-                                    updated_day = True
+                                    rows_by_hour.setdefault(hour, []).append(entry)
+
+                            def _mean(rows, field):
+                                vals = [r[field] for r in rows if field in r]
+                                return sum(vals) / len(vals) if vals else None
+
+                            for hour, rows in rows_by_hour.items():
+                                # Field-conditional vector update —
+                                # entries from a partial-field
+                                # enrichment pass may not carry every
+                                # weather field.
+                                temp_mean = _mean(rows, "temp")
+                                if temp_mean is not None:
+                                    vectors["temp"][hour] = temp_mean
+                                wind_mean = _mean(rows, "effective_wind")
+                                if wind_mean is not None:
+                                    vectors["wind"][hour] = wind_mean
+                                tdd_rows = [r["tdd"] for r in rows if "tdd" in r]
+                                if tdd_rows:
+                                    vectors["tdd"][hour] = sum(tdd_rows)
+                                    tdd_patched_hours.add(hour)
+                                solar_mean = _mean(rows, "solar_factor")
+                                if (self.coordinator.solar_enabled
+                                        and "solar_rad" in vectors
+                                        and solar_mean is not None):
+                                    vectors["solar_rad"][hour] = solar_mean
+                                if len(rows) > 1 or isinstance(vectors.get("hours"), list):
+                                    slot_hours = vectors.get("hours")
+                                    if not isinstance(slot_hours, list) or len(slot_hours) != 24:
+                                        slot_hours = [
+                                            1 if v is not None else None
+                                            for v in vectors["temp"]
+                                        ]
+                                        vectors["hours"] = slot_hours
+                                    slot_hours[hour] = len(rows)
+                                updated_day = True
 
                             if updated_day:
                                 # Re-calculate daily aggregates from updated vectors
                                 # We use the vectors as source of truth now
-                                valid_temps = [v for v in vectors["temp"] if v is not None]
-                                valid_winds = [v for v in vectors["wind"] if v is not None]
-                                valid_tdds = [v for v in vectors["tdd"] if v is not None]
-                                valid_solars = [v for v in vectors.get("solar_rad", []) if v is not None]
+                                # Means per clock hour, so a two-hour slot
+                                # counts twice.
+                                slot_hours = vector_slot_hours(vectors)
 
-                                if valid_temps:
-                                    history_entry["temp"] = round(sum(valid_temps) / len(valid_temps), 1)
-                                if valid_winds:
-                                    history_entry["wind"] = round(sum(valid_winds) / len(valid_winds), 1)
+                                def _hour_mean(values):
+                                    pairs = [
+                                        (v, slot_hours[i])
+                                        for i, v in enumerate(values[:24])
+                                        if v is not None
+                                    ]
+                                    if not pairs:
+                                        return None
+                                    return sum(v * n for v, n in pairs) / sum(n for _, n in pairs)
+
+                                valid_tdds = [v for v in vectors["tdd"] if v is not None]
+                                mean_temp = _hour_mean(vectors["temp"])
+                                mean_wind = _hour_mean(vectors["wind"])
+                                mean_solar = _hour_mean(vectors.get("solar_rad", []))
+
+                                if mean_temp is not None:
+                                    history_entry["temp"] = round(mean_temp, 1)
+                                if mean_wind is not None:
+                                    history_entry["wind"] = round(mean_wind, 1)
                                 if valid_tdds:
                                     history_entry["tdd"] = round(sum(valid_tdds), 1)
-                                if valid_solars:
-                                    history_entry["solar_factor"] = round(sum(valid_solars) / len(valid_solars), 3)
+                                if tdd_patched_hours:
+                                    # The patched hours carry the current BP,
+                                    # the rest the one they were stored at.
+                                    # The sum keeps a single BP only when
+                                    # those agree or every logged slot was
+                                    # patched.
+                                    bp_now = self.coordinator.balance_point
+                                    stored_bp = finite_float(history_entry.get("balance_point"))
+                                    logged_hours = {
+                                        h for h, v in enumerate(vectors["tdd"]) if v is not None
+                                    }
+                                    if logged_hours <= tdd_patched_hours or (
+                                        stored_bp is not None and abs(stored_bp - bp_now) < 1e-6
+                                    ):
+                                        history_entry["balance_point"] = bp_now
+                                    else:
+                                        history_entry["balance_point"] = None
+                                if mean_solar is not None:
+                                    history_entry["solar_factor"] = round(mean_solar, 3)
 
                                 rotated_updates_count += 1
 
@@ -2496,7 +2708,12 @@ class StorageManager:
                     unique_entries = [e for e in entries if e['timestamp'] not in existing_timestamps]
 
                     self.coordinator._hourly_log.extend(unique_entries)
-                    self.coordinator._hourly_log.sort(key=lambda x: x["timestamp"])
+                    # By instant, not by string: on the DST fall-back day
+                    # "02:00+01:00" sorts before "02:00+02:00" as text.
+                    _epoch = datetime.min.replace(tzinfo=timezone.utc)
+                    self.coordinator._hourly_log.sort(
+                        key=lambda x: (log_entry_instant(x) or _epoch, x["timestamp"])
+                    )
 
                 # Determine which days need daily history updates
                 if is_weather_only:

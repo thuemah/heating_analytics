@@ -528,7 +528,7 @@ WEEK_HORIZON_STATS_WINDOW_DAYS = 90   # trailing percentile window — keeps err
 WEEK_HORIZON_MIN_WINDOWS = 14         # scorable windows before the range band is surfaced (~2 independent weeks of evidence; rolling windows overlap)
 
 # Storage
-STORAGE_VERSION = 9  # v9: solar-window low+high obstruction gate per facade per entity (see storage.py:_migrate_v8_to_v9)
+STORAGE_VERSION = 10  # v10: balance point recorded on each daily_history day (see storage.py:_migrate_v9_to_v10)
 
 # Solar-window obstruction gate (v9).  Each facade per entity carries
 # two independent critical elevations: ``critical_elev_low`` (below
@@ -712,6 +712,12 @@ ATTR_FORECAST_BLEND_CONFIG = "forecast_blend_config"
 ATTR_FORECAST_ACCURACY_BY_SOURCE = "forecast_accuracy_by_source"
 ATTR_FORECAST_DETAILS = "forecast_details"
 
+# Internal (NOT an attribute): per-source accuracy fields consumed by
+# HeatingForecastDetailsSensor.native_value. Lives as a sibling key on
+# coordinator.data, deliberately outside ATTR_FORECAST_DETAILS — see the
+# comment on the ATTR_FORECAST_DETAILS assembly in coordinator.py.
+KEY_FORECAST_ACCURACY_INTERNAL = "forecast_accuracy_internal"
+
 ATTR_SOLAR_POTENTIAL = "solar_potential_kw"
 ATTR_SOLAR_GAIN_NOW = "solar_gain_now_kw"
 ATTR_RECOMMENDATION_STATE = "recommendation_state"
@@ -858,6 +864,97 @@ CONF_HOURLY_LOG_RETENTION_DAYS = "hourly_log_retention_days"
 DEFAULT_HOURLY_LOG_RETENTION_DAYS = 90
 HOURLY_LOG_RETENTION_OPTIONS = [90, 180, 365]
 
+# --- Heat-source type per unit (heat_source.py) ---
+# Classes named after what the data can show.  Inferred: a unit that both
+# heats and cools is a reversible heat pump; otherwise the curvature of its
+# heating energy against degree-hours (the relative COP slope κ of
+# calibrate_balance_point) says whether its COP depends on the outdoor
+# temperature.  κ ≈ 0 is direct electric *or* ground source — a constant COP
+# only rescales U, so energy data cannot tell those apart.
+HEAT_SOURCE_UNKNOWN = "unknown"
+HEAT_SOURCE_REVERSIBLE_HEAT_PUMP = "reversible_heat_pump"
+HEAT_SOURCE_OUTDOOR_DEPENDENT_COP = "outdoor_dependent_cop"
+HEAT_SOURCE_FLAT_COP = "flat_cop"
+# Set by the user (or, for the MPC-managed sensor, by the MPC integration).
+HEAT_SOURCE_DIRECT_ELECTRIC = "direct_electric"
+HEAT_SOURCE_GROUND_SOURCE = "ground_source"
+HEAT_SOURCE_AIR_TO_WATER = "air_to_water"
+HEAT_SOURCE_AIR_TO_AIR = "air_to_air"
+HEAT_SOURCE_TYPES = (
+    HEAT_SOURCE_REVERSIBLE_HEAT_PUMP,
+    HEAT_SOURCE_OUTDOOR_DEPENDENT_COP,
+    HEAT_SOURCE_FLAT_COP,
+    HEAT_SOURCE_DIRECT_ELECTRIC,
+    HEAT_SOURCE_GROUND_SOURCE,
+    HEAT_SOURCE_AIR_TO_WATER,
+    HEAT_SOURCE_AIR_TO_AIR,
+)
+# The types a user can set, in the config flow or with
+# ``set_heat_source_type`` — the devices.  The three inferred classes name a
+# curve, not a device, and are never set by hand.
+HEAT_SOURCE_USER_TYPES = (
+    HEAT_SOURCE_DIRECT_ELECTRIC,
+    HEAT_SOURCE_GROUND_SOURCE,
+    HEAT_SOURCE_AIR_TO_WATER,
+    HEAT_SOURCE_AIR_TO_AIR,
+)
+# ``set_heat_source_type`` value that clears the user's type.
+HEAT_SOURCE_AUTO = "auto"
+# Config entry: the user's type per energy sensor, ``{entity_id: type}``.
+CONF_HEAT_SOURCE_TYPES = "heat_source_types"
+# Config-flow fields (UI only, never stored): one entity list per user
+# type, turned into CONF_HEAT_SOURCE_TYPES by ``_build_final_data``.
+HEAT_SOURCE_FORM_FIELDS = {
+    f"heat_source_{heat_source_type}_units": heat_source_type
+    for heat_source_type in HEAT_SOURCE_USER_TYPES
+}
+# The shape of the heating curve each type implies (``None``: unknown).
+HEAT_SOURCE_CURVE = {
+    HEAT_SOURCE_REVERSIBLE_HEAT_PUMP: "outdoor",
+    HEAT_SOURCE_OUTDOOR_DEPENDENT_COP: "outdoor",
+    HEAT_SOURCE_AIR_TO_WATER: "outdoor",
+    HEAT_SOURCE_AIR_TO_AIR: "outdoor",
+    HEAT_SOURCE_FLAT_COP: "flat",
+    HEAT_SOURCE_DIRECT_ELECTRIC: "flat",
+    HEAT_SOURCE_GROUND_SOURCE: "flat",
+}
+# A curve class needs the whole supported κ set on one side: at or below
+# 0.01 is flat, at or above 0.02 depends on the outdoor temperature (an
+# air-to-air unit sits at ≈ 0.03–0.04).  In between, and a set spanning
+# both, is unknown.  The set comes from calibrate_balance_point's
+# profile-likelihood table, so thin or noisy data widens it into unknown.
+HEAT_SOURCE_FLAT_MAX_COP_SLOPE = 0.01
+HEAT_SOURCE_OUTDOOR_MIN_COP_SLOPE = 0.02
+# The curve must also hold without the coldest 20 % of the unit's days.  A
+# heat pump at its capacity limit on the coldest days (undersized, or
+# helped by heat on another meter) flattens exactly where κ is measured and
+# fits as flat; in simulation 6/6 such units classified flat without this
+# check and 0/6 with it (all unknown).  Limit: a cap on 15–25 % of all
+# days was always caught (16/16), a cap on 30 % — the whole winter, as an
+# exact plateau — slipped through 2 times in 4.  30 % would catch that
+# too but costs coverage on short windows (200 days: 1 heat pump in 4
+# classified instead of 4 in 4); 90 autumn days already cost 5 in 6 → 1
+# in 6 at 20 %.
+HEAT_SOURCE_COLD_TRIM_SHARE = 0.20
+# Reversible heat pump: at least this many days with at least this much
+# heating-mode energy on days colder than the balance point, *and* as many
+# with cooling-mode energy on days warmer than it.  Mode time alone is no
+# evidence (a panel heater left in cooling mode still heats); energy in
+# cooling mode on warm days is.
+HEAT_SOURCE_REVERSIBLE_MIN_DAYS = 5
+HEAT_SOURCE_REVERSIBLE_MIN_KWH = 0.5
+# Hysteresis: a first classification needs one run passing every check
+# above; replacing a class needs the other class in this many consecutive
+# runs, and a run that cannot classify never clears one.
+HEAT_SOURCE_SWITCH_RUNS = 2
+# The background classification runs after midnight at most this often.
+HEAT_SOURCE_RUN_INTERVAL_DAYS = 7
+
+# retrain_from_history dry run: the most recent days of the retrain window
+# whose hours are predicted on the current and on the retrained model.
+# 30 days is ~720 hours, two ``calculate_total_power`` calls each.
+RETRAIN_DRY_RUN_PREDICTION_DAYS = 30
+
 # --- Internal feature flags (not exposed in config flow) ---
 # #793: Use COP-weighted smearing for Track B instead of flat q/24.
 # When True and COP params are available (from MPC or future manual config),
@@ -906,6 +1003,18 @@ DNI_DHI_SOURCE_MIX_MIN_HOURS = 50
 # December (~6 h).  The window measures *evidence*, not elapsed time.  Do
 # not "fix" this into wall-clock hours.
 REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS = 24
+# Outer bound on how far back the walk may reach, in calendar days.  NOT
+# the window — the window is still counted in daylight hours above.  This
+# only stops the walk: without it a log predating the ``dni_dhi_source``
+# field (unlabelled entries consume no window budget) is walked end to end
+# on every hour boundary, and near the winter solstice at high latitude
+# the 24-hour window would reach back weeks, turning a "last day or two"
+# alert into a stale one.  14 days covers the ~4-day December window at
+# 60 °N with wide margin; above ~65 °N near the solstice (and in polar
+# night) the window cannot fill in time and the verdict is
+# ``insufficient_data`` — the honest answer, since a repair raised on
+# fortnight-old evidence says nothing about the provider today.
+REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS = 14
 # Asymmetric by design, so a provider that drops the fields intermittently
 # cannot create and delete the repair on alternating days.  Between the
 # two shares the state is sticky: neither raised nor cleared, whatever it
@@ -925,3 +1034,134 @@ REPAIR_DNI_DHI_OUTAGE_MIN_HOURS = 24
 # Issue ID registered with HA's issue registry.  Stable across restarts —
 # the registry persists, and re-registering the same ID is idempotent.
 REPAIR_ISSUE_DNI_DHI_OUTAGE = "dni_dhi_outage_4d_active"
+
+# --- calibrate_balance_point (#1045) --------------------------------------
+# Change-point fit of daily heating energy against degree-hours on the
+# model's own temperature axis (inertia temperature reconstructed from
+# ``daily_history`` hourly vectors):
+# ``E = b + U·DH(cp − Δ·S/S_ref)`` per hour of the day, where ``S`` is the
+# day's mean ``solar_factor``.  Sun lowers the day's effective balance
+# point by ``Δ`` °C on a clear (``S_ref``) day, so ``cp`` is the balance
+# point of a day without sun — what the regime boundary, the BP-2 shield
+# and Track C's heating/cooling split read the balance point as.  Daily
+# resolution integrates out thermal-mass lag and the within-day solar
+# storage that made hourly fits unreliable; ``daily_history`` is never
+# trimmed, so the fit is available all year.
+#
+# Sweep ceiling; intersected with the data-feasible range (the K-th
+# smallest / largest daily mean temperature).  0.5 °C matches the
+# resolution a user can meaningfully act on.
+BP_CALIBRATION_SWEEP_MIN_C = 8.0
+BP_CALIBRATION_SWEEP_MAX_C = 24.0
+BP_CALIBRATION_SWEEP_STEP_C = 0.5
+# Solar shift of the balance point on a clear day, swept 0 … max.  0 is
+# the no-solar model, so the fit nests it.
+BP_CALIBRATION_SOLAR_SHIFT_MAX_C = 12.0
+BP_CALIBRATION_SOLAR_SHIFT_STEP_C = 0.5
+# Share of the previous day's sun still acting today (heat stored in the
+# building's mass), swept over these values.  0 is the same-day model, so
+# the fit nests it.  Without this term a building that stores solar gain
+# fits a balance point about 1 °C too low in simulation (30 % carry-over),
+# the error the daily model exists to remove.
+BP_CALIBRATION_SOLAR_CARRYOVER_GRID = (0.0, 0.25, 0.5)
+# Coarse steps of the two-stage search: every change point is profiled
+# over a coarse (shift, carry-over, COP-slope) grid, then refined at the
+# fine steps around its coarse optimum.  A full fine grid in pure Python
+# would take tens of seconds.
+BP_CALIBRATION_SOLAR_SHIFT_COARSE_STEP_C = 2.0
+# Heat-pump efficiency: electrical energy is heat demand / COP, and COP
+# rises with outdoor temperature, so energy against degree-hours is
+# convex and a straight arm crosses the floor too early — on an air-source
+# install by several °C (simulation: COP 1.8 → 5.0 over −10 … 17 °C puts a
+# linear fit at 8 °C for a true 17 °C).  The arm is fitted on
+# ``(base − T) / (1 + κ·T)``: relative COP rising by κ per °C (1 at 0 °C).
+# κ = 0 is the linear arm (direct electric heating), so the fit nests it.
+BP_CALIBRATION_COP_SLOPE_MAX = 0.05
+BP_CALIBRATION_COP_SLOPE_STEP = 0.005
+BP_CALIBRATION_COP_SLOPE_COARSE_STEP = 0.02
+# The upper end is a physical limit, not a search convenience: relative COP
+# ``1 + κ·T`` at κ = 0.05 rises 3.5-fold from −10 to +15 °C, beyond an
+# air-to-air heat pump's ~2–2.5 (κ ≈ 0.03–0.04).  A fit that reaches it is
+# absorbing curvature from something other than COP (a thermostatic
+# direct-electric load with a higher setpoint, defrost, infiltration) and
+# is reported as ``nuisance_at_limit`` — do not raise the limit to let it
+# through; on a real install that moved the suggestion from withheld to
+# 21.5 °C at κ = 0.06.
+#
+# Floor on the relative COP ``1 + κ·T`` so very cold hours at a steep κ
+# cannot divide by ~0.
+BP_CALIBRATION_COP_FLOOR = 0.25
+# A day with more hours than this at or above the high-wind threshold is
+# skipped (wind loss steepens the arm).  Falls back to the daily mean
+# wind when the hourly vector is missing.
+BP_CALIBRATION_MAX_HIGH_WIND_HOURS = 6
+# COP slopes reported in ``change_point_by_cop_slope``, and over which the
+# change point must be stable: cp and κ trade off (a steeper COP curve
+# moves the change point up), so a cp that holds only at one κ is not
+# identified.  Stability is required over the slopes the data itself
+# supports (profile SSE within the interval's threshold).
+BP_CALIBRATION_COP_TABLE_STEP = 0.01
+# More outliers than this share of days means the model does not describe
+# the data (e.g. sun-driven cooling in spring): the fit is reported with
+# status ``poor_fit`` instead of ``fitted``.
+BP_CALIBRATION_MAX_OUTLIER_SHARE = 0.15
+# The carry-over acts only through the solar shift: below this shift it
+# moves each day's balance point by a fraction of a degree, is not
+# identified, and resting on its limit is not evidence of anything.
+BP_CALIBRATION_CARRYOVER_MIN_SHIFT_C = 2.0
+# Heteroscedasticity.  Heating energy's noise grows with demand (cold days
+# scatter ~10× more than the flat arm), and the information about the COP
+# slope comes from exactly those days — an equal-variance χ² threshold then
+# rejects the true slope about half the time.  One feasible-GLS step fits a
+# variance model ``σ² = s0² + s1²·ŷ²`` to the first pass's residuals and
+# refits with weights ``1/σ²``.  ``s0²`` is floored at this share of the
+# mean squared residual so near-zero fitted days cannot take all weight,
+# and weights are capped at this ratio (max / min).
+BP_CALIBRATION_VARIANCE_FLOOR_SHARE = 0.05
+BP_CALIBRATION_MAX_WEIGHT_RATIO = 100.0
+# ``S_ref``: this quantile of the window's daily mean solar_factor stands
+# for "a clear day", so the reported shift reads in °C.
+BP_CALIBRATION_SOLAR_REFERENCE_QUANTILE = 0.95
+# Days of daily_history the fit looks back over.  A full year always
+# contains a heating season, whenever the service is run.
+BP_CALIBRATION_LOOKBACK_DAYS = 365
+# Only complete days count: every hour of the local day logged (23 on the
+# spring-forward day; the fall-back day's 25 hours fill 24 slots).  After
+# downtime the missed hours' meter delta lands in the next logged hour, so
+# dividing by the logged hours would overstate a gappy day by ~4 % per
+# missing hour, and dividing by 24 would understate it when the spike guard
+# dropped the delta instead.
+# Minimum usable days before the fit runs at all, and days required on
+# EACH side of a candidate (daily mean below / above the day's balance
+# point).  A change point with a handful of days on one side is fitted to
+# those days' noise.
+BP_CALIBRATION_MIN_DAYS = 60
+BP_CALIBRATION_MIN_DAYS_PER_SIDE = 15
+# One robust pass: days whose residual exceeds this many robust standard
+# deviations (1.4826·MAD) are dropped and the fit repeated.  Catches days
+# the daily record cannot label — a whole-home shutdown, a party, a
+# metering glitch — without a rule per cause.
+BP_CALIBRATION_OUTLIER_K = 4.0
+# Stability: the change point fitted on even and on odd ISO weeks must
+# agree.  Interleaved halves cover the same seasons with little shared
+# data, which nested windows (a longer window contains the shorter) do
+# not.
+BP_CALIBRATION_STABILITY_TOLERANCE_C = 1.0
+# A change smaller than this is never suggested, however narrow the
+# interval: it is below the agreement the method itself requires, and a
+# multi-day effect the daily model does not capture (thermal mass carrying
+# yesterday into today) biases the fit by up to about this much in
+# simulation (0.5–1 °C low with 25–40 % day-to-day carry-over).
+BP_CALIBRATION_MIN_SUGGESTED_CHANGE_C = 1.0
+# ``cp + b/U`` further than this from ``cp`` means the proportional-TDD
+# assumption (consumption ∝ |BP − T|, used by extrapolation, Track B and
+# Track C weighting) is materially wrong for this install whichever BP is
+# chosen.  Reported, not acted on.
+BP_CALIBRATION_PROPORTIONAL_GAP_WARN_C = 1.0
+
+# A daily_history day whose per-unit breakdown accounts for less than this
+# share of its metered energy has no trustworthy heating/cooling split —
+# typically a day imported from CSV, whose hourly rows carry no per-unit
+# breakdown, so the split would read as zero heating on a day with real
+# consumption.
+DAILY_UNIT_ATTRIBUTION_MIN_SHARE = 0.9

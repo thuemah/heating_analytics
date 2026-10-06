@@ -76,3 +76,26 @@ class CoordinatorModelMixin:
     @property
     def model(self):
         return ModelProxy(self)
+
+
+def bind_inertia_axis(coordinator, tau: float = 4.0):
+    """Give a mock coordinator the real inertia axis used by replays.
+
+    Sets ``inertia_tau`` / ``inertia_weights`` as the coordinator builds
+    them and binds the real ``_entries_on_current_axis``, so retrain and the
+    solar replay re-key entries exactly as in production instead of calling
+    a MagicMock.
+    """
+    import types
+
+    from custom_components.heating_analytics.coordinator import HeatingDataCoordinator
+    from custom_components.heating_analytics.helpers import generate_exponential_kernel
+
+    coordinator.inertia_tau = float(tau)
+    coordinator.inertia_weights = generate_exponential_kernel(
+        tau=float(tau), window_hours=min(int(tau * 5), 168)
+    )
+    coordinator._entries_on_current_axis = types.MethodType(
+        HeatingDataCoordinator._entries_on_current_axis, coordinator
+    )
+    return coordinator

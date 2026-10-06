@@ -13,6 +13,7 @@ from .const import (
     BATCH_FIT_SATURATION_RATIO,
     COLD_START_SOLAR_DAMPING,
     COOLING_WIND_BUCKET,
+    DEFAULT_BALANCE_POINT,
     ENERGY_GUARD_THRESHOLD,
     INEQUALITY_MARGIN,
     INEQUALITY_STEP_SIZE,
@@ -66,7 +67,20 @@ from .const import (
     HARD_OUTLIER_CAP_FACTOR,
     HARD_OUTLIER_SANITY_MULTIPLIER,
 )
-from .helpers import compute_base_ema_step, solve_gauss_jordan
+from .helpers import (
+    UNIT_LEARNING_SKIP_REASONS,
+    aux_affected_entities_of,
+    compute_base_ema_step,
+    first_reported_instants,
+    hour_learning_skip_reason,
+    hour_slots,
+    hour_start_utc,
+    log_entry_instant,
+    log_first_reported,
+    solve_gauss_jordan,
+    unit_hour_reported_kwh,
+    unit_learning_skip_reason,
+)
 from .observation import HourlyObservation, ModelState, LearningConfig
 from .solar import SolarCalculator, coefficients_4d_are_learned
 
@@ -215,6 +229,39 @@ def _solar_coeff_regime(unit_mode: str) -> str | None:
     return None
 
 
+# Modes whose hours per-unit learning skips entirely: OFF is a stable
+# no-demand state, and guest modes are temporary occupancy that the unit's
+# own model must not absorb.
+PER_UNIT_SKIPPED_MODES = frozenset({MODE_OFF, MODE_GUEST_HEATING, MODE_GUEST_COOLING})
+
+
+def per_unit_hour_actual(
+    entity_id: str,
+    unit_mode: str,
+    hourly_delta_per_unit: dict,
+) -> float | None:
+    """The kWh per-unit learning learns for one unit in one hour, or ``None``.
+
+    ``None`` skips the unit: OFF and guest modes, and a sensor that did not
+    report during the hour (absent from ``hourly_delta_per_unit``).  DHW
+    learns 0 kWh — the unit is active but not heating the space, and its
+    energy never enters the meter map.  Otherwise the metered kWh, 0.0 for a
+    reported hour with no consumption.
+
+    One decision for live learning (``_process_per_unit_learning``) and
+    the retrain replay (``replay_per_unit_models``), which rebuilds
+    ``hourly_delta_per_unit`` from the log with
+    ``helpers.unit_hour_reported_kwh``.
+    """
+    if unit_mode in PER_UNIT_SKIPPED_MODES:
+        return None
+    if unit_mode == MODE_DHW:
+        return 0.0
+    if entity_id not in hourly_delta_per_unit:
+        return None
+    return hourly_delta_per_unit[entity_id]
+
+
 def evaluate_4d_learning_readiness(
     coeffs_4d_per_unit,
     solar_affected_entities,
@@ -356,7 +403,24 @@ def regime_energy_split(
     """
     heating_kwh = 0.0
     cooling_kwh = 0.0
+    for heating, cooling in unit_regime_energy(unit_modes, unit_energy_kwh).values():
+        heating_kwh += heating
+        cooling_kwh += cooling
+    return heating_kwh, cooling_kwh
 
+
+def unit_regime_energy(
+    unit_modes: dict[str, str],
+    unit_energy_kwh: dict[str, float],
+) -> dict[str, tuple[float, float]]:
+    """Each unit's energy as ``(heating_kwh, cooling_kwh)`` by regime.
+
+    The per-unit form of :func:`regime_energy_split` (which sums it), with
+    the same rules: the energy map is iterated and modes resolved with the
+    ``MODE_HEATING`` default, OFF / DHW energy is in neither regime, guest
+    modes count.  Units with no energy in either regime are left out.
+    """
+    out: dict[str, tuple[float, float]] = {}
     for entity_id, energy in unit_energy_kwh.items():
         energy = energy or 0.0
         if energy <= 0.0:
@@ -364,12 +428,8 @@ def regime_energy_split(
         regime = _solar_coeff_regime(unit_modes.get(entity_id, MODE_HEATING))
         if regime is None:
             continue
-        if regime == "heating":
-            heating_kwh += energy
-        else:
-            cooling_kwh += energy
-
-    return heating_kwh, cooling_kwh
+        out[entity_id] = (energy, 0.0) if regime == "heating" else (0.0, energy)
+    return out
 
 
 def classify_thermal_regime_from_split(
@@ -1628,10 +1688,36 @@ class LearningManager:
         # ``_compute_base_model_4d_shadow_report``.
         shadow_4d_fired = False
 
+        # The hour's SNR weight for the per-unit base EMA is the same for
+        # every unit; computed on first use (aux-active hours never need it).
+        hour_snr_weight: list[float] = []
+
+        def _hour_snr_weight() -> float:
+            if not hour_snr_weight:
+                hour_snr_weight.append(self._per_unit_hour_snr_weight(
+                    solar_factor=solar_factor,
+                    solar_dominant_entities=solar_dominant_entities,
+                    energy_sensors=energy_sensors,
+                    unit_modes=unit_modes,
+                    expected_base_per_unit=hourly_expected_base_per_unit,
+                    unit_min_base=unit_min_base,
+                    solar_calculator=solar_calculator,
+                    solar_enabled=solar_enabled,
+                    flag_4d_primary=_flag_4d_primary,
+                    obs=obs,
+                ))
+            return hour_snr_weight[0]
+
         for entity_id in energy_sensors:
             unit_mode = unit_modes.get(entity_id, MODE_HEATING)
-            if unit_mode in (MODE_OFF, MODE_GUEST_HEATING, MODE_GUEST_COOLING):
-                # Skip learning for non-tracked/temporary modes
+            # OFF / guest skipped, DHW learned as 0, an unreported sensor
+            # skipped.  DHW: the unit is active but not contributing to space
+            # heating, so the per-unit model learns the correct zero
+            # contribution rather than skipping the update entirely (also
+            # covers heat pump idle/standby cycles mapped to DHW by the
+            # heat_pump_mode_sync blueprint).  Shared with the retrain replay.
+            actual_unit = per_unit_hour_actual(entity_id, unit_mode, hourly_delta_per_unit)
+            if actual_unit is None:
                 continue
 
             # Per-entity solar-scope gate (#962).  Entities outside the
@@ -1668,25 +1754,11 @@ class LearningManager:
                     # Skip this unit
                     continue
 
-            # DHW mode: unit is active but not contributing to space heating.
-            # Force actual_unit = 0 so the per-unit model learns the correct
-            # zero contribution rather than skipping the update entirely.
-            # This also covers heat pump idle/standby cycles mapped to DHW by
-            # the heat_pump_mode_sync blueprint.
-            if unit_mode == MODE_DHW:
-                actual_unit = 0.0
-            else:
-                # Only update model if sensor actually reported during this hour
-                if entity_id not in hourly_delta_per_unit:
-                    # Sensor was offline/unavailable entire hour - skip learning
-                    continue
-                actual_unit = hourly_delta_per_unit[entity_id]
             # Dual-Track Learning: prefer the per-unit baseline from Track B calculations
             if entity_id in hourly_expected_base_per_unit:
                 expected_unit_base = hourly_expected_base_per_unit[entity_id]
             else:
                 expected_unit_base = get_predicted_unit_base_fn(entity_id, temp_key, effective_wind_bucket, avg_temp)
-            unit_mode = unit_modes.get(entity_id, MODE_HEATING)
 
             # Step 1: Learn Unit Solar (if enabled, sunny, and NOT aux)
             # We learn solar in Normal mode to establish the relationship.
@@ -2048,113 +2120,22 @@ class LearningManager:
                 )
             else:
                 unit_solar_impact = 0.0
-            unit_normalized = actual_unit
 
-            # Step 3: Learn Base or Aux Model
-            if is_aux_active:
-                # DHW + Aux simultaneously: the zero contribution is caused by DHW,
-                # not by the aux system. Skip aux-coefficient learning to avoid
-                # corrupting the per-unit aux coefficient.
-                if unit_mode == MODE_DHW:
-                    pass
-                else:
-                    # Learn Individual Aux Reduction (kW)
-                    # Check Exclusion: Only learn if unit is affected by aux
-                    is_affected = True
-                    if aux_affected_entities is not None:
-                        if entity_id not in aux_affected_entities:
-                            is_affected = False
-
-                    if is_affected:
-                        self._learn_unit_aux_coefficient(
-                            entity_id, temp_key, effective_wind_bucket,
-                            expected_unit_base, unit_normalized,
-                            learning_rate,  # Use global rate
-                            aux_coefficients_per_unit, learning_buffer_aux_per_unit,
-                            correlation_data_per_unit
-                        )
-                    else:
-                        # Excluded unit: Not affected by aux, so learn Base Model normally.
-                        # Note: This does NOT require Global Base to update - Global is locked
-                        # during aux (see process_learning). The models are independent.
-                        self._learn_unit_model(
-                            entity_id, temp_key, effective_wind_bucket,
-                            expected_unit_base, unit_normalized,
-                            learning_rate,
-                            learning_buffer_per_unit, correlation_data_per_unit, observation_counts
-                        )
-            else:
-                # Learn Normal Model.
-                # Headroom-weighted EMA rate (#838): when the unsaturated
-                # unit_solar_impact approaches or exceeds expected_unit_base,
-                # the normalization target (actual + solar_impact) reflects
-                # an inflated coefficient, not reality.  Slowing the EMA in
-                # proportion to the remaining headroom breaks the second
-                # link of the feedback loop without touching the formula.
-                # At full saturation (solar >= base) → multiplier = 0.
-                # Dark hours (solar ≈ 0) → multiplier = 1 (unchanged).
-                #
-                # The headroom multiplier is composed with the hour's SNR
-                # weight.  Both attenuate the step size for the same class
-                # of noisy hours (high solar impact) but for different
-                # reasons — headroom on saturation-per-unit, SNR on
-                # hour-level solar presence.  Multiplying them is
-                # conservative: any hour downweighted by either mechanism
-                # stays downweighted.
-                if solar_enabled and expected_unit_base > 0.0:
-                    headroom_multiplier = max(
-                        0.0,
-                        (expected_unit_base - unit_solar_impact) / expected_unit_base,
-                    )
-                    headroom_multiplier = min(1.0, headroom_multiplier)
-                else:
-                    headroom_multiplier = 1.0
-
-                # #985: anchor per-unit SNR in 4D DNI/DHI when 4D is the
-                # live read-path consumer, mirroring the global base fix
-                # from #28e0125.  Per-unit base coefficients suffer the
-                # same Kasten-misclassification failure mode as the global
-                # base — see the 2026-05-17 production log captured in
-                # #985 for the mitsubishi_vp_2 case study.  The helper
-                # takes a config-shaped object; ``_process_per_unit_learning``
-                # receives flat-unpacked params instead of ``config``, so
-                # we shim the three attrs the helper actually reads.
-                sf_for_snr = solar_factor
-                if _flag_4d_primary:
-                    _config_shim = SimpleNamespace(
-                        solar_calculator=solar_calculator,
-                        solar_enabled=solar_enabled,
-                        experimental_4d_primary=True,
-                    )
-                    sf_4d = self._compute_4d_solar_factor_for_snr(obs, _config_shim)
-                    if sf_4d is not None:
-                        sf_for_snr = sf_4d
-                snr_w = compute_snr_weight(
-                    sf_for_snr,
-                    solar_dominant_entities,
-                    total_units=count_active_learnable_units(
-                        energy_sensors,
-                        unit_modes,
-                        hourly_expected_base_per_unit,
-                        unit_min_base=unit_min_base,
-                    ),
-                )
-                rate_multiplier = headroom_multiplier * snr_w
-
-                # Per #885: cooling-at-cold no longer needs a guard here.
-                # Mode-stratified per-unit buckets route cooling samples
-                # to a dedicated "cooling" wind-bucket (see
-                # effective_wind_bucket above), so cold-hour cooling
-                # standby populates cooling[temp]["cooling"] — which is
-                # semantically correct (those ARE cooling-mode
-                # observations) and cannot contaminate heating buckets.
-                self._learn_unit_model(
-                    entity_id, temp_key, effective_wind_bucket,
-                    expected_unit_base, unit_normalized,
-                    learning_rate,
-                    learning_buffer_per_unit, correlation_data_per_unit, observation_counts,
-                    rate_multiplier=rate_multiplier,
-                )
+            # Step 3: Learn Base or Aux Model (shared with the retrain replay).
+            self._learn_unit_base_or_aux(
+                entity_id, temp_key, effective_wind_bucket, unit_mode,
+                actual_unit, expected_unit_base, unit_solar_impact,
+                is_aux_active=is_aux_active,
+                aux_affected_entities=aux_affected_entities,
+                solar_enabled=solar_enabled,
+                learning_rate=learning_rate,
+                snr_weight=_hour_snr_weight,
+                learning_buffer_per_unit=learning_buffer_per_unit,
+                correlation_data_per_unit=correlation_data_per_unit,
+                observation_counts=observation_counts,
+                aux_coefficients_per_unit=aux_coefficients_per_unit,
+                learning_buffer_aux_per_unit=learning_buffer_aux_per_unit,
+            )
 
         # Surface 4D shadow per-hour aggregates (#954 commit 9) only when
         # the 4D shadow path ACTUALLY fired for at least one entity in
@@ -2596,6 +2577,174 @@ class LearningManager:
             "e": c_scalar * d_e * COLD_START_SOLAR_DAMPING,
             "w": c_scalar * d_w * COLD_START_SOLAR_DAMPING,
         }
+
+    def _per_unit_hour_snr_weight(
+        self,
+        *,
+        solar_factor: float,
+        solar_dominant_entities,
+        energy_sensors,
+        unit_modes: dict,
+        expected_base_per_unit: dict,
+        unit_min_base: dict[str, float] | None,
+        solar_calculator,
+        solar_enabled: bool,
+        flag_4d_primary: bool = False,
+        obs: "HourlyObservation | None" = None,
+    ) -> float:
+        """The hour's SNR weight for the per-unit base EMA (#866).
+
+        Entity-independent: one value per hour, composed with each unit's
+        headroom multiplier in :meth:`_learn_unit_base_or_aux`.
+
+        #985: anchored in 4D DNI/DHI when 4D is the live read-path consumer,
+        mirroring the global base fix from #28e0125.  Per-unit base
+        coefficients suffer the same Kasten-misclassification failure mode as
+        the global base — see the 2026-05-17 production log captured in #985
+        for the mitsubishi_vp_2 case study.  The helper takes a config-shaped
+        object; this method receives flat params instead of ``config``, so we
+        shim the three attrs the helper actually reads.  Without ``obs`` (the
+        retrain replay) it falls back to the logged 3D ``solar_factor``, as
+        the Track A global retrain does.
+        """
+        sf_for_snr = solar_factor
+        if flag_4d_primary:
+            _config_shim = SimpleNamespace(
+                solar_calculator=solar_calculator,
+                solar_enabled=solar_enabled,
+                experimental_4d_primary=True,
+            )
+            sf_4d = self._compute_4d_solar_factor_for_snr(obs, _config_shim)
+            if sf_4d is not None:
+                sf_for_snr = sf_4d
+        return compute_snr_weight(
+            sf_for_snr,
+            solar_dominant_entities,
+            total_units=count_active_learnable_units(
+                energy_sensors,
+                unit_modes,
+                expected_base_per_unit,
+                unit_min_base=unit_min_base,
+            ),
+        )
+
+    def _learn_unit_base_or_aux(
+        self,
+        entity_id: str,
+        temp_key: str,
+        wind_bucket: str,
+        unit_mode: str,
+        actual_unit: float,
+        expected_unit_base: float,
+        unit_solar_impact: float,
+        *,
+        is_aux_active: bool,
+        aux_affected_entities,
+        solar_enabled: bool,
+        learning_rate: float,
+        snr_weight: Callable[[], float],
+        learning_buffer_per_unit: dict,
+        correlation_data_per_unit: dict,
+        observation_counts: dict,
+        aux_coefficients_per_unit: dict,
+        learning_buffer_aux_per_unit: dict,
+        learn_aux: bool = True,
+    ) -> str:
+        """Learn one unit's hour into its base bucket or its aux coefficient.
+
+        Step 3 of :meth:`_process_per_unit_learning`, shared with
+        :meth:`replay_per_unit_models` so a retrain routes and weights each
+        (hour, unit) the way live learning did.  ``wind_bucket`` is the
+        effective bucket (``COOLING_WIND_BUCKET`` for a cooling unit);
+        ``actual_unit`` comes from :func:`per_unit_hour_actual`.
+
+        ``snr_weight`` is called only on the base path of a non-aux hour.
+        ``learn_aux=False`` leaves the aux coefficients alone: the hour of an
+        aux-affected unit during aux is then not learned at all — it never
+        goes to the base bucket, where the aux reduction would read as lower
+        demand.
+
+        Returns the route taken: ``"base"``, ``"aux"``, ``"aux_not_learned"``
+        (``learn_aux=False``) or ``"dhw_during_aux"``.
+        """
+        # Step 3: Learn Base or Aux Model
+        if is_aux_active:
+            # DHW + Aux simultaneously: the zero contribution is caused by DHW,
+            # not by the aux system. Skip aux-coefficient learning to avoid
+            # corrupting the per-unit aux coefficient.
+            if unit_mode == MODE_DHW:
+                return "dhw_during_aux"
+            # Learn Individual Aux Reduction (kW)
+            # Check Exclusion: Only learn if unit is affected by aux
+            is_affected = True
+            if aux_affected_entities is not None:
+                if entity_id not in aux_affected_entities:
+                    is_affected = False
+
+            if is_affected:
+                if not learn_aux:
+                    return "aux_not_learned"
+                self._learn_unit_aux_coefficient(
+                    entity_id, temp_key, wind_bucket,
+                    expected_unit_base, actual_unit,
+                    learning_rate,  # Use global rate
+                    aux_coefficients_per_unit, learning_buffer_aux_per_unit,
+                    correlation_data_per_unit
+                )
+                return "aux"
+            # Excluded unit: Not affected by aux, so learn Base Model normally.
+            # Note: This does NOT require Global Base to update - Global is locked
+            # during aux (see process_learning). The models are independent.
+            self._learn_unit_model(
+                entity_id, temp_key, wind_bucket,
+                expected_unit_base, actual_unit,
+                learning_rate,
+                learning_buffer_per_unit, correlation_data_per_unit, observation_counts
+            )
+            return "base"
+
+        # Learn Normal Model.
+        # Headroom-weighted EMA rate (#838): when the unsaturated
+        # unit_solar_impact approaches or exceeds expected_unit_base,
+        # the normalization target (actual + solar_impact) reflects
+        # an inflated coefficient, not reality.  Slowing the EMA in
+        # proportion to the remaining headroom breaks the second
+        # link of the feedback loop without touching the formula.
+        # At full saturation (solar >= base) → multiplier = 0.
+        # Dark hours (solar ≈ 0) → multiplier = 1 (unchanged).
+        #
+        # The headroom multiplier is composed with the hour's SNR
+        # weight.  Both attenuate the step size for the same class
+        # of noisy hours (high solar impact) but for different
+        # reasons — headroom on saturation-per-unit, SNR on
+        # hour-level solar presence.  Multiplying them is
+        # conservative: any hour downweighted by either mechanism
+        # stays downweighted.
+        if solar_enabled and expected_unit_base > 0.0:
+            headroom_multiplier = max(
+                0.0,
+                (expected_unit_base - unit_solar_impact) / expected_unit_base,
+            )
+            headroom_multiplier = min(1.0, headroom_multiplier)
+        else:
+            headroom_multiplier = 1.0
+        rate_multiplier = headroom_multiplier * snr_weight()
+
+        # Per #885: cooling-at-cold no longer needs a guard here.
+        # Mode-stratified per-unit buckets route cooling samples
+        # to a dedicated "cooling" wind-bucket (the effective
+        # ``wind_bucket`` passed in), so cold-hour cooling
+        # standby populates cooling[temp]["cooling"] — which is
+        # semantically correct (those ARE cooling-mode
+        # observations) and cannot contaminate heating buckets.
+        self._learn_unit_model(
+            entity_id, temp_key, wind_bucket,
+            expected_unit_base, actual_unit,
+            learning_rate,
+            learning_buffer_per_unit, correlation_data_per_unit, observation_counts,
+            rate_multiplier=rate_multiplier,
+        )
+        return "base"
 
     def _learn_unit_model(
         self,
@@ -3134,7 +3283,12 @@ class LearningManager:
         """
         from .observation import WeightedSmear
 
-        log_by_hour: dict[int, dict] = {e.get("hour", -1): e for e in day_logs}
+        # One slot per logged hour, in time order, keyed on its UTC start
+        # instant.  Not a {local hour: entry} dict: on the DST fall-back day
+        # two entries share hour 2 and the second would overwrite the first
+        # (its energy lost from the day).  An hour missing from the log has
+        # no slot; it used to get a zero weight, which is the same thing.
+        slots = hour_slots(day_logs)
 
         # Clear stale distribution from previous day on all synthetic
         # WeightedSmear strategies.
@@ -3144,12 +3298,14 @@ class LearningManager:
 
         # Prepare WeightedSmear strategies with their data for this day.
         if track_c_distribution:
-            dist_by_hour: dict[int, dict] = {}
+            dist_by_hour: dict = {}
             for entry in track_c_distribution:
                 try:
+                    # Floored in the record's own offset, then UTC — the
+                    # same key hour_slots gives the log entry of that hour.
                     entry_dt = parse_datetime_fn(entry["datetime"])
                     if entry_dt is not None:
-                        dist_by_hour[entry_dt.hour] = entry
+                        dist_by_hour[hour_start_utc(entry_dt)] = entry
                 except (KeyError, TypeError, ValueError):
                     continue
 
@@ -3162,8 +3318,7 @@ class LearningManager:
         # receive proportional weight (#792).  Solar multiplier is inverted
         # for cooling: sun increases cooling load instead of reducing it.
         raw_weights: list[float] = []
-        for h in range(24):
-            log_h = log_by_hour.get(h, {})
+        for _key, log_h in slots:
             inertia_t = log_h.get("inertia_temp")
             raw_t = log_h.get("temp")
             outdoor = inertia_t if inertia_t is not None else (raw_t if raw_t is not None else balance_point)
@@ -3187,7 +3342,10 @@ class LearningManager:
                 solar_mult = max(0.0, 1.0 - solar_f)
             raw_weights.append(delta_t * wind_factor * solar_mult)
         total_weight = sum(raw_weights)
-        norm_weights = [w / total_weight if total_weight > 0 else 1.0 / 24 for w in raw_weights]
+        norm_weights = [
+            w / total_weight if total_weight > 0 else 1.0 / max(1, len(slots))
+            for w in raw_weights
+        ]
 
         # Set daily totals for non-MPC WeightedSmear strategies.
         # Mode filtering (#789): only sum hours where the unit is in a
@@ -3195,8 +3353,7 @@ class LearningManager:
         for strategy in strategies.values():
             if isinstance(strategy, WeightedSmear) and not strategy.use_synthetic:
                 daily_total = 0.0
-                for h in range(24):
-                    entry = log_by_hour.get(h, {})
+                for _key, entry in slots:
                     unit_modes = entry.get("unit_modes", {})
                     mode = unit_modes.get(strategy.sensor_id, MODE_HEATING)
                     if mode not in MODES_EXCLUDED_FROM_GLOBAL_LEARNING:
@@ -3208,8 +3365,7 @@ class LearningManager:
         learning_buffer = model.learning_buffer_global
         bucket_updates = 0
 
-        for h in range(24):
-            log_entry = log_by_hour.get(h, {})
+        for slot_index, (slot_key, log_entry) in enumerate(slots):
             h_temp_key = log_entry.get("temp_key")
             if h_temp_key is None:
                 continue
@@ -3230,7 +3386,7 @@ class LearningManager:
                 if h_wind_bucket is None:
                     continue
 
-            weight = norm_weights[h]
+            weight = norm_weights[slot_index]
 
             # #854 F1: split strategy contributions by type so solar
             # normalization is applied only to DirectMeter (raw-electrical)
@@ -3247,7 +3403,7 @@ class LearningManager:
             smear_kwh = 0.0
             has_direct = False
             for strategy in strategies.values():
-                contrib = strategy.get_hourly_contribution(h, weight, log_entry)
+                contrib = strategy.get_hourly_contribution(slot_key, weight, log_entry)
                 if contrib is None:
                     continue
                 if isinstance(strategy, WeightedSmear):
@@ -3322,48 +3478,89 @@ class LearningManager:
         reset_first: bool = False,
         wind_threshold: float | None = None,
         extreme_wind_threshold: float | None = None,
+        balance_point: float = DEFAULT_BALANCE_POINT,
+        get_prediction_from_model: Callable | None = None,
+        solar_calculator=None,
+        solar_enabled: bool = False,
+        screen_config: tuple[bool, bool, bool] | None = None,
+        screen_affected_entities: frozenset[str] | None = None,
+        unit_min_base: dict[str, float] | None = None,
+        aux_affected_entities=None,
+        replay_aux: bool = False,
+        first_reported: dict | None = None,
+        hourly_sensors: list[str] | None = None,
     ) -> dict | None:
-        """Replay per-unit correlation models from hourly log entries.
+        """Rebuild the per-unit base models from hourly log entries.
 
-        Each DirectMeter sensor's actual kWh is written to its per-unit
-        correlation table via buffer → jump-start → EMA.  Needed so that
-        ``isolate_sensor`` subtraction works after ``retrain_from_history(reset_first=True)``.
-        WeightedSmear sensors are skipped.
+        Learns each (hour, unit) the way live per-unit learning did
+        (``_process_per_unit_learning``), through the same code:
 
-        ``target_entity`` restricts the replay to a single DirectMeter
-        sensor (used by the ``retrain_unit_from_history`` service).
-        Default ``None`` preserves the original whole-installation behaviour.
+        - **Hours:** those live per-unit learning ran on
+          (``helpers.hour_learning_skip_reason``), and per unit not the
+          aux-affected units frozen by a post-aux cooldown
+          (``helpers.unit_learning_skip_reason``).
+        - **Units and kWh:** :func:`per_unit_hour_actual` — OFF and guest
+          skipped, DHW learned as 0, a sensor that did not report skipped,
+          a reported zero hour learned as 0.  Reporting is read with
+          ``helpers.unit_hour_reported_kwh`` (``units_reporting``, and the
+          legacy rule anchored on ``first_reported`` for older entries).
+        - **Route and rate:** :meth:`_learn_unit_base_or_aux` — an aux-active
+          hour of an aux-affected unit goes to the aux coefficient
+          (``replay_aux``) or is not learned, never into the base bucket;
+          otherwise ``_learn_unit_model`` with the 3 % per-unit cap, the
+          headroom multiplier and the hour's SNR weight, which also counts
+          observations.
 
-        ``dry_run`` routes writes through deep copies and returns a
-        diagnostic ``{"diff_summary", "buckets_changed", "entries_processed"}``
-        without mutating ``model``.  Only meaningful with ``target_entity``
-        set (the diff is computed for that entity's buckets).
+        The expected unit base behind headroom, the SNR unit count and the
+        aux reduction is read from the model being rebuilt, as live read
+        the model of its time; the logged ``unit_expected_base`` was
+        computed on the inertia axis and model in force at log time.  The
+        SNR weight uses the logged 3D ``solar_factor``, as the Track A
+        global retrain does, also under ``experimental_4d_primary``.
 
-        ``reset_first`` (only honoured when ``target_entity`` is set) clears
-        the target entity's slice of ``correlation_per_unit`` and
-        ``buffer_per_unit`` BEFORE the replay loop.  Cleared on the
-        deep-copies in dry-run mode and on live state otherwise, so the
-        reported diff matches what a real reset-then-replay would produce.
+        ``hourly_sensors`` are the units live hourly per-unit learning ran
+        for — ``observation.hourly_learning_sensors``, the list
+        ``hourly_processor`` hands to live learning: under daily learning
+        the DirectMeter sensors only, otherwise every energy sensor.  They
+        are the units replayed and the units the hour's SNR weight counts,
+        as live counts exactly the units it learns (a WeightedSmear / MPC
+        unit under daily learning is neither).  ``None`` (callers without
+        the coordinator's learning mode) takes the DirectMeter strategies.
+        ``target_entity`` restricts the replay to one of them (the
+        ``retrain_unit_from_history`` service); the others still count
+        toward the SNR weight.
 
-        Moved from coordinator.py (#784) — pure model-writing logic.
+        ``dry_run`` routes writes through deep copies and reports what would
+        change without mutating ``model``.  ``reset_first`` (only honoured
+        with ``target_entity``) clears that entity's base buckets, buffers
+        and observation counts before the replay — on the copies in dry-run,
+        so the reported diff matches a real reset-then-replay.
+
+        Returns the replay's counters (``entries_processed`` plus the
+        decisions below), and for ``target_entity`` the bucket diff
+        (``diff_summary``, ``buckets_changed``).  ``None`` when there is no
+        sensor to replay.
         """
         from copy import deepcopy
 
         from .observation import DirectMeter
 
-        direct_sensors = [
-            s for s in strategies.values()
-            if isinstance(s, DirectMeter)
-        ]
+        if hourly_sensors is None:
+            hourly_sensors = [
+                s.sensor_id for s in strategies.values()
+                if isinstance(s, DirectMeter)
+            ]
+        hourly_sensors = list(hourly_sensors)
+        replayed_sensors = hourly_sensors
         if target_entity is not None:
-            direct_sensors = [s for s in direct_sensors if s.sensor_id == target_entity]
-            if not direct_sensors:
+            replayed_sensors = [sid for sid in hourly_sensors if sid == target_entity]
+            if not replayed_sensors:
                 return {
                     "diff_summary": {},
                     "buckets_changed": 0,
                     "entries_processed": 0,
                 }
-        if not direct_sensors:
+        if not replayed_sensors:
             return None
 
         # Snapshot for diff diagnostic when we're reporting on a target
@@ -3373,20 +3570,59 @@ class LearningManager:
             before_snapshot = deepcopy(model.correlation_data_per_unit.get(target_entity, {}))
         else:
             before_snapshot = None
+        correlation_per_unit = model.correlation_data_per_unit
+        buffer_per_unit = model.learning_buffer_per_unit
+        observation_counts = model.observation_counts
+        aux_per_unit = model.aux_coefficients_per_unit
+        aux_buffer_per_unit = model.learning_buffer_aux_per_unit
         if dry_run:
-            correlation_per_unit = deepcopy(model.correlation_data_per_unit)
-            buffer_per_unit = deepcopy(model.learning_buffer_per_unit)
-        else:
-            correlation_per_unit = model.correlation_data_per_unit
-            buffer_per_unit = model.learning_buffer_per_unit
+            correlation_per_unit = deepcopy(correlation_per_unit)
+            buffer_per_unit = deepcopy(buffer_per_unit)
+            observation_counts = deepcopy(observation_counts)
+            aux_per_unit = deepcopy(aux_per_unit)
+            aux_buffer_per_unit = deepcopy(aux_buffer_per_unit)
 
         if reset_first and target_entity is not None:
             correlation_per_unit.pop(target_entity, None)
             buffer_per_unit.pop(target_entity, None)
+            observation_counts.pop(target_entity, None)
+
+        if first_reported is None:
+            first_reported = first_reported_instants(
+                getattr(model, "hourly_log", None) or day_entries
+            )
+
+        def _expected_unit_base(entity_id: str, temp_key: str, bucket: str, avg_temp: float) -> float:
+            unit_data = correlation_per_unit.get(entity_id, {}) or {}
+            if get_prediction_from_model is not None:
+                return get_prediction_from_model(
+                    unit_data, temp_key, bucket, avg_temp, balance_point
+                )
+            return float((unit_data.get(temp_key) or {}).get(bucket, 0.0))
+
+        counters = {
+            "hours_skipped_learning_status": 0,
+            "hours_skipped_missing_keys": 0,
+            "units_learned_base": 0,
+            "units_learned_base_zero_kwh": 0,
+            "units_learned_aux": 0,
+            "units_skipped_mode": 0,
+            "units_skipped_not_reporting": 0,
+            "units_skipped_post_aux_cooldown": 0,
+            "units_skipped_aux_not_replayed": 0,
+            "units_skipped_dhw_during_aux": 0,
+            # Entries logged before ``units_reporting``: absent units read
+            # as a 0 kWh hour by the legacy rule.
+            "legacy_absent_read_as_zero": 0,
+        }
 
         for log_entry in day_entries:
+            if hour_learning_skip_reason(log_entry) is not None:
+                counters["hours_skipped_learning_status"] += 1
+                continue
             h_temp_key = log_entry.get("temp_key")
             if h_temp_key is None:
+                counters["hours_skipped_missing_keys"] += 1
                 continue
             # Re-bucketize live from stored effective_wind when thresholds
             # are supplied and the entry carries ``effective_wind``;
@@ -3408,48 +3644,137 @@ class LearningManager:
             else:
                 h_wind_bucket = log_entry.get("wind_bucket")
                 if h_wind_bucket is None:
+                    counters["hours_skipped_missing_keys"] += 1
                     continue
-            breakdown = log_entry.get("unit_breakdown", {})
-            # Per #885: route cooling-mode samples to the dedicated
-            # "cooling" wind-bucket, mirroring live-write semantics in
-            # _process_per_unit_learning.  Without this, retrain from a
-            # log containing cooling hours would pollute heating buckets.
-            entry_unit_modes = log_entry.get("unit_modes", {}) or {}
-            for strategy in direct_sensors:
-                sid = strategy.sensor_id
-                unit_kwh = breakdown.get(sid, 0.0)
-                if unit_kwh <= 0.0:
-                    continue
-                effective_bucket = (
-                    COOLING_WIND_BUCKET
-                    if entry_unit_modes.get(sid) == MODE_COOLING
-                    else h_wind_bucket
-                )
-                if sid not in correlation_per_unit:
-                    correlation_per_unit[sid] = {}
-                if h_temp_key not in correlation_per_unit[sid]:
-                    correlation_per_unit[sid][h_temp_key] = {}
-                cur = correlation_per_unit[sid][h_temp_key].get(effective_bucket, 0.0)
-                if cur == 0.0:
-                    if sid not in buffer_per_unit:
-                        buffer_per_unit[sid] = {}
-                    if h_temp_key not in buffer_per_unit[sid]:
-                        buffer_per_unit[sid][h_temp_key] = {}
-                    if effective_bucket not in buffer_per_unit[sid][h_temp_key]:
-                        buffer_per_unit[sid][h_temp_key][effective_bucket] = []
-                    buf = buffer_per_unit[sid][h_temp_key][effective_bucket]
-                    buf.append(unit_kwh)
-                    if len(buf) >= LEARNING_BUFFER_THRESHOLD:
-                        correlation_per_unit[sid][h_temp_key][effective_bucket] = round(
-                            sum(buf) / len(buf), 5
-                        )
-                        buf.clear()
-                else:
-                    new_val = cur + learning_rate * (unit_kwh - cur)
-                    correlation_per_unit[sid][h_temp_key][effective_bucket] = round(new_val, 5)
 
+            # ``unit_modes`` is sparse (MODE_HEATING is not logged): resolve
+            # per sensor with the heating default, never iterate the map.
+            entry_unit_modes = log_entry.get("unit_modes", {}) or {}
+            is_aux_active = bool(log_entry.get("auxiliary_active", False))
+            try:
+                avg_temp = float(log_entry.get("temp", balance_point))
+            except (TypeError, ValueError):
+                avg_temp = balance_point
+            has_reporting = isinstance(log_entry.get("units_reporting"), (list, tuple))
+            breakdown = log_entry.get("unit_breakdown")
+            # Only the legacy reading of an absent unit needs the instant.
+            entry_instant = None if has_reporting else log_entry_instant(log_entry)
+
+            # The hour's meter map as live saw it (``hourly_delta_per_unit``).
+            hourly_delta_per_unit: dict[str, float] = {}
+            for sid in replayed_sensors:
+                kwh = unit_hour_reported_kwh(
+                    log_entry, sid, first_reported, instant=entry_instant,
+                )
+                if kwh is None:
+                    continue
+                hourly_delta_per_unit[sid] = kwh
+                if (
+                    not has_reporting
+                    and isinstance(breakdown, dict)
+                    and sid not in breakdown
+                ):
+                    counters["legacy_absent_read_as_zero"] += 1
+
+            def _bucket_for(sid: str) -> str:
+                mode = entry_unit_modes.get(sid, MODE_HEATING)
+                return COOLING_WIND_BUCKET if mode == MODE_COOLING else h_wind_bucket
+
+            hour_snr_weight: list[float] = []
+
+            def _hour_snr_weight() -> float:
+                # Live counts the hour's learnable units over the sensors it
+                # learns (``hourly_sensors``), from their expected base
+                # before the hour's learning.  Under daily learning a
+                # WeightedSmear (MPC) unit is not among them.
+                if not hour_snr_weight:
+                    expected_map = {
+                        sid: _expected_unit_base(sid, h_temp_key, _bucket_for(sid), avg_temp)
+                        for sid in hourly_sensors
+                    }
+                    hour_snr_weight.append(self._per_unit_hour_snr_weight(
+                        solar_factor=log_entry.get("solar_factor", 0.0) or 0.0,
+                        solar_dominant_entities=log_entry.get("solar_dominant_entities") or [],
+                        energy_sensors=hourly_sensors,
+                        unit_modes=entry_unit_modes,
+                        expected_base_per_unit=expected_map,
+                        unit_min_base=unit_min_base,
+                        solar_calculator=solar_calculator,
+                        solar_enabled=solar_enabled,
+                    ))
+                return hour_snr_weight[0]
+
+            for sid in replayed_sensors:
+                unit_mode = entry_unit_modes.get(sid, MODE_HEATING)
+                actual_unit = per_unit_hour_actual(sid, unit_mode, hourly_delta_per_unit)
+                if actual_unit is None:
+                    if unit_mode in PER_UNIT_SKIPPED_MODES:
+                        counters["units_skipped_mode"] += 1
+                    else:
+                        counters["units_skipped_not_reporting"] += 1
+                    continue
+                if unit_learning_skip_reason(log_entry, sid, aux_affected_entities) is not None:
+                    # Only the post-aux cooldown reaches here; the
+                    # entity-independent reasons were skipped above.
+                    counters["units_skipped_post_aux_cooldown"] += 1
+                    continue
+
+                effective_bucket = _bucket_for(sid)
+                expected_unit_base = _expected_unit_base(
+                    sid, h_temp_key, effective_bucket, avg_temp
+                )
+                unit_solar_impact = 0.0
+                if solar_enabled and solar_calculator is not None:
+                    entity_screen_config = (
+                        screen_config
+                        if screen_affected_entities is None or sid in screen_affected_entities
+                        else (False, False, False)
+                    )
+                    potential = SolarCalculator.reconstruct_potential_vector(
+                        (
+                            log_entry.get("solar_vector_s", 0.0) or 0.0,
+                            log_entry.get("solar_vector_e", 0.0) or 0.0,
+                            log_entry.get("solar_vector_w", 0.0) or 0.0,
+                        ),
+                        log_entry.get("correction_percent", 100.0),
+                        entity_screen_config,
+                    )
+                    unit_coeff = solar_calculator.calculate_unit_coefficient(
+                        sid, h_temp_key, unit_mode
+                    )
+                    unit_solar_impact = solar_calculator.calculate_unit_solar_impact(
+                        potential, unit_coeff
+                    )
+
+                route = self._learn_unit_base_or_aux(
+                    sid, h_temp_key, effective_bucket, unit_mode,
+                    actual_unit, expected_unit_base, unit_solar_impact,
+                    is_aux_active=is_aux_active,
+                    aux_affected_entities=aux_affected_entities,
+                    solar_enabled=solar_enabled,
+                    learning_rate=learning_rate,
+                    snr_weight=_hour_snr_weight,
+                    learning_buffer_per_unit=buffer_per_unit,
+                    correlation_data_per_unit=correlation_per_unit,
+                    observation_counts=observation_counts,
+                    aux_coefficients_per_unit=aux_per_unit,
+                    learning_buffer_aux_per_unit=aux_buffer_per_unit,
+                    learn_aux=replay_aux,
+                )
+                if route == "base":
+                    counters["units_learned_base"] += 1
+                    if actual_unit == 0.0:
+                        counters["units_learned_base_zero_kwh"] += 1
+                elif route == "aux":
+                    counters["units_learned_aux"] += 1
+                elif route == "aux_not_learned":
+                    counters["units_skipped_aux_not_replayed"] += 1
+                else:
+                    counters["units_skipped_dhw_during_aux"] += 1
+
+        result: dict = {"entries_processed": len(day_entries), **counters}
         if target_entity is None:
-            return None
+            return result
 
         # Build diff diagnostic for the targeted entity.
         sid = target_entity
@@ -3472,9 +3797,9 @@ class LearningManager:
             for key, b, a, d in capped
         }
         return {
+            **result,
             "diff_summary": diff_summary,
             "buckets_changed": len(diffs),
-            "entries_processed": len(day_entries),
         }
 
     # -------------------------------------------------------------------------
@@ -3597,6 +3922,7 @@ class LearningManager:
         solar_affected_entities: frozenset[str] | None = None,
         wind_threshold: float | None = None,
         extreme_wind_threshold: float | None = None,
+        first_reported: dict | None = None,
     ):
         """Re-run NLMS solar coefficient learning over historical entries.
 
@@ -3630,7 +3956,6 @@ class LearningManager:
         expected to have qualifying hours).
         """
         from .observation import DirectMeter, WeightedSmear
-        aux_set = set(aux_affected_entities or [])
         strategies = unit_strategies or {}
         # ``daily_history`` retained in signature for call-site stability;
         # no longer consumed because WeightedSmear sensors are skipped
@@ -3649,10 +3974,16 @@ class LearningManager:
             "entry_skipped_low_magnitude": 0,
             "entry_skipped_missing_temp_key": 0,
             "unit_skipped_aux_list": 0,
+            # Post-aux cooldown, aux-affected units only (live freezes
+            # just those; the rest keep learning).
+            "unit_skipped_post_aux_cooldown": 0,
             "unit_skipped_shutdown": 0,
             "unit_skipped_excluded_mode": 0,
             "unit_skipped_weighted_smear": 0,  # MPC-managed; no coherent solar signal
             "unit_skipped_below_threshold": 0,
+            # The unit's sensor did not report that hour
+            # (``helpers.unit_hour_reported_kwh``): live skipped the unit.
+            "unit_skipped_not_reporting": 0,
             "inequality_updates": 0,            # #865
             "inequality_non_binding": 0,        # constraint satisfied, no update
             "inequality_skipped_low_battery": 0,  # battery not yet populated
@@ -3670,6 +4001,13 @@ class LearningManager:
         battery_e = 0.0
         battery_w = 0.0
         battery_decay = SOLAR_BATTERY_DECAY
+
+        # Anchor for the legacy reading of a unit absent from an entry
+        # logged before ``units_reporting`` (see
+        # ``helpers.unit_hour_reported_kwh``).  Callers with the whole log
+        # pass it; otherwise the entries replayed stand in.
+        if first_reported is None:
+            first_reported = first_reported_instants(entries)
 
         for entry in entries:
             diag["entries_considered"] += 1
@@ -3690,17 +4028,21 @@ class LearningManager:
             if entry.get("auxiliary_active", False):
                 diag["entry_skipped_aux"] += 1
                 continue
-            # Match live ``_is_poisoned`` semantics (coordinator.py:922-930):
-            # all three statuses must be skipped for solar NLMS replay or the
-            # retrain produces a coefficient grounded in user-disabled or
-            # data-poisoned hours that live learning would never have seen.
-            # Counters are split so post-retrain diagnostics distinguish a
-            # user-toggle ("disabled") from a data-quality skip ("poisoned").
-            status = entry.get("learning_status", "unknown")
-            if status == "disabled":
+            # Replay the hours live per-unit learning used, no more and no
+            # fewer (``helpers.unit_learning_skip_reason``, shared with the
+            # offline fits).  Statuses under which per-unit learning ran for
+            # no unit are skipped here; post-aux cooldown freezes only the
+            # aux-affected units and is decided per entity below.  Not a
+            # ``startswith("skipped_")`` prefix: ``skipped_global_saturation``
+            # skips only the global base write, per-unit NLMS still learns
+            # from those (solar-clipped) hours.  Counters are split so
+            # post-retrain diagnostics distinguish a user-toggle
+            # ("disabled") from a data-quality skip ("poisoned").
+            hour_skip = hour_learning_skip_reason(entry)
+            if hour_skip == "learning_disabled":
                 diag["entry_skipped_disabled"] += 1
                 continue
-            if status.startswith("skipped_") or status == "cooldown_post_aux":
+            if hour_skip is not None:
                 diag["entry_skipped_poisoned"] += 1
                 continue
 
@@ -3730,7 +4072,6 @@ class LearningManager:
             else:
                 wind_bucket = entry.get("wind_bucket", "normal")
             unit_modes = entry.get("unit_modes", {}) or {}
-            unit_breakdown = entry.get("unit_breakdown", {}) or {}
             shutdown_entities = set(entry.get("solar_dominant_entities", []) or [])
             avg_temp = entry.get("temp", 0.0) or 0.0
 
@@ -3744,18 +4085,32 @@ class LearningManager:
                 ):
                     continue
                 # aux_affected_entities is NOT a solar-NLMS exclusion list.
-                # Live learning only uses it for cooldown-path aux coefficient
-                # handling (learning.py:_process_per_unit_learning lines
-                # 446-451 and 551-556).  Hours where aux itself was active
-                # are already filtered at the entry level via
-                # auxiliary_active.  Historical bug: an earlier version of
-                # this replay skipped entity_id in aux_affected_entities
-                # unconditionally, which blocked 100 % of solar hours on
-                # installs where the config-flow default (= all energy
-                # sensors) had left aux_affected_entities == energy_sensors.
-                # The counter below is retained (always 0 post-fix) so
-                # regressions that reintroduce the bug are immediately
-                # visible in diagnostics.
+                # Live learning uses it only to scope the post-aux cooldown
+                # (``_process_per_unit_learning`` skips affected units while
+                # the cooldown runs), which the check below mirrors.  Hours
+                # where aux itself was active are already filtered at the
+                # entry level via auxiliary_active.  Historical bug: an
+                # earlier version of this replay skipped entity_id in
+                # aux_affected_entities unconditionally, which blocked 100 %
+                # of solar hours on installs where the config-flow default
+                # (= all energy sensors) had left aux_affected_entities ==
+                # energy_sensors.  ``unit_skipped_aux_list`` is retained
+                # (always 0 post-fix) so regressions that reintroduce the
+                # bug are immediately visible in diagnostics.
+                if unit_learning_skip_reason(
+                    entry, entity_id, aux_affected_entities
+                ) is not None:
+                    # Only cooldown reaches here: every other reason is
+                    # entity-independent and was skipped above.
+                    diag["unit_skipped_post_aux_cooldown"] += 1
+                    continue
+                # A sensor that did not report is skipped before either
+                # branch, as live skips the unit before any solar step; a
+                # reported zero hour is learned as 0.
+                actual_unit = unit_hour_reported_kwh(entry, entity_id, first_reported)
+                if actual_unit is None:
+                    diag["unit_skipped_not_reporting"] += 1
+                    continue
                 if entity_id in shutdown_entities:
                     # Inequality learning: replace the NLMS skip with an
                     # inequality update that uses the battery-filtered
@@ -3870,7 +4225,6 @@ class LearningManager:
                 if expected_unit_base < nlms_threshold:
                     diag["unit_skipped_below_threshold"] += 1
                     continue
-                actual_unit = unit_breakdown.get(entity_id, 0.0)
                 # Per-entity screen routing: mirrors live learning.  Entities
                 # not in screen_affected_entities learn against the effective
                 # vector directly — no reconstruction needed because
@@ -4319,6 +4673,7 @@ class LearningManager:
         entry: dict,
         pot_tuple: tuple[float, float, float],
         unit_min_base: float,
+        actual: float | None = None,
     ) -> bool:
         """Re-run shutdown detection against current code on a logged entry.
 
@@ -4334,7 +4689,10 @@ class LearningManager:
         sequence per-entity (no need to handle multi-entity behaviour
         here since the caller is in a per-entity loop).  Reads:
 
-        - ``actual`` from ``entry["unit_breakdown"][entity]``.
+        - ``actual``: the caller's reported kWh
+          (``helpers.unit_hour_reported_kwh``, checked non-``None`` first — a
+          unit that did not report cannot be classified).  Without it,
+          ``entry["unit_breakdown"][entity]`` with absent read as 0.
         - ``base`` from ``entry["unit_expected_breakdown"][entity]``;
           falls back to ``unit_min_base × 2`` × ratio-floor as a
           conservative "in-range" estimate when the field is missing
@@ -4370,7 +4728,8 @@ class LearningManager:
         magnitude = (pot_tuple[0] ** 2 + pot_tuple[1] ** 2 + pot_tuple[2] ** 2) ** 0.5
         if magnitude < SOLAR_SHUTDOWN_MIN_MAGNITUDE:
             return False
-        actual = (entry.get("unit_breakdown", {}) or {}).get(entity_id, 0.0)
+        if actual is None:
+            actual = (entry.get("unit_breakdown", {}) or {}).get(entity_id, 0.0)
         base_raw = (entry.get("unit_expected_breakdown") or {}).get(entity_id)
         if base_raw is None:
             # Legacy log without unit_expected_breakdown.  Fall back to
@@ -4403,6 +4762,7 @@ class LearningManager:
         match_diagnose: bool = False,
         for_tobit: bool = False,
         solar_coefficients_per_unit: dict | None = None,
+        first_reported: dict | None = None,
     ) -> tuple[list[tuple[float, float, float, float]], list[bool], dict[str, int]]:
         """Filter + assemble samples for one (entity, regime) batch fit.
 
@@ -4461,6 +4821,15 @@ class LearningManager:
         Without this flag, the default filters apply (used by
         ``batch_fit_solar_coefficients``).
 
+        Hours live learning skipped for this entity — 20–80 % aux,
+        dual interference, post-aux cooldown, learning off — are dropped
+        under their own ``drop_counts`` key (``unit_learning_skip_reason``),
+        in both modes, so the fit and the diagnose number it reproduces
+        see the hours NLMS itself used.  So are hours the unit's sensor did
+        not report (``not_reporting``, ``helpers.unit_hour_reported_kwh``):
+        live skipped the unit, and reading them as 0 kWh would enter each
+        as a saturated row — sun that shut the unit down.
+
         Mode filter mirrors live ``_process_per_unit_learning``: only
         ``MODE_HEATING`` and ``MODE_COOLING`` produce solar-learning
         samples.  OFF / DHW / both guest modes are excluded — guest
@@ -4480,12 +4849,17 @@ class LearningManager:
             "below_min_base": 0,
             "non_positive_impact": 0,
             "saturated": 0,
+            "not_reporting": 0,
+            **{reason: 0 for reason in UNIT_LEARNING_SKIP_REASONS},
         }
         if for_tobit:
             drop_counts["censored"] = 0
             drop_counts["outlier"] = 0
         target_mode = MODE_HEATING if regime == "heating" else MODE_COOLING
         correlation_per_unit = coordinator.model.correlation_data_per_unit
+        aux_affected = aux_affected_entities_of(coordinator)
+        if first_reported is None:
+            first_reported = log_first_reported(coordinator, hourly_log, [entity_id])
 
         # Pre-fit MAD pass (#919 Part 1): collect all candidates first,
         # then filter by robust residual.
@@ -4511,6 +4885,22 @@ class LearningManager:
                 drop_counts["auxiliary_active"] += 1
                 continue
 
+            # Hours live learning skipped for this entity (20–80 % aux,
+            # dual interference, post-aux cooldown, learning off) —
+            # the fit calibrates against the hours NLMS itself used.
+            skip_reason = unit_learning_skip_reason(entry, entity_id, aux_affected)
+            if skip_reason is not None:
+                drop_counts[skip_reason] += 1
+                continue
+
+            # Before the shutdown reclassification: a sensor that did not
+            # report reads as 0 kWh there and would be kept as a censored
+            # shutdown row.
+            actual = unit_hour_reported_kwh(entry, entity_id, first_reported)
+            if actual is None:
+                drop_counts["not_reporting"] += 1
+                continue
+
             if for_tobit:
                 # Shutdown rows under Tobit: do NOT drop.  ``actual = 0``
                 # gives ``actual_impact = base``, which naturally clears
@@ -4530,6 +4920,7 @@ class LearningManager:
                     entry=entry,
                     pot_tuple=(pot_s, pot_e, pot_w),
                     unit_min_base=unit_threshold,
+                    actual=actual,
                 ):
                     drop_counts["shutdown_kept_censored"] = (
                         drop_counts.get("shutdown_kept_censored", 0) + 1
@@ -4594,7 +4985,6 @@ class LearningManager:
                     drop_counts["below_min_base"] += 1
                     continue
 
-            actual = (entry.get("unit_breakdown", {}) or {}).get(entity_id, 0.0)
             if regime == "heating":
                 actual_impact = expected_base - actual
             else:
@@ -5241,6 +5631,7 @@ class LearningManager:
         hourly_log: list[dict],
         coordinator,
         screen_affected_entities: frozenset[str] | None,
+        first_reported: dict | None = None,
     ) -> tuple[list[tuple[float, float, float, float, float]], list[bool], dict[str, int]]:
         """Collect 4D Tobit samples from the hourly log (#954).
 
@@ -5261,7 +5652,8 @@ class LearningManager:
                ``sum(potential_4d) < 0.01`` (matches f41ffd8 live-NLMS
                gate).
 
-        Gate filters (same as 3D): modulating regime, no aux, not
+        Gate filters (same as 3D): modulating regime, no aux, not an
+        hour live learning skipped (``unit_learning_skip_reason``), not
         shutdown, ``expected_unit_base > 0``, ``actual_impact > 0``.
         Saturated rows kept as right-censored with
         ``value = BATCH_FIT_SATURATION_RATIO × base``; unsaturated
@@ -5288,9 +5680,14 @@ class LearningManager:
             "below_min_base": 0,
             "non_positive_impact": 0,
             "censored": 0,
+            "not_reporting": 0,
+            **{reason: 0 for reason in UNIT_LEARNING_SKIP_REASONS},
         }
         target_mode = MODE_HEATING if regime == "heating" else MODE_COOLING
         correlation_per_unit = coordinator.model.correlation_data_per_unit
+        aux_affected = aux_affected_entities_of(coordinator)
+        if first_reported is None:
+            first_reported = log_first_reported(coordinator, hourly_log, [entity_id])
 
         scr_fn = getattr(coordinator, "screen_config_for_entity", None)
         if scr_fn is not None:
@@ -5309,6 +5706,16 @@ class LearningManager:
                 continue
             if entry.get("auxiliary_active", False):
                 drop_counts["auxiliary_active"] += 1
+                continue
+            # Same live-learning skip as the 3D collector.
+            skip_reason = unit_learning_skip_reason(entry, entity_id, aux_affected)
+            if skip_reason is not None:
+                drop_counts[skip_reason] += 1
+                continue
+            # A sensor that did not report is skipped, as live skips it.
+            actual = unit_hour_reported_kwh(entry, entity_id, first_reported)
+            if actual is None:
+                drop_counts["not_reporting"] += 1
                 continue
             # Shutdown rows under 4D Tobit: do NOT drop.  Same rationale
             # as the 3D collector — actual = 0 gives actual_impact = base,
@@ -5399,7 +5806,6 @@ class LearningManager:
                 drop_counts["below_min_base"] += 1
                 continue
 
-            actual = (entry.get("unit_breakdown", {}) or {}).get(entity_id, 0.0)
             if regime == "heating":
                 actual_impact = expected_base - actual
             else:
@@ -5783,6 +6189,7 @@ class LearningManager:
                     },
                     "<other_entity_id>": {...},
                     "n_skipped_cooling_unlearned": int,
+                    "n_skipped_learning_status": {reason: int},
                     "dry_run": bool,
                 }
         """
@@ -5851,6 +6258,14 @@ class LearningManager:
             for eid in candidate_entities
         }
         n_skipped_cooling_unlearned = 0
+        # Entity-hours live learning skipped (#1087), per discard reason,
+        # plus the hours the unit's sensor did not report.
+        aux_affected = aux_affected_entities_of(coordinator)
+        n_skipped_learning_status = {
+            reason: 0 for reason in UNIT_LEARNING_SKIP_REASONS
+        }
+        n_skipped_learning_status["not_reporting"] = 0
+        first_reported = log_first_reported(coordinator, hourly_log, candidate_entities)
 
         if solar is None:
             return {
@@ -5862,6 +6277,7 @@ class LearningManager:
                 for eid in candidate_entities
             } | {
                 "n_skipped_cooling_unlearned": 0,
+                "n_skipped_learning_status": n_skipped_learning_status,
                 "dry_run": dry_run,
                 "suggested_gates": [],
             }
@@ -5889,7 +6305,6 @@ class LearningManager:
             cos_elev = math.cos(elev_rad)
             dni_horiz = max(0.0, dni_v) * cos_elev
 
-            unit_breakdown = entry.get("unit_breakdown", {}) or {}
             # Per-entity baseline is recalculated from the current per-unit
             # base model (#1005) — single canonical source independent of
             # which integration version wrote the log entry.  The logged
@@ -5903,7 +6318,21 @@ class LearningManager:
                 entry_temp = balance_point
 
             for eid in candidate_entities:
-                if eid not in unit_breakdown:
+                # Reported hours only — a reported 0 kWh hour included.
+                # Presence in ``unit_breakdown`` (kWh > 0) used to decide,
+                # which dropped exactly the cleanest shutdown hours (unit
+                # fully off): their elevations never became constraints.
+                actual = unit_hour_reported_kwh(entry, eid, first_reported)
+                if actual is None:
+                    n_skipped_learning_status["not_reporting"] += 1
+                    continue
+
+                # Before the shutdown branch too: a 20–80 % aux hour
+                # lowers ``actual`` independently of the sun, so its
+                # shutdown flag is no evidence of unobstructed sun.
+                skip_reason = unit_learning_skip_reason(entry, eid, aux_affected)
+                if skip_reason is not None:
+                    n_skipped_learning_status[skip_reason] += 1
                     continue
 
                 unit_mode = unit_modes.get(eid, MODE_HEATING)
@@ -5984,7 +6413,6 @@ class LearningManager:
                         expected_base = 0.0
                 if expected_base <= 0.0:
                     continue
-                actual = float(unit_breakdown.get(eid, 0.0) or 0.0)
 
                 if regime == "heating":
                     actual_impact = expected_base - actual
@@ -6160,6 +6588,7 @@ class LearningManager:
         result: dict = {
             "dry_run": dry_run,
             "n_skipped_cooling_unlearned": n_skipped_cooling_unlearned,
+            "n_skipped_learning_status": n_skipped_learning_status,
         }
         # #1020: ``suggested_gates`` is the authoritative output for
         # the handler — auto-write was removed, so the handler builds

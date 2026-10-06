@@ -46,6 +46,9 @@ class HeatingAnalyticsModeSelect(CoordinatorEntity, SelectEntity):
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
     _attr_icon = "mdi:hvac"
+    # The classification evidence changes weekly at most; keep it out of
+    # the recorder all the same.
+    _unrecorded_attributes = frozenset({"heat_source_evidence"})
 
     def __init__(self, coordinator: HeatingDataCoordinator, source_entity_id: str) -> None:
         """Initialize the select entity."""
@@ -77,6 +80,18 @@ class HeatingAnalyticsModeSelect(CoordinatorEntity, SelectEntity):
             "identifiers": {(DOMAIN, self.coordinator.entry.entry_id)},
             "name": self.coordinator.entry.title,
             "manufacturer": "Heating Analytics",
+        }
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """The unit's heat-source type, where it came from, and the evidence."""
+        info = self.coordinator.heat_source_for(self._source_entity_id)
+        return {
+            "heat_source": info["type"],
+            "heat_source_provenance": info["provenance"],
+            "heat_source_inferred": info["inferred"],
+            "heat_source_classified_at": info["classified_at"],
+            "heat_source_evidence": info["evidence"],
         }
 
     @property

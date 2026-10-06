@@ -11,7 +11,9 @@ graph TD
     Sensors[HA Sensors] --> Coordinator
     Weather[Weather Providers] --> Coordinator
 
-    Coordinator[HeatingDataCoordinator] --> Collector[ObservationCollector]
+    Coordinator[HeatingDataCoordinator] --> Hourly[HourlyProcessor]
+    Coordinator --> Daily[DailyProcessor]
+    Coordinator --> Collector[ObservationCollector]
     Collector -- "HourlyObservation" --> Learning[LearningManager]
     Coordinator -- "ModelState" --> Statistics[StatisticsManager]
     Coordinator -- "ModelState" --> Forecast[ForecastManager]
@@ -23,10 +25,9 @@ graph TD
 
     subgraph "Core Logic"
     Statistics -- "Thermodynamics" --> Model[Global Energy Model]
-    Learning -- "Hourly EMA" --> Model
+    Learning -- "Hourly EMA / NLMS / Tobit" --> Model
     Learning -- "Daily Strategies" --> Model
-    Solar -- "Corrections" --> Model
-    Strategies -- "Daily Learning" --> Model
+    Solar -- "3D / 4D potential" --> Model
     end
 ```
 
@@ -34,9 +35,9 @@ graph TD
 
 The observation → learning pipeline communicates through explicit typed contracts:
 
-*   **`HourlyObservation`** (frozen dataclass): Immutable snapshot of one completed hour — weather averages, energy totals, per-unit breakdowns, aux/solar state. Produced by `ObservationCollector` at each hour boundary.
-*   **`ModelState`** (dataclass): Reference-based view of the learned model — correlation tables, aux/solar coefficients, learning buffers. Consumers read via `coordinator.model`; only the learning layer mutates the underlying dicts.
-*   **`LearningConfig`** (frozen dataclass): Per-hour learning settings — rates, eligibility flags, service dependencies.
+*   **`HourlyObservation`** (frozen dataclass): Immutable snapshot of one completed hour — weather averages, energy totals, per-unit breakdowns, aux/solar state, and the irradiance averages the 4D solar model uses (`dni_avg`, `dhi_avg`, `ghi_avg`, `cloud_avg`). Produced by `ObservationCollector` at each hour boundary.
+*   **`ModelState`** (dataclass): Reference-based view of the learned model — correlation tables, aux/solar coefficients, learning buffers, the Tobit live learner's running statistics. Consumers read via `coordinator.model`; only the learning layer mutates the underlying dicts.
+*   **`LearningConfig`** (frozen dataclass): Per-hour learning settings — rates, eligibility flags, service dependencies, the Tobit live-learner scope and the 4D-primary read-path flag.
 *   **`LearningStrategy`** (protocol): Per-unit strategy for daily learning with two implementations: `DirectMeter` (actual per-hour kWh) and `WeightedSmear` (COP-corrected synthetic baseline from Track C). Both implementations perform mode filtering (#789): units in `MODES_EXCLUDED_FROM_GLOBAL_LEARNING` (OFF, DHW, Guest) return `None` for that hour. Cooling participates in the global model with correct solar normalization (#801).
 *   **`CopParams`** (TypedDict in `thermodynamics.py`): MPC COP model parameters — `eta_carnot` and `lwt` (required), `f_defrost`, `defrost_temp_threshold`, `defrost_rh_threshold` (optional with defaults).
 
@@ -44,8 +45,9 @@ The observation → learning pipeline communicates through explicit typed contra
 
 1.  **HeatingDataCoordinator (`coordinator.py`):**
     *   **Role:** The Central Nervous System.
-    *   **Duty:** Orchestrates the 1-minute update loop, dispatches data to managers, and exposes learned model state via the `coordinator.model` property (backed by `ModelState` with live references).
+    *   **Duty:** Orchestrates the 1-minute update loop, dispatches data to managers, and exposes learned model state via the `coordinator.model` property (backed by `ModelState` with live references). Hour-boundary processing is delegated to `HourlyProcessor` (`hourly_processor.py`: closing the hour, gap fills, solar battery updates, building the `HourlyObservation`, the hourly log entry) and midnight processing to `DailyProcessor` (`daily_processor.py`: daily aggregation, Track B / C dispatch, backfill).
     *   **Key Behavior:** Handles "Smart Merging" of data gaps (e.g., if HA restarts) using persisted snapshots.
+    *   **Other engines:** `RetrainEngine` (`retrain.py`, replay and dry run), `balance_point.py` (`calibrate_balance_point`), `heat_source.py` (heat-source type per unit), `diagnostics.py` (`diagnose_model` / `diagnose_solar`), `repairs.py` (the irradiance-outage repair).
 
 2.  **ObservationCollector (`observation.py`):**
     *   **Role:** The Scribe.
@@ -66,15 +68,15 @@ The observation → learning pipeline communicates through explicit typed contra
     *   **Role:** The Student.
     *   **Duty:** Updates the energy model based on observed performance.
     *   **Interface:** `process_learning(obs: HourlyObservation, model: ModelState, config: LearningConfig)` — three typed objects instead of ~30 loose parameters.
-    *   **Key Behavior:** Uses **Exponential Moving Average (EMA)** to gently adapt the model over time, preventing single-day anomalies from corrupting long-term stats. It also enforces **Purity Guards** (ignoring data during Guest Mode or mixed heating/cooling usage).
+    *   **Key Behavior:** Uses **Exponential Moving Average (EMA)** to gently adapt the model over time, preventing single-day anomalies from corrupting long-term stats, with each hour's step scaled by its signal-to-noise weight (see Solar Modeling). Solar coefficients are learned by NLMS, a censoring-aware Tobit estimator and a one-sided inequality learner for hours the sun shut a unit off. It also enforces **Purity Guards** (ignoring data during Guest Mode or mixed heating/cooling usage).
 
 6.  **SolarCalculator (`solar.py`):**
     *   **Role:** The Astronomer.
-    *   **Duty:** Calculates theoretical solar potential and learns the **Solar Coefficient** (how well the house captures that potential).
+    *   **Duty:** Calculates sun position, air-mass and cloud attenuation, the 3D (south / east / west) and 4D (plus diffuse) solar potential, per-direction screen transmittance and direct-beam obstruction gates, and reads each unit's **Solar Coefficient** (how well it captures that potential).
 
 7.  **StorageManager (`storage.py`):**
     *   **Role:** The Librarian.
-    *   **Duty:** Handles JSON persistence, schema migrations (e.g., HDD -> TDD), and backfilling missing metadata. Canonical write-path for all model state.
+    *   **Duty:** Handles JSON persistence, schema migrations (e.g., HDD -> TDD), backfilling missing metadata, and validation of every file path a service or the CSV log writes to (see Section 5). Canonical write-path for all model state.
     *   **Data Lifecycle:** Manages the promotion of high-resolution `hourly_log` data into aggregated `daily_history` summaries. Hourly log retention is user-configurable (90 / 180 / 365 days, default 90). Daily history grows indefinitely (~200 bytes/day) with no retention limit.
 
 ---
@@ -86,17 +88,22 @@ Unlike traditional systems that split Heating Degree Days (HDD) and Cooling Degr
 
 *   **Formula:** `TDD = |Balance_Point - Effective_Temperature| / 24`
 *   **Why:** A well-insulated house behaves symmetrically: deviation from the balance point requires energy, whether it's heating or cooling. This allows a single continuous model curve.
+*   **Stored degree-days stay at the balance point they were logged under.** Each hour's TDD is written with the balance point in force at that hour, and every `daily_history` day records the balance point its TDD was summed at (`None` when its hours were logged under more than one). After a balance-point change no reader combines a stored TDD with the new value: `helpers.daily_tdd_at_balance_point` uses the stored value while it matches and otherwise recomputes from the day's hourly temperatures. Storage v10 stamped existing days from their own evidence.
+*   **Hours are keyed on instants.** The hour boundary and every join of hourly entries compare UTC instants, never the local hour number, so the repeated hour on the autumn clock change is an hour of its own (25 entries that day). The 24-slot `hourly_vectors` fold the two passes into one slot and record it in `hourly_vectors["hours"]`, and every reader weights a slot by the clock hours it covers.
+*   **Checking the balance point:** `calibrate_balance_point` fits a change-point model to the last 365 days of daily heating energy — a flat floor above the balance point and a rising arm below it, with the day's sun (and yesterday's stored sun) shifting the balance point and a heat pump COP slope `κ` bending the arm — weighted by a fitted variance model. It suggests a new value only when several independent checks agree and never writes it; the balance point is changed in the reconfigure flow.
 
 ### B. Inertia & Effective Temperature
 Buildings do not react instantly to outside air temperature. The system calculates an **Effective Temperature** using a causal exponential-decay kernel — physically equivalent to the steady-state response of a first-order RC thermal circuit. This value is exposed via the **Thermal State Sensor** for external automations.
 
-*   **Model:** Each hour's outdoor temperature is weighted by `e^(-t/τ)`, where `t` is how many hours ago it was and `τ` (tau) is the user-configured time constant. The most recent hour always carries the highest weight; influence decays monotonically going back in time, never peaking in the middle. The kernel window is `5×τ` hours, which captures ≥ 99 % of the total weight.
+*   **Model:** Each hour's outdoor temperature is weighted by `e^(-t/τ)`, where `t` is how many hours ago it was and `τ` (tau) is the user-configured time constant. The most recent hour always carries the highest weight; influence decays monotonically going back in time, never peaking in the middle. The kernel window is `min(5×τ, 168)` hours, which captures ≥ 99 % of the total weight.
 
 *   **Default τ = 4 hours:** Suitable for a typical well-insulated residential building. The effective temperature is a blend of roughly the last 20 hours, with the past 4 hours dominating.
 
-*   **Configurable Profiles (τ values):**
-    *   **Fast (τ = 2h):** High responsiveness. Good for poorly insulated structures or lightweight construction.
-    *   **Slow (τ = 12h):** Long thermal memory (~60 h window). Good for high thermal mass (concrete, passive house).
+*   **Configurable τ:** A 1–24 h slider in the config flow. Low values (1–2 h) suit poorly insulated structures or lightweight construction; high values (12 h and up) suit high thermal mass (concrete, passive house). Installations configured with the former named profiles read `fast` as 2 h and `slow` as 12 h. `calibrate_inertia` recommends a value from the data.
+
+*   **Gaps, not age, cut the history.** Each reading takes the kernel weight of its age, and the weights used are normalised, so a missing hour drops out instead of shifting older readings forward. History stops only at a gap longer than τ (a downtime is a thermal discontinuity).
+
+*   **One axis for every path.** Live learning, prediction, forecast, retrain and the calibration services all compute the effective temperature with `helpers.weighted_inertia`, so the model is taught on the same temperature it is asked about. Until 1.3.16 live learning kept only the newest τ − 1 hours of the kernel and retrain used a flat 4-hour mean. Replays recompute each logged hour's effective temperature at the current τ; the logged value is a record of the time, not an input.
 
 *   **Design Rule:** `NEVER` use future data (forecasts) to calculate inertia for the past. This prevents data leakage in the learning model.
 
@@ -121,28 +128,29 @@ When calculating "Typical Daily Consumption" (Median) for a given temperature, t
 ### D. Solar Modeling (The Kelvin Twist)
 Standard solar integration is difficult because "1000W of sun" doesn't mean "1000W of heat" inside. The system employs a sophisticated 3-Zone Geometric Model known as the **Kelvin Twist**:
 
-1.  **Geometric Zones (scalar recommendation path):**
-    *   **Direct Zone (+/- 45°):** Full solar gain. The sun is shining directly into the windows.
-    *   **Glancing Zone (+/- 90°):** Partial gain. The sun is hitting at an oblique angle, reducing penetration.
-    *   **Backside Zone (> 90°):** Zero gain. The sun is behind the building (shadow side).
+1.  **Geometric Zones (scalar recommendation path):** Measured from the configured azimuth:
+    *   **Direct Zone (0–75°):** A cosine rescaled from full gain to 10 %. The sun is shining into the windows.
+    *   **Glancing Zone (75–90°):** 10 % (diffuse). The sun is hitting at an oblique angle.
+    *   **Backside Zone (> 90°):** 5 % (diffuse). The sun is behind the building (shadow side).
 
 2.  **Solar Saturation Logic:**
     *   **Thermodynamic Cap:** Solar gain cannot exceed the base heating demand of the house.
     *   **Prevention:** This prevents the model from calculating negative net consumption on sunny winter days, ensuring that "Free Heat" is capped at "Total Heat Needed".
 
-3.  **Decoupled Learning (Normalization):**
-    *   The Base Model continues to learn during sunny periods by using **Normalized Energy** (Actual + Estimated Solar).
-    *   **Solar Coefficient Learning:** If `Solar_Factor > 0.1`, the system specifically trains the solar coefficients to improve future normalization.
+3.  **Decoupled Learning (Signal-to-Noise Weighting):**
+    *   The base model learns the raw metered consumption, but each hour's EMA step is scaled by `w = max(0.1, 1 − 3 × solar_factor) × (share of units the sun did not shut off)`. Dark hours drive convergence and sunny hours contribute in proportion to how little the sun disturbs them, so the bucket converges to *dark-equivalent* demand — what prediction subtracts the solar impact from.
+    *   Two gated paths use the estimated solar effect: an hour where the sun clipped the whole expected demand is skipped instead of pulling the bucket down, and once a solar coefficient has been learned a bucket below the dark-equivalent target (`actual + solar effect`) is lifted toward it.
+    *   **Solar Coefficient Learning:** Sunny hours train the solar coefficients separately (see the signal paths below).
 
 4.  **3D Solar Vector Model (#832):**
     *   The sun's position is decomposed into three non-negative cardinal direction components using `max(0, ...)` basis functions — no manual azimuth input required:
         - **South**: `max(0, -cos(azimuth))` × base_intensity — positive when sun is south of E-W line
         - **East**: `max(0, sin(azimuth))` × base_intensity — positive in morning (azimuth 0–180°)
         - **West**: `max(0, -sin(azimuth))` × base_intensity — positive in afternoon (azimuth 180–360°)
-    *   Each unit learns a matching 3D coefficient vector `(Coeff_S, Coeff_E, Coeff_W)` that captures its effective window orientation empirically. All three coefficients are clamped to `>= 0` — this is a true physics invariant (each window direction can only receive solar gain, never produce negative gain).
+    *   Each unit learns a matching 3D coefficient vector `(Coeff_S, Coeff_E, Coeff_W)` that captures its effective window orientation empirically — one vector per operating regime (`heating` / `cooling`), because each absorbs its own average `1/COP`. All three coefficients are clamped to `>= 0` — this is a true physics invariant (each window direction can only receive solar gain, never produce negative gain).
     *   `Unit_Solar_Impact = Coeff_S × Pot_S + Coeff_E × Pot_E + Coeff_W × Pot_W`  (screen transmittance is implicit in the learned coefficient)
     *   East and West are **orthogonal by construction** — they have disjoint temporal support (E is zero whenever W is non-zero, and vice versa). This gives well-conditioned NLMS learning and clean cold-start least squares without cross-contamination.
-    *   Coefficients are learned against the **potential** (pre-screen) solar vector. Because the learning target (`base − actual`) inherently includes the screen effect, each direction's coefficient converges to `physical_window_coeff × avg_transmittance` for *that direction*. Per #826, screen transmittance is per-direction: a configured-screened facade ramps from `SCREEN_DIRECT_TRANSMITTANCE` (0.08, screen fabric × glass) at slider 0% up to 1.0 at slider 100%; an unscreened facade is fixed at 1.0 regardless of slider. Closing the south-facade slider therefore does not pull down the model's east-window estimate when only the south facade is screened. Pre-1.3.3 used a single global floor (0.20) which over-coupled the three directions; the legacy fallback (when no screen config is stored) now uses a composite floor of 0.30 representing the typical Nordic mix of partly-screened buildings. Windowless rooms still correctly converge to near-zero coefficients regardless of slider state.
+    *   Coefficients are learned against the **potential** (pre-screen) solar vector. Because the learning target (`base − actual`) inherently includes the screen effect, each direction's coefficient converges to `physical_window_coeff × avg_transmittance` for *that direction*. Per #826, screen transmittance is per-direction: a configured-screened facade ramps from `SCREEN_DIRECT_TRANSMITTANCE` (0.30) at slider 0% up to 1.0 at slider 100%; an unscreened facade is fixed at 1.0 regardless of slider. The 0.30 is an area-weighted composite, not the screen fabric (about 0.08): typical screened facades carry 10–30 % unscreened glass on doors and smaller windows. `screen_affected_entities` limits the screen effect to the units behind screened windows; the others see 1.0. Closing the south-facade slider therefore does not pull down the model's east-window estimate when only the south facade is screened. Pre-1.3.3 used a single global floor (0.20) which over-coupled the three directions; the legacy fallback (when no screen config is stored) now uses a composite floor of 0.30 representing the typical Nordic mix of partly-screened buildings. Windowless rooms still correctly converge to near-zero coefficients regardless of slider state.
     *   Learning uses **Normalized LMS (NLMS)** instead of standard LMS gradient descent. NLMS divides the step by the input power (`solar_s² + solar_e² + solar_w² + ε`), making convergence rate independent of the solar vector magnitude. This prevents gain-dependent instability where high-solar units oscillate while low-solar units converge. The regularization constant `ε = 0.05` naturally shrinks poorly-constrained components when their signal is weak.
     *   During cold-start (no learned coefficients yet), a 3×3 least squares solver initialises all three coefficients from the first 4 qualifying hours. A collinear fallback handles degenerate cases (e.g. all data from one half of the day). An initial scalar default is decomposed along a 180° (south) assumption until real data replaces it.
 
@@ -154,21 +162,32 @@ Standard solar integration is difficult because "1000W of sun" doesn't mean "100
     *   The original Kasten & Czeplak formula `G/G_clear = 1 − 0.75 × (N/8)^3.4` was calibrated against ground-observed oktas, not satellite-derived percentages. HA weather APIs report model/satellite cloud area fractions (0–100%) which are a related but different quantity. The exponent 3.4 produces a nearly constant bias multiplier (~1.01×) across all cloud levels when applied to API percentages, which is the critical property: a constant bias is cleanly absorbed by the per-unit coefficient, leaving the coefficient to represent window physics rather than cloud-model compensation. A lower exponent (e.g. 1.5) creates a cloud-level-dependent bias (2–39%) that forces the coefficient to track weather patterns instead of building properties.
 
 7.  **Screen Transmittance Floor:**
-    *   When solar screens are closed, a minimum transmittance floor (20%) is enforced. This captures real physics beyond window transmittance: solar radiation heats exterior walls, roof surfaces, and the ground around the building, transferring heat inward through conduction regardless of screen position. The floor keeps the prediction path responsive to solar conditions even at 0% correction.
+    *   When solar screens are closed, a screened facade keeps a transmittance of 0.30 (see item 4), and installations without a per-direction screen configuration use a composite floor of 0.30. Besides unscreened glass, this captures physics beyond window transmittance: solar radiation heats exterior walls, roof surfaces, and the ground around the building, transferring heat inward through conduction regardless of screen position. The floor keeps the prediction path responsive to solar conditions even at 0% correction.
 
 8.  **Solar Thermal Battery (EMA model):**
     *   Solar gain is modeled as an exponential moving average: `state = state × decay + solar_impact × (1 − decay)`. This is the exact discrete-time solution of Newton's law of cooling for a first-order thermal system. At steady state, the effective solar impact equals the raw solar input — no amplification. The decay parameter controls only the time constant (how quickly the building releases stored heat).
     *   The previous leaky-integrator formula (`state = state × decay + solar_impact`) amplified the solar signal by `1/(1−decay)`, violating energy conservation. At decay 0.75 this meant 4× amplification; at 0.85, 6.7×. The EMA model eliminates this.
-    *   Default decay rate is 0.80 (half-life ~3.1 hours, `log(0.5) / log(0.80) ≈ 3.106 h`), a middle ground between lightweight and heavy construction. Raised from 0.75 (half-life ~2.4 h) in v1.3.3 to better match typical Norwegian construction with concrete floor slabs. Per-installation calibration via `diagnose_solar` with `apply_battery_decay: true` is recommended.
+    *   Default decay rate is 0.50 (`SOLAR_BATTERY_DECAY`, half-life about 1 hour). Earlier releases used 0.75 and 0.80 (half-lives of about 2.4 and 3.1 hours). Per-installation calibration via `diagnose_solar` with `apply_battery_decay: true` is recommended; it writes only a value the diagnostic actually recommends.
     *   The `diagnose_solar` calibration sweep tests decay rates 0.50–0.95 against post-sunset residuals using the same EMA formula.
 
 9.  **Solar Model and COP — Deliberate Trade-off:**
     *   The solar model operates entirely in the **electrical** domain (kWh from the meter), but solar gain is a **thermal** phenomenon. The per-unit solar coefficient is therefore not a pure physical constant — it converges to `physical_window_coeff × E[1/COP]`, where the expectation is weighted by qualifying sunny hours. For a typical Norwegian installation this effective COP is ~3.8.
     *   This creates temperature-dependent prediction errors: at cold temperatures (COP=3.0) the model under-credits solar by ~21%; at mild temperatures (COP=4.3) it over-credits by ~13%. However, the base model's temperature buckets absorb the residual through EMA learning — the bucket contamination and the coefficient error cancel to first order. The residual second-order error is ~20 Wh/hour, well below measurement noise.
-    *   **Temperature-stratifying the solar coefficient was evaluated and rejected.** Most temperature buckets see only 2–10 qualifying sunny hours per year. NLMS with 3 samples is pure noise. The current design — one global coefficient + bucket absorption of the COP residual — is the correct trade-off between model complexity and data availability.
+    *   **Temperature-stratifying the solar coefficient was evaluated and rejected.** Most temperature buckets see only 2–10 qualifying sunny hours per year. NLMS with 3 samples is pure noise. The current design — one coefficient per operating regime (heating / cooling) + bucket absorption of the COP residual within it — is the correct trade-off between model complexity and data availability. Heating and cooling are split because their COPs differ systematically, not by temperature.
     *   The battery decay has a similar COP mismatch: it charges at daytime COP and discharges at evening COP. The error is ~7–21 Wh/hour (0.5–2% of hourly consumption) and is not worth correcting.
     *   The largest COP-related error (~70 Wh) occurs near the balance point on very sunny days, where the coefficient's embedded average COP triggers solar saturation slightly early. This affects ~50–100 hours/year and contributes ~5 kWh annually — negligible against a 15,000–25,000 kWh annual total.
     *   **Total annual impact of COP-blindness: ~15–20 kWh (~0.1%).** No correction is needed. For Track C installations with explicit COP parameters, the solar model could theoretically be enhanced, but the improvement does not justify the complexity.
+
+10. **Solar Coefficient Signal Paths:** Every path writes through one clamp (non-negative, capped), per (unit, regime).
+    *   **NLMS** (live): modulating-regime hours, step μ = 0.10, regularisation ε = 0.05. The high-frequency drift correction.
+    *   **Inequality learner** (live): hours where the sun shut a unit off say only that the sun covered *at least* the demand. A projected-gradient step enforces `coeff · battery_potential ≥ 0.9 × base` and can only raise a coefficient, never lower it; lowering is NLMS's job. Heating regime and screen-affected units only.
+    *   **Tobit live learner** (live, on by default since 1.3.5): a censoring-aware maximum-likelihood estimate over a sliding window, where hours the sun saturated count as a lower bound. A plausibility gate decides per unit whether it or NLMS writes.
+    *   **Cold-start least squares**: the first 4 qualifying hours per (unit, regime), 3×3 normal equations, damped by 0.75.
+    *   **Offline services:** `batch_fit_solar` (Tobit over the log, blended with the current coefficient), `apply_implied_coefficient` (writes what `diagnose_solar` implies, direction by direction, with a stability guard — for units no learner can fit, such as a Track C heat pump).
+
+11. **Direct-Beam Obstruction Gates:** A fixed overhang or neighbouring building blocks direct sun as a step function of sun elevation, which no single coefficient can reproduce. `fit_solar_obstruction` sweeps a LOW (terrain, neighbours) and a HIGH (overhang) cutoff per unit and facade over the 30-, 60- and 90-day windows and surfaces a suggestion only when it improves the fit by ≥ 30 %, lies in a plausible range (LOW 2–20°, HIGH 20–60°) and agrees across windows. Nothing is written until the user accepts it with `apply_obstruction_gate`. The gate lives in the 4D path only.
+
+12. **4D Solar Model (optional):** A fourth, diffuse component `(S, E, W, diffuse)` from direct and diffuse irradiance: a local GHI sensor (split with the Erbs model) first, then native DNI/DHI from the weather entity, then an estimate from cloud coverage. It learns in parallel with the 3D model at all times and becomes the prediction path only when the user enables it. Without real irradiance data 4D is worse than 3D, so it is never on by default and 3D stays; `diagnose_solar.four_d_readiness` reports whether the input supports it and whether its coefficients have been learned, and a repair notice asks to switch back when the irradiance data disappears.
 
 ### E. Auxiliary Heating (Dynamic Coefficients)
 For hybrid systems (Heat Pump + Fireplace/Heater), the system does not use a separate "Fireplace Mode" curve. Instead, it learns an **Auxiliary Coefficient**.
@@ -193,7 +212,7 @@ To prevent this, the system implements a **Cooldown State Machine**:
 1.  **Trigger:** `auxiliary_heating_active` transitions `True` -> `False`.
 2.  **Action:** Learning is **LOCKED** for all units in `aux_affected_entities`.
     *   *Note:* Units NOT in this list continue learning normally (Dual-Track Learning).
-3.  **Exit Conditions:**
+3.  **Exit Conditions** (after at least `COOLDOWN_MIN_HOURS`, 2h):
     *   **Time-out:** `COOLDOWN_MAX_HOURS` (6h) elapsed.
     *   **Convergence:** `Actual_Consumption / Expected_Base > COOLDOWN_CONVERGENCE_THRESHOLD` (92%). This means the heating system has "woken up" and is behaving normally again. Waiting for 95% was unnecessarily conservative for radiant heat sources that linger well beyond the active burn period.
 
@@ -203,9 +222,11 @@ When a heating unit is removed from the 'Aux Affected Entities' list (or replace
 ### F. Wind Modeling (Bucket Hierarchy)
 Wind has a non-linear effect on heating. The system segments wind conditions into three discrete buckets to learn distinct behaviors:
 
-1.  **Normal Wind:** < 5.5 m/s (Light breeze).
-2.  **High Wind:** 5.5 - 10.8 m/s (Strong breeze).
-3.  **Extreme Wind:** > 10.8 m/s (Storm conditions).
+1.  **Normal Wind:** below the high-wind threshold (default 8.0 m/s).
+2.  **High Wind:** from 8.0 m/s up to the extreme-wind threshold (default 10.8 m/s).
+3.  **Extreme Wind:** above 10.8 m/s (storm conditions).
+
+Both thresholds are configurable, and `calibrate_wind_thresholds` searches for the pair that fits the history best. Per-unit cooling samples go to a separate `cooling` bucket regardless of wind (see the Mode System below).
 
 **Fallback Hierarchy:**
 To prevent dangerous under-estimation during storms (where data might be sparse), the system enforces a hierarchy:
@@ -334,6 +355,8 @@ The critical difference from Track A is the **data source**: Track A reads the e
 
 #### Graceful Degradation
 
+The buffer is also fetched at 22:00, 23:00 and 23:55 the evening before, and the midnight sync falls back to the latest of these snapshots when the live call fails. The snapshot is not persisted: a restart between 23:55 and midnight loses it.
+
 If the `heatpump_mpc` service is unavailable at midnight (e.g. integration restart, network issue), Track C falls back to Track B's thermal mass correction for that day. This ensures learning never stalls, at the cost of one day of reduced resolution.
 
 #### Multi-Unit Installations and Per-Unit Learning
@@ -368,12 +391,33 @@ This subtraction-based approach minimises error propagation: the bulk of the pre
 
 **Edge case:** When `Σ per_unit_other > global` (transition season, low total demand), the result is clamped to zero — the MPC unit stands idle and secondary units cover all demand.
 
-### J. Thermodynamic Reconstruction
-When reconstructing historical data (e.g., for model comparison), the system prioritizes **Hourly Vectors** (see Section 5). If vectors are missing (legacy data), it performs **Thermodynamic Reconstruction**:
+#### Re-spreading on Retrain
 
-*   It recovers the **Effective Temperature** from the stored TDD value.
-*   `Temp_Effective = Balance_Point - (TDD * 24)`
-*   This ensures that even scalar historical data respects the thermodynamic conditions under which it was recorded, allowing for accurate re-simulation even if original logs are lost.
+The stored distribution carries the settings of the night it was made (balance point, inertia, wind thresholds, battery decay). `retrain_from_history` and `diagnose_model` therefore spread each stored day again at the current settings, with the same smearing code as the midnight sync, conserving the day's thermal and electrical totals. The stored distribution itself is kept unchanged as the record of what that night learned.
+
+### J. Thermodynamic Reconstruction
+When reconstructing historical data (e.g., for model comparison), the system prioritizes **Hourly Vectors** (see Section 5), weighting each slot by the clock hours it covers. If vectors are missing (legacy data), it performs **Thermodynamic Reconstruction**:
+
+*   It recovers the **Effective Temperature** from the stored TDD value, **at the balance point the day recorded** — never at the current one, and not at all for a day that mixes balance points.
+*   `Temp_Effective = Recorded_Balance_Point - (TDD * 24 / logged_hours)`, with the sign of the day's regime.
+*   This ensures that even scalar historical data respects the thermodynamic conditions under which it was recorded, allowing for accurate re-simulation even if original logs are lost. Combining a stored TDD with the *current* balance point shifted every comparison day by the change in balance point; that is the failure the recorded balance point closes.
+
+### K. Mode System & Building Thermal Regime
+*   **Unit modes:** `heating`, `cooling`, `off`, `dhw`, `guest_heating`, `guest_cooling`. `off`, `dhw` and both guest modes are excluded from the global model's learning: their energy is subtracted from the hour before it is learned.
+*   **Cooling in the global model:** Cooling hours are learned like heating hours, so each global bucket holds total building consumption and the curve is U-shaped across the balance point. One guard (the BP − 2 shield): when every active unit is cooling and the outdoor temperature is more than 2 °C below the balance point, the global write is skipped — an air conditioner left in cooling mode through winter would otherwise write standby consumption into cold heating buckets.
+*   **Per-unit cooling buckets:** A unit's cooling-mode samples go to a dedicated `cooling` wind bucket at every temperature, so cooling standby can never contaminate the unit's heating buckets, and an empty cooling bucket predicts 0 instead of falling back to heating data.
+*   **Building thermal regime (reporting only):** `heating`, `cooling`, `mixed` (neither side ≥ 80 % of the energy) or `idle`, weighted by energy, not by unit count. DHW and off units are excluded, guest units count. It is accumulated per completed hour against that hour's modes, persisted per day as `regime_heating_kwh` / `regime_cooling_kwh`, and decides the sign conventions of the explanations; `mixed` makes no directional claim.
+
+### L. Heat-Source Type per Unit
+Each unit carries a heat-source class inferred from its own `daily_history`: `reversible_heat_pump` (real heating energy on cold days and cooling energy on warm days), else `outdoor_dependent_cop` or `flat_cop` from the unit's relative COP slope `κ`, fitted with `calibrate_balance_point`'s own sweep. `flat_cop` is direct electric *or* ground source — a constant COP only rescales the heat-loss coefficient. Three checks turn an unclear case into `unknown` rather than a wrong class: the whole supported `κ` set on one side of the boundary, no fitted term at its limit, and the same curve without the coldest 20 % of days (a heat pump at its capacity limit fits as flat). A class is replaced only after two consecutive runs. The user's device type (`direct_electric`, `ground_source`, `air_to_water`, `air_to_air`), set in the config flow or with `set_heat_source_type`, always wins; the MPC-managed unit is `air_to_water`. The curve shape may come from an inferred class, but the COP *level* cannot be inferred from energy data, so a consumer that needs it may use only the user's or the MPC's type. Nothing consumes the type yet.
+
+### M. Retraining & Replay
+*   **`retrain_from_history`** replays the hourly log with the current settings: the global model (Track A hourly, Track B daily, Track C re-spread), the per-unit models and the solar coefficients. Every logged hour's effective temperature is recomputed at the current τ. It is optional — live learning adapts to a settings change on its own.
+*   **Same code as live:** the per-unit replay decides every (hour, unit) with the functions live learning calls — guest and off hours skipped, DHW learned as 0, an unreported meter skipped and a reported zero hour learned as 0, aux hours to the aux coefficient, SNR-weighted steps. A parity test runs live and replay on the same hours and requires identical state.
+*   **`reset_first`** clears the model first, so the rebuild comes from the hourly log alone; temperatures outside the retention window lose their learned values.
+*   **`dry_run`** runs the whole retrain on deep copies of the model state swapped onto the coordinator for one synchronous call, reports the change (buckets, coefficients, predictions over the last 30 days against the consumption the model learns from) and restores the live objects. The replay must stay synchronous: an `await` would let an hour boundary learn into the copies.
+*   **`retrain_unit_from_history`** rebuilds one unit's base model the same way and leaves its solar and aux coefficients alone.
+
 
 ---
 
@@ -425,6 +469,10 @@ The daily net error is the *algebraic sum* of signed hourly errors within a day 
 | `weather_mae_30d` | Same as `weather_mae_7d` over 30 days. |
 | `weather_bias_30d` | Same as `weather_bias_7d` over 30 days. |
 
+#### Week-Ahead Range
+
+The 7-day plan is snapshotted every midnight and later scored as a week sum against actual consumption. The Week Ahead Forecast's range is the 95th percentile of those week-sum errors over a trailing 90-day window, shown once 14 scorable windows exist. Scoring the week directly, instead of building it from day-ahead errors, keeps the error of days 2–7 and the correlation between days in it.
+
 **Role in blend logic:** `weather_mae` and `weather_bias` are the primary inputs used internally to rank and select the better weather source before the crossover decision is applied. They are temperature-domain metrics (°C), not energy-domain metrics, and are therefore more sensitive to systematic forecast drift than `mae_7d`. They are exposed in the attribute for transparency and diagnostics, not as end-user KPIs.
 
 ### D. Hybrid Projection ("The Funnel")
@@ -459,11 +507,12 @@ This **Hybrid Approach** is also used for multi-day period comparisons (`compare
 
 ### The Learning Loop (Hourly — Track A)
 At the top of every hour, `ObservationCollector` freezes the accumulated sensor readings into an immutable `HourlyObservation`. The coordinator then:
-1.  **Validates:** Is data complete? Is the "Guest Switch" off? Is it mixed-mode (20–80% aux)?
-2.  **Normalizes:** Removes estimated Solar and Auxiliary impact from the actual consumption to find the "Pure Thermal Base".
-3.  **Updates:** Passes `HourlyObservation`, `ModelState`, and `LearningConfig` to `LearningManager.process_learning()`, which feeds the Pure Base into the model using **EMA (Exponential Moving Average)**.
-    *   `New_Model_Value = (Old_Value * (1 - Rate)) + (New_Observation * Rate)`
-    *   **Rate:** Typically 0.01 (1%). This makes the model "sticky" and resistant to outliers.
+1.  **Validates:** Is data complete? Is it mixed-mode (20–80% aux)? Is the post-aux cooldown active for this unit?
+2.  **Filters:** Subtracts the energy of units in OFF, DHW or guest mode; the model does not predict it. Auxiliary hours (≥ 80 % aux) teach the aux coefficient instead of the base.
+3.  **Updates:** Passes `HourlyObservation`, `ModelState`, and `LearningConfig` to `LearningManager.process_learning()`, which feeds the hour into the model using **EMA (Exponential Moving Average)**, its step scaled by the hour's signal-to-noise weight (Section 2.D.3).
+    *   `New_Model_Value = (Old_Value * (1 - Rate·w)) + (New_Observation * Rate·w)`
+    *   **Rate:** Typically 0.01 (1%). This makes the model "sticky" and resistant to outliers. Per-unit steps are additionally capped at 3 %.
+4.  **Logs:** The hour's entry in `hourly_log` records what was learned, the modes in force and which units' meters reported (`units_reporting`), so a reported zero hour can later be told apart from an offline meter.
 
 ### The Learning Loop (Daily — Track B / Track C)
 At midnight, `_process_daily_data()` assembles the full day's statistics and applies the appropriate learning path:
@@ -472,8 +521,8 @@ At midnight, `_process_daily_data()` assembles the full day's statistics and app
 
 ### Jump-Start Mechanism
 To prevent slow convergence on new installations:
-1.  **Buffering:** The system buffers the first 4 samples for any new Temperature/Wind bucket. (For Solar Coefficients, observations are pooled globally across all temperatures rather than partitioned by bucket to prevent stalling).
-2.  **Injection:** Once the buffer is full, it calculates the average and "Jump Starts" the model value directly to this average, bypassing the slow EMA warmup. For solar coefficients, a 2×2 least-squares fit is used to initialise both south and east components from the buffered observations.
+1.  **Buffering:** The system buffers the first 4 samples for any new Temperature/Wind bucket. (For Solar Coefficients, observations are pooled across all temperatures per unit and regime rather than partitioned by bucket to prevent stalling).
+2.  **Injection:** Once the buffer is full, it calculates the average and "Jump Starts" the model value directly to this average, bypassing the slow EMA warmup. For solar coefficients, a 3×3 least-squares fit initialises the south, east and west components from the buffered observations (the optional 4D model uses 5 samples and a 4×4 fit).
 3.  **Damping:** Initial jump-start estimates for solar coefficients are mathematically dampened by 25% (`COLD_START_SOLAR_DAMPING = 0.75`) to guard against early-learning noise inflating outliers.
 4.  **Post-jump-start:** Solar coefficients transition to NLMS adaptive learning. Base model and auxiliary coefficients continue with standard EMA.
 5.  **Result:** Useable predictions appear within hours, not weeks.
@@ -533,7 +582,7 @@ If `is_aux_active` and `unit_mode == MODE_DHW` are simultaneously true, aux-coef
 ### Guest Mode & Purity Guards
 The "Guest Mode" is a critical feature for model integrity.
 *   **Problem:** Guests crank the heat to 25°C, ruining the "Normal" model for the homeowner (21°C).
-*   **Solution:** When Guest Mode is active, the system **stops learning**. It tracks usage for billing/stats ("Guest Impact"), but the underlying thermodynamic model remains untouched.
+*   **Solution:** A unit in Guest Mode is **not learned**: its own model skips the hour, and its energy is subtracted before the whole-house model learns. It tracks usage for billing/stats ("Guest Impact"), but the underlying thermodynamic model remains untouched.
 
 ### Seamless Rolling Efficiency
 To avoid the "Midnight Jump" (where efficiency `kWh/TDD` goes to infinity because TDD is 0), the system uses a dynamic window.
@@ -549,6 +598,10 @@ To protect the user's hardware (specifically SD cards on Raspberry Pi), the inte
 1.  **Buffer First:** High-frequency sensor data is aggregated in memory (RAM).
 2.  **Hourly Flush:** Data is written to disk (`.storage/heating_analytics`) only **once per hour**, or immediately upon system shutdown/restart.
 3.  **Crash Recovery:** In the event of a power loss or ungraceful shutdown (where RAM buffer is lost), the **Gap Handling Logic** uses cumulative sensor counters to mathematically reconstruct the total consumption during the downtime.
+
+### Path Validation
+
+Every file path a service is given (`backup_data`, `restore_data`, `export_to_csv`, `import_from_csv`) and the CSV auto-logging paths go through `StorageManager._validate_external_path`: the path must resolve inside the Home Assistant config directory or a directory in `allowlist_external_dirs`, and the config directory's `.storage` folder is refused.
 
 ### Retention Policy
 
@@ -572,6 +625,15 @@ Current chain:
 |------|----|----------|------|
 | 1 | 2 | (retroactive) | `solar_correction_percent` support added |
 | 2 | 3 | `_migrate_pre_v3` | Bundled pre-v3 cleanup (#874): temp-stratified → flat solar coefficients; `(s, e, impact)` → `(s, e, w, impact)` solar buffer; legacy float → `{"normal": float}` aux coefficients; `with_auxiliary_heating` bucket removal across 4 structures; `with_auxiliary_heating` → `aux_coefficients` translation; `hdd` → `tdd` rename; `load` → `actual_kwh` rename; leaky-integrator → EMA battery scaling; forecast-history `unknown` → `primary` rename |
+| 3 | 4 | `_migrate_v3_to_v4` | Mode-stratified solar coefficients: flat `{s, e, w}` per unit becomes `{"heating": {...}, "cooling": {...}}` (cooling seeded from heating); the cold-start buffer likewise |
+| 4 | 5 | `_migrate_v4_to_v5` | Tobit live-learner state (running statistics, master flag, scope list), seeded disabled; the 1.3.5 default-on happens at load time |
+| 5 | 6 | `_migrate_v5_to_v6` | Empty 4D solar coefficient store and cold-start buffer |
+| 6 | 7 | `_migrate_v6_to_v7` | Building-level direct-beam obstruction gate, all facades `None` |
+| 7 | 8 | `_migrate_v7_to_v8` | Obstruction gate per unit; existing building-level values are dropped to force a refit |
+| 8 | 9 | `_migrate_v8_to_v9` | A LOW and a HIGH boundary per facade (a v8 value becomes the HIGH one) |
+| 9 | 10 | `_migrate_v9_to_v10` | Every `daily_history` day records the balance point its TDD was summed at, stamped from the day's own evidence |
+
+Purely additive keys whose absent value is the empty default ship without a bump (for example `units_reporting` on hourly entries, the per-unit daily heating / cooling split, the `heat_source` state).
 
 Invariant: a migration function emits canonical v-target shape directly — `async_load_data` does not compensate for legacy shapes post-migration. The load path's `isinstance(val, dict)` filters will silently drop malformed migration output, so emitting `round(savings, 3)` where a `{"normal": …}` dict is expected results in data loss (this was #874's blocker).
 
@@ -647,7 +709,7 @@ The model treats identical outdoor temperatures as thermodynamically equivalent,
 
 **Root causes:**
 
--   **Deep thermal mass lag.** Foundations, slabs, and structural elements have a thermal time constant of days to weeks, not hours. They continue acting as a heat sink (or, on the way into winter, storing heat) well after outdoor air has changed, drawing or releasing energy invisibly to the 4-hour inertia window. A concrete instance: a slab or thermostat-controlled load (e.g. a heating cable) that cooled overnight can switch on during the morning of an otherwise-mild day — before the mass core has recovered — depositing real load into a *higher*-temperature bucket that is off for most of its samples, corrupting that bucket until it re-converges.
+-   **Deep thermal mass lag.** Foundations, slabs, and structural elements have a thermal time constant of days to weeks, not hours. They continue acting as a heat sink (or, on the way into winter, storing heat) well after outdoor air has changed, drawing or releasing energy invisibly to the inertia window (hours, not days). A concrete instance: a slab or thermostat-controlled load (e.g. a heating cable) that cooled overnight can switch on during the morning of an otherwise-mild day — before the mass core has recovered — depositing real load into a *higher*-temperature bucket that is off for most of its samples, corrupting that bucket until it re-converges.
 -   **Heat pump COP history.** During a cold spell the heat pump operated in its least efficient zone (low COP, frequent defrost cycles). This accumulated thermal debt is not captured in any current model variable.
 -   **Direction-agnostic inertia model.** The exponential decay kernel (τ = 4 h by default) represents only the shallow, fast thermal mass (indoor air, wall surfaces). The same kernel is used regardless of whether temperatures are rising or falling — warming from cold and cooling from warm are treated as mirror images of the same physical process, which they are not.
 
@@ -655,16 +717,14 @@ The model treats identical outdoor temperatures as thermodynamically equivalent,
 
 **Why it is not fixed:** A correct remedy would require either a multi-day thermal state variable (e.g., an exponentially smoothed 48–72 h temperature integrator) or asymmetric inertia coefficients conditioned on the direction of thermal travel. Both introduce meaningful implementation complexity, require sufficient historical data to calibrate, and — most importantly — carry a real risk of making predictions worse in the statistically dominant case (steady-state within a regime) in order to improve them during transitions. The transitions are **not rare**: they recur at every season boundary and every significant multi-day swing, in both directions. But the resulting bias is **self-limiting** — the affected buckets re-converge to the new regime over the following weeks via ordinary EMA learning, so the standing error at any moment is bounded rather than permanent. The net materiality (per-transition magnitude × frequency, discounted by self-correction) is currently unquantified. The pragmatic decision is to accept and document this limitation rather than risk destabilising everyday accuracy; the threshold to revisit it is **a measurement showing the transition bias is material** — e.g. bucketing the `actual − predicted` residual by the sign of the trailing 48–72 h temperature trend and finding a systematic signed bias near +1 to +3 °C — not a new mechanism, since the mechanism is already understood. Declaration-first per-entity load typing (explored and rejected in issue #1024) does **not** address this: the bucket is memoryless with respect to the slow thermal state regardless of how each load is labelled.
 
-### Cooling-at-cold exclusion (1.3.3)
+### Cooling at cold temperatures
 
-Units in `MODE_COOLING` with outdoor temperature below `balance_point − 2` are excluded from per-unit base-EMA updates. This addresses the seasonal-automation pattern where a user sets cooling mode for an entire summer and the unit idles (low standby consumption) on cold nights — otherwise those idle hours would contaminate heating-dominated per-unit buckets that the same unit's heating-mode operation would later read from.
+The per-unit side is solved: since the mode-stratified per-unit buckets, a unit's cooling-mode samples go to a dedicated `cooling` bucket at every temperature, so an air conditioner idling in cooling mode on cold nights no longer writes standby consumption into the unit's heating buckets (the 1.3.3 guard that discarded those samples is gone).
 
-**Edge cases the guard does NOT cover:**
+The global model keeps one guard, the BP − 2 shield: when **every** active unit is in cooling mode and the outdoor temperature is more than 2 °C below the balance point, the hour is not written to the global buckets. Mixed hours, with any unit heating, are written normally.
 
--   **Commercial or data-center cooling at cold temperatures.** A unit actively cooling a server room at 5 °C produces real cooling demand. The guard discards this data. On residential installations this scenario is essentially absent; on commercial deployments it becomes lost signal.
--   **High balance-point installations.** With `balance_point = 20 °C` the threshold sits at 18 °C, which may be legitimate shoulder-season cooling temperature. Some real cooling signal is excluded at high BP values. The BP-relative threshold was chosen for consistency with `diagnose_solar.temperature_stratified` but does not scale perfectly across the full BP range.
--   **Mode misconfiguration.** A unit persistently set to cooling mode while the user actually needs heating has its per-unit bucket under-populated. The guard does not target this, but the effect compounds.
+**Edge cases the global guard does NOT cover:**
 
-**Why it is not fully fixed:** The proper remedy is mode-stratified per-unit base buckets — `correlation_data_per_unit[entity_id][mode][temp_key][wind_bucket]` — so cooling and heating have separate bucket tables at every temperature. That is a substantive data-structure change affecting all per-unit learning and prediction paths, requiring a storage migration and careful routing at ~6 call sites. Tracked in a dedicated issue for the 1.4.x cycle. The one-line guard in 1.3.3 covers the ~90 % of cases that matter to residential Nordic installations, which is where our validation base sits.
-
-**Global base is not guarded.** The same cooling-at-cold standby consumption also appears in `learning_energy_kwh` which feeds the global base. Measurement: on a typical residential install this contributes <1 % seasonal bias because standby consumption is 10–30 W versus heating consumption of 1.5–2.0 kWh/h. Tolerated; revisited only if field data shows it matters.
+-   **Commercial or data-center cooling at cold temperatures.** A building that only cools, actively, at 5 °C produces real cooling demand that the global model then never learns. On residential installations this scenario is essentially absent.
+-   **High balance-point installations.** With `balance_point = 20 °C` the threshold sits at 18 °C, which may be legitimate shoulder-season cooling temperature.
+-   **Standby in mixed hours.** When one unit heats while another idles in cooling mode, the idle unit's standby consumption is part of the global write. Standby is 10–30 W against 1.5–2.0 kWh/h of heating, under 1 % seasonal bias on a typical residential install; tolerated.

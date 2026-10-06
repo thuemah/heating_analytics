@@ -36,6 +36,12 @@ from .const import (
     MODE_HEATING,
     MODE_OFF,
 )
+# Module scope, not function scope: a function-level import pulled in
+# ``homeassistant.components.repairs`` on the first hour boundary — a
+# blocking import inside the event loop.  No cycle: ``repairs`` imports
+# only ``const`` from this package.
+from .repairs import async_check_dni_dhi_outage
+from .helpers import hour_start_utc
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -443,10 +449,14 @@ class HourlyProcessor:
              rec_state_avg = self.coordinator.solar_optimizer.get_recommendation_state(avg_temp, potential_factor_avg)
              self.coordinator.solar_optimizer.learn_correction_percent(rec_state_avg, elev, azimuth, actual_correction, cloud_cover=current_cloud)
 
-        # Calculate Inertia Temp for Learning (3 previous hours + this hour's average)
-        # We look at hourly_log (previous hours) + avg_temp (this hour)
-        # Use helper to ensure we don't pick up stale logs after a gap
-        inertia_temps = self.coordinator._get_recent_log_temps(current_time)
+        # Inertia temp for learning: the logged history over the whole kernel
+        # + this hour's average.  Ages are counted from the start of the hour
+        # being closed (``current_time`` is already in the next hour), and
+        # history stops at a gap longer than tau (see _get_recent_log_temps).
+        closed_hour_start = self.coordinator._collector.start_time or (
+            hour_start_utc(current_time) - timedelta(hours=1)
+        )
+        inertia_temps = self.coordinator._get_recent_log_temps(closed_hour_start)
         inertia_temps.append(avg_temp)
 
         inertia_avg = self.coordinator._calculate_weighted_inertia(inertia_temps)
@@ -821,6 +831,13 @@ class HourlyProcessor:
             is_dual_interference = (solar_impact > DUAL_INTERFERENCE_THRESHOLD) and (aux_impact_kwh > DUAL_INTERFERENCE_THRESHOLD)
             if is_dual_interference:
                 should_learn = False
+                # Per-unit too, under daily learning as under hourly (where
+                # per-unit follows ``should_learn``).  The hour is logged
+                # ``skipped_dual_interference`` either way, and replays read
+                # that label as "per-unit learning did not run"
+                # (``helpers.hour_learning_skip_reason``).
+                if should_learn_per_unit is not None:
+                    should_learn_per_unit = False
 
             # Detect Guest Mode Activity
             # If any unit is in Guest Mode, aux learning must be disabled to prevent pollution
@@ -919,11 +936,12 @@ class HourlyProcessor:
 
             # Only DirectMeter sensors participate in hourly per-unit learning;
             # WeightedSmear sensors are excluded (MPC-tainted meter data). (#776)
-            from .observation import DirectMeter
-            hourly_sensors = [
-                sid for sid, strat in self.coordinator._unit_strategies.items()
-                if isinstance(strat, DirectMeter)
-            ] if self.coordinator.daily_learning_mode else self.coordinator.energy_sensors
+            from .observation import hourly_learning_sensors
+            hourly_sensors = hourly_learning_sensors(
+                self.coordinator.energy_sensors,
+                self.coordinator._unit_strategies,
+                self.coordinator.daily_learning_mode,
+            )
 
             learning_config = LearningConfig(
                 learning_enabled=should_learn,
@@ -996,6 +1014,12 @@ class HourlyProcessor:
                 for eid, kwh in self.coordinator._hourly_delta_per_unit.items()
                 if kwh > 0
             }
+            # Units whose meter reported this hour, zero hours included.
+            # ``unit_breakdown`` drops a unit at 0 kWh, so without this a
+            # zero hour (learned as 0 by live per-unit learning) cannot be
+            # told from an offline sensor (skipped).  Read through
+            # ``helpers.unit_hour_reported_kwh``.
+            units_reporting = sorted(self.coordinator._hourly_delta_per_unit)
 
             # Prepare Unit Expected Breakdown for Log
             # This captures the true "mixed" expectation for the hour (solving "Majority Rule" contamination)
@@ -1100,6 +1124,7 @@ class HourlyProcessor:
                 "temp": round(avg_temp, 1),
                 "tdd": round(tdd_contribution, 3),
                 "unit_breakdown": unit_breakdown,
+                "units_reporting": units_reporting,
                 "unit_expected_breakdown": unit_expected_breakdown,
                 "unit_expected_base": unit_expected_base_log,
                 "temp_key": temp_key,
@@ -1196,6 +1221,22 @@ class HourlyProcessor:
                 ),
                 "solar_regime": "shutdown" if is_solar_dominant else "normal",
                 "solar_dominant_entities": list(solar_dominant_entities),
+                # Units the post-aux cooldown froze this hour, snapshotted at
+                # log time.  ``learning_status`` cannot carry this: under
+                # daily learning the hour logs ``disabled_global_only`` while
+                # per-unit learning still skips these units, and the aux
+                # scope can be reconfigured afterwards.  Offline fits read it
+                # via ``helpers.unit_learning_skip_reason``.  Present only on
+                # cooldown hours.
+                **(
+                    {"aux_cooldown_entities": sorted(
+                        eid for eid in self.coordinator.energy_sensors
+                        if self.coordinator.aux_affected_entities is None
+                        or eid in self.coordinator.aux_affected_entities
+                    )}
+                    if was_cooldown_active
+                    else {}
+                ),
                 # Balance point active when this entry was logged (#856).  BP is
                 # user-configurable via the reconfigure flow; recording it per
                 # entry lets diagnostics detect BP transitions in the analysis
@@ -1246,8 +1287,6 @@ class HourlyProcessor:
         # point is to react within a day or two of a provider dropping
         # irradiance, and skipping the freshest hour costs one hour of
         # that budget.  Never raises; see ``repairs.py``.
-        from .repairs import async_check_dni_dhi_outage
-
         async_check_dni_dhi_outage(self.coordinator.hass, self.coordinator)
 
         # Save Logic (force save on hourly boundary)

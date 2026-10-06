@@ -13,6 +13,10 @@ Architecture notes for contributors
   shown.  Do not "optimise" this to conditionally skip the step.
 - Wind *sensor* fields are behind ``_CONF_DEDICATED_WIND`` (UI-only, not
   stored).  Wind *tuning* is outside the toggle — accessible to all users.
+- The four heat-source lists (``HEAT_SOURCE_FORM_FIELDS``) are UI only:
+  ``_build_final_data`` turns them into ``CONF_HEAT_SOURCE_TYPES``
+  (``{entity: type}``), and ``_schema_advanced`` reads their defaults back
+  from it.  ``set_heat_source_type`` writes the same key.
 - Wind thresholds are only converted from display-unit to m/s when
   ``wind_from_user`` is True (form values).  ``setdefault`` values are already
   in m/s and must not be double-converted.
@@ -70,6 +74,9 @@ from homeassistant.helpers import selector
 
 from .const import (
     DOMAIN,
+    CONF_HEAT_SOURCE_TYPES,
+    HEAT_SOURCE_FORM_FIELDS,
+    HEAT_SOURCE_USER_TYPES,
     DEFAULT_NAME,
     DEFAULT_WIND_GUST_FACTOR,
     DEFAULT_BALANCE_POINT,
@@ -209,6 +216,17 @@ _FOUR_D_REASON_TEXT: dict[str, dict[str, str]] = {
         ),
     },
 }
+
+
+def _heat_source_conflict(user_input: dict) -> bool:
+    """Is a sensor in more than one heat-source list?"""
+    seen: set[str] = set()
+    for field in HEAT_SOURCE_FORM_FIELDS:
+        for eid in user_input.get(field) or []:
+            if eid in seen:
+                return True
+            seen.add(eid)
+    return False
 
 
 class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -420,6 +438,23 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if CONF_SOLAR_AFFECTED_ENTITIES not in data:
             data[CONF_SOLAR_AFFECTED_ENTITIES] = data.get("energy_sensors", [])
 
+        # Heat-source types: the form's per-type lists (UI only) become one
+        # {entity: type} map.  Without the lists in this flow the stored map
+        # is kept; either way only configured sensors keep a type.
+        if any(field in data for field in HEAT_SOURCE_FORM_FIELDS):
+            heat_source_types = {}
+            for field, heat_source_type in HEAT_SOURCE_FORM_FIELDS.items():
+                for eid in data.pop(field, None) or []:
+                    heat_source_types[eid] = heat_source_type
+        else:
+            heat_source_types = data.get(CONF_HEAT_SOURCE_TYPES) or {}
+        sensors = set(data.get("energy_sensors") or [])
+        data[CONF_HEAT_SOURCE_TYPES] = {
+            eid: heat_source_type
+            for eid, heat_source_type in heat_source_types.items()
+            if eid in sensors and heat_source_type in HEAT_SOURCE_USER_TYPES
+        }
+
         return data
 
     # ------------------------------------------------------------------ #
@@ -593,9 +628,27 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
             ),
-            # Derive dedicated-wind default from whether a wind sensor is already configured
-            vol.Optional(_CONF_DEDICATED_WIND, default=bool(g("wind_speed_sensor"))): selector.BooleanSelector(),
         })
+        # Heat-source type per unit (heat_source.py): one list of energy
+        # sensors per type the user can set.  A sensor in no list keeps the
+        # type inferred from its history.  UI only — ``_build_final_data``
+        # turns the lists into CONF_HEAT_SOURCE_TYPES, which the defaults
+        # are read back from.
+        sensors = list(self._flow_data.get("energy_sensors", []))
+        stored_types = g(CONF_HEAT_SOURCE_TYPES, {}) or {}
+        for field, heat_source_type in HEAT_SOURCE_FORM_FIELDS.items():
+            schema[vol.Optional(
+                field,
+                default=g(field, [
+                    eid for eid in sensors if stored_types.get(eid) == heat_source_type
+                ]),
+            )] = selector.EntitySelector(
+                selector.EntitySelectorConfig(include_entities=sensors, multiple=True)
+            )
+        # Derive dedicated-wind default from whether a wind sensor is already configured
+        schema[vol.Optional(_CONF_DEDICATED_WIND, default=bool(g("wind_speed_sensor")))] = (
+            selector.BooleanSelector()
+        )
         schema[vol.Optional(
             CONF_SECONDARY_WEATHER_ENTITY,
             description={"suggested_value": g(CONF_SECONDARY_WEATHER_ENTITY)},
@@ -797,6 +850,12 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_advanced(self, user_input=None) -> FlowResult:
+        if user_input is not None and _heat_source_conflict(user_input):
+            return self.async_show_form(
+                step_id="advanced",
+                data_schema=self._schema_advanced(user_input, self._flow_data),
+                errors={"base": "heat_source_conflict"},
+            )
         if user_input is not None:
             self._flow_data.update(user_input)
             self._clear_absent_entity_keys(user_input, [CONF_SECONDARY_WEATHER_ENTITY])
@@ -882,6 +941,17 @@ class HeatingAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_reconfigure_advanced(self, user_input=None) -> FlowResult:
+        if user_input is not None and _heat_source_conflict(user_input):
+            return self.async_show_form(
+                step_id="reconfigure_advanced",
+                data_schema=self._schema_advanced(
+                    user_input, self._flow_data, include_experimental_4d=True,
+                ),
+                errors={"base": "heat_source_conflict"},
+                description_placeholders={
+                    "four_d_readiness": self._four_d_readiness_placeholder(),
+                },
+            )
         if user_input is not None:
             self._flow_data.update(user_input)
             self._clear_absent_entity_keys(user_input, [CONF_SECONDARY_WEATHER_ENTITY])

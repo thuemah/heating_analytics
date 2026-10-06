@@ -108,6 +108,49 @@ class TestDailyRegimeSplit:
         assert split_total == pytest.approx(24.0)
 
 
+class TestImportedDaysCarryNoSplit:
+    """Hourly rows imported from CSV carry no per-unit breakdown.
+
+    Summing them recorded 0 / 0 on a day with real consumption — an idle
+    day, not a day without evidence — and ``calibrate_balance_point`` fitted
+    those days as zero-heating days.
+    """
+
+    @staticmethod
+    def _imported(hour: int) -> dict:
+        log = _make_log(hour, {"rad": 2.0})
+        del log["unit_breakdown"]
+        return log
+
+    def test_day_of_imported_rows_has_no_split(self):
+        proc = DailyProcessor(_make_coord())
+        result = proc.aggregate_logs([self._imported(h) for h in range(24)])
+        assert result["kwh"] == pytest.approx(48.0)
+        assert "regime_heating_kwh" not in result
+        assert "regime_cooling_kwh" not in result
+
+    def test_partly_imported_day_has_no_split(self):
+        proc = DailyProcessor(_make_coord())
+        logs = [_make_log(h, {"rad": 2.0}) for h in range(12)]
+        logs += [self._imported(h) for h in range(12, 24)]
+        assert "regime_heating_kwh" not in proc.aggregate_logs(logs)
+
+    def test_backfill_drops_a_stale_split(self):
+        coord = _make_coord()
+        coord._hourly_log = [self._imported(h) for h in range(24)]
+        coord._daily_history = {
+            "2026-05-17": {
+                "kwh": 48.0,
+                "regime_heating_kwh": 0.0,
+                "regime_cooling_kwh": 0.0,
+            },
+        }
+        DailyProcessor(coord).backfill_from_hourly()
+        day = coord._daily_history["2026-05-17"]
+        assert "regime_heating_kwh" not in day
+        assert "regime_cooling_kwh" not in day
+
+
 class TestThermalRegimeForDay:
     """coordinator.thermal_regime_for_day — unrecorded must not read as idle."""
 
@@ -155,6 +198,30 @@ class TestThermalRegimeForDay:
             },
         })
         assert coord.thermal_regime_for_day("2026-07-26") == expected
+
+    def test_split_the_breakdown_cannot_account_for_is_unrecorded(self):
+        """A day stored from imported rows before the aggregator stopped
+        writing a split: 0 / 0 against 48 kWh is no evidence, not idle."""
+        coord = self._coord({
+            "2026-07-26": {
+                "kwh": 48.0,
+                "unit_breakdown": {},
+                "regime_heating_kwh": 0.0,
+                "regime_cooling_kwh": 0.0,
+            },
+        })
+        assert coord.thermal_regime_for_day("2026-07-26") is None
+
+    def test_attributed_idle_day_stays_idle(self):
+        coord = self._coord({
+            "2026-07-26": {
+                "kwh": 3.0,
+                "unit_breakdown": {"dhw": 3.0},
+                "regime_heating_kwh": 0.0,
+                "regime_cooling_kwh": 0.0,
+            },
+        })
+        assert coord.thermal_regime_for_day("2026-07-26") == "idle"
 
     def test_partial_keys_are_treated_as_unrecorded(self):
         """Half a split is not a split."""

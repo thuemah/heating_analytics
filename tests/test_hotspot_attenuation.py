@@ -166,3 +166,23 @@ def test_just_inside_correction_boundary_fires(mock_hass):
     result = _run_with_sun(coord, elevation=45.0, correction_percent=79.999)
     bd = result["unit_breakdown"]["sensor.heater_1"]
     assert bd["raw_solar_kwh"] == pytest.approx(0.81 * 0.7)
+
+
+def test_disable_interventions_forces_gate_off(mock_hass):
+    """``disable_interventions=True`` suppresses a gate that would fire.
+
+    Used by the 4D no-irradiance fallback (#1073): that hour must be
+    computed without the 3D-only interventions the 4D path omits.
+    """
+    coord = _build_coord(mock_hass, gamma=0.3, screen_affected=True)
+    coord.solar_correction_percent = 20.0
+    coord.solar.get_approx_sun_pos = MagicMock(return_value=(45.0, 180.0))
+    result = coord.statistics._calculate_total_power_3d(
+        temp=5.0,
+        effective_wind=0.0,
+        solar_impact=0.0,
+        is_aux_active=False,
+        disable_interventions=True,
+    )
+    bd = result["unit_breakdown"]["sensor.heater_1"]
+    assert bd["raw_solar_kwh"] == pytest.approx(0.81)

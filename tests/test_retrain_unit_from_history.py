@@ -17,6 +17,7 @@ from custom_components.heating_analytics.observation import (
     ModelState,
 )
 from custom_components.heating_analytics.retrain import RetrainEngine
+from tests.helpers import bind_inertia_axis
 
 
 class _StubCoordinator:
@@ -39,6 +40,7 @@ class _StubCoordinator:
         self.wind_threshold = 8.0
         self.extreme_wind_threshold = 10.8
         self.save_calls = 0
+        bind_inertia_axis(self)
 
     def _get_wind_bucket(self, effective_wind: float) -> str:
         if effective_wind >= self.extreme_wind_threshold:
@@ -271,8 +273,23 @@ async def test_days_back_window_filters_log_by_timestamp():
 
 
 @pytest.mark.asyncio
-async def test_no_data_returns_status_when_log_empty_for_entity():
-    """Log has entries, but none have positive breakdown for the target entity."""
+async def test_no_data_returns_status_when_log_window_empty():
+    """``no_data`` only when the window holds no hours at all."""
+    entity = "sensor.unit_a"
+    coord = _StubCoordinator(energy_sensors=[entity], hourly_log=[])
+    engine = RetrainEngine(coord)
+    result = await engine.retrain_unit_from_history(
+        entity_id=entity, reset_first=False, dry_run=False,
+    )
+    assert result["status"] == "no_data"
+    assert result["entries_processed"] == 0
+    assert coord.save_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_entity_that_never_reported_learns_nothing():
+    """Hours exist, but the target never reported in them: every hour is
+    replayed and skipped as not reporting, and its model stays empty."""
     entity_a = "sensor.unit_a"
     entity_b = "sensor.unit_b"
     coord = _StubCoordinator(
@@ -285,9 +302,12 @@ async def test_no_data_returns_status_when_log_empty_for_entity():
     result = await engine.retrain_unit_from_history(
         entity_id=entity_a, reset_first=False, dry_run=False,
     )
-    assert result["status"] == "no_data"
-    assert result["entries_processed"] == 0
-    assert coord.save_calls == 0
+    assert result["status"] == "ok"
+    assert result["entries_processed"] == 1
+    assert result["buckets_modified"] == 0
+    assert result["replay"]["units_skipped_not_reporting"] == 1
+    assert entity_a not in coord._correlation_data_per_unit
+    assert entity_a not in coord._learning_buffer_per_unit
 
 
 def test_replay_per_unit_models_target_entity_isolation():

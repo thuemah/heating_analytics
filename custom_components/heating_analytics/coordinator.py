@@ -14,8 +14,17 @@ from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfSpeed
 
 from .helpers import (
+    coerce_config_float,
     convert_speed_to_ms,
+    daily_energy_is_unit_attributed,
+    finite_float,
+    first_reported_instants,
     generate_exponential_kernel,
+    hour_start_utc,
+    inertia_samples,
+    inertia_temperatures,
+    log_entry_instant,
+    weighted_inertia,
 )
 from .solar import SolarCalculator
 from .forecast import ForecastManager
@@ -35,6 +44,10 @@ from .storage import StorageManager
 from .solar_optimizer import SolarOptimizer
 from .const import (
     DOMAIN,
+    CONF_HEAT_SOURCE_TYPES,
+    HEAT_SOURCE_AUTO,
+    HEAT_SOURCE_RUN_INTERVAL_DAYS,
+    HEAT_SOURCE_USER_TYPES,
     ATTR_EFFICIENCY,
     ATTR_PREDICTED,
     ATTR_SOLAR_PREDICTED,
@@ -79,6 +92,7 @@ from .const import (
     ATTR_FORECAST_BLEND_CONFIG,
     ATTR_FORECAST_ACCURACY_BY_SOURCE,
     ATTR_FORECAST_DETAILS,
+    KEY_FORECAST_ACCURACY_INTERNAL,
     ATTR_SOLAR_POTENTIAL,
     ATTR_SOLAR_GAIN_NOW,
     ATTR_RECOMMENDATION_STATE,
@@ -86,6 +100,7 @@ from .const import (
     RECOMMENDATION_INSULATE,
     RECOMMENDATION_MITIGATE_SOLAR,
     DEFAULT_WIND_THRESHOLD,
+    DEFAULT_BALANCE_POINT,
     DEFAULT_WIND_GUST_FACTOR,
     DEFAULT_EXTREME_WIND_THRESHOLD,
     DEFAULT_WIND_UNIT,
@@ -439,10 +454,20 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             "missing_aux_data": False,
         }
         self._daily_history = {} # { "YYYY-MM-DD": { "kwh": float, "temp": float, "tdd": float } }
+        # Heat-source type per unit (heat_source.py): the last background
+        # classification run and, per unit, the inferred class with its
+        # evidence and hysteresis state, and the user's type if set.
+        self._heat_source_state: dict = {"last_run": None, "units": {}}
         self._daily_individual = {} # { entity_id: kwh_today }
         self._lifetime_individual = {} # { entity_id: kwh_lifetime }
         self._hourly_log = [] # List of dicts for hourly stats
+        # Local hour number of the last processed boundary.  Kept (and
+        # persisted) for state saved before ``_last_hour_start`` existed and
+        # for downgrades; the boundary itself is detected on the instant.
         self._last_hour_processed = None
+        # UTC instant at which the hour being accumulated started.  The hour
+        # number alone cannot see the repeated DST fall-back hour.
+        self._last_hour_start: datetime | None = None
         self._last_day_processed = None
         self._last_energy_values = {} # { entity_id: value_at_last_update }
         self._learned_u_coefficient = None
@@ -498,6 +523,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # evidence — see ghi_signal_agreement in diagnose_solar.
         self.ghi_sensor = entry.data.get("ghi_sensor")
         self.energy_sensors = entry.data.get("energy_sensors", [])
+        # The user's heat-source type per unit (config flow or
+        # set_heat_source_type); wins over the inferred class.
+        from .heat_source import user_heat_source_types
+
+        self.heat_source_user_types = user_heat_source_types(
+            entry.data.get(CONF_HEAT_SOURCE_TYPES), self.energy_sensors,
+        )
 
         # Per-unit learning strategies (#776) — must be after energy_sensors,
         # track_c_enabled, and mpc_managed_sensor are set.
@@ -585,13 +617,35 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         except (TypeError, ValueError):
             _tau_raw = 2.0
         self.solar_redistribution_tau_hours = max(0.5, min(6.0, _tau_raw))
-        self.wind_gust_factor = entry.data.get("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR)
-        self.balance_point = entry.data.get("balance_point", 17.0)
-        self.learning_rate = entry.data.get("learning_rate", 0.01)
+        # Coerced at the boundary like the scalars above: all five feed
+        # bare arithmetic with no downstream guard.  Unlike gamma / tau a
+        # malformed value is logged at ERROR rather than substituted
+        # silently — ``balance_point`` defines TDD, the cold/mild regime
+        # boundary and the BP-2 shield, so a substitution there must be
+        # visible.  Failing hard was rejected: it would stop the
+        # integration loading, with no UI path to repair ``entry.data``.
+        # No range clamp — type coercion only; the config flow owns ranges.
+        self.wind_gust_factor = coerce_config_float(
+            entry.data.get("wind_gust_factor", DEFAULT_WIND_GUST_FACTOR),
+            DEFAULT_WIND_GUST_FACTOR, "wind_gust_factor",
+        )
+        self.balance_point = coerce_config_float(
+            entry.data.get("balance_point", DEFAULT_BALANCE_POINT),
+            DEFAULT_BALANCE_POINT, "balance_point",
+        )
+        self.learning_rate = coerce_config_float(
+            entry.data.get("learning_rate", 0.01), 0.01, "learning_rate",
+        )
 
         # New Config Params
-        self.wind_threshold = entry.data.get("wind_threshold", DEFAULT_WIND_THRESHOLD)
-        self.extreme_wind_threshold = entry.data.get("extreme_wind_threshold", DEFAULT_EXTREME_WIND_THRESHOLD)
+        self.wind_threshold = coerce_config_float(
+            entry.data.get("wind_threshold", DEFAULT_WIND_THRESHOLD),
+            DEFAULT_WIND_THRESHOLD, "wind_threshold",
+        )
+        self.extreme_wind_threshold = coerce_config_float(
+            entry.data.get("extreme_wind_threshold", DEFAULT_EXTREME_WIND_THRESHOLD),
+            DEFAULT_EXTREME_WIND_THRESHOLD, "extreme_wind_threshold",
+        )
         self.wind_unit = entry.data.get(CONF_WIND_UNIT, DEFAULT_WIND_UNIT)
         self.max_energy_delta = entry.data.get("max_energy_delta", DEFAULT_MAX_ENERGY_DELTA)
         self.enable_lifetime_tracking = entry.data.get(CONF_ENABLE_LIFETIME_TRACKING, False)
@@ -650,7 +704,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             else:
                 inertia_setting = 4
 
-        # Store tau for use in gap detection (_get_inertia_parameters)
+        # Tau: the kernel's time constant, and the gap (hours) that breaks
+        # inertia history (see _get_recent_log_temps).
         self.inertia_tau = float(inertia_setting)
         # Generate weights dynamically; cap window at 5×tau (captures 99.3% of weight)
         # to avoid requesting hundreds of hours of history for large tau values.
@@ -771,6 +826,155 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         await self._async_save_data()
         self.async_set_updated_data(self.data)
 
+    # ------------------------------------------------------------------
+    # Heat-source type per unit (heat_source.py)
+    # ------------------------------------------------------------------
+
+    def heat_source_for(self, entity_id: str) -> dict:
+        """The unit's heat-source type, its provenance and the evidence.
+
+        ``type`` / ``provenance`` / ``curve`` are what consumers read
+        (``heat_source.resolve_heat_source``); ``inferred``, ``user`` and
+        ``evidence`` show how they came about.
+        """
+        from .heat_source import resolve_heat_source
+
+        unit = (self._heat_source_state.get("units") or {}).get(entity_id) or {}
+        return {
+            **resolve_heat_source(
+                self._heat_source_state, entity_id, self.mpc_managed_sensor,
+                self.heat_source_user_types,
+            ),
+            "inferred": unit.get("inferred"),
+            "user": self.heat_source_user_types.get(entity_id),
+            "classified_at": unit.get("classified_at"),
+            "pending": unit.get("pending"),
+            "evidence": unit.get("evidence"),
+        }
+
+    def _schedule_heat_source_classification(self) -> None:
+        """Start the background classification after midnight processing.
+
+        Runs only once Home Assistant is running; the run itself decides
+        whether it is due (``HEAT_SOURCE_RUN_INTERVAL_DAYS``).
+        """
+        if getattr(self.hass, "is_running", False) is not True:
+            return
+        coro = self.async_maybe_classify_heat_sources()
+        try:
+            self.hass.async_create_background_task(
+                coro, name=f"{DOMAIN} heat source classification",
+            )
+        except Exception:  # noqa: BLE001 — never break the hour boundary
+            coro.close()
+
+    async def async_maybe_classify_heat_sources(self) -> None:
+        """Run the heat-source classification when it is due."""
+        last = self._heat_source_state.get("last_run")
+        last_dt = dt_util.parse_datetime(last) if isinstance(last, str) else None
+        if last_dt is not None and dt_util.now() - last_dt < timedelta(
+            days=HEAT_SOURCE_RUN_INTERVAL_DAYS
+        ):
+            return
+        try:
+            await self.async_classify_heat_sources()
+        except Exception as err:  # noqa: BLE001 — a failed run retries next midnight
+            if self.hass.is_running:
+                _LOGGER.warning("Heat-source classification failed: %s", err)
+
+    async def async_classify_heat_sources(self) -> dict:
+        """Classify every unit's heat source now and store the result.
+
+        The fits run in an executor on a snapshot taken here; the stored
+        state is updated back on the event loop, with the hysteresis of
+        ``heat_source.apply_evidence``.  Returns each unit's evidence and
+        resulting type, and the class changes this run made.
+        """
+        from .heat_source import apply_evidence, heat_source_snapshot, unit_evidence
+
+        now = dt_util.now()
+        snapshot = heat_source_snapshot(self)
+        evidence = await self.hass.async_add_executor_job(
+            unit_evidence, self, snapshot, now.date(),
+        )
+        changes = apply_evidence(self._heat_source_state, evidence, now.isoformat())
+        self._notify_heat_source_changes(changes)
+        await self._async_save_data(force=True)
+        self.async_set_updated_data(self.data)
+        return {
+            "units": {
+                eid: {**self.heat_source_for(eid), "evidence": ev}
+                for eid, ev in evidence.items()
+            },
+            "changes": [
+                {"entity_id": eid, "from": old, "to": new} for eid, old, new in changes
+            ],
+        }
+
+    async def async_set_heat_source_type(self, entity_id: str, heat_source_type: str) -> dict:
+        """Set (or, with ``auto``, clear) the user's heat-source type.
+
+        Written to the config entry, where the config flow keeps it too, so
+        the two ways of setting it cannot disagree.  The entry has no update
+        listener, so this does not reload the integration.
+        """
+        if entity_id not in self.energy_sensors:
+            raise ValueError(f"{entity_id} is not one of this instance's energy sensors")
+        if heat_source_type != HEAT_SOURCE_AUTO and heat_source_type not in HEAT_SOURCE_USER_TYPES:
+            raise ValueError(f"Not a heat source type you can set: {heat_source_type}")
+        if heat_source_type == HEAT_SOURCE_AUTO:
+            self.heat_source_user_types.pop(entity_id, None)
+        else:
+            self.heat_source_user_types[entity_id] = heat_source_type
+        new_data = dict(self.entry.data)
+        new_data[CONF_HEAT_SOURCE_TYPES] = dict(self.heat_source_user_types)
+        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        self.async_set_updated_data(self.data)
+        return {"entity_id": entity_id, **self.heat_source_for(entity_id)}
+
+    def _notify_heat_source_changes(self, changes: list) -> None:
+        """One notification per run that classified a unit, once per class.
+
+        Units whose type the user has set are left out: the user's type
+        wins, so there is nothing to act on.
+        """
+        units = self._heat_source_state.get("units") or {}
+        lines = []
+        for eid, old, new in changes:
+            unit = units.get(eid) or {}
+            if eid in self.heat_source_user_types or unit.get("notified") == new:
+                continue
+            unit["notified"] = new
+            lines.append(f"- `{eid}`: **{new}**" + (f" (was {old})" if old else ""))
+        if not lines:
+            return
+        message = (
+            "Heating Analytics has worked out the heat source of these units "
+            "from their consumption history:\n\n"
+            + "\n".join(lines)
+            + "\n\n"
+            "- **reversible_heat_pump**: the unit both heats and cools.\n"
+            "- **outdoor_dependent_cop**: its efficiency rises with the outdoor "
+            "temperature, as an air-source heat pump's does.\n"
+            "- **flat_cop**: its efficiency does not change with the outdoor "
+            "temperature: direct electric heating or a ground-source heat pump.\n\n"
+            "The evidence is shown on each unit's Mode entity.  If a type is "
+            "wrong, set the right one in the integration's configuration "
+            "(the heat-source lists) or with the "
+            "`heating_analytics.set_heat_source_type` action."
+        )
+        try:
+            from homeassistant.components import persistent_notification
+
+            persistent_notification.async_create(
+                self.hass,
+                message,
+                title="Heating Analytics: heat source",
+                notification_id=f"{DOMAIN}_{self.entry.entry_id}_heat_source",
+            )
+        except Exception as err:  # noqa: BLE001 — the notice is best-effort
+            _LOGGER.debug("Heat-source notification failed: %s", err)
+
     def get_unit_mode(self, entity_id: str) -> str:
         """Get current mode for a unit."""
         return self._unit_modes.get(entity_id, MODE_HEATING)
@@ -825,6 +1029,10 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if not isinstance(entry, dict):
             return None
         if "regime_heating_kwh" not in entry or "regime_cooling_kwh" not in entry:
+            return None
+        if not daily_energy_is_unit_attributed(entry):
+            # Stored before the aggregator stopped writing a split for
+            # imported days: 0 / 0 against real consumption is no evidence.
             return None
         return classify_thermal_regime_from_split(
             entry.get("regime_heating_kwh") or 0.0,
@@ -1081,6 +1289,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 entries = [e for e in self._hourly_log if e.get("timestamp", "") >= cutoff_str]
             else:
                 entries = list(self._hourly_log)
+            # Same inertia axis as live learning now (see retrain).
+            entries = self._entries_on_current_axis(entries)
 
             # Per-unit filter: pass a single-element energy_sensors list so
             # replay_solar_nlms naturally skips all other units.  No change
@@ -1109,6 +1319,7 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 wind_threshold=self.wind_threshold,
                 extreme_wind_threshold=self.extreme_wind_threshold,
                 return_diagnostics=True,
+                first_reported=first_reported_instants(self._hourly_log),
             )
             _LOGGER.info(
                 f"Solar NLMS replay: {solar_replay_diagnostics.get('updates', 0)} updates "
@@ -1798,11 +2009,17 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 self.aux_affected_entities.append(new_entity_id)
                 self._aux_affected_set.add(new_entity_id)
 
+        # The user's heat-source type follows the unit.
+        if old_entity_id in self.heat_source_user_types:
+            self.heat_source_user_types[new_entity_id] = self.heat_source_user_types.pop(old_entity_id)
+
         # 2. Update Persistent Configuration (Config Entry)
         new_data = self.entry.data.copy()
         new_data["energy_sensors"] = self.energy_sensors
         if CONF_AUX_AFFECTED_ENTITIES in new_data:
             new_data[CONF_AUX_AFFECTED_ENTITIES] = self.aux_affected_entities
+        if CONF_HEAT_SOURCE_TYPES in new_data:
+            new_data[CONF_HEAT_SOURCE_TYPES] = dict(self.heat_source_user_types)
         self.hass.config_entries.async_update_entry(self.entry, data=new_data)
         _LOGGER.info(f"Config entry updated. New sensor list: {self.energy_sensors}")
 
@@ -1826,6 +2043,20 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         _migrate_key(self._learning_buffer_solar_per_unit, old_entity_id, new_entity_id) # New: Migrate unit solar buffer
         _migrate_key(self._daily_individual, old_entity_id, new_entity_id)
         _migrate_key(self._lifetime_individual, old_entity_id, new_entity_id)
+        _migrate_key(self._heat_source_state.setdefault("units", {}), old_entity_id, new_entity_id)
+        # Per-unit maps of the daily history: the heat-source classification
+        # and per-unit comparisons read the unit's days under its current id.
+        for day in self._daily_history.values():
+            if not isinstance(day, dict):
+                continue
+            for field in (
+                "unit_breakdown",
+                "unit_expected_breakdown",
+                "unit_heating_kwh",
+                "unit_cooling_kwh",
+            ):
+                if isinstance(day.get(field), dict):
+                    _migrate_key(day[field], old_entity_id, new_entity_id)
 
         # 4. Handle Last Energy Values (Baseline Reset)
         # We DELETE the old key to remove the old baseline.
@@ -1837,16 +2068,33 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             _LOGGER.info(f"Removed baseline for '{old_entity_id}'. New sensor '{new_entity_id}' will initialize baseline on next update.")
 
         # 5. Migrate Hourly Log History (Preserve Statistics)
-        # We iterate through history and rename the keys in the breakdown dicts.
+        # Every per-unit field of an entry is renamed, not just the energy
+        # breakdowns: replays and offline fits resolve the unit's mode, its
+        # reporting, shutdown and cooldown state from the same entry, and a
+        # field left on the old id silently reads as "heating, not shut
+        # down, not in cooldown, not reporting" for the new one.
+        per_unit_maps = (
+            "unit_breakdown",
+            "unit_expected_breakdown",
+            "unit_expected_base",
+            "unit_modes",
+        )
+        per_unit_lists = (
+            "units_reporting",
+            "solar_dominant_entities",
+            "aux_cooldown_entities",
+        )
         count_migrated = 0
         for entry in self._hourly_log:
-            # Unit Breakdown (Actual)
-            if "unit_breakdown" in entry:
-                _migrate_key(entry["unit_breakdown"], old_entity_id, new_entity_id)
-
-            # Unit Expected Breakdown
-            if "unit_expected_breakdown" in entry:
-                _migrate_key(entry["unit_expected_breakdown"], old_entity_id, new_entity_id)
+            for field in per_unit_maps:
+                if isinstance(entry.get(field), dict):
+                    _migrate_key(entry[field], old_entity_id, new_entity_id)
+            for field in per_unit_lists:
+                values = entry.get(field)
+                if isinstance(values, list) and old_entity_id in values:
+                    entry[field] = [
+                        new_entity_id if v == old_entity_id else v for v in values
+                    ]
 
             count_migrated += 1
 
@@ -1888,12 +2136,14 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         days_back: int | None = None,
         reset_first: bool = False,
         experimental_cop_smear: bool = False,
+        dry_run: bool = False,
     ) -> dict:
         """Delegates to :class:`retrain.RetrainEngine`."""
         return await self._retrain.retrain_from_history(
             days_back=days_back,
             reset_first=reset_first,
             experimental_cop_smear=experimental_cop_smear,
+            dry_run=dry_run,
         )
 
     async def retrain_unit_from_history(
@@ -1953,7 +2203,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         over a trailing window of daylight hours.
 
         Cheap: walks ``_hourly_log`` backwards and stops once the window
-        is full — tens of entries, not the whole log.
+        is full or the entries are older than
+        ``REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS`` — at most ~14 days of
+        entries, never the whole log.  The age bound is the one that
+        matters on a log predating ``dni_dhi_source``: unlabelled entries
+        do not fill the window, so window fill alone would not stop it.
 
         Delegates to :class:`diagnostics.DiagnosticsEngine`.
         """
@@ -2124,112 +2378,107 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
                 return str(val)
         return None
 
-    def _get_inertia_parameters(self) -> tuple[int, int]:
-        """Helper to derive requirements from weights."""
-        hours_back = len(self.inertia_weights) - 1
-        # max_gap is the stale-data cutoff (gap detection), tied to tau – not the kernel window.
-        # Logs older than tau hours are considered a thermal discontinuity and discarded.
-        max_gap = int(self.inertia_tau)
-        return hours_back, max_gap
+    def _calculate_weighted_inertia(self, temps: list) -> float:
+        """Inertia temperature of an hourly-aligned history (``helpers.weighted_inertia``).
 
-    def _calculate_weighted_inertia(self, temps: list[float]) -> float:
-        """Calculate weighted inertia temperature.
-
-        Aligns available temps (Newest -> Oldest) to weights (Newest -> Oldest).
-        Normalizes weights to 1.0 based on available samples.
+        ``temps`` runs oldest → newest, one position per clock hour, the
+        newest being the current hour; ``None`` marks an hour without a
+        reading.  Every reading is weighted by its age on the full kernel
+        and history stops at the first gap longer than tau.  Returns 0.0
+        when nothing is usable.
         """
-        if not temps:
-            return 0.0
+        value = weighted_inertia(temps, self.inertia_weights, self.inertia_tau)
+        return value if value is not None else 0.0
 
-        # Weights are defined Oldest -> Newest (Time increasing)
-        # e.g. [0.1, 0.2, 0.3, 0.4]
-        # temps list is also Oldest -> Newest (History + Current)
-        # e.g. [12, 11, 10] (H-2, H-1, Current)
+    def _get_recent_log_temps(self, hour_start: datetime) -> list:
+        """Logged temperatures before the hour holding ``hour_start``.
 
-        # We want to match Newest Temp to Newest Weight.
-        # Temp[-1] matches Weight[-1]
-        # Temp[-2] matches Weight[-2]
+        Hourly-aligned, oldest → newest: the last position is the hour just
+        before, ``None`` where an hour has no entry, so the caller appends
+        the current hour's temperature and passes the list to
+        :meth:`_calculate_weighted_inertia`.  Covers the whole kernel
+        (``len(inertia_weights) − 1`` hours) and stops at a thermal
+        discontinuity: two consecutive readings, or the current hour and the
+        newest reading, more than tau hours apart (a long downtime).  Ages
+        are counted on instants, so the repeated DST fall-back hour is an
+        hour of its own.
 
-        num_temps = len(temps)
-        num_weights = len(self.inertia_weights)
-
-        # Take the last N weights where N = num_temps
-        # But limited by num_weights (shouldn't happen if logic is correct, but safe)
-        count = min(num_temps, num_weights)
-
-        active_temps = temps[-count:]
-        active_weights = self.inertia_weights[-count:]
-
-        total_weight = sum(active_weights)
-        if total_weight == 0:
-            return sum(active_temps) / count # Fallback to simple average
-
-        weighted_sum = sum(t * w for t, w in zip(active_temps, active_weights))
-        return weighted_sum / total_weight
-
-    def _get_recent_log_temps(self, reference_time: datetime, hours_back: int | None = None, max_gap_hours: int | None = None) -> list[float]:
-        """Get recent temperatures from log, ensuring no thermodynamic discontinuity.
-
-        Args:
-            reference_time: The point in time to look backwards from.
-            hours_back: Number of past hourly samples to retrieve (target). Defaults to the
-                        active inertia kernel length (derived from CONF_THERMAL_INERTIA via
-                        generate_exponential_kernel; capped at 5×tau hours).
-            max_gap_hours: Maximum allowable age of a log sample. If older, it's ignored.
-                           This protects against using data from before a long downtime.
-                           Defaults to the configured inertia tau (in hours).
+        Tau is a gap threshold, not an age cutoff — applied to every hour it
+        used to cap live history at tau − 1 samples of a 5·tau kernel.
         """
-        def_hours, def_gap = self._get_inertia_parameters()
-
-        if hours_back is None:
-            hours_back = def_hours
-        if max_gap_hours is None:
-            max_gap_hours = def_gap
-
-        temps = []
-        if not self._hourly_log:
-            return temps
-
-        # Calculate threshold: Logs older than max_gap_hours should be ignored
-        cutoff_time = reference_time - timedelta(hours=max_gap_hours)
-
-        # Filter FIRST: Select all logs that are recent (within tolerance)
-        valid_logs = []
-        # Optimization: Iterate backwards as logs are sorted by time (newest last)
+        window = len(self.inertia_weights)
+        if window < 2 or not self._hourly_log:
+            return []
+        reference = (
+            hour_start_utc(hour_start) if isinstance(hour_start, datetime) else None
+        )
+        if reference is None:
+            return []
+        readings: dict[int, float] = {}
         for log in reversed(self._hourly_log):
-            try:
-                timestamp_str = log.get("timestamp")
-                if timestamp_str:
-                    log_dt = dt_util.parse_datetime(timestamp_str)
-                    if log_dt:
-                        # Ensure timezone awareness for comparison
-                        if log_dt.tzinfo is None and reference_time.tzinfo:
-                            log_dt = log_dt.replace(tzinfo=reference_time.tzinfo)
+            instant = log_entry_instant(log)
+            if instant is None:
+                continue
+            age = int(round((reference - hour_start_utc(instant)).total_seconds() / 3600.0))
+            if age < 1:
+                continue  # the current hour or later
+            if age >= window:
+                break  # sorted by time: everything further back is older
+            temp = finite_float(log.get("temp"))
+            if temp is not None:
+                readings.setdefault(age, temp)
 
-                        if log_dt >= cutoff_time:
-                            valid_logs.append(log)
-                        else:
-                            # Since we iterate backwards, once we hit an old log, we can stop
-                            # assuming logs are sorted.
-                            break
-            except (ValueError, TypeError):
-                pass
+        aligned: list = [None] * (window - 1)
+        previous_age = 0
+        oldest = 0
+        for age in sorted(readings):
+            if age - previous_age > self.inertia_tau:
+                break
+            aligned[window - 1 - age] = readings[age]
+            previous_age = oldest = age
+        return aligned[window - 1 - oldest:] if oldest else []
 
-        # Restore chronological order (oldest first)
-        valid_logs.reverse()
+    def _entries_on_current_axis(self, entries: list[dict]) -> list[dict]:
+        """Shallow copies of hourly-log entries re-keyed on the current axis.
 
-        # Take last N valid logs
-        recent_logs = valid_logs[-hours_back:]
-        for log in recent_logs:
-            temps.append(log["temp"])
+        ``temp_key`` / ``inertia_temp`` are logged with the inertia axis in
+        force at the time.  Replays (retrain, the solar replay service, the
+        ``diagnose_solar`` shadow replay) learn into buckets keyed on the
+        axis live learning uses now, so they recompute both from ``temp``
+        with the current kernel and tau (``helpers.inertia_temperatures``).
+        History comes from the whole hourly log, so the first hours of a
+        ``days_back`` window keep their warm-up.  An entry whose inertia
+        cannot be computed (no readable timestamp or temp) keeps its stored
+        values.  The log itself is not modified.
+        """
+        if not entries:
+            return []
+        source = self._hourly_log or []
+        by_id = {id(e): i for i, e in enumerate(source)}
+        if all(id(e) in by_id for e in entries):
+            values = inertia_temperatures(source, self.inertia_weights, self.inertia_tau)
+            inertia = [values[by_id[id(e)]] for e in entries]
+        else:
+            inertia = inertia_temperatures(entries, self.inertia_weights, self.inertia_tau)
+        out = []
+        for entry, value in zip(entries, inertia):
+            if value is None:
+                out.append(entry)
+                continue
+            out.append({
+                **entry,
+                "inertia_temp": round(value, 2),
+                "temp_key": str(int(round(value))),
+            })
+        return out
 
-        return temps
+    def _get_inertia_list(self, current_time: datetime) -> list:
+        """Hourly-aligned temperatures for inertia: history + the current hour.
 
-    def _get_inertia_list(self, current_time: datetime) -> list[float]:
-        """Get full list of temperatures for inertia calculation (History + Current).
-
-        Centralizes the logic used by forecast seeding and inertia calculations.
-        Returns the raw list of temperatures [H-3, H-2, H-1, Current].
+        Centralizes the logic used by forecast seeding and inertia
+        calculations.  Oldest → newest, one position per clock hour, the
+        last being the current hour; ``None`` where an hour has no reading
+        (see :meth:`_get_recent_log_temps`).
         """
         # Get valid history using helper
         temps = self._get_recent_log_temps(current_time)
@@ -2254,9 +2503,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
 
         if current_temp is not None:
             temps.append(current_temp)
-
-        # If list is empty but we have a running average (edge case?), return that seeded
-        # Handled by caller if needed.
+        elif temps:
+            # Keep the history aligned: the last position is the current hour.
+            temps.append(None)
 
         return temps
 
@@ -2277,7 +2526,8 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if len(temps) == 1:
             return temps[0]
 
-        return self._calculate_weighted_inertia(temps)
+        value = weighted_inertia(temps, self.inertia_weights, self.inertia_tau)
+        return value
 
     def _calculate_effective_wind(self, speed: float, gust: float | None) -> float:
         """Calculate effective wind speed.
@@ -2417,13 +2667,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         if not self._hourly_log:
             return None
 
-        current_time = dt_util.now()
-        current_hour = current_time.hour
-        today_iso = current_time.date().isoformat()
-
-        # Check the most recent log entry
+        # Compared on the hour's start instant: during the repeated DST
+        # fall-back hour the previous entry has the same date and hour
+        # number, yet belongs to the hour before.
         last_entry = self._hourly_log[-1]
-        if last_entry["hour"] == current_hour and last_entry["timestamp"].startswith(today_iso):
+        if log_entry_instant(last_entry) == hour_start_utc(dt_util.now()):
             return last_entry
 
         return None
@@ -2860,16 +3108,48 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         self.data["daily_wind_chill_penalty"] = self._calculate_daily_wind_penalty()
 
         # Per-Source Accuracy & Blend Config (New Unified Attribute)
+        self._update_forecast_details()
+
+    def _update_forecast_details(self):
+        """Publish the forecast blend config and per-source accuracy.
+
+        Split out of _update_daily_budgets so the producer -> projection ->
+        HeatingForecastDetailsSensor contract can be exercised end to end; the
+        two halves of that contract drifted apart once and left the sensor
+        permanently stuck on its warm-up string.
+        """
+        per_source_stats = self.forecast.calculate_per_source_uncertainty_stats()
+
         self.data[ATTR_FORECAST_DETAILS] = {
             "blend_config": {
                 "primary_entity_id": self.weather_entity,
                 "secondary_entity_id": self.entry.data.get(CONF_SECONDARY_WEATHER_ENTITY),
                 "crossover_day": self.entry.data.get(CONF_FORECAST_CROSSOVER_DAY, DEFAULT_FORECAST_CROSSOVER_DAY)
             },
+            # The "hourly" half of each source's stats is deliberately projected
+            # away here: it carries hourly-derived percentile/MAE numbers that are
+            # not actionable for a user reading the attribute in the UI. Only the
+            # "daily" half is user-facing. This is an attribute-payload decision,
+            # NOT a statement that "hourly" is unused — HeatingForecastDetailsSensor
+            # needs two of its fields to produce its state string, and those are
+            # published on the sibling key below instead of being re-exposed here.
             "accuracy_by_source": {
                 source: {"daily": stats["daily"]}
-                for source, stats in self.forecast.calculate_per_source_uncertainty_stats().items()
+                for source, stats in per_source_stats.items()
             }
+        }
+
+        # Internal, non-attribute companion to the projection above. Nothing
+        # returns coordinator.data wholesale as entity attributes, so a sibling
+        # key keeps these numbers out of the state machine and the recorder while
+        # still reaching the sensor. Note "samples" counts DAYS, not hours — see
+        # the docstring on ForecastManager.calculate_per_source_uncertainty_stats.
+        self.data[KEY_FORECAST_ACCURACY_INTERNAL] = {
+            source: {
+                "samples": stats["hourly"].get("samples", 0),
+                "p50_abs_error": stats["hourly"].get("p50_abs_error"),
+            }
+            for source, stats in per_source_stats.items()
         }
 
     def _update_tdd_calculations(self, temp: float | None, minutes_passed: int):
@@ -2942,6 +3222,22 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             "explanation": adjusted_explanation
         }
 
+    def _hour_boundary_crossed(self, current_time: datetime) -> bool:
+        """Has the clock hour changed since the last boundary?
+
+        Compared on the hour's start instant, not its local number: when the
+        clocks go back, ``02:59+02:00`` is followed by ``02:00+01:00`` — the
+        same hour number, but a new hour that needs its own log entry.
+        Without a recorded instant (first run, or state saved by a version
+        that stored only the number) the number decides, as it used to, so
+        an hour missed across a restart is still finalized.
+        """
+        if self._last_hour_start is not None:
+            return hour_start_utc(current_time) != self._last_hour_start
+        if self._last_hour_processed is None:
+            return False
+        return current_time.hour != self._last_hour_processed
+
     async def _async_update_data(self):
         """Update data."""
         if not self._is_loaded:
@@ -2954,14 +3250,11 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             self._accumulation_start_time = current_time
         if self._last_day_processed is None:
             self._last_day_processed = current_time.date()
-        if self._last_hour_processed is None:
-            self._last_hour_processed = current_time.hour
-
         # --- Boundary Processing ---
         # First, handle hour/day rollovers to ensure all historical data is up-to-date
         # before any new calculations for the current period are made.
         # This resolves the midnight race condition.
-        completed_hour = current_time.hour != self._last_hour_processed
+        completed_hour = self._hour_boundary_crossed(current_time)
         if completed_hour:
             await self._process_hourly_data(current_time)
             # Recalculate stats that depend on hourly_log (moved from per-minute execution)
@@ -2969,14 +3262,16 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
             self.statistics.update_daily_savings_cache()
             _LOGGER.debug("Stats recalculated after hourly processing")
 
-            self._last_hour_processed = current_time.hour
             self._accumulation_start_time = current_time
+        self._last_hour_processed = current_time.hour
+        self._last_hour_start = hour_start_utc(current_time)
 
         completed_day = current_time.date() != self._last_day_processed
         if completed_day:
             if self._last_day_processed is not None:
                 # Process the completed day
                 await self._process_daily_data(self._last_day_processed)
+                self._schedule_heat_source_classification()
             self._last_day_processed = current_time.date()
 
         # --- Track C pre-midnight snapshot (#855 follow-up) ---
@@ -3090,7 +3385,9 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         inertia_list = self._get_inertia_list(current_time)
         inertia_temp = None
         if inertia_list:
-             inertia_temp = self._calculate_weighted_inertia(inertia_list)
+             inertia_temp = weighted_inertia(
+                 inertia_list, self.inertia_weights, self.inertia_tau
+             )
 
         calc_temp = inertia_temp if inertia_temp is not None else temp
         temp_key = str(int(round(calc_temp))) if calc_temp is not None else "0"
@@ -3221,17 +3518,18 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         # (inertia_list and inertia_temp calculated earlier in Step 1)
 
         # Calculate Thermal State Attributes
-        # Normalize weights to the active subset so they sum to 1.0,
-        # allowing direct verification: sum(history[i] * weights[i]) == effective_temperature.
-        _active_w = list(self.inertia_weights[-len(inertia_list):]) if inertia_list else []
-        _w_sum = sum(_active_w)
-        _display_weights = [round(w / _w_sum, 4) for w in _active_w] if _w_sum > 0 else _active_w
+        # The readings the effective temperature averages, with their weights
+        # normalised to 1.0, allowing direct verification:
+        # sum(history[i] * weights[i]) == effective_temperature.
+        _used = inertia_samples(inertia_list, self.inertia_weights, self.inertia_tau)
+        _w_sum = sum(w for _, w in _used)
+        _display_weights = [round(w / _w_sum, 4) for _, w in _used] if _w_sum > 0 else [w for _, w in _used]
         thermal_state = {
              "raw_temperature": round(temp, 1) if temp is not None else None,
              "effective_temperature": round(inertia_temp, 1) if inertia_temp is not None else None,
-             "inertia_history": [round(t, 1) for t in inertia_list],
+             "inertia_history": [round(t, 1) for t, _ in _used],
              "weights": _display_weights,
-             "samples_used": len(inertia_list),
+             "samples_used": len(_used),
              "last_updated": current_time.isoformat(),
              "balance_point": self.balance_point,
         }
@@ -3274,18 +3572,17 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
              thermal_state["instant_tdd"] = None
 
         # Trend Calculation
-        if len(inertia_list) >= 2:
+        if len(inertia_list) >= 2 and inertia_list[-1] is not None:
              # Look back up to 2 hours if possible (3 points: Current, H-1, H-2)
-             # List is [oldest, ..., newest]
-             # If len=4: [H-3, H-2, H-1, Current]
-             # Compare Current (index -1) with H-2 (index -3)
+             # List is [oldest, ..., newest], one position per hour
+             # Compare Current (index -1) with H-2 (index -3), else H-1
              hours_back = 0
              old_val = inertia_list[-1]
 
-             if len(inertia_list) >= 3:
+             if len(inertia_list) >= 3 and inertia_list[-3] is not None:
                   old_val = inertia_list[-3]
                   hours_back = 2
-             elif len(inertia_list) == 2:
+             elif inertia_list[-2] is not None:
                   old_val = inertia_list[-2]
                   hours_back = 1
 
@@ -3690,9 +3987,13 @@ class HeatingDataCoordinator(DataUpdateCoordinator):
         """Delegates to :class:`daily_processor.DailyProcessor`."""
         return self._daily_processor.replay_per_unit_models(*args, **kwargs)
 
-    async def _try_track_b_cop_smearing(self, *args, **kwargs):
+    async def _fetch_track_b_cop_params(self, *args, **kwargs):
         """Delegates to :class:`daily_processor.DailyProcessor`."""
-        return await self._daily_processor.try_track_b_cop_smearing(*args, **kwargs)
+        return await self._daily_processor.fetch_track_b_cop_params(*args, **kwargs)
+
+    def _track_b_cop_distribution(self, *args, **kwargs):
+        """Delegates to :class:`daily_processor.DailyProcessor`."""
+        return self._daily_processor.track_b_cop_distribution(*args, **kwargs)
 
     @staticmethod
     def _compute_excluded_mode_energy(day_logs: list[dict]) -> float:

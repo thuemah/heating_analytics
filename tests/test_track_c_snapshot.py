@@ -165,9 +165,12 @@ class TestMidnightSyncFallback:
         result = await track_c_coord._run_track_c_midnight_sync(day_logs, "2026-04-20")
 
         assert result is not None
-        total, dist, source = result
+        total, dist, source, smear = result
         assert source == "live"
         assert dist == fake_dist
+        # What the day was smeared at, stored beside the distribution.
+        assert smear["balance_point"] == track_c_coord.balance_point
+        assert smear["cop_params"] is None
 
     @pytest.mark.asyncio
     async def test_live_failure_uses_snapshot(self, track_c_coord, monkeypatch):
@@ -203,7 +206,7 @@ class TestMidnightSyncFallback:
         result = await track_c_coord._run_track_c_midnight_sync(day_logs, "2026-04-20")
 
         assert result is not None
-        _, _, source = result
+        _, _, source, _smear = result
         assert source == "snapshot_2355"
         # Snapshot cleared after successful consumption.
         assert track_c_coord._track_c_snapshot is None
@@ -255,7 +258,7 @@ class TestTrackUsedTagging:
         """Successful live Track C → track_used='C_live'."""
         dist = [{"synthetic_kwh_el": 0.5} for _ in range(24)]
         track_c_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(
-            return_value=(12.0, dist, "live")
+            return_value=(12.0, dist, "live", {"balance_point": 15.0, "cop_params": None})
         )
         track_c_coord._daily_processor.apply_strategies_to_global_model = MagicMock(return_value=3)
         from custom_components.heating_analytics.observation import build_strategies
@@ -277,7 +280,7 @@ class TestTrackUsedTagging:
         """Snapshot-sourced Track C → track_used='C_snapshot_2355'."""
         dist = [{"synthetic_kwh_el": 0.5} for _ in range(24)]
         track_c_coord._daily_processor.run_track_c_midnight_sync = AsyncMock(
-            return_value=(12.0, dist, "snapshot_2355")
+            return_value=(12.0, dist, "snapshot_2355", {"balance_point": 15.0, "cop_params": None})
         )
         track_c_coord._daily_processor.apply_strategies_to_global_model = MagicMock(return_value=3)
         from custom_components.heating_analytics.observation import build_strategies

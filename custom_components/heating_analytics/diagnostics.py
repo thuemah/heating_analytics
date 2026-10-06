@@ -25,6 +25,7 @@ from .const import (
     REPAIR_DNI_DHI_OUTAGE_MIN_HOURS,
     REPAIR_DNI_DHI_OUTAGE_RAISE_BELOW,
     REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS,
+    REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS,
     MODE_COOLING,
     MODE_DHW,
     MODE_GUEST_COOLING,
@@ -33,7 +34,18 @@ from .const import (
     MODE_OFF,
     SOLAR_BATTERY_DECAY,
 )
-from .helpers import compute_base_ema_step
+from .helpers import (
+    UNIT_LEARNING_SKIP_REASONS,
+    as_utc_instant,
+    aux_affected_entities_of,
+    compute_base_ema_step,
+    first_reported_instants,
+    hour_start_utc,
+    log_entry_instant,
+    unit_hour_reported_kwh,
+    unit_learning_skip_reason,
+)
+from .daily_processor import resmear_track_c_day
 from .learning import (
     compute_snr_weight,
     evaluate_4d_learning_readiness,
@@ -369,7 +381,7 @@ def battery_decay_verdict(
     """Verdict for the (decay, k) calibration sweep (#1066).
 
     ``withheld_reason`` is computed where the sweep ran — it needs the
-    residuals and both window surfaces — and carries the three
+    residuals and both window surfaces — and carries the
     suppressing conditions in priority order.  This maps it onto the
     user-facing verdict so both battery verdicts have the same shape.
 
@@ -422,6 +434,10 @@ def battery_decay_verdict(
         if bias_assessment in ("too_fast", "too_slow"):
             return bias_assessment
         return "insufficient_data"
+    # Decay only, and consistent with ``changed`` at the call site, which
+    # is decay-only for the same reason: decay is the only parameter the
+    # apply path writes.  A k-only difference is therefore "ok" here by
+    # design, not a dropped recommendation.
     if recommended_decay == current_decay:
         return "ok"
     if withheld_reason:
@@ -542,6 +558,9 @@ class DiagnosticsEngine:
             mode_stats[day]["total_hours"] += 1
 
             unit_modes = entry.get("unit_modes", {})
+            # Units that consumed energy (``unit_breakdown`` holds kWh > 0):
+            # contamination is excluded-mode *energy*, so an idle unit in an
+            # excluded mode is not counted.
             breakdown = entry.get("unit_breakdown", {})
             for sid, kwh in breakdown.items():
                 mode = unit_modes.get(sid, "heating")
@@ -680,24 +699,60 @@ class DiagnosticsEngine:
         # nothing.  An empty dict marks "no distribution available".
         dist_by_day_hour: dict[str, dict[int, float]] = {}
 
-        def _resolve_distribution(day_key: str) -> dict[int, float] | None:
-            """Return {hour: synthetic_kwh_el} for a Track C day, or None."""
+        def _hour_key(ts) -> datetime | None:
+            """Hour start as a UTC instant; see ``helpers.hour_slots``."""
+            if not isinstance(ts, str):
+                return None
+            try:
+                parsed = dt_util.parse_datetime(ts)
+            except (TypeError, ValueError):
+                return None
+            return hour_start_utc(parsed) if isinstance(parsed, datetime) else None
+
+        logs_by_day: dict[str, list] | None = None
+
+        def _day_logs_on_current_axis(day_key: str) -> list | None:
+            # The whole log re-keyed once (one inertia pass), then grouped.
+            nonlocal logs_by_day
+            if logs_by_day is None:
+                log = self.coordinator._hourly_log or []
+                to_axis = getattr(self.coordinator, "_entries_on_current_axis", None)
+                rekeyed = to_axis(log) if callable(to_axis) else None
+                if not isinstance(rekeyed, list) or len(rekeyed) != len(log):
+                    rekeyed = list(log)
+                logs_by_day = {}
+                for _e in rekeyed:
+                    logs_by_day.setdefault(str(_e.get("timestamp", ""))[:10], []).append(_e)
+            return logs_by_day.get(day_key, [])
+
+        def _resolve_distribution(day_key: str) -> dict[datetime, float] | None:
+            """Return {hour start (UTC): synthetic_kwh_el} for a Track C day.
+
+            Keyed on the instant, not the local hour number, so the repeated
+            DST fall-back hour does not overwrite the one before it.
+            """
             if day_key in dist_by_day_hour:
                 return dist_by_day_hour[day_key] or None
             day_history = self.coordinator._daily_history.get(day_key, {}) or {}
-            raw_dist = day_history.get("track_c_distribution")
+            if not day_history.get("track_c_distribution"):
+                dist_by_day_hour[day_key] = {}
+                return None
+            # The buckets are compared as retrain rebuilds them: the day
+            # re-spread at the current settings, from its whole log on the
+            # current inertia axis, not the shape of its midnight (#1111).
+            raw_dist, _info = resmear_track_c_day(
+                self.coordinator, _day_logs_on_current_axis(day_key), day_history,
+            )
             if not raw_dist:
                 dist_by_day_hour[day_key] = {}
                 return None
-            hour_map: dict[int, float] = {}
+            hour_map: dict[datetime, float] = {}
             for d in raw_dist:
                 try:
-                    dt_str = d.get("datetime", "")
-                    # ISO format: "2026-04-15T13:00:00..."  Hour at chars 11-13.
-                    if len(dt_str) >= 13 and dt_str[10] == "T":
-                        h = int(dt_str[11:13])
-                        hour_map[h] = float(d.get("synthetic_kwh_el", 0.0))
-                except (ValueError, TypeError):
+                    key = _hour_key(d.get("datetime"))
+                    if key is not None:
+                        hour_map[key] = float(d.get("synthetic_kwh_el", 0.0))
+                except (ValueError, TypeError, AttributeError):
                     continue
             dist_by_day_hour[day_key] = hour_map
             return hour_map or None
@@ -713,8 +768,7 @@ class DiagnosticsEngine:
             hour_map = _resolve_distribution(day_key)
             if hour_map is None:
                 return float(actual), False
-            hour = entry.get("hour", -1)
-            synthetic = hour_map.get(hour)
+            synthetic = hour_map.get(_hour_key(entry.get("timestamp")))
             if synthetic is None:
                 # Track C day but this specific hour missing from the
                 # distribution.  Fall back to raw rather than guess; the
@@ -856,7 +910,10 @@ class DiagnosticsEngine:
                 "date": day_key,
                 "raw_kwh": round(day_data["kwh"], 2),
                 "temp_avg": round(day_data.get("temp", 0.0), 1),
+                # As stored: the degree-days that day's midnight learning
+                # used, at the BP it recorded.
                 "tdd": round(day_data.get("tdd", 0.0), 2),
+                "tdd_balance_point": day_data.get("balance_point"),
                 "wind_avg": round(day_data.get("wind", 0.0), 1),
             }
             if "track_c_kwh" in day_data:
@@ -1157,7 +1214,18 @@ class DiagnosticsEngine:
             return unit_accum[eid]
 
         # Global accumulators
-        excluded = {"aux": 0, "guest": 0, "saturated": 0, "low_vector": 0, "no_base": 0, "legacy": 0, "outlier": 0}
+        excluded = {
+            "aux": 0, "guest": 0, "saturated": 0, "low_vector": 0, "no_base": 0,
+            "legacy": 0, "outlier": 0,
+            # The unit's sensor did not report that hour: live skipped it.
+            "not_reporting": 0,
+        }
+        # Hours live learning skipped per unit (#1087), one key per reason.
+        excluded.update({reason: 0 for reason in UNIT_LEARNING_SKIP_REASONS})
+        aux_affected = aux_affected_entities_of(self.coordinator)
+        # Anchor for reading an absent unit on entries logged before
+        # ``units_reporting`` (``helpers.unit_hour_reported_kwh``).
+        first_reported = first_reported_instants(self.coordinator._hourly_log)
         total_qualifying = 0
 
         # Battery calibration: collect per-day hourly sequences for decay sweep.
@@ -1174,17 +1242,24 @@ class DiagnosticsEngine:
         # Hour-of-day residual curve (hours 6-18)
         hourly_residuals: dict[int, list[float]] = {h: [] for h in range(6, 19)}
 
-        # Timestamp → entry index for the lag walk in
+        # Hour-start instant → entry index for the lag walk in
         # `elevation_diagnostics.lag` (#927 Tier 2).  Built once over the
         # cutoff-filtered log so each per-(entity, sample) lag walk does
         # constant-time lookups without re-scanning the log.  Cost on a
         # 90-day log is ~2160 entries × dict insertion ≈ <1 ms.  Cleared
         # implicitly when diagnose_solar returns; rebuilt next call.
-        log_by_timestamp: dict[str, dict] = {}
+        # Keyed on UTC instants, never on the timestamp string: the walk
+        # steps H + k hours, and across a DST change the string of the
+        # target hour carries the other offset (and ``aware + timedelta``
+        # is wall-clock arithmetic), so a string key missed every tail
+        # that crossed the change.
+        log_by_instant: dict = {}
         for _entry in self.coordinator._hourly_log:
             _ts = _entry.get("timestamp", "")
             if _ts and _ts[:10] >= cutoff:
-                log_by_timestamp[_ts] = _entry
+                _instant = log_entry_instant(_entry)
+                if _instant is not None:
+                    log_by_instant[_instant] = _entry
 
         # Battery thermal-feedback sweep (#896): chronological tuples for
         # replay of the EMA under candidate k values.  Data shape mirrors the
@@ -1224,7 +1299,6 @@ class DiagnosticsEngine:
             aux_active = entry.get("auxiliary_active", False)
             guest_kwh = entry.get("guest_impact_kwh", 0.0)
             unit_modes = entry.get("unit_modes", {})
-            unit_breakdown = entry.get("unit_breakdown", {})
             unit_expected_base = entry.get("unit_expected_breakdown", {})
             # Solar shutdown (#838): missing on legacy logs → empty list means
             # no shutdown hours recorded, which is treated as "all qualifying
@@ -1378,6 +1452,8 @@ class DiagnosticsEngine:
             # parse failure or when astral is unavailable; downstream
             # bucketing skips those entries.
             entry_dt = dt_util.parse_datetime(ts) if ts else None
+            # UTC instant of the hour start, for the lag walk's lookups.
+            entry_instant = as_utc_instant(entry_dt) if entry_dt is not None else None
             sun_elev_entry: float | None = None
             if entry_dt is not None:
                 mid_dt = entry_dt + timedelta(minutes=30)
@@ -1399,11 +1475,25 @@ class DiagnosticsEngine:
                     excluded["aux"] += 1
                     continue
 
+                # Same hours live learning used — keeps the implied
+                # coefficient (and ``apply_implied_coefficient``, which
+                # reproduces it) off 20–80 % aux and dual-interference
+                # hours, where aux lowering ``actual`` reads as solar gain.
+                skip_reason = unit_learning_skip_reason(entry, entity_id, aux_affected)
+                if skip_reason is not None:
+                    excluded[skip_reason] += 1
+                    continue
+
                 if vector_mag < 0.01:
                     excluded["low_vector"] += 1
                     continue
 
-                actual_unit = unit_breakdown.get(entity_id, 0.0)
+                # A sensor that did not report is skipped, as live skips
+                # it; read as 0 it would land in the saturated bucket.
+                actual_unit = unit_hour_reported_kwh(entry, entity_id, first_reported)
+                if actual_unit is None:
+                    excluded["not_reporting"] += 1
+                    continue
                 base_unit = unit_expected_base.get(entity_id)
                 if base_unit is None:
                     excluded["no_base"] += 1
@@ -1659,11 +1749,12 @@ class DiagnosticsEngine:
                             # Lag 0 is the originator's own
                             # `base − actual = implied_solar`, included
                             # without the self-qualify gate.
-                            if entry_dt is not None:
+                            if entry_instant is not None:
                                 ev_lag = acc["elevation_lag_buckets"][bucket_key]
                                 for _k in range(7):
-                                    _tail_ts = (entry_dt + timedelta(hours=_k)).isoformat()
-                                    _tail = log_by_timestamp.get(_tail_ts)
+                                    _tail = log_by_instant.get(
+                                        entry_instant + timedelta(hours=_k)
+                                    )
                                     if _tail is None:
                                         continue
                                     _tail_modes = _tail.get("unit_modes") or {}
@@ -1674,8 +1765,12 @@ class DiagnosticsEngine:
                                         continue
                                     if _k > 0 and (_tail.get("solar_factor") or 0.0) > 0.05:
                                         continue
+                                    # A tail hour the unit reported at 0 kWh
+                                    # (still off) is the signal, not a gap.
                                     _tail_base = (_tail.get("unit_expected_breakdown") or {}).get(entity_id)
-                                    _tail_actual = (_tail.get("unit_breakdown") or {}).get(entity_id)
+                                    _tail_actual = unit_hour_reported_kwh(
+                                        _tail, entity_id, first_reported
+                                    )
                                     if _tail_base is None or _tail_actual is None:
                                         continue
                                     ev_lag[f"lag_{_k}"].append(
@@ -1697,10 +1792,9 @@ class DiagnosticsEngine:
                                 _ev_acc = acc["elevation_evening_tail_buckets"][bucket_key]
                                 _dark_offset = None
                                 for _search in range(1, 13):
-                                    _search_ts = (
-                                        entry_dt + timedelta(hours=_search)
-                                    ).isoformat()
-                                    _candidate = log_by_timestamp.get(_search_ts)
+                                    _candidate = log_by_instant.get(
+                                        entry_instant + timedelta(hours=_search)
+                                    )
                                     if _candidate is None:
                                         continue
                                     if (_candidate.get("solar_factor") or 0.0) < 0.05:
@@ -1709,11 +1803,10 @@ class DiagnosticsEngine:
                                 if _dark_offset is not None:
                                     _ev_acc["dark_offsets"].append(_dark_offset)
                                     for _ek in range(6):
-                                        _ev_ts = (
-                                            entry_dt
+                                        _ev_entry = log_by_instant.get(
+                                            entry_instant
                                             + timedelta(hours=_dark_offset + _ek)
-                                        ).isoformat()
-                                        _ev_entry = log_by_timestamp.get(_ev_ts)
+                                        )
                                         if _ev_entry is None:
                                             continue
                                         _ev_modes = _ev_entry.get("unit_modes") or {}
@@ -1727,9 +1820,9 @@ class DiagnosticsEngine:
                                         _ev_base = (
                                             _ev_entry.get("unit_expected_breakdown") or {}
                                         ).get(entity_id)
-                                        _ev_actual = (
-                                            _ev_entry.get("unit_breakdown") or {}
-                                        ).get(entity_id)
+                                        _ev_actual = unit_hour_reported_kwh(
+                                            _ev_entry, entity_id, first_reported
+                                        )
                                         if _ev_base is None or _ev_actual is None:
                                             continue
                                         _ev_acc["residuals"].append(
@@ -2024,6 +2117,8 @@ class DiagnosticsEngine:
             e for e in self.coordinator._hourly_log
             if e.get("timestamp", "") >= cutoff
         ]
+        # Keyed on the inertia axis live learning uses now, like retrain.
+        window_entries = self.coordinator._entries_on_current_axis(window_entries)
         shadow_coeffs: dict = {}
         shadow_buffers: dict = {}
         # Seed shadow per-unit correlation from the current coordinator
@@ -2054,6 +2149,7 @@ class DiagnosticsEngine:
             wind_threshold=self.coordinator.wind_threshold,
             extreme_wind_threshold=self.coordinator.extreme_wind_threshold,
             return_diagnostics=True,
+            first_reported=first_reported_instants(self.coordinator._hourly_log),
         )
 
         per_unit = {}
@@ -2996,10 +3092,30 @@ class DiagnosticsEngine:
             )
 
             # --- Is the recommendation worth showing? (#1066) ---------
-            # Three independent reasons to withhold it, all computed
+            # Independent reasons to withhold it, all computed
             # here so the verdict below reads as a lookup rather than a
             # second decision procedure.
-            changed = (best[0] != decay_live or best[1] != k_live)
+            #
+            # Decay only, deliberately.  The verdict and the apply path act
+            # on decay alone (``apply_battery_decay`` writes
+            # ``solar_battery_decay`` only; k is retired and stripped on
+            # every init), so a k-only difference is not a recommendation
+            # anything can act on.  Every consumer below — the boundary
+            # check, ``windows_disagree``, the withholding chain and
+            # ``battery_decay_verdict`` — therefore branches on decay, and
+            # none of them may be widened to the joint pair without also
+            # giving k a writer.  With ``K_GRID = [0.0]`` the joint and
+            # decay-only forms are identical; the distinction is what
+            # keeps the layer honest if the grid is ever widened.
+            changed = best[0] != decay_live
+            # A decay the sweep found *conditional on* a k the install
+            # does not have is not a recommendation for this install —
+            # applying it would leave decay fitted for a k that evaporates
+            # on the next restart.  Unreachable while ``K_GRID`` is
+            # pinned; withheld explicitly rather than left to the
+            # reader so widening the grid cannot surface such a value as
+            # advice.
+            requires_k_change = changed and best[1] != k_live
             # ``len(surface)`` is the number of candidates that actually
             # qualified and competed in the argmin — not len(DECAY_GRID) ×
             # len(K_GRID), since candidates below the hour floor are
@@ -3045,6 +3161,9 @@ class DiagnosticsEngine:
             # the recommendation is window-specific overfitting rather
             # than a property of the building.  Previously computed,
             # reported next to the recommendation, and not acted on.
+            # Compares decay only, consistent with ``changed`` above: k is
+            # not a recommendable parameter, so disagreement about it is
+            # not disagreement about the recommendation.
             windows_disagree = bool(
                 changed
                 and morning_best_rmse != float("inf")
@@ -3092,6 +3211,7 @@ class DiagnosticsEngine:
                 "windows_disagree": windows_disagree,
                 "recommendation_withheld_reason": (
                     None if not changed
+                    else "requires_k_change" if requires_k_change
                     else "windows_disagree" if windows_disagree
                     else "optimum_at_sweep_boundary" if decay_at_boundary
                     else "below_noise_floor" if not significance["significant"]
@@ -3667,7 +3787,7 @@ class DiagnosticsEngine:
         if calibration:
             # ``recommended_decay != current_decay`` is necessary but not
             # sufficient (#1066).  ``recommendation_withheld_reason``
-            # carries the three suppressing conditions in priority order,
+            # carries the suppressing conditions in priority order,
             # computed where the sweep ran; the verdict is a lookup.
             decay_verdict = battery_decay_verdict(
                 calibration.get("current_decay"),
@@ -4006,7 +4126,12 @@ class DiagnosticsEngine:
         weeks to notice.  Two questions, two windows.
 
         Walks ``_hourly_log`` backwards, counting **daylight** hours only
-        (``solar_factor > 0``) until the window is full.  The daylight
+        (``solar_factor > 0``) until the window is full, and never further
+        back than ``REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS`` calendar days.  The
+        age bound is what keeps the walk cheap: window fill alone does not,
+        because unlabelled (pre-``dni_dhi_source``) entries consume no
+        window budget, so a log predating that field would otherwise be
+        walked end to end on every hour boundary.  The daylight
         filter is load-bearing for the same reason it is in the source
         mix: :func:`solar.derive_dni_dhi_source_label` never emits
         ``"no_sun"``, so night hours carry a ``kasten_synthetic`` label on
@@ -4050,8 +4175,18 @@ class DiagnosticsEngine:
 
         real_hours = 0
         examined = 0
+        # The log is chronological, so walking it backwards the first
+        # entry older than the age bound ends the walk — everything before
+        # it is older still.  Entries without a timestamp do not trigger
+        # the exit (an empty string sorts before any date).
+        age_cutoff = (
+            dt_util.now() - timedelta(days=REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS)
+        ).date().isoformat()
         for entry in reversed(self.coordinator._hourly_log):
             if examined >= REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS:
+                break
+            ts = entry.get("timestamp") or ""
+            if ts and ts[:10] < age_cutoff:
                 break
             try:
                 if float(entry.get("solar_factor") or 0.0) <= 0.0:
@@ -4074,6 +4209,7 @@ class DiagnosticsEngine:
             "daylight_hours_examined": examined,
             "real_source_hours": real_hours,
             "window_hours": REPAIR_DNI_DHI_OUTAGE_WINDOW_HOURS,
+            "max_age_days": REPAIR_DNI_DHI_OUTAGE_MAX_AGE_DAYS,
             "thresholds": {
                 "raise_below": REPAIR_DNI_DHI_OUTAGE_RAISE_BELOW,
                 "clear_at": REPAIR_DNI_DHI_OUTAGE_CLEAR_AT,
@@ -4446,6 +4582,9 @@ class DiagnosticsEngine:
         )
 
         samples: list[dict] = []
+        # Anchor for reading an absent unit on entries logged before
+        # ``units_reporting`` (``helpers.unit_hour_reported_kwh``).
+        first_reported = first_reported_instants(self.coordinator._hourly_log)
         for entry in self.coordinator._hourly_log:
             ts = entry.get("timestamp", "")
             if ts[:10] < cutoff:
@@ -4606,7 +4745,6 @@ class DiagnosticsEngine:
             #  * skip if per-entity base bucket is missing or
             #    non-positive
             y_per_entity: dict[str, float] = {}
-            unit_breakdown = entry.get("unit_breakdown") or {}
             solar_dominant = set(entry.get("solar_dominant_entities") or [])
             unit_modes_full = entry.get("unit_modes") or {}
             temp_key = entry.get("temp_key")
@@ -4622,8 +4760,10 @@ class DiagnosticsEngine:
                     mode = unit_modes_full.get(eid, MODE_HEATING)
                     if mode not in _LEARNABLE_PER_UNIT_MODES:
                         continue
-                    unit_actual = unit_breakdown.get(eid)
-                    if not isinstance(unit_actual, (int, float)):
+                    # Reported hours only; a reported 0 kWh hour is a
+                    # sample (``unit_base − 0``), not a gap.
+                    unit_actual = unit_hour_reported_kwh(entry, eid, first_reported)
+                    if unit_actual is None:
                         continue
                     unit_base = (
                         correlation_data_per_unit.get(eid, {})
@@ -5014,8 +5154,11 @@ class DiagnosticsEngine:
                vs previous value).  Protects against a single anomalous
                week flipping the threshold.
 
-        Only heating-mode samples contribute.  Aux-active hours and guest
-        modes are excluded — matches the live learning exclusion set.
+        Only heating-mode samples contribute.  Aux-active hours, guest
+        modes and hours live learning skipped for the unit (20–80 % aux,
+        dual interference, post-aux cooldown, learning off — counted in
+        ``learning_skipped``) are excluded — matches the live learning
+        exclusion set.
 
         Returns a diagnostic dict usable by the ``calibrate_unit_thresholds``
         service and the startup log; ``self.coordinator._per_unit_min_base_thresholds``
@@ -5058,6 +5201,8 @@ class DiagnosticsEngine:
 
         # Collect dark-hour actuals per unit.
         samples: dict[str, list[float]] = {sid: [] for sid in self.coordinator.energy_sensors}
+        aux_affected = aux_affected_entities_of(self.coordinator)
+        learning_skipped = {reason: 0 for reason in UNIT_LEARNING_SKIP_REASONS}
         for entry in self.coordinator._hourly_log:
             ts = entry.get("timestamp", "")
             if ts[:10] < cutoff_iso:
@@ -5073,12 +5218,26 @@ class DiagnosticsEngine:
                 mode = unit_modes.get(sid, MODE_HEATING)
                 if mode != MODE_HEATING:
                     continue
+                # Operating hours only, deliberately: presence in
+                # ``unit_breakdown`` means the unit consumed energy, and the
+                # p10 is the noise floor of a *running* unit.  Idle (0 kWh)
+                # hours stay out — not ``helpers.unit_hour_reported_kwh``,
+                # which would add them: p10 would collapse to 0 (clamped to
+                # the floor) for any unit that cycles off in dark hours, and
+                # the p10 / median ratio guard would stop meaning anything.
                 if sid not in unit_breakdown:
+                    continue
+                # 20–80 % aux hours pull dark-hour actuals down and
+                # would set the noise floor low (#1087).
+                skip_reason = unit_learning_skip_reason(entry, sid, aux_affected)
+                if skip_reason is not None:
+                    learning_skipped[skip_reason] += 1
                     continue
                 actual = unit_breakdown.get(sid, 0.0)
                 if actual is None or actual < 0.0:
                     continue
                 samples[sid].append(float(actual))
+        result["learning_skipped"] = learning_skipped
 
         def _p10(values: list[float]) -> float:
             if not values:

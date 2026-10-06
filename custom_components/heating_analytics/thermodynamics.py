@@ -208,9 +208,6 @@ class ThermodynamicEngine:
 
         total_weight = sum(weights)
 
-        # 4. Smear the total thermal energy and calculate the synthetic baseline
-        distribution: list[HourlyDistribution] = []
-
         # Safe default weather if completely empty
         default_weather: WeatherData = {
             "datetime": "unknown",
@@ -226,7 +223,9 @@ class ThermodynamicEngine:
         # cost than warm hours (high COP).
         use_per_hour_cop = cop_params is not None and "eta_carnot" in cop_params
 
-        for i, mpc in enumerate(mpc_data_24h):
+        hour_weights: list[float] = []
+        hour_cops: list[float] = []
+        for i, _mpc in enumerate(mpc_data_24h):
             # Match weather to MPC data (assuming they are aligned/sorted)
             if i < len(weather_data_24h):
                 weather = weather_data_24h[i]
@@ -234,61 +233,156 @@ class ThermodynamicEngine:
                 weather = weather_data_24h[-1]
             else:
                 weather = default_weather
-
-            weight = weights[i] if i < len(weights) else self._calculate_theoretical_loss_weight(weather)
-
-            # Smear the thermal load proportionally
-            if total_weight > 0:
-                smeared_th = total_kwh_th * (weight / total_weight)
-            else:
-                # If the weather says 0 heat loss for the whole 24h, distribute evenly or set to 0.
-                # Usually, total_weight > 0 if there was any heating need.
-                smeared_th = total_kwh_th / len(mpc_data_24h) if mpc_data_24h else 0.0
-
-            # NOTE ON DHW:
-            # If mpc["mode"] == "dhw", the heat pump was producing hot water, not heating the house.
-            # However, the building envelope still lost heat to the environment during this hour!
-            # Therefore, this hour STILL receives its proportional share of `smeared_th`.
-            # The thermodynamic truth is that the house cooled down, and that lost energy
-            # had to be replaced either before or after the DHW run.
-
-            # Convert smeared thermal to synthetic electrical.
+            hour_weights.append(
+                weights[i] if i < len(weights) else self._calculate_theoretical_loss_weight(weather)
+            )
             # Per-hour COP: uses MPC model at this hour's (T, RH) → correct
             #   attribution of COP variation across the day.
             # Daily avg COP (fallback): COP cancels mathematically → equivalent
             #   to weather-weighted redistribution of actual electrical.
-            if use_per_hour_cop:
-                hour_cop = self.cop_at_conditions(
-                    t_outdoor=weather.get("outdoor_temp", self.balance_point - weather["delta_t"]),
-                    humidity=weather.get("humidity", 50.0),
-                    eta_carnot=cop_params["eta_carnot"],
-                    lwt=cop_params["lwt"],
-                    f_defrost=cop_params.get("f_defrost", 0.85),
-                    defrost_temp_threshold=cop_params.get("defrost_temp_threshold", 7.0),
-                    defrost_rh_threshold=cop_params.get("defrost_rh_threshold", 70.0),
-                )
-            else:
-                hour_cop = daily_avg_cop
-            synthetic_el = smeared_th / hour_cop
-
-            dist: HourlyDistribution = {
-                "datetime": mpc["datetime"],
-                "mode": mpc["mode"],
-                "theoretical_loss_weight": weight,
-                "smeared_kwh_th": round(smeared_th, 3),
-                "synthetic_kwh_el": round(synthetic_el, 3)
-            }
-            distribution.append(dist)
+            hour_cops.append(
+                self._hour_cop(weather, cop_params) if use_per_hour_cop else daily_avg_cop
+            )
 
         # Renormalize per-hour COP path to preserve daily electrical total.
         # sum(smeared_th_h / COP_h) != total_kwh_el in general (Jensen's
         # inequality).  Scaling preserves the per-hour *shape* while anchoring
         # the 24h total to actual metered consumption.  The daily-avg COP
         # path already conserves energy by construction.
-        if use_per_hour_cop and total_kwh_el > 0:
+        return self._smear(
+            [(mpc["datetime"], mpc["mode"]) for mpc in mpc_data_24h],
+            hour_weights,
+            total_weight,
+            total_kwh_th,
+            hour_cops,
+            renormalize_to=total_kwh_el if use_per_hour_cop else None,
+        )
+
+    # Below this, an hour's stored smeared / synthetic kWh are too coarse
+    # (rounded to 3 decimals) to recover its COP from their ratio: at 0.01 kWh
+    # each carries up to 5 % rounding error.
+    RESMEAR_MIN_RATIO_KWH = 0.01
+
+    def resmear_distribution(
+        self,
+        stored: list[HourlyDistribution],
+        weather_rows: list[WeatherData],
+        cop_params: CopParams | None = None,
+    ) -> tuple[list[HourlyDistribution], str]:
+        """Re-spread a stored day at this engine's settings (#1111).
+
+        A day's distribution is smeared once, at midnight, with the balance
+        point, inertia axis, wind thresholds and solar battery decay in force
+        then.  Retrain replays history under the current settings, so it
+        re-spreads each day with ``weather_rows`` built from them — one row
+        per stored hour, in order.  The day's totals are kept: thermal is
+        ``Σ smeared_kwh_th`` and electrical ``Σ synthetic_kwh_el``.
+
+        The per-hour COP comes from ``cop_params`` when the day recorded
+        them (exact).  Otherwise it is recovered from the stored hours: the
+        midnight sync made ``synthetic_h = total_el · (w_h / COP_h) /
+        Σ w_k / COP_k``, so ``smeared_h / synthetic_h`` is ``COP_h`` times
+        a daily constant, and the constant cancels when the result is
+        renormalised to the electrical total.  An hour too small to read
+        (or with no weight at midnight, hence no energy) takes the day's
+        mean ratio.
+
+        Returns the new distribution and ``"exact_cop"`` or
+        ``"recovered_cop"``.
+        """
+        total_kwh_th = sum(max(0.0, float(d.get("smeared_kwh_th", 0.0) or 0.0)) for d in stored)
+        total_kwh_el = sum(max(0.0, float(d.get("synthetic_kwh_el", 0.0) or 0.0)) for d in stored)
+        weights = [self._calculate_theoretical_loss_weight(w) for w in weather_rows]
+        hours = [(d.get("datetime"), d.get("mode", "sh")) for d in stored]
+
+        if cop_params is not None and "eta_carnot" in cop_params:
+            hour_cops = [self._hour_cop(w, cop_params) for w in weather_rows]
+            method = "exact_cop"
+        else:
+            mean_ratio = total_kwh_th / total_kwh_el if total_kwh_el > 0 else 1.0
+            if mean_ratio <= 0:
+                mean_ratio = 1.0
+            hour_cops = []
+            for d in stored:
+                th = float(d.get("smeared_kwh_th", 0.0) or 0.0)
+                el = float(d.get("synthetic_kwh_el", 0.0) or 0.0)
+                if th >= self.RESMEAR_MIN_RATIO_KWH and el >= self.RESMEAR_MIN_RATIO_KWH:
+                    hour_cops.append(th / el)
+                else:
+                    hour_cops.append(mean_ratio)
+            method = "recovered_cop"
+
+        return self._smear(
+            hours,
+            weights,
+            sum(weights),
+            total_kwh_th,
+            hour_cops,
+            renormalize_to=total_kwh_el if total_kwh_el > 0 else None,
+        ), method
+
+    def _hour_cop(self, weather: WeatherData, cop_params: CopParams) -> float:
+        """The MPC COP model at one hour's outdoor temperature and humidity."""
+        return self.cop_at_conditions(
+            t_outdoor=weather.get("outdoor_temp", self.balance_point - weather["delta_t"]),
+            humidity=weather.get("humidity", 50.0),
+            eta_carnot=cop_params["eta_carnot"],
+            lwt=cop_params["lwt"],
+            f_defrost=cop_params.get("f_defrost", 0.85),
+            defrost_temp_threshold=cop_params.get("defrost_temp_threshold", 7.0),
+            defrost_rh_threshold=cop_params.get("defrost_rh_threshold", 70.0),
+        )
+
+    @staticmethod
+    def _smear(
+        hours: list[tuple[str, str]],
+        weights: list[float],
+        total_weight: float,
+        total_kwh_th: float,
+        hour_cops: list[float],
+        *,
+        renormalize_to: float | None,
+    ) -> list[HourlyDistribution]:
+        """Spread a day's thermal total over its hours and convert to electrical.
+
+        The one smearing implementation: the midnight sync
+        (:meth:`calculate_synthetic_baseline`) and the retrain re-smear
+        (:meth:`resmear_distribution`) both end here.  ``hours`` are the
+        (datetime, mode) of each hour, ``weights`` its theoretical loss
+        weight and ``hour_cops`` its COP.  ``renormalize_to`` rescales the
+        electrical hours to that daily total (per-hour COP does not conserve
+        it by itself).
+        """
+        distribution: list[HourlyDistribution] = []
+        for (dt_str, mode), weight, hour_cop in zip(hours, weights, hour_cops):
+            # Smear the thermal load proportionally
+            if total_weight > 0:
+                smeared_th = total_kwh_th * (weight / total_weight)
+            else:
+                # If the weather says 0 heat loss for the whole 24h, distribute evenly or set to 0.
+                # Usually, total_weight > 0 if there was any heating need.
+                smeared_th = total_kwh_th / len(hours) if hours else 0.0
+
+            # NOTE ON DHW:
+            # If mode == "dhw", the heat pump was producing hot water, not heating the house.
+            # However, the building envelope still lost heat to the environment during this hour!
+            # Therefore, this hour STILL receives its proportional share of `smeared_th`.
+            # The thermodynamic truth is that the house cooled down, and that lost energy
+            # had to be replaced either before or after the DHW run.
+            synthetic_el = smeared_th / hour_cop
+
+            distribution.append({
+                "datetime": dt_str,
+                "mode": mode,
+                "theoretical_loss_weight": weight,
+                "smeared_kwh_th": round(smeared_th, 3),
+                "synthetic_kwh_el": round(synthetic_el, 3),
+            })
+
+        if renormalize_to is not None and renormalize_to > 0:
             synthetic_total = sum(d["synthetic_kwh_el"] for d in distribution)
             if synthetic_total > 0:
-                scale = total_kwh_el / synthetic_total
+                scale = renormalize_to / synthetic_total
                 for d in distribution:
                     d["synthetic_kwh_el"] = round(d["synthetic_kwh_el"] * scale, 3)
 

@@ -168,6 +168,7 @@ async def test_csv_import_rotated_data_update(storage_manager, mock_coordinator)
             "kwh": 50.0,
             "temp": 0.0, # Initial temp (mocked as 0)
             "tdd": 15.0, # Initial TDD
+            "balance_point": 12.0,
             "hourly_vectors": {
                 "temp": [0.0] * 24, # Initial vector
                 "wind": [0.0] * 24,
@@ -215,4 +216,6 @@ async def test_csv_import_rotated_data_update(storage_manager, mock_coordinator)
 
             # Check Vectors at Hour 10 and 11
             assert day_data["hourly_vectors"]["temp"][10] == 10.0
+            # Every logged slot was re-patched at the current BP.
+            assert day_data["balance_point"] == 15.0
             assert day_data["hourly_vectors"]["wind"][10] == 5.0

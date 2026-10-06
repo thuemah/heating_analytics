@@ -27,7 +27,7 @@ from unittest.mock import MagicMock, AsyncMock
 import pytest
 
 from custom_components.heating_analytics.learning import LearningManager
-from custom_components.heating_analytics.observation import DirectMeter, WeightedSmear, build_strategies
+from custom_components.heating_analytics.observation import DirectMeter, ModelState, WeightedSmear, build_strategies
 from custom_components.heating_analytics.solar import SolarCalculator
 from custom_components.heating_analytics.const import (
     SOLAR_LEARNING_MIN_BASE,
@@ -36,6 +36,7 @@ from custom_components.heating_analytics.const import (
     MODE_DHW,
 )
 from custom_components.heating_analytics.retrain import RetrainEngine
+from tests.helpers import bind_inertia_axis
 
 
 # -----------------------------------------------------------------------------
@@ -475,6 +476,116 @@ class TestReplaySolarNLMS:
         )
         assert updates == 0
 
+class TestReplaySolarNLMSHourSelection:
+    """Replay admits the hours live per-unit learning used.
+
+    Same selection as the offline fits (``helpers.unit_learning_skip_reason``).
+    ``skipped_global_saturation`` skips only the global base write, so live
+    NLMS learns from it; post-aux cooldown freezes aux-affected units only.
+    """
+
+    SENSORS = ["sensor.a", "sensor.b"]
+
+    def _entries(self, status, n=20, **extra):
+        return [{
+            "timestamp": f"2026-04-15T{h:02d}:00:00",
+            "temp_key": "10",
+            "wind_bucket": "normal",
+            "correction_percent": 100.0,
+            "solar_vector_s": 0.5,
+            "solar_vector_e": 0.1,
+            "solar_vector_w": 0.02,
+            "auxiliary_active": False,
+            "learning_status": status,
+            "temp": 10.0,
+            "unit_modes": {},
+            "unit_breakdown": {"sensor.a": 0.5, "sensor.b": 0.5},
+            "solar_dominant_entities": [],
+            **extra,
+        } for h in range(n)]
+
+    def _replay(self, entries, *, aux_affected):
+        coord = MagicMock()
+        coord.screen_config = (True, True, True)
+        solar_coeffs: dict = {}
+        diag = LearningManager().replay_solar_nlms(
+            entries,
+            solar_calculator=SolarCalculator(coord),
+            screen_config=(True, True, True),
+            correlation_data_per_unit={
+                sid: {"10": {"normal": 1.0}} for sid in self.SENSORS
+            },
+            solar_coefficients_per_unit=solar_coeffs,
+            learning_buffer_solar_per_unit={},
+            energy_sensors=self.SENSORS,
+            learning_rate=0.1,
+            balance_point=15.0,
+            aux_affected_entities=aux_affected,
+            return_diagnostics=True,
+        )
+        return diag, solar_coeffs
+
+    def test_global_saturation_hours_are_replayed(self):
+        diag, coeffs = self._replay(
+            self._entries("skipped_global_saturation"), aux_affected=[],
+        )
+        assert diag["entry_skipped_poisoned"] == 0
+        assert diag["updates"] == 40
+        assert set(coeffs) == {"sensor.a", "sensor.b"}
+
+    def test_cooldown_freezes_only_aux_affected_units(self):
+        diag, coeffs = self._replay(
+            self._entries("cooldown_post_aux"), aux_affected=["sensor.a"],
+        )
+        assert diag["entry_skipped_poisoned"] == 0
+        assert diag["unit_skipped_post_aux_cooldown"] == 20
+        assert diag["updates"] == 20
+        assert set(coeffs) == {"sensor.b"}
+
+    def test_cooldown_with_no_aux_scope_freezes_every_unit(self):
+        """``None`` = every entity affected, as in ``_process_per_unit_learning``."""
+        diag, coeffs = self._replay(
+            self._entries("cooldown_post_aux"), aux_affected=None,
+        )
+        assert diag["unit_skipped_post_aux_cooldown"] == 40
+        assert diag["updates"] == 0
+        assert coeffs == {}
+
+    def test_cooldown_snapshot_wins_over_current_aux_scope(self):
+        """Under daily learning a cooldown hour logs ``disabled_global_only``;
+        the snapshot, not the current scope, names the frozen units."""
+        entries = self._entries(
+            "disabled_global_only", aux_cooldown_entities=["sensor.b"],
+        )
+        diag, coeffs = self._replay(entries, aux_affected=["sensor.a"])
+        assert diag["unit_skipped_post_aux_cooldown"] == 20
+        assert set(coeffs) == {"sensor.a"}
+
+    @pytest.mark.parametrize(
+        "status",
+        ["skipped_mixed_mode", "skipped_dual_interference", "skipped_no_data"],
+    )
+    def test_statuses_without_unit_learning_are_skipped(self, status):
+        diag, coeffs = self._replay(self._entries(status), aux_affected=[])
+        assert diag["entry_skipped_poisoned"] == 20
+        assert diag["entry_skipped_disabled"] == 0
+        assert diag["updates"] == 0
+        assert coeffs == {}
+
+    def test_disabled_is_counted_separately(self):
+        diag, coeffs = self._replay(self._entries("disabled"), aux_affected=[])
+        assert diag["entry_skipped_disabled"] == 20
+        assert diag["entry_skipped_poisoned"] == 0
+        assert coeffs == {}
+
+    def test_entries_without_status_are_replayed(self):
+        entries = self._entries(None)
+        for e in entries:
+            del e["learning_status"]
+        diag, _ = self._replay(entries, aux_affected=[])
+        assert diag["updates"] == 40
+
+
 # -----------------------------------------------------------------------------
 # Integration: retrain_from_history 3-pass EM
 # -----------------------------------------------------------------------------
@@ -525,6 +636,7 @@ def _retrain_coord(hourly_log):
         track_c_enabled=False,
         mpc_managed_sensor=None,
     )
+    bind_inertia_axis(coord)
     return coord
 
 
@@ -901,7 +1013,7 @@ class TestBatteryDecayOnAuxSkippedHours:
         # Locate key markers in the body
         battery_idx = body.find("battery_s = battery_s * battery_decay")
         aux_skip_idx = body.find('entry.get("auxiliary_active"')
-        poisoned_idx = body.find('"learning_status"')
+        poisoned_idx = body.find("hour_learning_skip_reason(entry)")
         magnitude_idx = body.find("magnitude <= 0.1")
 
         # All four markers must be present
@@ -989,6 +1101,7 @@ def _track_a_coord_with_log(hourly_log):
 
     coord._replay_per_unit_models = MagicMock(side_effect=_replay)
     coord._replay_calls = replay_calls
+    bind_inertia_axis(coord)
     return coord
 
 
@@ -1048,31 +1161,56 @@ class TestTrackARetrainPerUnitReplay:
         assert coord._correlation_data_per_unit["sensor.heater2"]["10"]["normal"] == pytest.approx(0.15)
 
     @pytest.mark.asyncio
-    async def test_per_unit_replay_skipped_when_no_processed_entries(self):
-        """All entries poisoned → no replay call (avoids empty work)."""
+    async def test_per_unit_replay_gets_every_entry(self):
+        """The per-unit replay gets every entry, not only those the global
+        pass learned from: live per-unit learning also runs on hours whose
+        global write was skipped, so the replay itself picks the hours
+        (``LearningManager.replay_per_unit_models``)."""
         coord = _track_a_coord_with_log([
-            _track_a_entry("2026-04-10T12:00:00", status="skipped_bad_data"),
+            _track_a_entry("2026-04-10T12:00:00", status="skipped_global_saturation"),
+            _track_a_entry("2026-04-10T13:00:00", status="skipped_mixed_mode"),
         ])
         await RetrainEngine(coord).retrain_from_history()
 
-        assert coord._replay_per_unit_models.call_count == 0
+        assert coord._replay_per_unit_models.call_count == 1
+        replayed = coord._replay_calls[0]
+        assert [e["learning_status"] for e in replayed] == [
+            "skipped_global_saturation", "skipped_mixed_mode",
+        ]
 
     @pytest.mark.asyncio
-    async def test_per_unit_replay_excludes_poisoned_hours(self):
-        """Poisoned entries are excluded from replay input."""
+    async def test_per_unit_replay_skips_hours_live_skipped(self):
+        """Hours live per-unit learning did not run on are not learned."""
         entries = [
             _track_a_entry("2026-04-10T12:00:00", actual=0.3,
                            unit_breakdown={"sensor.heater1": 0.3}),
-            _track_a_entry("2026-04-10T13:00:00", status="skipped_bad_data",
+            _track_a_entry("2026-04-10T13:00:00", status="skipped_mixed_mode",
                            unit_breakdown={"sensor.heater1": 999.0}),  # poison value
             _track_a_entry("2026-04-10T14:00:00", actual=0.4,
                            unit_breakdown={"sensor.heater1": 0.4}),
         ]
         coord = _track_a_coord_with_log(entries)
-        await RetrainEngine(coord).retrain_from_history()
+        coord._unit_strategies = {"sensor.heater1": DirectMeter("sensor.heater1")}
+        coord.get_model_state = lambda: ModelState(
+            correlation_data=coord._correlation_data,
+            correlation_data_per_unit=coord._correlation_data_per_unit,
+            observation_counts=coord._observation_counts,
+            aux_coefficients=coord._aux_coefficients,
+            aux_coefficients_per_unit=coord._aux_coefficients_per_unit,
+            solar_coefficients_per_unit=coord._solar_coefficients_per_unit,
+            learned_u_coefficient=None,
+            learning_buffer_per_unit=coord._learning_buffer_per_unit,
+            learning_buffer_aux_per_unit=coord._learning_buffer_aux_per_unit,
+        )
+        from custom_components.heating_analytics.daily_processor import DailyProcessor
+        processor = DailyProcessor(coord)
+        coord._replay_per_unit_models = MagicMock(
+            side_effect=lambda e: processor.replay_per_unit_models(e)
+        )
+        result = await RetrainEngine(coord).retrain_from_history()
 
-        replayed = coord._replay_calls[0]
-        # Poisoned entry NOT in replay input
-        assert len(replayed) == 2
-        kwhs = [e["unit_breakdown"]["sensor.heater1"] for e in replayed]
-        assert 999.0 not in kwhs
+        report = result["per_unit_replay"]
+        assert report["hours_skipped_learning_status"] == 1
+        # Two samples in the cold-start buffer, the poison value not among them.
+        buffered = coord._learning_buffer_per_unit["sensor.heater1"]["10"]["normal"]
+        assert buffered == [0.3, 0.4]

@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 from homeassistant.util import dt as dt_util
 from homeassistant.const import UnitOfSpeed
@@ -387,8 +387,77 @@ class ForecastManager:
             primary_daily, secondary_daily, blended_daily
         )
 
+    @staticmethod
+    def _chronological_key(item: dict) -> tuple:
+        """Sort key over the UTC instant a forecast item refers to.
+
+        Never sort forecast items on the raw ``datetime`` string. Providers
+        publish different UTC offsets, and lexicographic order over mixed
+        offsets is not chronological order: ``2026-08-10T00:00:00+02:00`` is
+        two hours *earlier* than ``2026-08-09T23:00:00+00:00`` but sorts after
+        it. Lists assembled from more than one source — blended forecasts, a
+        live forecast gap-filled from a persisted reference, provider items
+        interleaved with locally-stamped synthetic ones — can all carry mixed
+        offsets, and every one of them feeds an order-dependent consumer
+        (thermal inertia, the solar carryover EMA).
+
+        Items whose timestamp cannot be parsed sort last, keeping their
+        relative order under Python's stable sort.
+
+        The comparand is the UTC instant, NOT the localized datetime, and that
+        distinction is load-bearing on the autumn fall-back day. The repeated
+        local hour yields two datetimes with the same wall time and the same
+        tzinfo object differing only in ``fold``; Python compares aware
+        datetimes sharing a tzinfo by their naive wall clocks and ignores
+        ``fold``, so those two compare EQUAL despite being an hour apart, and a
+        stable sort would leave whichever was inserted first in front. Comparing
+        UTC instants orders them correctly. (Their ``isoformat()`` values do
+        differ, in the offset, so both survive the blend map as distinct slots —
+        they are genuinely different hours and both should be kept.)
+
+        The key is total: it never raises for any item shape. A naive result is
+        given UTC purely so it stays comparable — Python refuses to order naive
+        against aware datetimes, and a sort key that can throw on provider-
+        supplied data is worse than one that picks an arbitrary-but-consistent
+        answer for a case that carries no information either way. Production
+        does not reach it (HA's as_local attaches the local zone to a naive
+        input), but the string sort this replaces never raised, and a sort key
+        is the wrong place to start.
+        """
+        dt_str = item.get("datetime")
+        if dt_str:
+            try:
+                parsed = dt_util.parse_datetime(dt_str)
+                if parsed:
+                    local_dt = dt_util.as_local(parsed)
+                    if local_dt.tzinfo is None:
+                        local_dt = local_dt.replace(tzinfo=timezone.utc)
+                    return (0, local_dt.astimezone(timezone.utc))
+            except (ValueError, TypeError):
+                pass
+        return (1,)
+
     def _blend_forecasts(self, primary: list, secondary: list, crossover_day: int, forecast_type: str) -> list:
-        """Blend two forecast lists based on a crossover day with robust gap-filling."""
+        """Blend two forecast lists based on a crossover day with robust gap-filling.
+
+        The blend is a map keyed on the resolution the forecast is *addressed*
+        at, so that the two sources' entries for the same slot collide and the
+        crossover rule picks a single winner:
+
+        - ``hourly`` keys on the local timestamp. Both providers deliver whole
+          hours, so the same instant produces the same key regardless of the
+          UTC offset each one happens to publish in.
+        - ``daily`` keys on the local DATE. Providers disagree about which
+          instant stands for a day — local midnight vs. a mid-day UTC stamp —
+          so timestamp keying leaves both entries alive and the crossover rule
+          silently loses its vote on every day both sources cover. The date is
+          also exactly what ``_get_daily_forecast_item`` looks a day up by, so
+          producer and consumer address a day the same way by construction.
+
+        One entry per slot is an invariant of the returned list, not an
+        incidental property: a caller that sums it (rather than looking up by
+        date, which is all today's single consumer does) would double-count.
+        """
         if not primary and not secondary: return []
         if not secondary:
             for item in primary: item['_source'] = 'primary'
@@ -397,10 +466,14 @@ class ForecastManager:
             for item in secondary: item['_source'] = 'secondary'
             return secondary
 
+        is_daily = forecast_type == 'daily'
         blended_map = {}
         now = dt_util.now()
         today = now.date()
         crossover_date = today + timedelta(days=crossover_day)
+
+        def _slot_key(f_dt):
+            return f_dt.date().isoformat() if is_daily else f_dt.isoformat()
 
         # 1. Populate with secondary as a baseline
         for item in secondary:
@@ -410,7 +483,7 @@ class ForecastManager:
                     continue
                 f_dt = dt_util.as_local(parsed)
                 item['_source'] = 'secondary'
-                blended_map[f_dt.isoformat()] = item
+                blended_map[_slot_key(f_dt)] = item
             except (ValueError, TypeError):
                 continue
 
@@ -423,12 +496,13 @@ class ForecastManager:
                 f_dt = dt_util.as_local(parsed)
                 if f_dt.date() < crossover_date:
                     item['_source'] = 'primary'
-                    blended_map[f_dt.isoformat()] = item
+                    blended_map[_slot_key(f_dt)] = item
             except (ValueError, TypeError):
                 continue
 
-        blended_list = list(blended_map.values())
-        blended_list.sort(key=lambda x: x.get("datetime", ""))
+        # Sort on the local instant, not the raw "datetime" string: the two
+        # sources publish different UTC offsets. See _chronological_key.
+        blended_list = sorted(blended_map.values(), key=self._chronological_key)
 
         _LOGGER.info(f"Blended {forecast_type} forecast: {len(blended_list)} total items. Crossover at day {crossover_day}.")
         return blended_list
@@ -569,23 +643,10 @@ class ForecastManager:
         today_start = dt_util.start_of_local_day()
         today_end = today_start + timedelta(days=1)
 
-        # Seed thermal inertia from recent actual temperatures (prior to start of day)
-        inertia_history = []
-        target_iso = today_start.isoformat()
-
-        history_needed = len(self.coordinator.inertia_weights) - 1
-
-        if self.coordinator.model.hourly_log:
-            recent_logs = []
-            for log in reversed(self.coordinator.model.hourly_log):
-                 if log["timestamp"] < target_iso:
-                     recent_logs.append(log)
-                 if len(recent_logs) >= history_needed:
-                     break
-
-            for log in reversed(recent_logs):
-                 # Use RAW temp for inertia calculation to prevent double-averaging
-                 inertia_history.append(log["temp"])
+        # Seed thermal inertia from the logged hours before the start of the
+        # day: the same hourly-aligned, gap-cut history live learning uses.
+        # RAW temps, to prevent double-averaging.
+        inertia_history = self.coordinator._get_recent_log_temps(today_start)
 
         res_main = self._sum_forecast_energy_internal(
             start_time=today_start,
@@ -652,22 +713,17 @@ class ForecastManager:
 
     def calculate_future_energy(self, start_time: datetime, ignore_aux: bool = False, force_aux: bool = False, screen_override: float | None = None, force_no_wind: bool = False) -> tuple[float, float, dict[str, float]]:
         """Calculate sum of predicted energy for future hours using LIVE forecast."""
-        # Prepare for Inertia Calculation on Forecast
-        inertia_history = []
-        history_needed = len(self.coordinator.inertia_weights) - 1
-
-        if self.coordinator.model.hourly_log:
-            recent_logs = []
-            if history_needed > 0:
-                recent_logs = self.coordinator.model.hourly_log[-history_needed:]
-            for log in recent_logs:
-                # Use RAW temp for inertia calculation to prevent double-averaging
-                inertia_history.append(log["temp"])
+        # Prepare for Inertia Calculation on Forecast: the logged history
+        # before the current hour (hourly-aligned, gap-cut, RAW temps) plus
+        # the current hour's estimate.
+        inertia_history = self.coordinator._get_recent_log_temps(dt_util.now())
 
         # Append current hour temp estimation
         curr_temp = self.coordinator._get_float_state(self.coordinator.outdoor_temp_sensor)
         if curr_temp is not None:
             inertia_history.append(curr_temp)
+        elif inertia_history:
+            inertia_history.append(None)  # keep the last position the current hour
 
         end_of_day = start_time.replace(hour=23, minute=59, second=59)
 
@@ -836,9 +892,13 @@ class ForecastManager:
                  except (ValueError, TypeError):
                      pass
 
-        # 3. Convert back to list and sort
-        merged_list = list(merged_map.values())
-        merged_list.sort(key=lambda x: x.get("datetime", ""))
+        # 3. Convert back to list and sort.
+        # Keyed on the local hour and filtered to one date above, so the map key
+        # is itself the chronological order — and unlike the raw "datetime"
+        # string it cannot be thrown by live and reference data carrying
+        # different UTC offsets (a provider switch, or either side of a DST
+        # changeover). See _chronological_key.
+        merged_list = [item for _, item in sorted(merged_map.items())]
 
         # Log gap filling if relevant
         live_hours = [item for item in live_data if dt_util.parse_datetime(item["datetime"]).date() == start_time.date()] if live_data else []
@@ -1025,9 +1085,14 @@ class ForecastManager:
                         new_item["datetime"] = synthetic_dt.isoformat()
                         processed_items.append(new_item)
 
-                    # 3. Sort by time to ensure inertia calculation is correct
-                    # Since we use ISO strings, string sort works for same-day items
-                    processed_items.sort(key=lambda x: x.get("datetime", ""))
+                    # 3. Sort by time to ensure inertia calculation is correct.
+                    # The synthetic items just appended are stamped in the local
+                    # zone while the provider's own items carry whatever offset it
+                    # publishes, so a string sort over the mix is not chronological
+                    # — it only looked safe because the common Nordic case (a
+                    # UTC-stamping provider behind local time) happens to order
+                    # correctly. See _chronological_key.
+                    processed_items.sort(key=self._chronological_key)
 
         total_kwh = 0.0
         total_solar = 0.0
@@ -1873,7 +1938,16 @@ class ForecastManager:
         return stats
 
     def calculate_per_source_uncertainty_stats(self) -> dict:
-        """Calculate uncertainty stats split by forecast source using hourly attribution."""
+        """Calculate uncertainty stats split by forecast source using hourly attribution.
+
+        Returns ``{source: {"hourly": {...}, "daily": {...}}}``.
+
+        The ``"hourly"`` key means *hourly-derived*, not *per hour*: the errors
+        are summed from hourly attribution, but the aggregation unit is a
+        ``_forecast_history`` entry, and there is exactly one of those per day.
+        ``hourly["samples"]`` is therefore a DAY count. ``"daily"`` carries no
+        sample count of its own, so it is the only place that count exists.
+        """
         result = {}
 
         current_primary = self.coordinator.weather_entity
@@ -1900,7 +1974,9 @@ class ForecastManager:
                 elif h.get("source") == src:
                     abs_errors.append(h.get("abs_error_kwh", 0.0))
 
-            # Base stats (P50/P95) go into "hourly" as they use hourly deviations
+            # Base stats (P50/P95) go into "hourly" as they use hourly deviations.
+            # abs_errors holds one value per _forecast_history entry, i.e. one per
+            # day, so the "samples" this emits is a day count.
             hourly_stats = self._calculate_uncertainty_from_errors(abs_errors)
 
             # Period Stats (7d, 30d) - Split into Hourly and Daily

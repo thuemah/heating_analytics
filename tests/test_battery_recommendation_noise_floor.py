@@ -257,12 +257,27 @@ class TestDecayVerdict:
     def test_unchanged_recommendation_is_ok(self):
         assert battery_decay_verdict(0.5, 0.5, None) == "ok"
 
+    def test_k_only_difference_is_ok_by_design(self):
+        """The verdict branches on decay alone, like ``changed``.
+
+        Decay is the only parameter the apply path writes (k is retired
+        and stripped on every init), so a sweep whose optimum differs
+        from live only in k has no recommendation anyone can act on.
+        ``recommended_decay == current_decay`` is the whole test.
+        """
+        assert battery_decay_verdict(0.5, 0.5, None) == "ok"
+
     def test_clean_change_is_recommended(self):
         assert battery_decay_verdict(0.5, 0.7, None) == "consider_decay_0.7"
 
     @pytest.mark.parametrize(
         "reason",
-        ["windows_disagree", "optimum_at_sweep_boundary", "below_noise_floor"],
+        [
+            "requires_k_change",
+            "windows_disagree",
+            "optimum_at_sweep_boundary",
+            "below_noise_floor",
+        ],
     )
     def test_any_withheld_reason_replaces_the_recommendation(self, reason):
         """The reason is the verdict — the user learns why, not a value.
